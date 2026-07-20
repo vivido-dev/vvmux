@@ -1,0 +1,4 @@
+vvmux|vvmux terminal multiplexer,
+    am, bce, ccc, km, mir, msgr, npc, xenl,
+    colors#0x100, cols#80, it#8, lines#24, pairs#0x7fff,
+    use=xterm-256color,
