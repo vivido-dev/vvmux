@@ -8,9 +8,9 @@ license = "Apache-2.0"
 repository = "https://github.com/wensheng/vvmux"
 description = "A detachable Vivid-aware terminal multiplexer"
 
-[workspace]
-members = [".", "vvmux-terminal"]
-resolver = "2"
+[lib]
+name = "vvmux_terminal"
+path = "vvmux-terminal/src/lib.rs"
 
 [dependencies]
 base64 = "0.22"
@@ -22,8 +22,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 toml = "1.1"
+unicode-width = "0.2"
 vivid_protocol = { version = "1.2.1", path = "../vivid_protocol" }
-vvmux-terminal = { path = "vvmux-terminal" }
+vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
 zeroize = "1.9"
 
 [target.'cfg(unix)'.dependencies]
@@ -40,6 +41,7 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_System_Com",
   "Win32_System_Environment",
   "Win32_System_IO",
+  "Win32_System_JobObjects",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_Pipes",
