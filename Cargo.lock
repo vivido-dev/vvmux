@@ -731,20 +731,11 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "toml",
- "vivid_protocol",
- "vvmux-terminal",
- "windows-sys",
- "zeroize",
-]
-
-[[package]]
-name = "vvmux-terminal"
-version = "0.1.0"
-dependencies = [
- "libc",
  "unicode-width",
+ "vivid_protocol",
  "vte",
  "windows-sys",
+ "zeroize",
 ]
 
 [[package]]
