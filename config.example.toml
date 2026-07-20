@@ -1,0 +1,36 @@
+[general]
+prefix = "C-b"
+# shell = "/bin/zsh"
+# default_cwd = "/home/me"
+scrollback_lines = 10000
+status_visible = true
+mouse = true
+render_interval_ms = 16
+
+[appearance]
+active_frame = 12
+inactive_frame = 8
+status_foreground = 15
+status_background = 4
+
+[media]
+aggregate_retained_bytes = 268435456
+max_sources = 64
+max_nodes = 256
+max_anchors = 256
+ipc_queue_bytes = 33554432
+
+[floating]
+default_width_percent = 60
+default_height_percent = 60
+border_drag_margin = 1
+
+[keys.prefix]
+f = "new-floating-pane"
+F = "toggle-floating-panes"
+P = "toggle-pane-pinned"
+m = "enter-floating-move-mode"
+r = "enter-floating-resize-mode"
+
+[keys.copy]
+PageUp = "page-up"

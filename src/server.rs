@@ -1,0 +1,179 @@
+use std::io;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
+
+use crate::config::Config;
+use crate::ipc::{self, ChannelKind, ClientMessage, SharedWriter};
+use crate::platform::{self, SessionListener, Transport};
+use crate::runtime::{RuntimePaths, registry_process_matches};
+use crate::session::{self, ActorEvent, ActorHandle};
+
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn run(
+    name: String,
+    config_path: Option<PathBuf>,
+    ready_handle: Option<usize>,
+) -> io::Result<()> {
+    platform::prepare_server_process();
+    let mut readiness = platform::ReadinessWriter::from_metadata(ready_handle)?;
+    match run_inner(name, config_path, &mut readiness) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            readiness.failure(&error);
+            Err(error)
+        }
+    }
+}
+
+fn run_inner(
+    name: String,
+    config_path: Option<PathBuf>,
+    readiness: &mut platform::ReadinessWriter,
+) -> io::Result<()> {
+    let paths =
+        RuntimePaths::for_session(&name).map_err(|error| context("runtime paths", error))?;
+    clean_stale(&paths).map_err(|error| context("stale-session check", error))?;
+    let listener = SessionListener::bind(&paths.socket)
+        .map_err(|error| context("bind session endpoint", error))?;
+
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| io::Error::other(format!("could not create session nonce: {error}")))?;
+    let registry = paths
+        .write_registry(&name, &nonce)
+        .map_err(|error| context("write session registry", error))?;
+    let config = Config::load(config_path.as_deref()).map_err(|error| {
+        paths.remove_instance(&registry);
+        context("load session config", error)
+    })?;
+    let actor = session::start(name, config, paths.vivid_socket.clone()).map_err(|error| {
+        paths.remove_instance(&registry);
+        context("start session actor", error)
+    })?;
+    install_signal_forwarder(actor.clone())
+        .map_err(|error| context("install signal handler", error))?;
+    readiness.success()?;
+
+    while !actor.shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok(stream) => {
+                let actor = actor.clone();
+                thread::Builder::new()
+                    .name("vvmux-client-ipc".into())
+                    .spawn(move || handle_client(stream, actor))?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                paths.remove_instance(&registry);
+                return Err(error);
+            }
+        }
+    }
+    paths.remove_instance(&registry);
+    Ok(())
+}
+
+fn context(operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
+}
+
+pub fn connect(name: &str) -> io::Result<(ipc::RecordReader, SharedWriter)> {
+    let paths = RuntimePaths::for_session(name)?;
+    let stream = platform::connect_session(&paths.socket)?;
+    ipc::establish(stream, ChannelKind::Control)
+}
+
+pub fn probe(name: &str) -> io::Result<()> {
+    let (mut reader, writer) = connect(name)?;
+    writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .send(&ClientMessage::Ping)?;
+    match reader.recv()? {
+        crate::ipc::ServerMessage::Pong => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected session probe reply",
+        )),
+    }
+}
+
+fn handle_client(stream: Transport, actor: ActorHandle) {
+    let Ok((mut reader, writer)) = ipc::establish(stream, ChannelKind::Control) else {
+        return;
+    };
+    let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+    while let Ok(message) = reader.recv::<ClientMessage>() {
+        if actor
+            .sender
+            .send(ActorEvent::Client {
+                id,
+                writer: writer.clone(),
+                message,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+    let _ = actor.sender.send(ActorEvent::Disconnected(id));
+}
+
+fn clean_stale(paths: &RuntimePaths) -> io::Result<()> {
+    if !paths.artifacts_exist() {
+        return Ok(());
+    }
+    if platform::session_is_connectable(&paths.socket) {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "session already exists",
+        ));
+    }
+    match paths.read_registry() {
+        Ok(registry) => {
+            if registry_process_matches(&registry) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "session owner is alive but its endpoint is unavailable",
+                ));
+            }
+            paths.remove_instance(&registry);
+            if paths.artifacts_exist() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "could not remove the exact stale session instance",
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(context("validate stale session registry", error)),
+    }
+    #[cfg(unix)]
+    paths.remove_stale_endpoints();
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_signal_forwarder(actor: ActorHandle) -> io::Result<()> {
+    let mut signals =
+        signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM, libc::SIGHUP])?;
+    thread::Builder::new()
+        .name("vvmux-signals".into())
+        .spawn(move || {
+            if signals.forever().next().is_some() {
+                actor.shutdown.store(true, Ordering::Release);
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_signal_forwarder(_actor: ActorHandle) -> io::Result<()> {
+    Ok(())
+}
