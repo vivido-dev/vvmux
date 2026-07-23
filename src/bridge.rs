@@ -707,8 +707,15 @@ impl OuterBridge {
                     .then_some((*key, *upstream))
             })
             .collect::<Vec<_>>();
+        let mut obsolete_media = Vec::with_capacity(obsolete.len());
         for (key, upstream) in &obsolete {
-            self.media.remove(key);
+            if let Some(writer) = self.media.remove(key) {
+                // Keep the old media transport open until its scene nodes are deleted and
+                // DESTROY_SOURCE is acknowledged. Presenters treat an early media EOF as
+                // SOURCE_LOST and remove those nodes themselves, making the ordered scene
+                // transaction fail with NOT_FOUND.
+                obsolete_media.push(writer);
+            }
             self.pending.remove(key);
             self.reverse_source_ids.remove(upstream);
             if !requested.contains_key(key) {
@@ -744,6 +751,7 @@ impl OuterBridge {
             )?;
             self.wait_for(request, messages::OK, upstream)?;
         }
+        drop(obsolete_media);
         self.active_sources = sources
             .iter()
             .cloned()
@@ -1615,6 +1623,165 @@ mod tests {
         )?;
         stream.write_all(body)?;
         stream.flush()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_removal_keeps_media_open_until_nodes_and_source_are_destroyed() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("outer-removal-order.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping outer removal-order socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("fake outer presenter bind failed: {error}"),
+        };
+        let server = thread::spawn(move || -> io::Result<()> {
+            let (mut control, _) = listener.accept()?;
+            let mut preface = [0; PREFACE_SIZE];
+            control.read_exact(&mut preface)?;
+            let hello = read_client_record(&mut control)?;
+            let request = messages::request_id(&hello.body)?;
+            let features = [
+                messages::FEATURE_RASTER_RGBA8,
+                messages::FEATURE_SCENE_TRANSACTIONS,
+                messages::FEATURE_GRID_CELL_NODES,
+                messages::FEATURE_CREDIT_FLOW_CONTROL,
+                messages::FEATURE_NODE_CLIP_RECT_V1,
+            ];
+            let mut sequence = 0;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::WELCOME,
+                0,
+                &messages::welcome(
+                    request,
+                    1,
+                    &[1; 16],
+                    1,
+                    messages::DisplayChanged {
+                        display_generation: 1,
+                        viewport_width: 800,
+                        viewport_height: 600,
+                        grid_columns: 80,
+                        grid_rows: 24,
+                        cell_width: 10,
+                        cell_height: 25,
+                    },
+                    &features,
+                ),
+            )?;
+
+            let create = read_client_record(&mut control)?;
+            assert_eq!(create.record_type, messages::CREATE_RASTER);
+            let create_request = messages::request_id(&create.body)?;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::SOURCE_READY,
+                create.object_id,
+                &messages::source_ready(
+                    create_request,
+                    create.object_id,
+                    &[7; 32],
+                    messages::Credits {
+                        bytes: 4096,
+                        packets: 1,
+                        fragments: 0,
+                    },
+                    4096,
+                ),
+            )?;
+
+            let (mut media, _) = listener.accept()?;
+            media.read_exact(&mut preface)?;
+            let attached = read_client_record(&mut media)?;
+            assert_eq!(attached.record_type, messages::ATTACH_CHANNEL);
+            let (media_closed_tx, media_closed_rx) = mpsc::channel();
+            let media_reader = thread::spawn(move || {
+                let mut byte = [0_u8; 1];
+                while media.read(&mut byte).is_ok_and(|read| read != 0) {}
+                let _ = media_closed_tx.send(());
+            });
+
+            for expected in [
+                messages::BEGIN_TXN,
+                messages::CREATE_NODE,
+                messages::COMMIT_TXN,
+            ] {
+                let record = read_client_record(&mut control)?;
+                assert_eq!(record.record_type, expected);
+                let request = messages::request_id(&record.body)?;
+                let response = if expected == messages::COMMIT_TXN {
+                    messages::PRESENTED
+                } else {
+                    messages::OK
+                };
+                write_server_record(
+                    &mut control,
+                    &mut sequence,
+                    response,
+                    record.object_id,
+                    &messages::ok(request),
+                )?;
+            }
+
+            assert!(
+                media_closed_rx
+                    .recv_timeout(Duration::from_millis(50))
+                    .is_err(),
+                "outer media closed before the node-removal transaction began"
+            );
+            for expected in [
+                messages::BEGIN_TXN,
+                messages::DELETE_NODE,
+                messages::COMMIT_TXN,
+                messages::DESTROY_SOURCE,
+            ] {
+                let record = read_client_record(&mut control)?;
+                assert_eq!(record.record_type, expected);
+                let request = messages::request_id(&record.body)?;
+                let response = if expected == messages::COMMIT_TXN {
+                    messages::PRESENTED
+                } else {
+                    messages::OK
+                };
+                write_server_record(
+                    &mut control,
+                    &mut sequence,
+                    response,
+                    record.object_id,
+                    &messages::ok(request),
+                )?;
+            }
+            media_closed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "outer media remained open after DESTROY_SOURCE",
+                    )
+                })?;
+            media_reader.join().unwrap();
+            Ok(())
+        });
+
+        let mut bridge = OuterBridge::connect(
+            format!("unix:{}", socket.display()),
+            Zeroizing::new("11".repeat(32)),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+        bridge
+            .rebuild(&[test_raster_source()], &[test_fragment(9, 0, 0)])
+            .unwrap();
+        bridge.rebuild(&[], &[]).unwrap();
+        server.join().unwrap().unwrap();
     }
 
     #[cfg(unix)]
