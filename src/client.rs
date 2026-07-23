@@ -1717,7 +1717,7 @@ mod tests {
             offset: 0,
             total: u32::try_from(encoded.len()).unwrap(),
             last: true,
-            bytes: encoded,
+            bytes: encoded.clone(),
         }));
         let snapshot = wait_for(
             &|snapshot| {
@@ -1729,6 +1729,42 @@ mod tests {
             "image body arriving after its source-creation generation",
         );
         assert_eq!(outer_video(&snapshot).unwrap(), (outer_key, true));
+
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            sources: Vec::new(),
+            nodes: Vec::new(),
+            videos_needing_keyframes: Vec::new(),
+        });
+        wait_for(
+            &|snapshot| snapshot.sources.is_empty() && snapshot.nodes.is_empty(),
+            "empty projection after switching away from the image tab",
+        );
+
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            sources: vec![image_source.clone()],
+            nodes: vec![image_node.clone()],
+            videos_needing_keyframes: Vec::new(),
+        });
+        assert!(worker.queue_media(BridgeMedia {
+            generation: 0,
+            delivery_id: 0,
+            source: image_key,
+            record_type: vivid_protocol::messages::IMAGE_DATA,
+            offset: 0,
+            total: u32::try_from(encoded.len()).unwrap(),
+            last: true,
+            bytes: encoded,
+        }));
+        wait_for(
+            &|snapshot| {
+                snapshot.sources.len() == 1
+                    && snapshot.sources[0].retained.is_some()
+                    && snapshot.nodes.len() == 1
+            },
+            "retained image after switching back to its tab",
+        );
 
         let remaining_image_node = BridgeNode {
             x: 0,
