@@ -25,6 +25,14 @@ default_width_percent = 60
 default_height_percent = 60
 border_drag_margin = 1
 
+[server]
+listen = "127.0.0.1:7880"
+# Browser WebSocket origins are matched exactly; at least one is required by `vvmux serve`.
+allowed_origins = ["http://127.0.0.1:3000"]
+# auth_file = "/home/me/.config/vvmux/server-auth.json"
+max_connections = 32
+outbound_queue_bytes = 4194304
+
 [keys.prefix]
 f = "new-floating-pane"
 F = "toggle-floating-panes"

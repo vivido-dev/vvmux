@@ -23,8 +23,8 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
@@ -72,6 +72,13 @@ pub struct PtyControl {
 
 pub struct PtyWaiter {
     process: OwnedHandle,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PtyExitStatus {
+    pub code: Option<i64>,
+    pub signal: Option<i32>,
+    pub success: bool,
 }
 
 struct ControlInner {
@@ -152,9 +159,17 @@ impl PtyControl {
 }
 
 impl PtyWaiter {
-    pub fn wait(self) -> io::Result<()> {
+    pub fn wait(self) -> io::Result<PtyExitStatus> {
         if unsafe { WaitForSingleObject(self.process.raw(), u32::MAX) } == WAIT_OBJECT_0 {
-            Ok(())
+            let mut code = 0;
+            if unsafe { GetExitCodeProcess(self.process.raw(), &mut code) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(PtyExitStatus {
+                code: Some(i64::from(code)),
+                signal: None,
+                success: code == 0,
+            })
         } else {
             Err(io::Error::last_os_error())
         }

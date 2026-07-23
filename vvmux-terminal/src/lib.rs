@@ -8,12 +8,13 @@ use std::mem;
 
 use unicode_width::UnicodeWidthChar;
 use vte::ansi::{
-    Attr, ClearMode, Color, Handler, LineClearMode, NamedColor, PrivateMode, Processor,
+    Attr, ClearMode, Color, Handler, Hyperlink, LineClearMode, NamedColor, PrivateMode, Processor,
+    TabulationClearMode,
 };
 
 pub mod pty;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TerminalColor {
     #[default]
     Default,
@@ -21,17 +22,44 @@ pub enum TerminalColor {
     Rgb(u8, u8, u8),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Cell {
     pub ch: char,
     pub combining: String,
     pub foreground: TerminalColor,
     pub background: TerminalColor,
     pub bold: bool,
+    pub dim: bool,
     pub italic: bool,
     pub underline: bool,
+    pub underline_style: UnderlineStyle,
+    pub underline_color: Option<TerminalColor>,
+    pub blink: bool,
     pub inverse: bool,
+    pub hidden: bool,
+    pub strikeout: bool,
     pub wide_continuation: bool,
+    pub leading_wide_spacer: bool,
+    /// Number of physical cells traversed by a literal horizontal tab starting here.
+    pub tab_width: Option<u16>,
+    pub hyperlink: Option<TerminalHyperlink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TerminalHyperlink {
+    pub id: Option<String>,
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curl,
+    Dotted,
+    Dashed,
 }
 
 impl Default for Cell {
@@ -42,15 +70,24 @@ impl Default for Cell {
             foreground: TerminalColor::Default,
             background: TerminalColor::Default,
             bold: false,
+            dim: false,
             italic: false,
             underline: false,
+            underline_style: UnderlineStyle::None,
+            underline_color: None,
+            blink: false,
             inverse: false,
+            hidden: false,
+            strikeout: false,
             wide_continuation: false,
+            leading_wide_spacer: false,
+            tab_width: None,
+            hyperlink: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct TerminalModes {
     pub application_cursor: bool,
     pub bracketed_paste: bool,
@@ -59,6 +96,7 @@ pub struct TerminalModes {
     pub sgr_mouse: bool,
     pub focus_reporting: bool,
     pub cursor_visible: bool,
+    pub application_keypad: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +120,10 @@ pub struct Terminal {
     cols: usize,
     grid: Vec<Vec<Cell>>,
     alternate_grid: Vec<Vec<Cell>>,
+    grid_wrapped: Vec<bool>,
+    alternate_grid_wrapped: Vec<bool>,
     history: VecDeque<Vec<Cell>>,
+    history_wrapped: VecDeque<bool>,
     history_limit: usize,
     cursor_row: usize,
     cursor_col: usize,
@@ -95,6 +136,8 @@ pub struct Terminal {
     modes: TerminalModes,
     title: Option<String>,
     alternate_screen: bool,
+    tab_stops: Vec<bool>,
+    tab_stops_customized: bool,
     marker_scanner: VividMarkerScanner,
 }
 
@@ -107,7 +150,10 @@ impl Terminal {
             cols,
             grid: blank_grid(rows, cols),
             alternate_grid: blank_grid(rows, cols),
+            grid_wrapped: vec![false; rows],
+            alternate_grid_wrapped: vec![false; rows],
             history: VecDeque::new(),
+            history_wrapped: VecDeque::new(),
             history_limit,
             cursor_row: 0,
             cursor_col: 0,
@@ -123,6 +169,8 @@ impl Terminal {
             },
             title: None,
             alternate_screen: false,
+            tab_stops: default_tab_stops(cols, 8),
+            tab_stops_customized: false,
             marker_scanner: VividMarkerScanner::default(),
         }
     }
@@ -176,6 +224,13 @@ impl Terminal {
         let cols = cols.max(1);
         resize_grid(&mut self.grid, rows, cols);
         resize_grid(&mut self.alternate_grid, rows, cols);
+        self.grid_wrapped.resize(rows, false);
+        self.alternate_grid_wrapped.resize(rows, false);
+        if self.tab_stops_customized {
+            self.tab_stops.resize(cols, false);
+        } else {
+            self.tab_stops = default_tab_stops(cols, 8);
+        }
         self.rows = rows;
         self.cols = cols;
         self.cursor_row = self.cursor_row.min(rows - 1);
@@ -224,6 +279,52 @@ impl Terminal {
         }
     }
 
+    pub fn line_wrapped(&self, line: isize) -> Option<bool> {
+        if line < 0 {
+            let index = self.history.len() as isize + line;
+            (index >= 0)
+                .then(|| self.history_wrapped.get(index as usize).copied())
+                .flatten()
+        } else {
+            self.grid_wrapped.get(line as usize).copied()
+        }
+    }
+
+    pub fn alternate_screen(&self) -> bool {
+        self.alternate_screen
+    }
+
+    pub fn visible_text(&self, display_offset: usize) -> String {
+        let rows = self.rows;
+        let start = -(display_offset.min(self.history.len()) as isize);
+        self.extract_rows(start, rows)
+    }
+
+    pub fn latest_text(&self, rows: usize) -> String {
+        let available = self.history.len().saturating_add(self.rows);
+        let count = rows.min(available);
+        let start_absolute = available.saturating_sub(count);
+        let start = start_absolute as isize - self.history.len() as isize;
+        self.extract_rows(start, count)
+    }
+
+    pub fn extract_rows(&self, start_line: isize, row_count: usize) -> String {
+        let mut text = String::new();
+        let mut previous_wrapped = false;
+        for index in 0..row_count {
+            let line = start_line.saturating_add(index as isize);
+            let Some(cells) = self.viewport_line(line) else {
+                continue;
+            };
+            if index > 0 && !previous_wrapped {
+                text.push('\n');
+            }
+            append_row_text(&mut text, &cells[..cells.len().min(self.cols)]);
+            previous_wrapped = self.line_wrapped(line).unwrap_or(false);
+        }
+        text
+    }
+
     fn damage(&mut self) {
         if !self
             .events
@@ -239,6 +340,8 @@ impl Terminal {
             ch: ' ',
             combining: String::new(),
             wide_continuation: false,
+            leading_wide_spacer: false,
+            tab_width: None,
             ..self.template.clone()
         }
     }
@@ -247,14 +350,18 @@ impl Terminal {
         let count = count.min(self.scroll_bottom.saturating_sub(self.scroll_top));
         for _ in 0..count {
             let removed = self.grid.remove(self.scroll_top);
+            let removed_wrapped = self.grid_wrapped.remove(self.scroll_top);
             if self.scroll_top == 0 && self.scroll_bottom == self.rows && !self.alternate_screen {
                 self.history.push_back(removed);
+                self.history_wrapped.push_back(removed_wrapped);
                 while self.history.len() > self.history_limit {
                     self.history.pop_front();
+                    self.history_wrapped.pop_front();
                 }
             }
             self.grid
                 .insert(self.scroll_bottom - 1, vec![self.blank(); self.cols]);
+            self.grid_wrapped.insert(self.scroll_bottom - 1, false);
         }
         if count > 0 {
             self.events.push(TerminalEvent::GridScroll(count as i32));
@@ -266,8 +373,10 @@ impl Terminal {
         let count = count.min(self.scroll_bottom.saturating_sub(self.scroll_top));
         for _ in 0..count {
             self.grid.remove(self.scroll_bottom - 1);
+            self.grid_wrapped.remove(self.scroll_bottom - 1);
             self.grid
                 .insert(self.scroll_top, vec![self.blank(); self.cols]);
+            self.grid_wrapped.insert(self.scroll_top, false);
         }
         if count > 0 {
             self.events.push(TerminalEvent::GridScroll(-(count as i32)));
@@ -284,11 +393,32 @@ impl Terminal {
     }
 
     fn clear_row_range(&mut self, row: usize, start: usize, end: usize) {
+        let start = start.min(self.cols);
+        let end = end.min(self.cols);
+        for column in 0..self.cols {
+            if let Some(width) = self.grid[row][column].tab_width {
+                let tab_end = column.saturating_add(usize::from(width));
+                if column < end && tab_end > start {
+                    self.grid[row][column].tab_width = None;
+                }
+            }
+        }
         let blank = self.blank();
-        for cell in &mut self.grid[row][start.min(self.cols)..end.min(self.cols)] {
+        for cell in &mut self.grid[row][start..end] {
             *cell = blank.clone();
         }
         self.damage();
+    }
+
+    fn invalidate_tab_at(&mut self, row: usize, column: usize) {
+        for start in 0..self.cols {
+            if let Some(width) = self.grid[row][start].tab_width
+                && start <= column
+                && start.saturating_add(usize::from(width)) > column
+            {
+                self.grid[row][start].tab_width = None;
+            }
+        }
     }
 }
 
@@ -302,17 +432,28 @@ impl Handler for Terminal {
             return;
         }
         if self.cursor_col >= self.cols {
+            self.grid_wrapped[self.cursor_row] = true;
             self.cursor_col = 0;
             self.line_feed();
         }
         if width == 2 && self.cursor_col + 1 >= self.cols {
+            self.invalidate_tab_at(self.cursor_row, self.cursor_col);
+            let mut spacer = self.blank();
+            spacer.leading_wide_spacer = true;
+            self.grid[self.cursor_row][self.cursor_col] = spacer;
+            self.grid_wrapped[self.cursor_row] = true;
             self.cursor_col = 0;
             self.line_feed();
+        }
+        self.invalidate_tab_at(self.cursor_row, self.cursor_col);
+        if width == 2 {
+            self.invalidate_tab_at(self.cursor_row, self.cursor_col + 1);
         }
         let mut cell = self.template.clone();
         cell.ch = c;
         cell.combining.clear();
         cell.wide_continuation = false;
+        cell.leading_wide_spacer = false;
         self.grid[self.cursor_row][self.cursor_col] = cell;
         self.cursor_col += 1;
         if width == 2 && self.cursor_col < self.cols {
@@ -383,14 +524,48 @@ impl Handler for Terminal {
 
     fn put_tab(&mut self, count: u16) {
         for _ in 0..count {
-            self.cursor_col = ((self.cursor_col / 8 + 1) * 8).min(self.cols - 1);
+            let start = self.cursor_col;
+            let next = (start + 1..self.cols)
+                .find(|column| self.tab_stops.get(*column).copied().unwrap_or(false))
+                .unwrap_or(self.cols - 1);
+            if next > start {
+                self.grid[self.cursor_row][start].tab_width = u16::try_from(next - start).ok();
+            }
+            self.cursor_col = next;
         }
+    }
+
+    fn set_horizontal_tabstop(&mut self) {
+        self.tab_stops_customized = true;
+        if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
+            *stop = true;
+        }
+    }
+
+    fn clear_tabs(&mut self, mode: TabulationClearMode) {
+        self.tab_stops_customized = true;
+        match mode {
+            TabulationClearMode::Current => {
+                if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
+                    *stop = false;
+                }
+            }
+            TabulationClearMode::All => self.tab_stops.fill(false),
+        }
+    }
+
+    fn set_tabs(&mut self, interval: u16) {
+        self.tab_stops_customized = true;
+        self.tab_stops = default_tab_stops(self.cols, usize::from(interval.max(1)));
     }
 
     fn insert_blank(&mut self, count: usize) {
         let count = count.min(self.cols - self.cursor_col);
         let blank = self.blank();
         let row = &mut self.grid[self.cursor_row];
+        for cell in row.iter_mut() {
+            cell.tab_width = None;
+        }
         for column in (self.cursor_col..self.cols - count).rev() {
             row[column + count] = row[column].clone();
         }
@@ -402,6 +577,9 @@ impl Handler for Terminal {
         let count = count.min(self.cols - self.cursor_col);
         let blank = self.blank();
         let row = &mut self.grid[self.cursor_row];
+        for cell in row.iter_mut() {
+            cell.tab_width = None;
+        }
         for column in self.cursor_col..self.cols - count {
             row[column] = row[column + count].clone();
         }
@@ -443,11 +621,13 @@ impl Handler for Terminal {
             }
             ClearMode::All => {
                 self.grid = blank_grid(self.rows, self.cols);
+                self.grid_wrapped.fill(false);
                 self.events.push(TerminalEvent::Clear);
                 self.damage();
             }
             ClearMode::Saved => {
                 self.history.clear();
+                self.history_wrapped.clear();
                 // ConPTY renders `cls` as erase-line on every viewport row followed by ED 3,
                 // never ED 2. When the scrollback purge arrives with the viewport already
                 // blank, the terminal was fully cleared and media anchors must not survive.
@@ -512,12 +692,18 @@ impl Handler for Terminal {
 
     fn reset_state(&mut self) {
         self.grid = blank_grid(self.rows, self.cols);
+        self.alternate_grid = blank_grid(self.rows, self.cols);
+        self.grid_wrapped.fill(false);
+        self.alternate_grid_wrapped.fill(false);
         self.history.clear();
+        self.history_wrapped.clear();
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows;
         self.template = Cell::default();
+        self.tab_stops = default_tab_stops(self.cols, 8);
+        self.tab_stops_customized = false;
         self.modes = TerminalModes {
             cursor_visible: true,
             ..TerminalModes::default()
@@ -528,22 +714,39 @@ impl Handler for Terminal {
 
     fn terminal_attribute(&mut self, attr: Attr) {
         match attr {
-            Attr::Reset => self.template = Cell::default(),
+            Attr::Reset => {
+                let hyperlink = self.template.hyperlink.take();
+                self.template = Cell::default();
+                self.template.hyperlink = hyperlink;
+            }
             Attr::Bold => self.template.bold = true,
-            Attr::CancelBold | Attr::CancelBoldDim => self.template.bold = false,
+            Attr::Dim => self.template.dim = true,
+            Attr::CancelBold => self.template.bold = false,
+            Attr::CancelBoldDim => {
+                self.template.bold = false;
+                self.template.dim = false;
+            }
             Attr::Italic => self.template.italic = true,
             Attr::CancelItalic => self.template.italic = false,
-            Attr::Underline
-            | Attr::DoubleUnderline
-            | Attr::Undercurl
-            | Attr::DottedUnderline
-            | Attr::DashedUnderline => self.template.underline = true,
-            Attr::CancelUnderline => self.template.underline = false,
+            Attr::Underline => self.set_underline(UnderlineStyle::Single),
+            Attr::DoubleUnderline => self.set_underline(UnderlineStyle::Double),
+            Attr::Undercurl => self.set_underline(UnderlineStyle::Curl),
+            Attr::DottedUnderline => self.set_underline(UnderlineStyle::Dotted),
+            Attr::DashedUnderline => self.set_underline(UnderlineStyle::Dashed),
+            Attr::CancelUnderline => self.set_underline(UnderlineStyle::None),
+            Attr::UnderlineColor(color) => {
+                self.template.underline_color = color.map(|color| convert_color(color, true));
+            }
+            Attr::BlinkSlow | Attr::BlinkFast => self.template.blink = true,
+            Attr::CancelBlink => self.template.blink = false,
             Attr::Reverse => self.template.inverse = true,
             Attr::CancelReverse => self.template.inverse = false,
+            Attr::Hidden => self.template.hidden = true,
+            Attr::CancelHidden => self.template.hidden = false,
+            Attr::Strike => self.template.strikeout = true,
+            Attr::CancelStrike => self.template.strikeout = false,
             Attr::Foreground(color) => self.template.foreground = convert_color(color, true),
             Attr::Background(color) => self.template.background = convert_color(color, false),
-            _ => {}
         }
     }
 
@@ -558,6 +761,23 @@ impl Handler for Terminal {
     fn set_title(&mut self, title: Option<String>) {
         self.title.clone_from(&title);
         self.events.push(TerminalEvent::Title(title));
+    }
+
+    fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
+        self.template.hyperlink = hyperlink.map(|link| TerminalHyperlink {
+            id: link.id,
+            uri: link.uri,
+        });
+    }
+
+    fn set_keypad_application_mode(&mut self) {
+        self.modes.application_keypad = true;
+        self.events.push(TerminalEvent::ModeChange(self.modes));
+    }
+
+    fn unset_keypad_application_mode(&mut self) {
+        self.modes.application_keypad = false;
+        self.events.push(TerminalEvent::ModeChange(self.modes));
     }
 
     fn bell(&mut self) {
@@ -596,6 +816,7 @@ impl Terminal {
             25 => self.modes.cursor_visible = enabled,
             1049 if enabled != self.alternate_screen => {
                 mem::swap(&mut self.grid, &mut self.alternate_grid);
+                mem::swap(&mut self.grid_wrapped, &mut self.alternate_grid_wrapped);
                 self.alternate_screen = enabled;
                 self.cursor_row = 0;
                 self.cursor_col = 0;
@@ -607,6 +828,13 @@ impl Terminal {
     }
 }
 
+impl Terminal {
+    fn set_underline(&mut self, style: UnderlineStyle) {
+        self.template.underline = style != UnderlineStyle::None;
+        self.template.underline_style = style;
+    }
+}
+
 fn blank_grid(rows: usize, cols: usize) -> Vec<Vec<Cell>> {
     vec![vec![Cell::default(); cols]; rows]
 }
@@ -615,6 +843,39 @@ fn resize_grid(grid: &mut Vec<Vec<Cell>>, rows: usize, cols: usize) {
     grid.resize_with(rows, || vec![Cell::default(); cols]);
     for row in grid {
         row.resize(cols, Cell::default());
+    }
+}
+
+fn default_tab_stops(cols: usize, interval: usize) -> Vec<bool> {
+    (0..cols)
+        .map(|column| column > 0 && column % interval == 0)
+        .collect()
+}
+
+fn append_row_text(output: &mut String, cells: &[Cell]) {
+    let end = cells
+        .iter()
+        .rposition(|cell| {
+            cell.ch != ' '
+                || !cell.combining.is_empty()
+                || cell.tab_width.is_some()
+                || cell.wide_continuation
+                || cell.leading_wide_spacer
+        })
+        .map_or(0, |index| index + 1);
+    let mut column = 0;
+    while column < end {
+        let cell = &cells[column];
+        if let Some(width) = cell.tab_width {
+            output.push('\t');
+            column = column.saturating_add(usize::from(width).max(1));
+            continue;
+        }
+        if !cell.wide_continuation && !cell.leading_wide_spacer {
+            output.push(cell.ch);
+            output.push_str(&cell.combining);
+        }
+        column += 1;
     }
 }
 
@@ -992,5 +1253,85 @@ mod tests {
                 .collect::<String>(),
             "main"
         );
+    }
+
+    #[test]
+    fn bracketed_paste_mode_changes_are_reported() {
+        let mut terminal = Terminal::new(2, 4, 10);
+        let enabled = terminal.feed(b"\x1b[?2004h");
+        assert!(terminal.modes().bracketed_paste);
+        assert!(enabled.iter().any(|event| matches!(
+            event,
+            TerminalEvent::ModeChange(modes) if modes.bracketed_paste
+        )));
+
+        let disabled = terminal.feed(b"\x1b[?2004l");
+        assert!(!terminal.modes().bracketed_paste);
+        assert!(disabled.iter().any(|event| matches!(
+            event,
+            TerminalEvent::ModeChange(modes) if !modes.bracketed_paste
+        )));
+    }
+
+    #[test]
+    fn logical_text_joins_soft_wraps_but_preserves_hard_lines() {
+        let mut wrapped = Terminal::new(2, 4, 10);
+        wrapped.feed(b"abcde");
+        assert_eq!(wrapped.line_wrapped(0), Some(true));
+        assert_eq!(wrapped.visible_text(0), "abcde");
+
+        let mut hard = Terminal::new(2, 4, 10);
+        hard.feed(b"ab\r\ncd");
+        assert_eq!(hard.line_wrapped(0), Some(false));
+        assert_eq!(hard.visible_text(0), "ab\ncd");
+    }
+
+    #[test]
+    fn logical_text_preserves_blank_rows_and_literal_tabs() {
+        let mut terminal = Terminal::new(3, 10, 10);
+        terminal.feed(b"\r\n\r\na\tb");
+        assert_eq!(terminal.visible_text(0), "\n\na\tb");
+        assert_eq!(terminal.cells()[2][1].tab_width, Some(7));
+    }
+
+    #[test]
+    fn custom_tab_stops_and_hyperlinks_are_retained() {
+        let mut terminal = Terminal::new(2, 12, 10);
+        terminal.feed(b"abc\x1bH\r\tb");
+        assert_eq!(terminal.visible_text(0), "\tb\n");
+        assert_eq!(terminal.cells()[0][0].tab_width, Some(3));
+
+        terminal.feed(b"\r\n\x1b]8;id=link-1;https://example.test/\x1b\\x\x1b]8;;\x1b\\");
+        assert_eq!(
+            terminal.cells()[1][0]
+                .hyperlink
+                .as_ref()
+                .map(|link| link.uri.as_str()),
+            Some("https://example.test/")
+        );
+        assert_eq!(
+            terminal.cells()[1][0]
+                .hyperlink
+                .as_ref()
+                .and_then(|link| link.id.as_deref()),
+            Some("link-1")
+        );
+    }
+
+    #[test]
+    fn rich_attributes_combining_and_wide_cells_are_retained() {
+        let mut terminal = Terminal::new(2, 12, 10);
+        terminal.feed("\x1b[1;2;3;4;9;38;5;2m界e\u{301}".as_bytes());
+        let wide = &terminal.cells()[0][0];
+        assert!(wide.bold && wide.dim && wide.italic && wide.underline && wide.strikeout);
+        assert_eq!(wide.foreground, TerminalColor::Indexed(2));
+        assert!(terminal.cells()[0][1].wide_continuation);
+        assert_eq!(terminal.cells()[0][2].combining, "\u{301}");
+
+        let mut edge = Terminal::new(2, 4, 0);
+        edge.feed("abc界".as_bytes());
+        assert!(edge.cells()[0][3].leading_wide_spacer);
+        assert_eq!(edge.line_wrapped(0), Some(true));
+        assert_eq!(edge.visible_text(0), "abc界");
     }
 }

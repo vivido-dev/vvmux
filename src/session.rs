@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -6,14 +6,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use vvmux_terminal::pty::{PtyControl, PtyInput, PtyProcess};
-use vvmux_terminal::{Terminal, TerminalEvent};
+use vvmux_terminal::TerminalHyperlink;
+use vvmux_terminal::pty::{PtyControl, PtyExitStatus, PtyInput, PtyProcess};
+use vvmux_terminal::{Cell, Terminal, TerminalColor, TerminalEvent, TerminalModes, UnderlineStyle};
 
 use crate::config::Config;
 use crate::ipc::{
-    Action, Axis, BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceKey,
-    BridgeSourceKind, ClientMessage, Direction, DisplayMetrics, FloatingEditCommand,
-    FloatingEditKind, MouseEvent, MouseKind, ServerMessage, SharedWriter,
+    Action, AutomationError, AutomationMethod, AutomationRequest, AutomationResponse, Axis,
+    BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceKey, BridgeSourceKind,
+    ClientMessage, Direction, DisplayMetrics, FloatingEditCommand, FloatingEditKind, MouseEvent,
+    MouseKind, ServerMessage, SharedWriter,
 };
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
@@ -28,17 +30,46 @@ const COPY_BUFFER_LIMIT: usize = 1024 * 1024;
 const MAX_NODE_FRAGMENTS: usize = 8;
 const MAX_PROJECTED_NODES: usize = 256;
 const INPUT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_AUTOMATION_REQUESTS_PER_CLIENT: usize = 64;
+const MAX_AUTOMATION_WAITERS: usize = 256;
+const AUTOMATION_RESPONSE_QUEUE: usize = 8;
+const SCREEN_CHANGE_HISTORY: usize = 1024;
+const EXIT_TOMBSTONES: usize = 128;
+const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTOMATION_REPLY_LIMIT: usize = 16 * 1024 * 1024;
+#[cfg(windows)]
+const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
+#[cfg(windows)]
+const DISABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004l";
 
 pub enum ActorEvent {
     Client {
         id: u64,
         writer: SharedWriter,
+        cancel: crate::platform::ConnectionCancel,
         message: ClientMessage,
     },
     Disconnected(u64),
     PtyOutput(PaneId, Vec<u8>),
-    PtyExit(PaneId),
+    PtyExit(PaneId, Option<PtyExitStatus>),
+    AutomationInputComplete {
+        reply: AutomationReplyTarget,
+        result: Result<(), String>,
+    },
     Media(crate::media::MediaEvent),
+}
+
+#[derive(Clone)]
+pub struct AutomationReplyTarget {
+    client_id: u64,
+    request_id: u64,
+    writer: SharedWriter,
+    cancel: crate::platform::ConnectionCancel,
+}
+
+struct AutomationResponseJob {
+    writer: SharedWriter,
+    response: AutomationResponse,
 }
 
 #[derive(Clone)]
@@ -53,6 +84,8 @@ struct AttachedClient {
     display: DisplayMetrics,
     acknowledged_frame: u64,
     vivid: bool,
+    rendered_session_sequence: u64,
+    frame_sequences: VecDeque<(u64, u64)>,
 }
 
 struct Pane {
@@ -63,6 +96,51 @@ struct Pane {
     copy: Option<CopyState>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
     last_input_warning: Option<Instant>,
+    screen_sequence: u64,
+    last_screen_change: Instant,
+    screen_changes: VecDeque<ScreenChange>,
+}
+
+#[derive(Debug, Clone)]
+struct ScreenChange {
+    sequence: u64,
+    rows: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExitTombstone {
+    pane_id: PaneId,
+    status: Option<PtyExitStatus>,
+}
+
+struct AutomationWaiter {
+    reply: AutomationReplyTarget,
+    pane_id: Option<PaneId>,
+    deadline: Instant,
+    kind: AutomationWaitKind,
+}
+
+enum AutomationWaitKind {
+    Text {
+        pattern: AutomationTextPattern,
+        after_screen: Option<u64>,
+    },
+    ScreenChange {
+        after_screen: u64,
+    },
+    ScreenStable {
+        quiet: Duration,
+        after_screen: Option<u64>,
+    },
+    Rendered {
+        after_session: u64,
+    },
+    Exit,
+}
+
+enum AutomationTextPattern {
+    Literal(String),
+    Regex(regex::Regex),
 }
 
 #[derive(Clone, Copy)]
@@ -86,7 +164,7 @@ fn queue_pane_input(pane: &mut Pane, bytes: &[u8]) -> Option<InputFailure> {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CopyState {
     offset: usize,
     row: usize,
@@ -384,11 +462,14 @@ struct SessionActor {
     tabs: Vec<Tab>,
     active_tab: usize,
     attached: Option<AttachedClient>,
+    last_display: DisplayMetrics,
     next_pane_id: PaneId,
     next_tab_id: u64,
     copy_buffer: Vec<u8>,
     frame_id: u64,
     last_screen: Option<ScreenBuffer>,
+    #[cfg(windows)]
+    outer_bracketed_paste: Option<bool>,
     force_full: bool,
     pending_render: bool,
     layout_revision: u64,
@@ -399,6 +480,11 @@ struct SessionActor {
     pointer_drag: Option<PointerDrag>,
     float_modal: Option<FloatModal>,
     next_float_mode: u64,
+    session_sequence: u64,
+    response_sender: mpsc::SyncSender<AutomationResponseJob>,
+    automation_inflight: HashMap<u64, HashSet<u64>>,
+    automation_waiters: Vec<AutomationWaiter>,
+    exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
     vivid: VirtualVivid,
 }
@@ -413,6 +499,26 @@ pub fn start(
     let shutdown = Arc::new(AtomicBool::new(false));
     let vivid =
         VirtualVivid::start_with_events(vivid_endpoint, config.media.clone(), Some(media_sender))?;
+    let (response_sender, response_receiver) =
+        mpsc::sync_channel::<AutomationResponseJob>(AUTOMATION_RESPONSE_QUEUE);
+    let response_receiver = Arc::new(std::sync::Mutex::new(response_receiver));
+    for index in 0..2 {
+        let receiver = response_receiver.clone();
+        std::thread::Builder::new()
+            .name(format!("vvmux-automation-response-{index}"))
+            .spawn(move || {
+                loop {
+                    let job = {
+                        receiver
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .recv()
+                    };
+                    let Ok(job) = job else { break };
+                    let _ = crate::ipc::send_automation(&job.writer, job.response);
+                }
+            })?;
+    }
     let media_events = sender.clone();
     std::thread::Builder::new()
         .name("vvmux-media-events".into())
@@ -423,6 +529,15 @@ pub fn start(
                 }
             }
         })?;
+    let last_display = normalized_display(
+        DisplayMetrics {
+            columns: 80,
+            rows: 24,
+            cell_width: 0,
+            cell_height: 0,
+        },
+        config.general.status_visible,
+    );
     let mut actor = SessionActor {
         name,
         config,
@@ -431,11 +546,14 @@ pub fn start(
         tabs: Vec::new(),
         active_tab: 0,
         attached: None,
+        last_display,
         next_pane_id: 1,
         next_tab_id: 1,
         copy_buffer: Vec::new(),
         frame_id: 0,
         last_screen: None,
+        #[cfg(windows)]
+        outer_bracketed_paste: None,
         force_full: true,
         pending_render: false,
         layout_revision: 0,
@@ -446,6 +564,11 @@ pub fn start(
         pointer_drag: None,
         float_modal: None,
         next_float_mode: 0,
+        session_sequence: 1,
+        response_sender,
+        automation_inflight: HashMap::new(),
+        automation_waiters: Vec::new(),
+        exit_tombstones: VecDeque::new(),
         shutdown: shutdown.clone(),
         vivid,
     };
@@ -461,11 +584,12 @@ impl SessionActor {
         let interval = Duration::from_millis(self.config.general.render_interval_ms);
         let mut render_at = Instant::now();
         loop {
-            let timeout = if self.pending_render {
+            let mut timeout = if self.pending_render {
                 render_at.saturating_duration_since(Instant::now())
             } else {
                 Duration::from_secs(1)
             };
+            timeout = timeout.min(self.next_automation_deadline());
             match receiver.recv_timeout(timeout) {
                 Ok(event) => {
                     if self.handle_event(event).is_err() {
@@ -479,6 +603,7 @@ impl SessionActor {
                     } else if self.pending_render {
                         render_at = Instant::now() + interval;
                     }
+                    self.check_automation_waiters();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if self.pending_render {
@@ -486,6 +611,7 @@ impl SessionActor {
                         render_at = Instant::now() + interval;
                     }
                     self.sync_media(false);
+                    self.check_automation_waiters();
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -502,15 +628,23 @@ impl SessionActor {
             ActorEvent::Client {
                 id,
                 writer,
+                cancel,
                 message,
             } => {
-                self.handle_client(id, writer, message)?;
+                self.handle_client(id, writer, cancel, message)?;
             }
             ActorEvent::Disconnected(id) => {
+                self.automation_inflight.remove(&id);
+                self.automation_waiters
+                    .retain(|waiter| waiter.reply.client_id != id);
                 if self.attached.as_ref().is_some_and(|client| client.id == id) {
                     self.cancel_pointer_drag(true);
                     self.attached = None;
                     self.last_screen = None;
+                    #[cfg(windows)]
+                    {
+                        self.outer_bracketed_paste = None;
+                    }
                     self.force_full = true;
                     self.end_float_mode(true);
                 }
@@ -522,6 +656,10 @@ impl SessionActor {
                 let mut input_warning = false;
                 let mut input_closed = false;
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    let old_cells = pane.terminal.cells().to_vec();
+                    let old_cursor = pane.terminal.cursor();
+                    let old_modes = pane.terminal.modes();
+                    let old_screen = pane.terminal.alternate_screen();
                     let events = pane.terminal.feed(&bytes);
                     for event in events {
                         match event {
@@ -557,6 +695,24 @@ impl SessionActor {
                             _ => {}
                         }
                     }
+                    let semantic_changed = old_cells != pane.terminal.cells()
+                        || old_cursor != pane.terminal.cursor()
+                        || old_modes != pane.terminal.modes()
+                        || old_screen != pane.terminal.alternate_screen();
+                    if semantic_changed {
+                        let rows = changed_rows(&old_cells, pane.terminal.cells());
+                        let rows = (old_screen == pane.terminal.alternate_screen()).then_some(rows);
+                        pane.screen_sequence = pane.screen_sequence.wrapping_add(1);
+                        pane.last_screen_change = Instant::now();
+                        pane.screen_changes.push_back(ScreenChange {
+                            sequence: pane.screen_sequence,
+                            rows,
+                        });
+                        while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
+                            pane.screen_changes.pop_front();
+                        }
+                        self.session_sequence = self.session_sequence.wrapping_add(1);
+                    }
                     if let Some(client) = &self.attached {
                         if let Some(title) = title {
                             let _ = crate::ipc::send(
@@ -577,16 +733,28 @@ impl SessionActor {
                     self.close_pane(pane_id);
                 }
             }
-            ActorEvent::PtyExit(pane_id) => {
+            ActorEvent::PtyExit(pane_id, status) => {
+                self.complete_exit_waiters(pane_id, status);
+                self.exit_tombstones
+                    .push_back(ExitTombstone { pane_id, status });
+                while self.exit_tombstones.len() > EXIT_TOMBSTONES {
+                    self.exit_tombstones.pop_front();
+                }
                 self.close_pane(pane_id);
             }
+            ActorEvent::AutomationInputComplete { reply, result } => match result {
+                Ok(()) => self.reply_automation(reply, serde_json::Value::Null),
+                Err(message) => {
+                    self.reply_automation_error(reply, AutomationError::new("pty_closed", message))
+                }
+            },
             ActorEvent::Media(event) => {
                 // PLAY/PAUSE/EOS arrive on the producer's control connection while media arrives
                 // on independent source connections. Publish any resulting authoritative
                 // projection revision before forwarding the next media record. Otherwise a busy
                 // stream can starve the actor's idle sync, fill outer pre-roll with later audio,
                 // and leave video waiting for a PLAY snapshot that is queued behind that media.
-                self.sync_media(false);
+                self.sync_media_before_delivery(event.source);
                 let sent = self
                     .attached
                     .as_ref()
@@ -613,6 +781,7 @@ impl SessionActor {
         &mut self,
         id: u64,
         writer: SharedWriter,
+        cancel: crate::platform::ConnectionCancel,
         message: ClientMessage,
     ) -> io::Result<()> {
         match message {
@@ -637,12 +806,16 @@ impl SessionActor {
                         },
                     );
                 }
+                let display = normalized_display(display, self.config.general.status_visible);
+                self.last_display = display;
                 self.attached = Some(AttachedClient {
                     id,
                     writer: writer.clone(),
-                    display: normalized_display(display, self.config.general.status_visible),
+                    display,
                     acknowledged_frame: 0,
                     vivid,
+                    rendered_session_sequence: 0,
+                    frame_sequences: VecDeque::new(),
                 });
                 self.fragment_assignments.clear();
                 self.last_projection_warning = None;
@@ -660,6 +833,10 @@ impl SessionActor {
                     },
                 )?;
                 self.last_screen = None;
+                #[cfg(windows)]
+                {
+                    self.outer_bracketed_paste = None;
+                }
                 self.force_full = true;
                 self.resize_all();
                 self.sync_media(true);
@@ -682,6 +859,7 @@ impl SessionActor {
                     if let Some(client) = &mut self.attached {
                         client.display =
                             normalized_display(display, self.config.general.status_visible);
+                        self.last_display = client.display;
                     }
                     // Deterministic host-resize clamp: size before position, per float.
                     let area = self.content_area();
@@ -705,6 +883,14 @@ impl SessionActor {
                         self.force_full = true;
                     } else {
                         client.acknowledged_frame = frame_id;
+                        while let Some(&(sent_frame, sequence)) = client.frame_sequences.front() {
+                            if sent_frame > frame_id {
+                                break;
+                            }
+                            client.rendered_session_sequence =
+                                client.rendered_session_sequence.max(sequence);
+                            client.frame_sequences.pop_front();
+                        }
                     }
                 }
             }
@@ -750,6 +936,10 @@ impl SessionActor {
                     )?;
                     self.attached = None;
                     self.last_screen = None;
+                    #[cfg(windows)]
+                    {
+                        self.outer_bracketed_paste = None;
+                    }
                     self.end_float_mode(true);
                     self.vivid.deactivate_bridge();
                 }
@@ -773,12 +963,976 @@ impl SessionActor {
             ClientMessage::Ping => {
                 crate::ipc::send(&writer, &ServerMessage::Pong)?;
             }
+            ClientMessage::Automation(request) => {
+                self.handle_automation(id, writer, cancel, request);
+            }
         }
         Ok(())
     }
 
+    fn handle_automation(
+        &mut self,
+        client_id: u64,
+        writer: SharedWriter,
+        cancel: crate::platform::ConnectionCancel,
+        request: AutomationRequest,
+    ) {
+        let target = AutomationReplyTarget {
+            client_id,
+            request_id: request.id,
+            writer,
+            cancel,
+        };
+        let requests = self.automation_inflight.entry(client_id).or_default();
+        if requests.contains(&request.id) {
+            self.send_automation_response(
+                &target,
+                AutomationResponse::error(
+                    target.request_id,
+                    "duplicate_request_id",
+                    "request ID is already in flight",
+                ),
+            );
+            return;
+        }
+        if requests.len() >= MAX_AUTOMATION_REQUESTS_PER_CLIENT {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("limit_exceeded", "too many in-flight requests"),
+            );
+            return;
+        }
+        requests.insert(request.id);
+        if let Err(error) = validate_automation_method(&request.method) {
+            self.reply_automation_error(target, error);
+            return;
+        }
+
+        let pane_id = if method_needs_pane(&request.method) {
+            let resolved = if matches!(&request.method, AutomationMethod::WaitExit { .. })
+                && request.pane_id.is_some_and(|pane| {
+                    self.exit_tombstones.iter().any(|exit| exit.pane_id == pane)
+                }) {
+                Ok(request.pane_id.unwrap())
+            } else {
+                self.resolve_automation_pane(request.pane_id, request.allow_focused)
+            };
+            match resolved {
+                Ok(pane) => Some(pane),
+                Err(error) => {
+                    self.reply_automation_error(target, error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        match request.method {
+            AutomationMethod::Capabilities => {
+                self.reply_automation(target, automation_capabilities());
+            }
+            AutomationMethod::ListPanes => {
+                let panes = self
+                    .panes
+                    .keys()
+                    .copied()
+                    .filter_map(|pane| self.pane_description(pane))
+                    .collect::<Vec<_>>();
+                self.reply_automation(
+                    target,
+                    serde_json::json!({
+                        "session": self.name,
+                        "session_sequence": self.session_sequence,
+                        "rendered_session_sequence": self.rendered_session_sequence(),
+                        "panes": panes,
+                    }),
+                );
+            }
+            AutomationMethod::Inspect => {
+                let pane_id = pane_id.unwrap();
+                let Some(pane) = self.pane_description(pane_id) else {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("pane_not_found", "pane no longer exists"),
+                    );
+                    return;
+                };
+                self.reply_automation(
+                    target,
+                    serde_json::json!({
+                        "session": self.name,
+                        "session_sequence": self.session_sequence,
+                        "layout_sequence": self.layout_revision,
+                        "rendered_session_sequence": self.rendered_session_sequence(),
+                        "pane": pane,
+                        "limits": automation_limits(),
+                    }),
+                );
+            }
+            AutomationMethod::Split { axis } => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_split(pane_id, axis) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::Focus => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_focus(pane_id) {
+                    Ok(()) => self.reply_automation(target, serde_json::Value::Null),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::ClosePane => {
+                let pane_id = pane_id.unwrap();
+                self.close_pane(pane_id);
+                self.reply_automation(target, serde_json::Value::Null);
+            }
+            AutomationMethod::Typing { text } => {
+                self.automation_input(target, pane_id.unwrap(), text.into_bytes());
+            }
+            AutomationMethod::Key {
+                key,
+                modifiers,
+                repeat,
+            } => {
+                let pane_id = pane_id.unwrap();
+                let Some(pane) = self.panes.get(&pane_id) else {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("pane_not_found", "pane no longer exists"),
+                    );
+                    return;
+                };
+                match encode_automation_key(&key, &modifiers, pane.terminal.modes()) {
+                    Ok(encoded) => {
+                        let total = encoded.len().saturating_mul(usize::from(repeat));
+                        if total > 1024 * 1024 {
+                            self.reply_automation_error(
+                                target,
+                                AutomationError::new(
+                                    "limit_exceeded",
+                                    "encoded key input exceeds 1 MiB",
+                                ),
+                            );
+                            return;
+                        }
+                        self.automation_input(target, pane_id, encoded.repeat(usize::from(repeat)));
+                    }
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::Paste { text } => {
+                let pane_id = pane_id.unwrap();
+                let bracketed = self
+                    .panes
+                    .get(&pane_id)
+                    .is_some_and(|pane| pane.terminal.modes().bracketed_paste);
+                let mut bytes = sanitize_bracketed_paste(text.as_bytes());
+                if bracketed {
+                    bytes.splice(0..0, b"\x1b[200~".iter().copied());
+                    bytes.extend_from_slice(b"\x1b[201~");
+                }
+                self.automation_input(target, pane_id, bytes);
+            }
+            AutomationMethod::GetText { rows } => {
+                let pane = &self.panes[&pane_id.unwrap()];
+                let text = match rows {
+                    Some(rows) => pane.terminal.latest_text(usize::from(rows)),
+                    None => pane
+                        .terminal
+                        .visible_text(pane.copy.as_ref().map_or(0, |copy| copy.offset)),
+                };
+                if text.len() > AUTOMATION_REPLY_LIMIT {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "limit_exceeded",
+                            "pane text exceeds the 16 MiB reply limit",
+                        ),
+                    );
+                    return;
+                }
+                self.reply_automation(target, serde_json::Value::String(text));
+            }
+            AutomationMethod::GetGrid {
+                start_line,
+                row_count,
+                since_screen,
+            } => {
+                let pane_id = pane_id.unwrap();
+                match self.grid_snapshot(pane_id, start_line, row_count, since_screen) {
+                    Ok(snapshot) => self.reply_automation(target, snapshot),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::WaitText {
+                text,
+                regex,
+                after_screen,
+                timeout_ms,
+            } => {
+                let current = self.panes[&pane_id.unwrap()].screen_sequence;
+                if after_screen.is_some_and(|sequence| sequence > current) {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "sequence_gap",
+                            format!(
+                                "screen sequence is {current}, before requested {after_screen:?}"
+                            ),
+                        ),
+                    );
+                    return;
+                }
+                let pattern = if regex {
+                    if text.len() > 8 * 1024 {
+                        self.reply_automation_error(
+                            target,
+                            AutomationError::new(
+                                "limit_exceeded",
+                                "regular expression exceeds 8 KiB",
+                            ),
+                        );
+                        return;
+                    }
+                    match regex::Regex::new(&text) {
+                        Ok(regex) => AutomationTextPattern::Regex(regex),
+                        Err(error) => {
+                            self.reply_automation_error(
+                                target,
+                                AutomationError::new("regex_invalid", error.to_string()),
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    AutomationTextPattern::Literal(text)
+                };
+                self.add_automation_waiter(AutomationWaiter {
+                    reply: target,
+                    pane_id,
+                    deadline: deadline(timeout_ms),
+                    kind: AutomationWaitKind::Text {
+                        pattern,
+                        after_screen,
+                    },
+                });
+            }
+            AutomationMethod::WaitScreenChange {
+                after_screen,
+                timeout_ms,
+            } => {
+                let pane_id = pane_id.unwrap();
+                if after_screen
+                    .is_some_and(|sequence| sequence > self.panes[&pane_id].screen_sequence)
+                {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "sequence_gap",
+                            "after-screen is newer than the pane screen sequence",
+                        ),
+                    );
+                    return;
+                }
+                let after_screen = after_screen.unwrap_or(self.panes[&pane_id].screen_sequence);
+                self.add_automation_waiter(AutomationWaiter {
+                    reply: target,
+                    pane_id: Some(pane_id),
+                    deadline: deadline(timeout_ms),
+                    kind: AutomationWaitKind::ScreenChange { after_screen },
+                });
+            }
+            AutomationMethod::WaitScreenStable {
+                quiet_ms,
+                after_screen,
+                timeout_ms,
+            } => {
+                let current = self.panes[&pane_id.unwrap()].screen_sequence;
+                if after_screen.is_some_and(|sequence| sequence > current) {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "sequence_gap",
+                            "after-screen is newer than the pane screen sequence",
+                        ),
+                    );
+                    return;
+                }
+                self.add_automation_waiter(AutomationWaiter {
+                    reply: target,
+                    pane_id,
+                    deadline: deadline(timeout_ms),
+                    kind: AutomationWaitKind::ScreenStable {
+                        quiet: Duration::from_millis(quiet_ms),
+                        after_screen,
+                    },
+                })
+            }
+            AutomationMethod::WaitRendered {
+                after_session,
+                timeout_ms,
+            } => {
+                if self.attached.is_none() {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("unsupported", "session has no attached client"),
+                    );
+                } else {
+                    self.add_automation_waiter(AutomationWaiter {
+                        reply: target,
+                        pane_id: None,
+                        deadline: deadline(timeout_ms),
+                        kind: AutomationWaitKind::Rendered { after_session },
+                    });
+                }
+            }
+            AutomationMethod::WaitExit { timeout_ms } => {
+                self.add_automation_waiter(AutomationWaiter {
+                    reply: target,
+                    pane_id,
+                    deadline: deadline(timeout_ms),
+                    kind: AutomationWaitKind::Exit,
+                })
+            }
+        }
+    }
+
     fn client_is(&self, id: u64) -> bool {
         self.attached.as_ref().is_some_and(|client| client.id == id)
+    }
+
+    fn resolve_automation_pane(
+        &self,
+        requested: Option<PaneId>,
+        allow_focused: bool,
+    ) -> Result<PaneId, AutomationError> {
+        if let Some(pane) = requested {
+            return self
+                .panes
+                .contains_key(&pane)
+                .then_some(pane)
+                .ok_or_else(|| {
+                    AutomationError::new("pane_not_found", format!("pane {pane} does not exist"))
+                });
+        }
+        if allow_focused {
+            return self
+                .active_tab()
+                .map(|tab| tab.focused)
+                .filter(|pane| self.panes.contains_key(pane))
+                .ok_or_else(|| AutomationError::new("no_focused_pane", "no focused vvmux pane"));
+        }
+        Err(AutomationError::new(
+            "invalid_params",
+            "this command requires a pane ID",
+        ))
+    }
+
+    fn reply_automation(&mut self, target: AutomationReplyTarget, result: serde_json::Value) {
+        self.finish_automation_request(target.client_id, target.request_id);
+        self.send_automation_response(
+            &target,
+            AutomationResponse::success(target.request_id, result),
+        );
+    }
+
+    fn reply_automation_error(&mut self, target: AutomationReplyTarget, error: AutomationError) {
+        self.finish_automation_request(target.client_id, target.request_id);
+        self.send_automation_response(
+            &target,
+            AutomationResponse {
+                id: target.request_id,
+                ok: false,
+                result: None,
+                error: Some(error),
+            },
+        );
+    }
+
+    fn send_automation_response(
+        &self,
+        target: &AutomationReplyTarget,
+        response: AutomationResponse,
+    ) {
+        let job = AutomationResponseJob {
+            writer: target.writer.clone(),
+            response,
+        };
+        if self.response_sender.try_send(job).is_err() {
+            target.cancel.cancel();
+        }
+    }
+
+    fn finish_automation_request(&mut self, client_id: u64, request_id: u64) {
+        let mut empty = false;
+        if let Some(requests) = self.automation_inflight.get_mut(&client_id) {
+            requests.remove(&request_id);
+            empty = requests.is_empty();
+        }
+        if empty {
+            self.automation_inflight.remove(&client_id);
+        }
+    }
+
+    fn automation_split(
+        &mut self,
+        pane_id: PaneId,
+        axis: Axis,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let tab_index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.contains(pane_id))
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+        let tab_id = self.tabs[tab_index].id;
+        let mut candidate = self.tabs[tab_index]
+            .tree
+            .clone()
+            .ok_or_else(|| AutomationError::new("unsupported", "tab has no tiled layout"))?;
+        if !candidate.contains(pane_id) {
+            return Err(AutomationError::new(
+                "unsupported",
+                "floating panes cannot be split",
+            ));
+        }
+        let new_pane_id = self.next_pane_id;
+        candidate
+            .split(pane_id, new_pane_id, axis, self.content_area())
+            .map_err(|_| AutomationError::new("invalid_state", "pane is too small to split"))?;
+        self.spawn_pane(new_pane_id, tab_id)
+            .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
+        self.next_pane_id = self.next_pane_id.wrapping_add(1);
+        self.tabs[tab_index].tree = Some(candidate);
+        self.tabs[tab_index].set_focus(new_pane_id);
+        self.force_full = true;
+        self.relayout();
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "new_pane_id": new_pane_id,
+            "tab_id": tab_id,
+            "session_sequence": self.session_sequence,
+        }))
+    }
+
+    fn automation_focus(&mut self, pane_id: PaneId) -> Result<(), AutomationError> {
+        let tab_index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.contains(pane_id))
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+        let tab = &mut self.tabs[tab_index];
+        if tab
+            .floating
+            .get(pane_id)
+            .is_some_and(|floating| !floating.pinned)
+        {
+            tab.floating.ordinary_visible = true;
+        }
+        if tab.zoomed.is_some_and(|zoomed| zoomed != pane_id) {
+            tab.zoomed = None;
+        }
+        tab.set_focus(pane_id);
+        self.active_tab = tab_index;
+        self.force_full = true;
+        self.relayout();
+        Ok(())
+    }
+
+    fn automation_input(&mut self, target: AutomationReplyTarget, pane_id: PaneId, bytes: Vec<u8>) {
+        if bytes.len() > 1024 * 1024 {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("limit_exceeded", "PTY input exceeds 1 MiB"),
+            );
+            return;
+        }
+        let receiver = match self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "pane no longer exists"))
+            .and_then(|pane| pane.input.send_with_completion(&bytes))
+        {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                self.reply_automation_error(
+                    target,
+                    AutomationError::new("pty_closed", error.to_string()),
+                );
+                return;
+            }
+        };
+        let sender = self.sender.clone();
+        let completion_target = target.clone();
+        let spawn = std::thread::Builder::new()
+            .name(format!("vvmux-automation-input-{pane_id}"))
+            .spawn(move || {
+                let result = match receiver.recv_timeout(PTY_WRITE_TIMEOUT) {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        Err("PTY write did not complete within five seconds".into())
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        Err("PTY writer closed before acknowledging input".into())
+                    }
+                };
+                let _ = sender.send(ActorEvent::AutomationInputComplete {
+                    reply: completion_target,
+                    result,
+                });
+            });
+        if let Err(error) = spawn {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("unsupported", error.to_string()),
+            );
+        }
+    }
+
+    fn pane_description(&self, pane_id: PaneId) -> Option<serde_json::Value> {
+        let pane = self.panes.get(&pane_id)?;
+        let tab_index = self.tabs.iter().position(|tab| tab.contains(pane_id))?;
+        let tab = &self.tabs[tab_index];
+        let area = self.content_area();
+        let tiled_geometry = tab.tree.as_ref().and_then(|tree| {
+            tree.geometry(area)
+                .into_iter()
+                .find(|(pane, _)| *pane == pane_id)
+        });
+        let floating = tab.floating.get(pane_id);
+        let (layer, outer) = if let Some(floating) = floating {
+            (
+                if floating.pinned {
+                    "pinned"
+                } else {
+                    "floating"
+                },
+                floating.rect,
+            )
+        } else {
+            (
+                "tiled",
+                tiled_geometry.map_or(Rect::default(), |(_, rect)| rect),
+            )
+        };
+        let visible = tab_index == self.active_tab
+            && visible_projections(tab, area)
+                .iter()
+                .any(|projection| projection.pane_id == pane_id);
+        let cursor = pane.terminal.cursor();
+        Some(serde_json::json!({
+            "pane_id": pane_id,
+            "tab_id": tab.id,
+            "active_tab": tab_index == self.active_tab,
+            "focused": tab.focused == pane_id,
+            "visible": visible,
+            "layer": layer,
+            "zoomed": tab.zoomed == Some(pane_id),
+            "title": pane.terminal.title(),
+            "geometry": rect_json(outer),
+            "content_geometry": rect_json(outer.content()),
+            "columns": pane.terminal.cols(),
+            "rows": pane.terminal.rows(),
+            "history_size": pane.terminal.history_len(),
+            "display_offset": pane.copy.as_ref().map_or(0, |copy| copy.offset),
+            "copy_mode": pane.copy.is_some(),
+            "cursor": { "row": cursor.0, "column": cursor.1, "visible": pane.terminal.modes().cursor_visible },
+            "modes": terminal_mode_names(pane.terminal.modes()),
+            "screen": if pane.terminal.alternate_screen() { "alternate" } else { "primary" },
+            "process_state": "running",
+            "screen_sequence": pane.screen_sequence,
+            "session_sequence": self.session_sequence,
+        }))
+    }
+
+    fn grid_snapshot(
+        &self,
+        pane_id: PaneId,
+        start_line: Option<isize>,
+        row_count: Option<u16>,
+        since_screen: Option<u64>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
+        let display_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
+        let mut full = true;
+        let mut gap = None;
+        let mut viewport_rows = None;
+        if let Some(since) = since_screen {
+            if start_line.is_some() || row_count.is_some() {
+                return Err(AutomationError::new(
+                    "invalid_params",
+                    "--since-screen conflicts with explicit line ranges",
+                ));
+            }
+            if since > pane.screen_sequence {
+                return Err(AutomationError::new(
+                    "sequence_gap",
+                    "requested screen sequence is newer than the pane",
+                ));
+            }
+            if since == pane.screen_sequence {
+                full = false;
+                viewport_rows = Some(Vec::new());
+            } else if display_offset > 0 {
+                gap = Some(serde_json::json!({
+                    "requested_sequence": since,
+                    "oldest_sequence": pane.screen_changes.front().map(|change| change.sequence),
+                    "current_sequence": pane.screen_sequence,
+                    "reason": "copy_view",
+                }));
+            } else {
+                let oldest = pane
+                    .screen_changes
+                    .front()
+                    .map_or(pane.screen_sequence, |change| change.sequence);
+                if since.saturating_add(1) < oldest {
+                    gap = Some(serde_json::json!({
+                        "requested_sequence": since,
+                        "oldest_sequence": oldest,
+                        "current_sequence": pane.screen_sequence,
+                        "reason": "history_evicted",
+                    }));
+                } else {
+                    let mut changed = std::collections::BTreeSet::new();
+                    let mut invalidated = false;
+                    for change in pane
+                        .screen_changes
+                        .iter()
+                        .filter(|change| change.sequence > since)
+                    {
+                        match &change.rows {
+                            Some(rows) => changed.extend(rows.iter().copied()),
+                            None => invalidated = true,
+                        }
+                    }
+                    if !invalidated {
+                        full = false;
+                        viewport_rows = Some(changed.into_iter().collect());
+                    }
+                }
+            }
+        }
+
+        let (range_start, count) = if let (Some(start), Some(count)) = (start_line, row_count) {
+            (start, usize::from(count))
+        } else {
+            (-(display_offset as isize), pane.terminal.rows())
+        };
+        let available_start = -(pane.terminal.history_len() as isize);
+        let available_end = pane.terminal.rows() as isize;
+        if range_start < available_start
+            || range_start > available_end
+            || range_start.saturating_add(count as isize) > available_end
+        {
+            return Err(AutomationError::new(
+                "invalid_params",
+                format!("grid range must be within {available_start}..{available_end}"),
+            ));
+        }
+        let selected_rows = viewport_rows.unwrap_or_else(|| (0..count).collect());
+        let mut estimated_bytes = 4096_usize;
+        for row_index in selected_rows.iter().copied().filter(|row| *row < count) {
+            let line = range_start + row_index as isize;
+            let Some(cells) = pane.terminal.viewport_line(line) else {
+                continue;
+            };
+            estimated_bytes = estimated_bytes
+                .checked_add(pane.terminal.cols().saturating_mul(160))
+                .ok_or_else(|| {
+                    AutomationError::new("limit_exceeded", "grid reply size overflows")
+                })?;
+            for cell in cells.iter().take(pane.terminal.cols()) {
+                estimated_bytes = estimated_bytes
+                    .checked_add(cell.combining.len())
+                    .and_then(|size| {
+                        size.checked_add(cell.hyperlink.as_ref().map_or(0, |link| {
+                            link.uri.len() + link.id.as_ref().map_or(0, String::len)
+                        }))
+                    })
+                    .ok_or_else(|| {
+                        AutomationError::new("limit_exceeded", "grid reply size overflows")
+                    })?;
+            }
+            if estimated_bytes > AUTOMATION_REPLY_LIMIT {
+                return Err(AutomationError::new(
+                    "limit_exceeded",
+                    "estimated grid reply exceeds 16 MiB; request fewer rows",
+                ));
+            }
+        }
+        let mut styles = Vec::<serde_json::Value>::new();
+        let mut style_ids = HashMap::<StyleKey, usize>::new();
+        let mut rows = Vec::new();
+        let mut returned_lines = Vec::new();
+        for row_index in selected_rows {
+            if row_index >= count {
+                continue;
+            }
+            let line = range_start + row_index as isize;
+            let Some(source_cells) = pane.terminal.viewport_line(line) else {
+                continue;
+            };
+            let mut cells = source_cells.to_vec();
+            cells.resize(pane.terminal.cols(), Cell::default());
+            cells.truncate(pane.terminal.cols());
+            let serialized = cells
+                .iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    let key = StyleKey::from(cell);
+                    let style_id = *style_ids.entry(key.clone()).or_insert_with(|| {
+                        let id = styles.len();
+                        styles.push(style_json(&key));
+                        id
+                    });
+                    let width = if cell.wide_continuation || cell.leading_wide_spacer {
+                        0
+                    } else if cells
+                        .get(column + 1)
+                        .is_some_and(|next| next.wide_continuation)
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    let text = if cell.wide_continuation || cell.leading_wide_spacer {
+                        String::new()
+                    } else if cell.tab_width.is_some() {
+                        "\t".into()
+                    } else {
+                        let mut text = cell.ch.to_string();
+                        text.push_str(&cell.combining);
+                        text
+                    };
+                    serde_json::json!({
+                        "text": text,
+                        "width": width,
+                        "kind": if cell.wide_continuation { "continuation" } else if cell.leading_wide_spacer { "leading_wide_spacer" } else if cell.tab_width.is_some() { "tab" } else { "character" },
+                        "tab_width": cell.tab_width,
+                        "style": style_id,
+                    })
+                })
+                .collect::<Vec<_>>();
+            returned_lines.push(line);
+            rows.push(serde_json::json!({
+                "grid_line": line,
+                "viewport_row": ((line + display_offset as isize) >= 0
+                    && (line + display_offset as isize) < pane.terminal.rows() as isize)
+                    .then_some(line + display_offset as isize),
+                "wrapped": pane.terminal.line_wrapped(line).unwrap_or(false),
+                "cells": serialized,
+            }));
+        }
+        let cursor = pane.terminal.cursor();
+        let selection = pane.copy.as_ref().map(|copy| serde_json::json!({
+            "cursor": { "row": copy.row, "column": copy.column },
+            "start": copy.selection_start.map(|(line, column)| serde_json::json!({ "line": line, "column": column })),
+        }));
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "screen_sequence": pane.screen_sequence,
+            "session_sequence": self.session_sequence,
+            "full": full,
+            "gap": gap,
+            "grid": { "columns": pane.terminal.cols(), "rows": pane.terminal.rows() },
+            "returned_lines": {
+                "start": returned_lines.first(),
+                "end": returned_lines.last(),
+            },
+            "history_size": pane.terminal.history_len(),
+            "display_offset": display_offset,
+            "screen": if pane.terminal.alternate_screen() { "alternate" } else { "primary" },
+            "terminal_modes": terminal_mode_names(pane.terminal.modes()),
+            "cursor": { "line": cursor.0, "column": cursor.1, "visible": pane.terminal.modes().cursor_visible },
+            "selection": selection,
+            "styles": styles,
+            "rows": rows,
+        }))
+    }
+
+    fn add_automation_waiter(&mut self, waiter: AutomationWaiter) {
+        if self.automation_waiters.len() >= MAX_AUTOMATION_WAITERS {
+            self.reply_automation_error(
+                waiter.reply,
+                AutomationError::new("limit_exceeded", "too many automation waiters"),
+            );
+            return;
+        }
+        self.automation_waiters.push(waiter);
+        self.check_automation_waiters();
+    }
+
+    fn next_automation_deadline(&self) -> Duration {
+        let now = Instant::now();
+        self.automation_waiters
+            .iter()
+            .map(|waiter| {
+                let stable_ready = match (&waiter.kind, waiter.pane_id) {
+                    (AutomationWaitKind::ScreenStable { quiet, .. }, Some(pane)) => self
+                        .panes
+                        .get(&pane)
+                        .map(|pane| pane.last_screen_change + *quiet),
+                    _ => None,
+                };
+                stable_ready
+                    .map_or(waiter.deadline, |ready| ready.min(waiter.deadline))
+                    .saturating_duration_since(now)
+            })
+            .min()
+            .unwrap_or(Duration::from_secs(1))
+    }
+
+    fn check_automation_waiters(&mut self) {
+        let now = Instant::now();
+        let waiters = std::mem::take(&mut self.automation_waiters);
+        for waiter in waiters {
+            if waiter.deadline <= now {
+                self.reply_automation_error(
+                    waiter.reply,
+                    AutomationError::new("timeout", "automation wait timed out"),
+                );
+                continue;
+            }
+            match self.automation_waiter_result(&waiter, now) {
+                Some(Ok(result)) => self.reply_automation(waiter.reply, result),
+                Some(Err(error)) => self.reply_automation_error(waiter.reply, error),
+                None => self.automation_waiters.push(waiter),
+            }
+        }
+    }
+
+    fn automation_waiter_result(
+        &self,
+        waiter: &AutomationWaiter,
+        now: Instant,
+    ) -> Option<Result<serde_json::Value, AutomationError>> {
+        match &waiter.kind {
+            AutomationWaitKind::Rendered { after_session } => {
+                let Some(client) = self.attached.as_ref() else {
+                    return Some(Err(AutomationError::new(
+                        "unsupported",
+                        "attached client disconnected while waiting for render",
+                    )));
+                };
+                (client.rendered_session_sequence >= *after_session).then(|| {
+                    Ok(serde_json::json!({
+                        "session_sequence": self.session_sequence,
+                        "rendered_session_sequence": client.rendered_session_sequence,
+                    }))
+                })
+            }
+            AutomationWaitKind::Exit => {
+                let pane_id = waiter.pane_id?;
+                self.exit_tombstones
+                    .iter()
+                    .rev()
+                    .find(|exit| exit.pane_id == pane_id)
+                    .map(|exit| Ok(exit_result(pane_id, exit.status)))
+                    .or_else(|| {
+                        (!self.panes.contains_key(&pane_id)).then(|| {
+                            Err(AutomationError::new(
+                                "pane_not_found",
+                                "pane does not exist and has no retained exit status",
+                            ))
+                        })
+                    })
+            }
+            kind => {
+                let pane_id = waiter.pane_id?;
+                let Some(pane) = self.panes.get(&pane_id) else {
+                    return Some(Err(AutomationError::new(
+                        "pane_not_found",
+                        "pane closed while waiting",
+                    )));
+                };
+                match kind {
+                    AutomationWaitKind::Text {
+                        pattern,
+                        after_screen,
+                    } => {
+                        if after_screen.is_some_and(|sequence| pane.screen_sequence <= sequence) {
+                            return None;
+                        }
+                        let text = pane
+                            .terminal
+                            .visible_text(pane.copy.as_ref().map_or(0, |copy| copy.offset));
+                        let matched = match pattern {
+                            AutomationTextPattern::Literal(pattern) => text.contains(pattern),
+                            AutomationTextPattern::Regex(pattern) => pattern.is_match(&text),
+                        };
+                        matched.then(|| {
+                            Ok(serde_json::json!({
+                                "pane_id": pane_id,
+                                "screen_sequence": pane.screen_sequence,
+                            }))
+                        })
+                    }
+                    AutomationWaitKind::ScreenChange { after_screen } => {
+                        (pane.screen_sequence > *after_screen).then(|| {
+                            Ok(serde_json::json!({
+                                "pane_id": pane_id,
+                                "screen_sequence": pane.screen_sequence,
+                            }))
+                        })
+                    }
+                    AutomationWaitKind::ScreenStable {
+                        quiet,
+                        after_screen,
+                    } => {
+                        let newer =
+                            after_screen.is_none_or(|sequence| pane.screen_sequence > sequence);
+                        (newer && now.saturating_duration_since(pane.last_screen_change) >= *quiet)
+                            .then(|| {
+                                Ok(serde_json::json!({
+                                    "pane_id": pane_id,
+                                    "screen_sequence": pane.screen_sequence,
+                                    "quiet_ms": quiet.as_millis(),
+                                }))
+                            })
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    fn complete_exit_waiters(&mut self, pane_id: PaneId, status: Option<PtyExitStatus>) {
+        let waiters = std::mem::take(&mut self.automation_waiters);
+        for waiter in waiters {
+            if waiter.pane_id == Some(pane_id) && matches!(waiter.kind, AutomationWaitKind::Exit) {
+                self.reply_automation(waiter.reply, exit_result(pane_id, status));
+            } else {
+                self.automation_waiters.push(waiter);
+            }
+        }
+    }
+
+    fn rendered_session_sequence(&self) -> u64 {
+        self.attached
+            .as_ref()
+            .map_or(0, |client| client.rendered_session_sequence)
+    }
+
+    fn mark_pane_screen_change(&mut self, pane_id: PaneId, rows: Option<Vec<usize>>) {
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
+        pane.screen_sequence = pane.screen_sequence.wrapping_add(1);
+        pane.last_screen_change = Instant::now();
+        pane.screen_changes.push_back(ScreenChange {
+            sequence: pane.screen_sequence,
+            rows,
+        });
+        while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
+            pane.screen_changes.pop_front();
+        }
+        self.session_sequence = self.session_sequence.wrapping_add(1);
     }
 
     fn input(&mut self, bytes: Vec<u8>) {
@@ -1171,6 +2325,7 @@ impl SessionActor {
                         column: 0,
                         selection_start: None,
                     });
+                    self.mark_pane_screen_change(pane_id, None);
                     self.schedule_render();
                 }
             }
@@ -1306,7 +2461,9 @@ impl SessionActor {
     }
 
     fn split(&mut self, axis: Axis) {
-        let Some((focused, tree)) = self.active_tab().map(|tab| (tab.focused, tab.tree.clone()))
+        let Some((focused, tree, tab_id)) = self
+            .active_tab()
+            .map(|tab| (tab.focused, tab.tree.clone(), tab.id))
         else {
             return;
         };
@@ -1330,7 +2487,7 @@ impl SessionActor {
             self.status("pane is too small to split");
             return;
         }
-        if self.spawn_pane(pane_id).is_err() {
+        if self.spawn_pane(pane_id, tab_id).is_err() {
             self.status("could not spawn shell");
             return;
         }
@@ -1387,7 +2544,8 @@ impl SessionActor {
             return;
         }
         let pane_id = self.next_pane_id;
-        if self.spawn_pane(pane_id).is_err() {
+        let tab_id = self.active_tab().map_or(self.next_tab_id, |tab| tab.id);
+        if self.spawn_pane(pane_id, tab_id).is_err() {
             self.status("could not spawn shell");
             return;
         }
@@ -1450,10 +2608,11 @@ impl SessionActor {
 
     fn new_tab(&mut self) -> io::Result<()> {
         let pane_id = self.next_pane_id;
-        self.spawn_pane(pane_id)?;
+        let tab_id = self.next_tab_id;
+        self.spawn_pane(pane_id, tab_id)?;
         self.next_pane_id += 1;
         self.tabs.push(Tab {
-            id: self.next_tab_id,
+            id: tab_id,
             tree: Some(TiledNode::leaf(pane_id)),
             floating: FloatingLayer::default(),
             focused: pane_id,
@@ -1465,7 +2624,7 @@ impl SessionActor {
         Ok(())
     }
 
-    fn spawn_pane(&mut self, pane_id: PaneId) -> io::Result<()> {
+    fn spawn_pane(&mut self, pane_id: PaneId, tab_id: u64) -> io::Result<()> {
         let shell = self
             .config
             .general
@@ -1491,7 +2650,7 @@ impl SessionActor {
             ("TERM_PROGRAM".into(), "vvmux".into()),
             ("COLORTERM".into(), "truecolor".into()),
             ("VVMUX_SESSION".into(), self.name.clone()),
-            ("VVMUX_TAB_ID".into(), self.next_tab_id.to_string()),
+            ("VVMUX_TAB_ID".into(), tab_id.to_string()),
             ("VVMUX_PANE_ID".into(), pane_id.to_string()),
             ("VIVID_ENDPOINT".into(), self.vivid.endpoint()),
             (
@@ -1539,8 +2698,8 @@ impl SessionActor {
         std::thread::Builder::new()
             .name(format!("vvmux-wait-{pane_id}"))
             .spawn(move || {
-                let _ = waiter.wait();
-                let _ = exit_sender.send(ActorEvent::PtyExit(pane_id));
+                let status = waiter.wait().ok();
+                let _ = exit_sender.send(ActorEvent::PtyExit(pane_id, status));
             })?;
         self.panes.insert(
             pane_id,
@@ -1552,6 +2711,9 @@ impl SessionActor {
                 copy: None,
                 vivid_metrics: None,
                 last_input_warning: None,
+                screen_sequence: 1,
+                last_screen_change: Instant::now(),
+                screen_changes: VecDeque::new(),
             },
         );
         Ok(())
@@ -1598,6 +2760,7 @@ impl SessionActor {
 
     fn relayout(&mut self) {
         self.layout_revision = self.layout_revision.wrapping_add(1);
+        self.session_sequence = self.session_sequence.wrapping_add(1);
         self.resize_all();
         self.schedule_render();
     }
@@ -1607,6 +2770,7 @@ impl SessionActor {
     /// needed on this path.
     fn projection_changed(&mut self) {
         self.layout_revision = self.layout_revision.wrapping_add(1);
+        self.session_sequence = self.session_sequence.wrapping_add(1);
         self.schedule_render();
     }
 
@@ -1618,6 +2782,7 @@ impl SessionActor {
             .map(|client| client.display)
             .unwrap_or_default();
         let mut resize_failures = Vec::new();
+        let mut resized_panes = 0_u64;
         for tab in &self.tabs {
             // Hidden ordinary floats keep consuming PTY output but are not resized while
             // hidden; a re-shown float is resized here on the next relayout if its content
@@ -1630,6 +2795,16 @@ impl SessionActor {
                     {
                         pane.terminal
                             .resize(content.height as usize, content.width as usize);
+                        pane.screen_sequence = pane.screen_sequence.wrapping_add(1);
+                        pane.last_screen_change = Instant::now();
+                        pane.screen_changes.push_back(ScreenChange {
+                            sequence: pane.screen_sequence,
+                            rows: None,
+                        });
+                        while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
+                            pane.screen_changes.pop_front();
+                        }
+                        resized_panes = resized_panes.wrapping_add(1);
                         if pane.control.resize(content.width, content.height).is_err() {
                             resize_failures.push(projection.pane_id);
                         }
@@ -1652,6 +2827,7 @@ impl SessionActor {
                 }
             }
         }
+        self.session_sequence = self.session_sequence.wrapping_add(resized_panes);
         resize_failures.sort_unstable();
         resize_failures.dedup();
         for pane in resize_failures {
@@ -1665,6 +2841,11 @@ impl SessionActor {
         let Some(client) = &self.attached else {
             return;
         };
+        #[cfg(windows)]
+        let focused_bracketed_paste = self
+            .active_tab()
+            .and_then(|tab| self.panes.get(&tab.focused))
+            .is_some_and(|pane| pane.terminal.modes().bracketed_paste);
         let mut screen = ScreenBuffer::new(client.display.columns, client.display.rows);
         let area = self.content_area();
         if let Some(tab) = self.active_tab() {
@@ -1757,12 +2938,22 @@ impl SessionActor {
             );
         }
         self.frame_id = self.frame_id.wrapping_add(1);
-        let bytes = ansi_diff(self.last_screen.as_ref(), &screen, self.force_full);
+        // Mutated only by the Windows bracketed-paste prepend below.
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut bytes = ansi_diff(self.last_screen.as_ref(), &screen, self.force_full);
+        #[cfg(windows)]
+        let bracketed_paste_transition =
+            bracketed_paste_transition(self.outer_bracketed_paste, focused_bracketed_paste);
+        #[cfg(windows)]
+        if let Some(transition) = bracketed_paste_transition {
+            prepend_bracketed_paste_transition(&mut bytes, transition);
+        }
         let chunks = bytes.chunks(256 * 1024).collect::<Vec<_>>();
         let mut sent = true;
         for (index, chunk) in chunks.iter().enumerate() {
             let message = ServerMessage::Render {
                 frame_id: self.frame_id,
+                session_sequence: self.session_sequence,
                 full: self.force_full && index == 0,
                 last: index + 1 == chunks.len(),
                 bytes: chunk.to_vec(),
@@ -1775,14 +2966,42 @@ impl SessionActor {
         if !sent {
             self.attached = None;
             self.last_screen = None;
+            #[cfg(windows)]
+            {
+                self.outer_bracketed_paste = None;
+            }
         } else {
             self.last_screen = Some(screen);
+            if let Some(client) = &mut self.attached {
+                client
+                    .frame_sequences
+                    .push_back((self.frame_id, self.session_sequence));
+                while client.frame_sequences.len() > 1024 {
+                    client.frame_sequences.pop_front();
+                }
+            }
+            #[cfg(windows)]
+            if bracketed_paste_transition.is_some() {
+                self.outer_bracketed_paste = Some(focused_bracketed_paste);
+            }
         }
         self.force_full = false;
         self.sync_media(false);
     }
 
     fn sync_media(&mut self, force: bool) {
+        self.sync_media_inner(force, None);
+    }
+
+    fn sync_media_before_delivery(&mut self, source: crate::media::SourceKey) {
+        self.sync_media_inner(false, Some(source));
+    }
+
+    fn sync_media_inner(
+        &mut self,
+        force: bool,
+        live_delivery_source: Option<crate::media::SourceKey>,
+    ) {
         let Some(client) = &self.attached else {
             self.vivid.deactivate_bridge();
             return;
@@ -1948,6 +3167,12 @@ impl SessionActor {
             return;
         }
         for source in snapshot.sources {
+            if !should_replay_retained(source.key, live_delivery_source) {
+                // The MediaEvent that triggered this projection sync follows immediately. Do not
+                // also send the same retained raster body as delivery 0: the outer source would
+                // observe the same frame ID twice and reject the live update.
+                continue;
+            }
             if let Some(body) = source.retained {
                 let record_type = match source.descriptor {
                     crate::media::SourceDescriptor::Raster(_) => {
@@ -1972,15 +3197,10 @@ impl SessionActor {
     }
 
     fn content_area(&self) -> Rect {
-        let display = self.attached.as_ref().map_or(
-            DisplayMetrics {
-                columns: 80,
-                rows: 24,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            |client| client.display,
-        );
+        let display = self
+            .attached
+            .as_ref()
+            .map_or(self.last_display, |client| client.display);
         Rect {
             x: 0,
             y: 0,
@@ -2034,6 +3254,7 @@ impl SessionActor {
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             return;
         };
+        let previous = pane.copy.clone();
         let Some(copy) = &mut pane.copy else {
             return;
         };
@@ -2078,6 +3299,10 @@ impl SessionActor {
             }
             _ => {}
         }
+        let changed = previous != pane.copy;
+        if changed {
+            self.mark_pane_screen_change(pane_id, None);
+        }
         self.schedule_render();
     }
 
@@ -2120,6 +3345,466 @@ impl SessionActor {
             let _ = worker.join();
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StyleKey {
+    foreground: TerminalColor,
+    background: TerminalColor,
+    underline_color: Option<TerminalColor>,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: UnderlineStyle,
+    blink: bool,
+    inverse: bool,
+    hidden: bool,
+    strikeout: bool,
+    hyperlink: Option<TerminalHyperlink>,
+}
+
+impl From<&Cell> for StyleKey {
+    fn from(cell: &Cell) -> Self {
+        Self {
+            foreground: cell.foreground,
+            background: cell.background,
+            underline_color: cell.underline_color,
+            bold: cell.bold,
+            dim: cell.dim,
+            italic: cell.italic,
+            underline: cell.underline_style,
+            blink: cell.blink,
+            inverse: cell.inverse,
+            hidden: cell.hidden,
+            strikeout: cell.strikeout,
+            hyperlink: cell.hyperlink.clone(),
+        }
+    }
+}
+
+fn method_needs_pane(method: &AutomationMethod) -> bool {
+    !matches!(
+        method,
+        AutomationMethod::Capabilities
+            | AutomationMethod::ListPanes
+            | AutomationMethod::WaitRendered { .. }
+    )
+}
+
+fn validate_automation_method(method: &AutomationMethod) -> Result<(), AutomationError> {
+    let input = match method {
+        AutomationMethod::Typing { text } | AutomationMethod::Paste { text } => Some(text.len()),
+        _ => None,
+    };
+    if input.is_some_and(|length| length > 1024 * 1024) {
+        return Err(AutomationError::new(
+            "limit_exceeded",
+            "input exceeds 1 MiB",
+        ));
+    }
+    match method {
+        AutomationMethod::Key { repeat, .. } if !(1..=1000).contains(repeat) => Err(
+            AutomationError::new("invalid_params", "key repeat must be from 1 through 1000"),
+        ),
+        AutomationMethod::GetText { rows: Some(rows) } if !(1..=1000).contains(rows) => Err(
+            AutomationError::new("invalid_params", "rows must be from 1 through 1000"),
+        ),
+        AutomationMethod::GetGrid {
+            start_line,
+            row_count,
+            since_screen,
+        } => {
+            if start_line.is_some() != row_count.is_some() {
+                return Err(AutomationError::new(
+                    "invalid_params",
+                    "start_line and row_count must be supplied together",
+                ));
+            }
+            if since_screen.is_some() && start_line.is_some() {
+                return Err(AutomationError::new(
+                    "invalid_params",
+                    "since_screen conflicts with an explicit row range",
+                ));
+            }
+            if row_count.is_some_and(|rows| !(1..=1000).contains(&rows)) {
+                return Err(AutomationError::new(
+                    "invalid_params",
+                    "row_count must be from 1 through 1000",
+                ));
+            }
+            Ok(())
+        }
+        AutomationMethod::WaitText { text, regex, .. } if *regex && text.len() > 8 * 1024 => Err(
+            AutomationError::new("limit_exceeded", "regular expression exceeds 8 KiB"),
+        ),
+        AutomationMethod::WaitScreenStable { quiet_ms, .. }
+            if !(1..=24 * 60 * 60 * 1000).contains(quiet_ms) =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "quiet duration must be from 1ms through 24h",
+            ))
+        }
+        method => {
+            let timeout = match method {
+                AutomationMethod::WaitText { timeout_ms, .. }
+                | AutomationMethod::WaitScreenChange { timeout_ms, .. }
+                | AutomationMethod::WaitScreenStable { timeout_ms, .. }
+                | AutomationMethod::WaitRendered { timeout_ms, .. }
+                | AutomationMethod::WaitExit { timeout_ms } => Some(*timeout_ms),
+                _ => None,
+            };
+            if timeout.is_some_and(|timeout| !(1..=24 * 60 * 60 * 1000).contains(&timeout)) {
+                Err(AutomationError::new(
+                    "invalid_params",
+                    "timeout must be from 1ms through 24h",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn automation_capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "protocol": "VVMX",
+        "protocol_version": crate::ipc::VERSION,
+        "methods": [
+            "capabilities", "list_panes", "inspect", "split", "focus", "close_pane",
+            "typing", "key", "paste", "get_text", "get_grid", "wait_text",
+            "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit"
+        ],
+        "limits": automation_limits(),
+        "render_acknowledgment": "attached_client_write",
+    })
+}
+
+fn automation_limits() -> serde_json::Value {
+    serde_json::json!({
+        "request_bytes": 1024 * 1024,
+        "reply_bytes": 16 * 1024 * 1024,
+        "rows": 1000,
+        "key_repeats": 1000,
+        "regex_bytes": 8 * 1024,
+        "timeout_ms": { "minimum": 1, "maximum": 24 * 60 * 60 * 1000_u64 },
+        "pty_write_timeout_ms": 5000,
+    })
+}
+
+fn deadline(timeout_ms: u64) -> Instant {
+    Instant::now() + Duration::from_millis(timeout_ms.clamp(1, 24 * 60 * 60 * 1000))
+}
+
+fn rect_json(rect: Rect) -> serde_json::Value {
+    serde_json::json!({
+        "x": rect.x,
+        "y": rect.y,
+        "width": rect.width,
+        "height": rect.height,
+    })
+}
+
+fn terminal_mode_names(modes: TerminalModes) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if modes.application_cursor {
+        names.push("application_cursor");
+    }
+    if modes.application_keypad {
+        names.push("application_keypad");
+    }
+    if modes.bracketed_paste {
+        names.push("bracketed_paste");
+    }
+    if modes.mouse_clicks {
+        names.push("mouse_clicks");
+    }
+    if modes.mouse_motion {
+        names.push("mouse_motion");
+    }
+    if modes.sgr_mouse {
+        names.push("sgr_mouse");
+    }
+    if modes.focus_reporting {
+        names.push("focus_reporting");
+    }
+    if modes.cursor_visible {
+        names.push("cursor_visible");
+    }
+    names
+}
+
+fn style_json(style: &StyleKey) -> serde_json::Value {
+    let mut attributes = Vec::new();
+    if style.bold {
+        attributes.push("bold");
+    }
+    if style.dim {
+        attributes.push("dim");
+    }
+    if style.italic {
+        attributes.push("italic");
+    }
+    match style.underline {
+        UnderlineStyle::None => {}
+        UnderlineStyle::Single => attributes.push("underline"),
+        UnderlineStyle::Double => attributes.push("double_underline"),
+        UnderlineStyle::Curl => attributes.push("undercurl"),
+        UnderlineStyle::Dotted => attributes.push("dotted_underline"),
+        UnderlineStyle::Dashed => attributes.push("dashed_underline"),
+    }
+    if style.blink {
+        attributes.push("blink");
+    }
+    if style.inverse {
+        attributes.push("inverse");
+    }
+    if style.hidden {
+        attributes.push("hidden");
+    }
+    if style.strikeout {
+        attributes.push("strikeout");
+    }
+    serde_json::json!({
+        "foreground": color_json(style.foreground),
+        "background": color_json(style.background),
+        "underline_color": style.underline_color.map(color_json),
+        "attributes": attributes,
+        "hyperlink": style.hyperlink.as_ref().map(|link| serde_json::json!({
+            "id": link.id,
+            "uri": link.uri,
+        })),
+    })
+}
+
+fn color_json(color: TerminalColor) -> serde_json::Value {
+    match color {
+        TerminalColor::Default => serde_json::json!({ "kind": "default" }),
+        TerminalColor::Indexed(index) => {
+            serde_json::json!({ "kind": "indexed", "index": index })
+        }
+        TerminalColor::Rgb(red, green, blue) => serde_json::json!({
+            "kind": "rgb",
+            "red": red,
+            "green": green,
+            "blue": blue,
+        }),
+    }
+}
+
+fn exit_result(pane_id: PaneId, status: Option<PtyExitStatus>) -> serde_json::Value {
+    serde_json::json!({
+        "pane_id": pane_id,
+        "code": status.and_then(|status| status.code),
+        "signal": status.and_then(|status| status.signal),
+        "success": status.is_some_and(|status| status.success),
+        "status_available": status.is_some(),
+    })
+}
+
+fn changed_rows(previous: &[Vec<Cell>], current: &[Vec<Cell>]) -> Vec<usize> {
+    let length = previous.len().max(current.len());
+    (0..length)
+        .filter(|row| previous.get(*row) != current.get(*row))
+        .collect()
+}
+
+fn encode_automation_key(
+    key: &str,
+    modifiers: &[String],
+    modes: TerminalModes,
+) -> Result<Vec<u8>, AutomationError> {
+    let mut bits = 0_u8;
+    for modifier in modifiers {
+        match modifier.to_ascii_lowercase().as_str() {
+            "shift" => bits |= 1,
+            "alt" | "option" => bits |= 2,
+            "ctrl" | "control" => bits |= 4,
+            "super" | "command" | "cmd" => bits |= 8,
+            _ => {
+                return Err(AutomationError::new(
+                    "invalid_params",
+                    format!("unknown modifier {modifier:?}"),
+                ));
+            }
+        }
+    }
+    let modifier_parameter = bits + 1;
+    let mut characters = key.chars();
+    if let (Some(mut character), None) = (characters.next(), characters.next()) {
+        if bits & 4 != 0 {
+            character = character.to_ascii_lowercase();
+            let control = match character {
+                '@' | ' ' => Some(0),
+                'a'..='z' => Some(character as u8 - b'a' + 1),
+                '[' => Some(27),
+                '\\' => Some(28),
+                ']' => Some(29),
+                '^' => Some(30),
+                '_' | '?' => Some(31),
+                _ => None,
+            };
+            if let Some(control) = control {
+                let mut bytes = Vec::with_capacity(2);
+                if bits & 2 != 0 {
+                    bytes.push(0x1b);
+                }
+                bytes.push(control);
+                return Ok(bytes);
+            }
+        }
+        if bits & 8 != 0 {
+            return Ok(format!("\x1b[{};{modifier_parameter}u", u32::from(character)).into_bytes());
+        }
+        let mut bytes = Vec::new();
+        if bits & 2 != 0 {
+            bytes.push(0x1b);
+        }
+        let mut encoded = [0; 4];
+        bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+        return Ok(bytes);
+    }
+
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    if let Some(byte) = match normalized.as_str() {
+        "enter" | "return" => Some(b'\r'),
+        "escape" | "esc" => Some(0x1b),
+        "tab" => Some(b'\t'),
+        "backspace" => Some(0x7f),
+        _ => None,
+    } {
+        if normalized == "tab" && bits & 1 != 0 {
+            let mut bytes = if bits & 2 != 0 {
+                vec![0x1b]
+            } else {
+                Vec::new()
+            };
+            bytes.extend_from_slice(b"\x1b[Z");
+            return Ok(bytes);
+        }
+        let mut bytes = if bits & 2 != 0 {
+            vec![0x1b]
+        } else {
+            Vec::new()
+        };
+        bytes.push(byte);
+        return Ok(bytes);
+    }
+    if let Some(final_byte) = match normalized.as_str() {
+        "arrowup" | "up" => Some('A'),
+        "arrowdown" | "down" => Some('B'),
+        "arrowright" | "right" => Some('C'),
+        "arrowleft" | "left" => Some('D'),
+        "home" => Some('H'),
+        "end" => Some('F'),
+        _ => None,
+    } {
+        return if bits == 0 {
+            Ok(format!(
+                "{}{}",
+                if modes.application_cursor {
+                    "\x1bO"
+                } else {
+                    "\x1b["
+                },
+                final_byte
+            )
+            .into_bytes())
+        } else {
+            Ok(format!("\x1b[1;{modifier_parameter}{final_byte}").into_bytes())
+        };
+    }
+    if let Some(code) = match normalized.as_str() {
+        "insert" => Some(2),
+        "delete" | "del" => Some(3),
+        "pageup" => Some(5),
+        "pagedown" => Some(6),
+        _ => None,
+    } {
+        return Ok(if bits == 0 {
+            format!("\x1b[{code}~")
+        } else {
+            format!("\x1b[{code};{modifier_parameter}~")
+        }
+        .into_bytes());
+    }
+    if let Some(number) = normalized
+        .strip_prefix('f')
+        .and_then(|number| number.parse::<u8>().ok())
+        .filter(|number| (1..=35).contains(number))
+    {
+        if number <= 4 {
+            let final_byte = char::from(b'P' + number - 1);
+            return Ok(if bits == 0 {
+                format!("\x1bO{final_byte}")
+            } else {
+                format!("\x1b[1;{modifier_parameter}{final_byte}")
+            }
+            .into_bytes());
+        }
+        let codes = [
+            15, 17, 18, 19, 20, 21, 23, 24, 25, 26, 28, 29, 31, 32, 33, 34,
+        ];
+        let code = if number <= 20 {
+            codes[usize::from(number - 5)]
+        } else {
+            42 + u32::from(number - 21)
+        };
+        return Ok(if bits == 0 {
+            format!("\x1b[{code}~")
+        } else {
+            format!("\x1b[{code};{modifier_parameter}~")
+        }
+        .into_bytes());
+    }
+    let keypad = match normalized.as_str() {
+        "keypad0" => Some((b'0', 'p')),
+        "keypad1" => Some((b'1', 'q')),
+        "keypad2" => Some((b'2', 'r')),
+        "keypad3" => Some((b'3', 's')),
+        "keypad4" => Some((b'4', 't')),
+        "keypad5" => Some((b'5', 'u')),
+        "keypad6" => Some((b'6', 'v')),
+        "keypad7" => Some((b'7', 'w')),
+        "keypad8" => Some((b'8', 'x')),
+        "keypad9" => Some((b'9', 'y')),
+        "keypaddecimal" => Some((b'.', 'n')),
+        "keypaddivide" => Some((b'/', 'o')),
+        "keypadmultiply" => Some((b'*', 'j')),
+        "keypadsubtract" => Some((b'-', 'm')),
+        "keypadadd" => Some((b'+', 'k')),
+        "keypadenter" => Some((b'\r', 'M')),
+        "keypadequal" => Some((b'=', 'X')),
+        _ => None,
+    };
+    if let Some((literal, application)) = keypad {
+        if modes.application_keypad {
+            return Ok(if bits == 0 {
+                format!("\x1bO{application}")
+            } else {
+                format!("\x1b[1;{modifier_parameter}{application}")
+            }
+            .into_bytes());
+        }
+        let mut bytes = if bits & 2 != 0 {
+            vec![0x1b]
+        } else {
+            Vec::new()
+        };
+        bytes.push(literal);
+        return Ok(bytes);
+    }
+    Err(AutomationError::new(
+        "invalid_params",
+        format!("unknown key {key:?}"),
+    ))
+}
+
+fn should_replay_retained(
+    source: crate::media::SourceKey,
+    live_delivery_source: Option<crate::media::SourceKey>,
+) -> bool {
+    Some(source) != live_delivery_source
 }
 
 #[cfg(unix)]
@@ -2241,6 +3926,8 @@ fn bridge_source_kind(
             sar_num: config.sar_num,
             sar_den: config.sar_den,
             max_access_unit_bytes: config.max_access_unit_bytes,
+            codec_string: config.codec_string.clone(),
+            decoder_config: config.decoder_config.clone(),
         },
         crate::media::SourceDescriptor::Audio(config) => BridgeSourceKind::Audio {
             linked_video: config.linked_video_source_id.map(|source| BridgeSourceKey {
@@ -2255,6 +3942,7 @@ fn bridge_source_kind(
             channel_mask: config.channel_mask,
             bitrate: config.bitrate,
             max_access_unit_bytes: config.max_access_unit_bytes,
+            codec_string: config.codec_string.clone(),
         },
     }
 }
@@ -2450,16 +4138,27 @@ fn extract_selection(terminal: &Terminal, start: (isize, usize), end: (isize, us
         } else {
             line.len()
         };
-        for cell in &line[first.min(line.len())..last.min(line.len())] {
-            if !cell.wide_continuation {
-                output.push(cell.ch);
-                output.push_str(&cell.combining);
+        let mut row = String::new();
+        let mut column = first.min(line.len());
+        let last = last.min(line.len());
+        while column < last {
+            let cell = &line[column];
+            if let Some(width) = cell.tab_width {
+                row.push('\t');
+                column = column.saturating_add(usize::from(width).max(1));
+                continue;
             }
+            if !cell.wide_continuation && !cell.leading_wide_spacer {
+                row.push(cell.ch);
+                row.push_str(&cell.combining);
+            }
+            column += 1;
         }
-        while output.ends_with(' ') {
-            output.pop();
+        while row.ends_with(' ') {
+            row.pop();
         }
-        if line_index != end.0 {
+        output.push_str(&row);
+        if line_index != end.0 && !terminal.line_wrapped(line_index).unwrap_or(false) {
             output.push('\n');
         }
     }
@@ -2481,6 +4180,25 @@ fn sanitize_bracketed_paste(bytes: &[u8]) -> Vec<u8> {
     }
     output.extend_from_slice(&bytes[cursor..]);
     output
+}
+
+#[cfg(windows)]
+fn bracketed_paste_transition(previous: Option<bool>, enabled: bool) -> Option<&'static [u8]> {
+    if previous == Some(enabled) {
+        None
+    } else if enabled {
+        Some(ENABLE_BRACKETED_PASTE)
+    } else {
+        Some(DISABLE_BRACKETED_PASTE)
+    }
+}
+
+#[cfg(windows)]
+fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
+    let mut output = Vec::with_capacity(transition.len() + bytes.len());
+    output.extend_from_slice(transition);
+    output.append(bytes);
+    *bytes = output;
 }
 
 #[cfg(test)]
@@ -2513,6 +4231,33 @@ mod tests {
     #[test]
     fn bracketed_paste_cannot_inject_terminator() {
         assert_eq!(sanitize_bracketed_paste(b"a\x1b[201~b"), b"a\x1b[201;~b");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn outer_bracketed_paste_transitions_are_authoritative_and_deduplicated() {
+        assert_eq!(
+            bracketed_paste_transition(None, false),
+            Some(DISABLE_BRACKETED_PASTE)
+        );
+        assert_eq!(bracketed_paste_transition(Some(false), false), None);
+        assert_eq!(
+            bracketed_paste_transition(Some(false), true),
+            Some(ENABLE_BRACKETED_PASTE)
+        );
+        assert_eq!(bracketed_paste_transition(Some(true), true), None);
+        assert_eq!(
+            bracketed_paste_transition(Some(true), false),
+            Some(DISABLE_BRACKETED_PASTE)
+        );
+
+        let mut enabled = b"render".to_vec();
+        prepend_bracketed_paste_transition(&mut enabled, ENABLE_BRACKETED_PASTE);
+        assert_eq!(enabled, b"\x1b[?2004hrender");
+
+        let mut disabled = Vec::new();
+        prepend_bracketed_paste_transition(&mut disabled, DISABLE_BRACKETED_PASTE);
+        assert_eq!(disabled, b"\x1b[?2004l");
     }
 
     #[test]
@@ -2724,6 +4469,14 @@ mod tests {
     }
 
     #[test]
+    fn projection_sync_does_not_duplicate_the_triggering_live_raster() {
+        let raster = (3, 7);
+        assert!(!should_replay_retained(raster, Some(raster)));
+        assert!(should_replay_retained(raster, None));
+        assert!(should_replay_retained(raster, Some((3, 8))));
+    }
+
+    #[test]
     fn fragment_ids_are_stable_and_recycle_only_disappeared_rectangles() {
         let left = FixedRect::new(0, 0, 10, 10).unwrap();
         let right = FixedRect::new(20, 0, 10, 10).unwrap();
@@ -2918,6 +4671,7 @@ mod tests {
             establish(test_transport(server_stream), ChannelKind::Control).unwrap();
         let (_unused_reader, client_writer) = client_establish.join().unwrap().unwrap();
         let (actor_sender, _actor_receiver) = mpsc::sync_channel(8);
+        let (response_sender, _response_receiver) = mpsc::sync_channel(8);
         let mut actor = SessionActor {
             name: "media-order".into(),
             config,
@@ -2937,6 +4691,8 @@ mod tests {
             copy_buffer: Vec::new(),
             frame_id: 0,
             last_screen: None,
+            #[cfg(windows)]
+            outer_bracketed_paste: None,
             force_full: false,
             pending_render: false,
             layout_revision: 1,
@@ -2947,6 +4703,11 @@ mod tests {
             pointer_drag: None,
             float_modal: None,
             next_float_mode: 0,
+            session_sequence: 1,
+            response_sender,
+            automation_inflight: HashMap::new(),
+            automation_waiters: Vec::new(),
+            exit_tombstones: VecDeque::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             vivid,
             attached: Some(AttachedClient {
@@ -2960,7 +4721,15 @@ mod tests {
                 },
                 acknowledged_frame: 0,
                 vivid: true,
+                rendered_session_sequence: 0,
+                frame_sequences: VecDeque::new(),
             }),
+            last_display: DisplayMetrics {
+                columns: 80,
+                rows: 24,
+                cell_width: 10,
+                cell_height: 20,
+            },
         };
 
         let endpoint = Endpoint::Unix(socket);
@@ -2973,6 +4742,8 @@ mod tests {
             messages::WELCOME
         );
         let video = messages::VideoSourceConfig {
+            codec_string: None,
+            decoder_config: None,
             source_id: 9,
             codec: "h264",
             packetization: "h264-annexb-au-v1",
@@ -3001,6 +4772,7 @@ mod tests {
         let video_ready =
             messages::parse_source_ready(&control.read_record().unwrap().body).unwrap();
         let audio = messages::AudioSourceConfig {
+            codec_string: None,
             source_id: 10,
             linked_video_source_id: Some(9),
             codec: "pcm_s16le",
@@ -3143,5 +4915,66 @@ mod tests {
             }
             other => panic!("expected post-EOS projection snapshot, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn automation_keys_honor_cursor_keypad_modifiers_and_reject_unknown_values() {
+        let mut modes = TerminalModes::default();
+        assert_eq!(
+            encode_automation_key("ArrowUp", &[], modes).unwrap(),
+            b"\x1b[A"
+        );
+        modes.application_cursor = true;
+        assert_eq!(
+            encode_automation_key("ArrowUp", &[], modes).unwrap(),
+            b"\x1bOA"
+        );
+        modes.application_keypad = true;
+        assert_eq!(
+            encode_automation_key("Keypad7", &[], modes).unwrap(),
+            b"\x1bOw"
+        );
+        assert_eq!(
+            encode_automation_key("c", &["Ctrl".into()], modes).unwrap(),
+            b"\x03"
+        );
+        assert_eq!(
+            encode_automation_key("Tab", &["Shift".into()], modes).unwrap(),
+            b"\x1b[Z"
+        );
+        assert!(encode_automation_key("NoSuchKey", &[], modes).is_err());
+        assert!(encode_automation_key("x", &["Hyper".into()], modes).is_err());
+    }
+
+    #[test]
+    fn automation_raw_request_limits_are_enforced() {
+        assert!(
+            validate_automation_method(&AutomationMethod::Key {
+                key: "x".into(),
+                modifiers: Vec::new(),
+                repeat: 0,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::GetText { rows: Some(1001) }).is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::GetGrid {
+                start_line: Some(0),
+                row_count: None,
+                since_screen: None,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::WaitText {
+                text: "x".into(),
+                regex: false,
+                after_screen: None,
+                timeout_ms: 0,
+            })
+            .is_err()
+        );
     }
 }

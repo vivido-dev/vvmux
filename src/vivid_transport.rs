@@ -6,7 +6,7 @@ use std::time::Duration;
 use vivid_protocol::wire::{
     HEADER_SIZE, PREFACE_SIZE, Preface, RECORD_KNOWN_FLAGS, Record, RecordHeader,
 };
-use vivid_protocol::{CONTROL_MAX_RECORD_BODY, FRAMING_MAJOR, FRAMING_MINOR, HARD_MAX_RECORD_BODY};
+use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
 
 use crate::platform::{ConnectionCancel, Transport};
 
@@ -29,8 +29,8 @@ impl Reader {
         let mut bytes = [0_u8; PREFACE_SIZE];
         transport.reader.read_exact(&mut bytes)?;
         let preface = Preface::decode(bytes)?;
-        if (preface.major, preface.minor) != (FRAMING_MAJOR, FRAMING_MINOR) {
-            return Err(invalid("unsupported Vivid framing version"));
+        if (preface.major, preface.minor) != (VIVID_MAJOR, VIVID_MINOR) {
+            return Err(invalid("unsupported Vivid version"));
         }
         let negotiated_maximum = preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY);
         let maximum = if preface.kind == vivid_protocol::wire::ConnectionKind::Control {

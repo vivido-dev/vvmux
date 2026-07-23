@@ -1,6 +1,6 @@
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -11,6 +11,27 @@ use crate::runtime::{RuntimePaths, registry_process_matches};
 use crate::session::{self, ActorEvent, ActorHandle};
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+const MAX_CLIENTS: usize = 32;
+
+struct ClientSlot;
+
+impl ClientSlot {
+    fn acquire() -> Option<Self> {
+        ACTIVE_CLIENTS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CLIENTS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        ACTIVE_CLIENTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub fn run(
     name: String,
@@ -105,9 +126,13 @@ pub fn probe(name: &str) -> io::Result<()> {
 }
 
 fn handle_client(stream: Transport, actor: ActorHandle) {
+    let Some(_slot) = ClientSlot::acquire() else {
+        return;
+    };
     let Ok((mut reader, writer)) = ipc::establish(stream, ChannelKind::Control) else {
         return;
     };
+    let cancel = reader.cancel_handle();
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     while let Ok(message) = reader.recv::<ClientMessage>() {
         if actor
@@ -115,6 +140,7 @@ fn handle_client(stream: Transport, actor: ActorHandle) {
             .send(ActorEvent::Client {
                 id,
                 writer: writer.clone(),
+                cancel: cancel.clone(),
                 message,
             })
             .is_err()

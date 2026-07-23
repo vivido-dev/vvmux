@@ -71,10 +71,9 @@ fn probe_first_image_after_cls() {
     });
 
     let mut transcript = Vec::new();
-    let wait_quiet = |transcript: &mut Vec<u8>, quiet_ms: u64| loop {
-        match receiver.recv_timeout(Duration::from_millis(quiet_ms)) {
-            Ok(chunk) => transcript.extend(chunk),
-            Err(_) => break,
+    let wait_quiet = |transcript: &mut Vec<u8>, quiet_ms: u64| {
+        while let Ok(chunk) = receiver.recv_timeout(Duration::from_millis(quiet_ms)) {
+            transcript.extend(chunk);
         }
     };
     let wait_for = |needle: &str, timeout_ms: u64, transcript: &mut Vec<u8>| -> bool {
@@ -107,7 +106,11 @@ fn probe_first_image_after_cls() {
     wait_quiet(&mut transcript, 800);
     let run_vivi = format!("\"{}\" -v \"{}\"\r\n", vivi.display(), test_png.display());
 
-    for (label, do_cls) in [("run-1 (fresh)", false), ("run-2", false), ("run-3 (after cls)", true)] {
+    for (label, do_cls) in [
+        ("run-1 (fresh)", false),
+        ("run-2", false),
+        ("run-3 (after cls)", true),
+    ] {
         if do_cls {
             parts.input.send(b"cls\r\n").unwrap();
             wait_quiet(&mut transcript, 1200);

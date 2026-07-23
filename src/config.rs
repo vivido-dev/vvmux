@@ -13,6 +13,7 @@ pub struct Config {
     pub media: Media,
     pub keys: Keys,
     pub floating: Floating,
+    pub server: Server,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +60,28 @@ pub struct Floating {
     pub default_width_percent: u16,
     pub default_height_percent: u16,
     pub border_drag_margin: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Server {
+    pub listen: String,
+    pub allowed_origins: Vec<String>,
+    pub auth_file: Option<PathBuf>,
+    pub max_connections: usize,
+    pub outbound_queue_bytes: usize,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:7880".into(),
+            allowed_origins: Vec::new(),
+            auth_file: None,
+            max_connections: 32,
+            outbound_queue_bytes: 4 * 1024 * 1024,
+        }
+    }
 }
 
 impl Default for Floating {
@@ -170,6 +193,34 @@ impl Config {
                 "[floating] border_drag_margin must be between 1 and 4",
             ));
         }
+        let listen = self
+            .server
+            .listen
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "[server].listen must be an IP socket address",
+                )
+            })?;
+        if !listen.ip().is_loopback() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "[server].listen must use a loopback address",
+            ));
+        }
+        if !(1..=1024).contains(&self.server.max_connections) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "[server].max_connections must be between 1 and 1024",
+            ));
+        }
+        if !(512 * 1024..=64 * 1024 * 1024).contains(&self.server.outbound_queue_bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "[server].outbound_queue_bytes must be between 512 KiB and 64 MiB",
+            ));
+        }
         const PREFIX_ACTIONS: &[&str] = &[
             "split-horizontal",
             "split-vertical",
@@ -265,6 +316,7 @@ mod tests {
         let config = Config::default();
         config.validate().unwrap();
         assert_eq!(config.media.aggregate_retained_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.server.listen, "127.0.0.1:7880");
     }
 
     #[test]
@@ -301,6 +353,19 @@ mod tests {
             .keys
             .prefix
             .insert("f".into(), "not-an-action".into());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn network_server_is_loopback_and_bounded() {
+        let mut config = Config::default();
+        config.server.listen = "0.0.0.0:7880".into();
+        assert!(config.validate().is_err());
+        config.server.listen = "[::1]:7880".into();
+        config.validate().unwrap();
+        config.server.outbound_queue_bytes = 511 * 1024;
+        assert!(config.validate().is_err());
+        config.server.outbound_queue_bytes = 64 * 1024 * 1024 + 1;
         assert!(config.validate().is_err());
     }
 }

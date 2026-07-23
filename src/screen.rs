@@ -1,4 +1,4 @@
-use vvmux_terminal::{Cell, Terminal, TerminalColor};
+use vvmux_terminal::{Cell, Terminal, TerminalColor, TerminalHyperlink, UnderlineStyle};
 
 use crate::layout::Rect;
 
@@ -137,8 +137,8 @@ pub fn ansi_diff(
                 }
                 let cell = &current.cells[index];
                 let next_style = Style::from(cell);
-                if style != Some(next_style) {
-                    write_style(&mut output, next_style);
+                if style.as_ref() != Some(&next_style) {
+                    write_style(&mut output, &next_style);
                     style = Some(next_style);
                 }
                 if !cell.wide_continuation {
@@ -150,7 +150,7 @@ pub fn ansi_diff(
             }
         }
     }
-    output.extend_from_slice(b"\x1b[0m");
+    output.extend_from_slice(b"\x1b]8;;\x1b\\\x1b[0m");
     if let Some((x, y)) = current.cursor {
         output.extend_from_slice(format!("\x1b[{};{}H\x1b[?25h", y + 1, x + 1).as_bytes());
     } else {
@@ -159,14 +159,20 @@ pub fn ansi_diff(
     output
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Style {
     foreground: TerminalColor,
     background: TerminalColor,
     bold: bool,
+    dim: bool,
     italic: bool,
-    underline: bool,
+    underline: UnderlineStyle,
+    underline_color: Option<TerminalColor>,
+    blink: bool,
     inverse: bool,
+    hidden: bool,
+    strikeout: bool,
+    hyperlink: Option<TerminalHyperlink>,
 }
 
 impl From<&Cell> for Style {
@@ -175,30 +181,87 @@ impl From<&Cell> for Style {
             foreground: cell.foreground,
             background: cell.background,
             bold: cell.bold,
+            dim: cell.dim,
             italic: cell.italic,
-            underline: cell.underline,
+            underline: cell.underline_style,
+            underline_color: cell.underline_color,
+            blink: cell.blink,
             inverse: cell.inverse,
+            hidden: cell.hidden,
+            strikeout: cell.strikeout,
+            hyperlink: cell
+                .hyperlink
+                .as_ref()
+                .filter(|link| {
+                    !link.uri.chars().any(char::is_control)
+                        && link
+                            .id
+                            .as_ref()
+                            .is_none_or(|id| !id.chars().any(char::is_control) && !id.contains(';'))
+                })
+                .cloned(),
         }
     }
 }
 
-fn write_style(output: &mut Vec<u8>, style: Style) {
+fn write_style(output: &mut Vec<u8>, style: &Style) {
+    output.extend_from_slice(b"\x1b]8;;\x1b\\");
     output.extend_from_slice(b"\x1b[0");
     if style.bold {
         output.extend_from_slice(b";1");
     }
+    if style.dim {
+        output.extend_from_slice(b";2");
+    }
     if style.italic {
         output.extend_from_slice(b";3");
     }
-    if style.underline {
-        output.extend_from_slice(b";4");
+    match style.underline {
+        UnderlineStyle::None => {}
+        UnderlineStyle::Single => output.extend_from_slice(b";4"),
+        UnderlineStyle::Double => output.extend_from_slice(b";4:2"),
+        UnderlineStyle::Curl => output.extend_from_slice(b";4:3"),
+        UnderlineStyle::Dotted => output.extend_from_slice(b";4:4"),
+        UnderlineStyle::Dashed => output.extend_from_slice(b";4:5"),
+    }
+    if style.blink {
+        output.extend_from_slice(b";5");
     }
     if style.inverse {
         output.extend_from_slice(b";7");
     }
+    if style.hidden {
+        output.extend_from_slice(b";8");
+    }
+    if style.strikeout {
+        output.extend_from_slice(b";9");
+    }
     write_color(output, style.foreground, true);
     write_color(output, style.background, false);
+    write_underline_color(output, style.underline_color);
     output.push(b'm');
+    if let Some(uri) = &style.hyperlink {
+        output.extend_from_slice(b"\x1b]8;");
+        if let Some(id) = &uri.id {
+            output.extend_from_slice(b"id=");
+            output.extend_from_slice(id.as_bytes());
+        }
+        output.push(b';');
+        output.extend_from_slice(uri.uri.as_bytes());
+        output.extend_from_slice(b"\x1b\\");
+    }
+}
+
+fn write_underline_color(output: &mut Vec<u8>, color: Option<TerminalColor>) {
+    match color {
+        None | Some(TerminalColor::Default) => output.extend_from_slice(b";59"),
+        Some(TerminalColor::Indexed(index)) => {
+            output.extend_from_slice(format!(";58;5;{index}").as_bytes());
+        }
+        Some(TerminalColor::Rgb(red, green, blue)) => {
+            output.extend_from_slice(format!(";58;2;{red};{green};{blue}").as_bytes());
+        }
+    }
 }
 
 fn write_color(output: &mut Vec<u8>, color: TerminalColor, foreground: bool) {
@@ -244,6 +307,7 @@ fn write_color(output: &mut Vec<u8>, color: TerminalColor, foreground: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vvmux_terminal::TerminalHyperlink;
 
     #[test]
     fn diff_skips_unchanged_cells() {
@@ -297,5 +361,39 @@ mod tests {
         continuation_overlap.set(2, 0, continuation);
         continuation_overlap.set(2, 0, Cell::default());
         assert_eq!(continuation_overlap.cells[1], Cell::default());
+    }
+
+    #[test]
+    fn rich_styles_and_hyperlinks_are_forwarded_to_the_outer_terminal() {
+        let mut screen = ScreenBuffer::new(2, 1);
+        screen.cells[0] = Cell {
+            ch: 'x',
+            dim: true,
+            underline: true,
+            underline_style: UnderlineStyle::Curl,
+            underline_color: Some(TerminalColor::Rgb(1, 2, 3)),
+            strikeout: true,
+            hyperlink: Some(TerminalHyperlink {
+                id: Some("link-1".into()),
+                uri: "https://example.test/".into(),
+            }),
+            ..Cell::default()
+        };
+        let output = ansi_diff(None, &screen, true);
+        assert!(
+            output
+                .windows(b";2;4:3;9".len())
+                .any(|bytes| bytes == b";2;4:3;9")
+        );
+        assert!(
+            output
+                .windows(b";58;2;1;2;3".len())
+                .any(|bytes| bytes == b";58;2;1;2;3")
+        );
+        assert!(
+            output
+                .windows(b"\x1b]8;id=link-1;https://example.test/\x1b\\".len())
+                .any(|bytes| { bytes == b"\x1b]8;id=link-1;https://example.test/\x1b\\" })
+        );
     }
 }

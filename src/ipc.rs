@@ -3,14 +3,124 @@ use std::sync::{Arc, Mutex};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 pub const CONTROL_MAX_BODY: u32 = 1024 * 1024;
 pub const BULK_MAX_BODY: u32 = 64 * 1024 * 1024;
 const STRUCTURED_RECORD: u16 = 1;
+const AUTOMATION_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+const AUTOMATION_CHUNK_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutomationRequest {
+    pub id: u64,
+    pub pane_id: Option<u64>,
+    pub allow_focused: bool,
+    pub method: AutomationMethod,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum AutomationMethod {
+    Capabilities,
+    ListPanes,
+    Inspect,
+    Split {
+        axis: Axis,
+    },
+    Focus,
+    ClosePane,
+    Typing {
+        text: String,
+    },
+    Key {
+        key: String,
+        modifiers: Vec<String>,
+        repeat: u16,
+    },
+    Paste {
+        text: String,
+    },
+    GetText {
+        rows: Option<u16>,
+    },
+    GetGrid {
+        start_line: Option<isize>,
+        row_count: Option<u16>,
+        since_screen: Option<u64>,
+    },
+    WaitText {
+        text: String,
+        regex: bool,
+        after_screen: Option<u64>,
+        timeout_ms: u64,
+    },
+    WaitScreenChange {
+        after_screen: Option<u64>,
+        timeout_ms: u64,
+    },
+    WaitScreenStable {
+        quiet_ms: u64,
+        after_screen: Option<u64>,
+        timeout_ms: u64,
+    },
+    WaitRendered {
+        after_session: u64,
+        timeout_ms: u64,
+    },
+    WaitExit {
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutomationError {
+    pub code: String,
+    pub message: String,
+}
+
+impl AutomationError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutomationResponse {
+    pub id: u64,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<AutomationError>,
+}
+
+impl AutomationResponse {
+    pub fn success(id: u64, result: Value) -> Self {
+        Self {
+            id,
+            ok: true,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn error(id: u64, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            id,
+            ok: false,
+            result: None,
+            error: Some(AutomationError::new(code, message)),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -150,6 +260,8 @@ pub enum BridgeSourceKind {
         sar_num: u32,
         sar_den: u32,
         max_access_unit_bytes: u32,
+        codec_string: Option<String>,
+        decoder_config: Option<Vec<u8>>,
     },
     Audio {
         linked_video: Option<BridgeSourceKey>,
@@ -161,6 +273,7 @@ pub enum BridgeSourceKind {
         channel_mask: u64,
         bitrate: u64,
         max_access_unit_bytes: u32,
+        codec_string: Option<String>,
     },
 }
 
@@ -234,6 +347,7 @@ pub enum ClientMessage {
     Detach,
     Kill,
     Ping,
+    Automation(AutomationRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -244,6 +358,7 @@ pub enum ServerMessage {
     },
     Render {
         frame_id: u64,
+        session_sequence: u64,
         full: bool,
         last: bool,
         bytes: Vec<u8>,
@@ -280,6 +395,13 @@ pub enum ServerMessage {
     },
     Error(String),
     Pong,
+    Automation(AutomationResponse),
+    AutomationChunk {
+        request_id: u64,
+        index: u32,
+        last: bool,
+        base64: String,
+    },
 }
 
 pub struct RecordReader {
@@ -399,6 +521,35 @@ pub fn send(writer: &SharedWriter, message: &ServerMessage) -> io::Result<()> {
         .send(message)
 }
 
+pub fn send_automation(writer: &SharedWriter, mut response: AutomationResponse) -> io::Result<()> {
+    let mut encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
+    if encoded.len() > AUTOMATION_RESPONSE_LIMIT {
+        response = AutomationResponse::error(
+            response.id,
+            "limit_exceeded",
+            "automation response exceeds the 16 MiB decoded limit",
+        );
+        encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
+    }
+    if encoded.len() <= CONTROL_MAX_BODY as usize / 2 {
+        return send(writer, &ServerMessage::Automation(response));
+    }
+    use base64::Engine;
+    let mut locked = writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let chunks = encoded.chunks(AUTOMATION_CHUNK_BYTES).collect::<Vec<_>>();
+    for (index, chunk) in chunks.iter().enumerate() {
+        locked.send(&ServerMessage::AutomationChunk {
+            request_id: response.id,
+            index: index as u32,
+            last: index + 1 == chunks.len(),
+            base64: base64::engine::general_purpose::STANDARD.encode(chunk),
+        })?;
+    }
+    Ok(())
+}
+
 fn encode_preface(channel: ChannelKind, maximum_body: u32) -> [u8; 12] {
     let mut preface = [0_u8; 12];
     preface[0..4].copy_from_slice(MAGIC);
@@ -436,6 +587,20 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct SharedBytes(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBytes {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn preface_rejects_version_reserved_and_limits() {
@@ -489,6 +654,65 @@ mod tests {
         assert_eq!(
             client_reader.recv::<ServerMessage>().unwrap(),
             ServerMessage::Pong
+        );
+    }
+
+    #[test]
+    fn large_automation_responses_are_correlated_and_chunked_below_record_limit() {
+        use base64::Engine;
+
+        let output = SharedBytes::default();
+        let writer = Arc::new(Mutex::new(RecordWriter {
+            stream: Box::new(output.clone()),
+            next_sequence: 0,
+            maximum_body: CONTROL_MAX_BODY,
+        }));
+        let response =
+            AutomationResponse::success(77, Value::String("x".repeat(CONTROL_MAX_BODY as usize)));
+        send_automation(&writer, response.clone()).unwrap();
+
+        let bytes = output.0.lock().unwrap().clone();
+        let mut cursor = 0;
+        let mut sequence = 0;
+        let mut decoded = Vec::new();
+        loop {
+            let header = &bytes[cursor..cursor + 16];
+            assert_eq!(
+                u64::from_be_bytes(header[0..8].try_into().unwrap()),
+                sequence
+            );
+            let length = u32::from_be_bytes(header[12..16].try_into().unwrap()) as usize;
+            assert!(length <= CONTROL_MAX_BODY as usize);
+            cursor += 16;
+            let message: ServerMessage =
+                serde_json::from_slice(&bytes[cursor..cursor + length]).unwrap();
+            cursor += length;
+            sequence += 1;
+            match message {
+                ServerMessage::AutomationChunk {
+                    request_id,
+                    index,
+                    last,
+                    base64,
+                } => {
+                    assert_eq!(request_id, 77);
+                    assert_eq!(u64::from(index), sequence - 1);
+                    decoded.extend(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(base64)
+                            .unwrap(),
+                    );
+                    if last {
+                        break;
+                    }
+                }
+                other => panic!("unexpected chunk message: {other:?}"),
+            }
+        }
+        assert_eq!(cursor, bytes.len());
+        assert_eq!(
+            serde_json::from_slice::<AutomationResponse>(&decoded).unwrap(),
+            response
         );
     }
 }

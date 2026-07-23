@@ -9,6 +9,7 @@ use vivid_protocol::messages::{
     SceneNodeConfig, VideoSourceConfig,
 };
 use vivid_protocol::wire::{Connection, ConnectionKind, ConnectionWriter, Endpoint, Record};
+use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 use zeroize::Zeroizing;
 
 use crate::ipc::{BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind, DisplayMetrics};
@@ -27,21 +28,15 @@ const OPTIONAL_FEATURES: &[u64] = &[
     messages::FEATURE_VIDEO_ACCESS_UNIT_V1,
     messages::FEATURE_VIDEO_CONTROL_V1,
     messages::FEATURE_AUDIO_ACCESS_UNIT_V1,
+    messages::FEATURE_DECODER_DESCRIPTION_V1,
 ];
 const MAX_PENDING_CONTROL_REPLIES: usize = 4096;
 const MEDIA_WRITER_QUEUE: usize = 32;
 
-#[derive(Default)]
-struct CreditBalance {
-    bytes: u64,
-    packets: u64,
-    lost: bool,
-}
-
 struct ControlState {
     replies: HashMap<u64, Record>,
     pending_requests: HashSet<u64>,
-    credits: HashMap<u64, CreditBalance>,
+    credits: HashMap<u64, messages::CreditLedger>,
     keyframes: Vec<messages::NeedKeyframe>,
     source_losses: Vec<u64>,
     display_generation: u64,
@@ -163,24 +158,11 @@ impl ControlDispatcher {
                     let routed = match record.record_type {
                         messages::CREDIT => {
                             messages::parse_credit(&record.body).and_then(|credits| {
-                                let balance = state.credits.entry(record.object_id).or_default();
-                                balance.bytes =
-                                    balance.bytes.checked_add(credits.bytes).ok_or_else(|| {
-                                        io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "outer byte credit overflow",
-                                        )
-                                    })?;
-                                balance.packets = balance
-                                    .packets
-                                    .checked_add(credits.packets)
-                                    .ok_or_else(|| {
-                                        io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "outer packet credit overflow",
-                                        )
-                                    })?;
-                                Ok(())
+                                state
+                                    .credits
+                                    .entry(record.object_id)
+                                    .or_default()
+                                    .grant(credits)
                             })
                         }
                         messages::NEED_KEYFRAME => messages::parse_need_keyframe(&record.body)
@@ -193,8 +175,8 @@ impl ControlDispatcher {
                                         "outer SOURCE_LOST source/object ID mismatch",
                                     ));
                                 }
-                                if let Some(balance) = state.credits.get_mut(&lost.source_id) {
-                                    balance.lost = true;
+                                if let Some(ledger) = state.credits.get_mut(&lost.source_id) {
+                                    ledger.mark_lost();
                                 }
                                 state.source_losses.push(lost.source_id);
                                 Ok(())
@@ -406,11 +388,11 @@ impl ControlDispatcher {
             .credits
             .insert(
                 ready.source_id,
-                CreditBalance {
+                messages::CreditLedger::new(messages::Credits {
                     bytes: ready.byte_credits,
                     packets: ready.packet_credits,
-                    lost: false,
-                },
+                    fragments: ready.fragment_credits,
+                }),
             )
             .is_some()
         {
@@ -493,9 +475,28 @@ struct SourceMediaWriter {
     sender: mpsc::SyncSender<MediaWrite>,
 }
 
+pub(crate) trait ConnectionFactory: Send + Sync {
+    fn open(&self, kind: ConnectionKind) -> io::Result<Connection>;
+}
+
+struct EndpointConnectionFactory {
+    primary: Endpoint,
+    bulk: Option<Endpoint>,
+}
+
+impl ConnectionFactory for EndpointConnectionFactory {
+    fn open(&self, kind: ConnectionKind) -> io::Result<Connection> {
+        if kind != ConnectionKind::Control
+            && let Some(bulk) = &self.bulk
+        {
+            return Connection::open(bulk, kind).or_else(|_| Connection::open(&self.primary, kind));
+        }
+        Connection::open(&self.primary, kind)
+    }
+}
+
 pub struct OuterBridge {
-    endpoint: Endpoint,
-    bulk_endpoint: Option<Endpoint>,
+    connection_factory: Arc<dyn ConnectionFactory>,
     token: Zeroizing<String>,
     control: ControlDispatcher,
     root_context: u64,
@@ -513,6 +514,9 @@ pub struct OuterBridge {
     active_sources: HashMap<BridgeSourceKey, BridgeSource>,
     node_ids: HashMap<(u64, u64, u8), u64>,
     display: DisplayMetrics,
+    /// Outer presenter accepted `decoder-description-v1`; forwarding the optional CREATE fields
+    /// without acceptance would violate the specification.
+    decoder_description: bool,
 }
 
 struct PendingBody {
@@ -537,17 +541,27 @@ impl OuterBridge {
         token: Zeroizing<String>,
         display: DisplayMetrics,
     ) -> io::Result<Self> {
-        let endpoint = Endpoint::parse(&endpoint)?;
-        let bulk_endpoint = bulk_endpoint.as_deref().map(Endpoint::parse).transpose()?;
-        let mut connection = Connection::open(&endpoint, ConnectionKind::Control)?;
+        let connection_factory = Arc::new(EndpointConnectionFactory {
+            primary: Endpoint::parse(&endpoint)?,
+            bulk: bulk_endpoint.as_deref().map(Endpoint::parse).transpose()?,
+        });
+        Self::connect_with_factory(connection_factory, token, display)
+    }
+
+    pub(crate) fn connect_with_factory(
+        connection_factory: Arc<dyn ConnectionFactory>,
+        token: Zeroizing<String>,
+        display: DisplayMetrics,
+    ) -> io::Result<Self> {
+        let mut connection = connection_factory.open(ConnectionKind::Control)?;
         let hello_request = 1;
         let body = messages::encode_hello(
             hello_request,
             &HelloConfig {
-                minimum_major: 1,
-                minimum_minor: 1,
-                maximum_major: 1,
-                maximum_minor: 1,
+                minimum_major: u64::from(VIVID_MAJOR),
+                minimum_minor: u64::from(VIVID_MINOR),
+                maximum_major: u64::from(VIVID_MAJOR),
+                maximum_minor: u64::from(VIVID_MINOR),
                 token: &token,
                 producer: "vvmux",
                 producer_version: env!("CARGO_PKG_VERSION"),
@@ -565,21 +579,29 @@ impl OuterBridge {
                 _ => continue,
             }
         };
-        if !welcome
-            .accepted_features
-            .contains(&messages::FEATURE_NODE_CLIP_RECT_V1)
-        {
+        let accepted_features =
+            messages::negotiate_features(REQUIRED_FEATURES, OPTIONAL_FEATURES, |feature| {
+                welcome.accepted_features.contains(&feature)
+            })
+            .map_err(|feature| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outer presenter did not negotiate required feature {feature}"),
+                )
+            })?;
+        if accepted_features != welcome.accepted_features {
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "outer presenter did not negotiate node-clip-rect-v1",
+                io::ErrorKind::InvalidData,
+                "outer WELCOME accepted features are unsorted, duplicated, or were not offered",
             ));
         }
+        let decoder_description =
+            accepted_features.contains(&messages::FEATURE_DECODER_DESCRIPTION_V1);
         connection.set_send_body_limit(welcome.maximum_control_body)?;
         let control = ControlDispatcher::start(connection, welcome.display_generation)?;
         let (completions_tx, completions_rx) = mpsc::channel();
         Ok(Self {
-            endpoint,
-            bulk_endpoint,
+            connection_factory,
             token,
             control,
             root_context: welcome.root_context_id,
@@ -597,6 +619,7 @@ impl OuterBridge {
             active_sources: HashMap::new(),
             node_ids: HashMap::new(),
             display,
+            decoder_description,
         })
     }
 
@@ -615,9 +638,8 @@ impl OuterBridge {
         // playing source.
         let previous = self.active_sources.values().cloned().collect::<Vec<_>>();
         let _ = self.pause_playing_sources(&previous);
-        let mut replacement = Self::connect_with_bulk(
-            endpoint_string(&self.endpoint),
-            self.bulk_endpoint.as_ref().map(endpoint_string),
+        let mut replacement = Self::connect_with_factory(
+            self.connection_factory.clone(),
             Zeroizing::new((*self.token).clone()),
             self.display,
         )?;
@@ -636,9 +658,8 @@ impl OuterBridge {
         validate_snapshot(sources, nodes)?;
         let previous = self.active_sources.values().cloned().collect::<Vec<_>>();
         let _ = self.pause_playing_sources(&previous);
-        let mut replacement = Self::connect_with_bulk(
-            endpoint_string(&self.endpoint),
-            self.bulk_endpoint.as_ref().map(endpoint_string),
+        let mut replacement = Self::connect_with_factory(
+            self.connection_factory.clone(),
             Zeroizing::new((*self.token).clone()),
             self.display,
         )?;
@@ -960,6 +981,8 @@ impl OuterBridge {
                     sar_num,
                     sar_den,
                     max_access_unit_bytes,
+                    codec_string,
+                    decoder_config,
                 } => (
                     messages::CREATE_VIDEO,
                     ConnectionKind::Video,
@@ -982,6 +1005,14 @@ impl OuterBridge {
                             sar_num: *sar_num,
                             sar_den: *sar_den,
                             max_access_unit_bytes: *max_access_unit_bytes,
+                            codec_string: self
+                                .decoder_description
+                                .then_some(codec_string.as_deref())
+                                .flatten(),
+                            decoder_config: self
+                                .decoder_description
+                                .then_some(decoder_config.as_deref())
+                                .flatten(),
                         },
                     ),
                 ),
@@ -995,6 +1026,7 @@ impl OuterBridge {
                     channel_mask,
                     bitrate,
                     max_access_unit_bytes,
+                    codec_string,
                 } => {
                     let linked = linked_video.and_then(|key| self.source_ids.get(&key).copied());
                     (
@@ -1013,6 +1045,10 @@ impl OuterBridge {
                                 channel_mask: *channel_mask,
                                 bitrate: (*bitrate).min(i64::MAX as u64) as i64,
                                 max_access_unit_bytes: *max_access_unit_bytes,
+                                codec_string: self
+                                    .decoder_description
+                                    .then_some(codec_string.as_deref())
+                                    .flatten(),
                             },
                         ),
                     )
@@ -1027,11 +1063,7 @@ impl OuterBridge {
         for (source, request, upstream, kind) in pending {
             let ready = self.wait_source_ready(request, upstream)?;
             self.control.register_source(&ready)?;
-            let mut media = if let Some(bulk) = &self.bulk_endpoint {
-                Connection::open(bulk, kind).or_else(|_| Connection::open(&self.endpoint, kind))?
-            } else {
-                Connection::open(&self.endpoint, kind)?
-            };
+            let mut media = self.connection_factory.open(kind)?;
             media.set_send_body_limit(ready.max_media_body)?;
             media.write_record(
                 messages::ATTACH_CHANNEL,
@@ -1248,68 +1280,48 @@ impl OuterBridge {
 }
 
 fn validate_snapshot(sources: &[BridgeSource], nodes: &[BridgeNode]) -> io::Result<()> {
-    if nodes.len() > 256 {
-        return Err(invalid_snapshot("outer snapshot exceeds 256 nodes"));
-    }
-    let source_keys = sources
+    let sources = sources
         .iter()
-        .map(|source| source.key)
-        .collect::<std::collections::HashSet<_>>();
-    if source_keys.len() != sources.len() {
-        return Err(invalid_snapshot("outer snapshot repeats a source key"));
-    }
-    for source in sources {
-        if let BridgeSourceKind::Audio {
-            linked_video: Some(video),
-            ..
-        } = source.kind
-            && (video.producer != source.key.producer || !source_keys.contains(&video))
-        {
-            return Err(invalid_snapshot(
-                "outer snapshot audio references a missing video source",
-            ));
-        }
-    }
-
-    let mut fragment_keys = std::collections::HashSet::new();
-    let mut logical_counts = HashMap::<(u64, u64), usize>::new();
-    for node in nodes {
-        if !fragment_keys.insert((node.producer, node.node, node.fragment)) {
-            return Err(invalid_snapshot("outer snapshot repeats a fragment key"));
-        }
-        let count = logical_counts
-            .entry((node.producer, node.node))
-            .or_default();
-        *count += 1;
-        if *count > 8 {
-            return Err(invalid_snapshot(
-                "outer snapshot exceeds eight fragments for a logical node",
-            ));
-        }
-        if node.producer != node.source.producer || !source_keys.contains(&node.source) {
-            return Err(invalid_snapshot(
-                "outer snapshot node references a missing or foreign source",
-            ));
-        }
-        if node.width <= 0
-            || node.height <= 0
-            || node.x.checked_add(node.width).is_none()
-            || node.y.checked_add(node.height).is_none()
-            || node.clip.width <= 0
-            || node.clip.height <= 0
-            || node.clip.x.checked_add(node.clip.width).is_none()
-            || node.clip.y.checked_add(node.clip.height).is_none()
-        {
-            return Err(invalid_snapshot(
-                "outer snapshot contains invalid node or clip geometry",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn invalid_snapshot(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+        .map(|source| messages::SceneValidationSource {
+            key: messages::SceneValidationKey {
+                owner_id: source.key.producer,
+                object_id: source.key.source,
+            },
+            is_video: matches!(source.kind, BridgeSourceKind::Video { .. }),
+            linked_video: match source.kind {
+                BridgeSourceKind::Audio { linked_video, .. } => {
+                    linked_video.map(|video| messages::SceneValidationKey {
+                        owner_id: video.producer,
+                        object_id: video.source,
+                    })
+                }
+                _ => None,
+            },
+        })
+        .collect::<Vec<_>>();
+    let nodes = nodes
+        .iter()
+        .map(|node| messages::SceneValidationNode {
+            owner_id: node.producer,
+            node_id: node.node,
+            fragment_id: u64::from(node.fragment),
+            source: messages::SceneValidationKey {
+                owner_id: node.source.producer,
+                object_id: node.source.source,
+            },
+            x: node.x,
+            y: node.y,
+            width: node.width,
+            height: node.height,
+            clip: Some(ClipRect {
+                x: node.clip.x,
+                y: node.clip.y,
+                width: node.clip.width,
+                height: node.clip.height,
+            }),
+        })
+        .collect::<Vec<_>>();
+    messages::validate_scene_snapshot(&sources, &nodes)
 }
 
 fn run_media_writer(
@@ -1345,21 +1357,20 @@ fn reserve_outer_credit(shared: &SharedControl, source_id: u64, bytes: u64) -> i
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     loop {
-        let balance = state.credits.get_mut(&source_id).ok_or_else(|| {
+        let ledger = state.credits.get_mut(&source_id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "outer source has no credit ledger",
             )
         })?;
-        if balance.lost {
+        if ledger.is_lost() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "outer source was lost",
             ));
         }
-        if balance.bytes >= bytes && balance.packets > 0 {
-            balance.bytes -= bytes;
-            balance.packets -= 1;
+        if ledger.can_consume(bytes) {
+            ledger.consume(bytes)?;
             return Ok(());
         }
         if let Some(error) = &state.closed {
@@ -1369,13 +1380,6 @@ fn reserve_outer_credit(shared: &SharedControl, source_id: u64, bytes: u64) -> i
             .changed
             .wait(state)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
-}
-
-fn endpoint_string(endpoint: &Endpoint) -> String {
-    match endpoint {
-        Endpoint::Unix(path) => format!("unix:{}", path.display()),
-        Endpoint::Tcp(address) => format!("tcp:{address}"),
     }
 }
 
@@ -1740,6 +1744,8 @@ mod tests {
                 source: 2,
             },
             kind: BridgeSourceKind::Video {
+                codec_string: None,
+                decoder_config: None,
                 codec: "h264".into(),
                 packetization: "h264-annexb-au-v1".into(),
                 extradata: Vec::new(),
@@ -1825,6 +1831,8 @@ mod tests {
                 source: 9,
             },
             kind: BridgeSourceKind::Video {
+                codec_string: None,
+                decoder_config: None,
                 codec: "h264".into(),
                 packetization: "h264-annexb-au-v1".into(),
                 extradata: Vec::new(),

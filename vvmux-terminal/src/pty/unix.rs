@@ -26,6 +26,13 @@ pub struct PtyWaiter {
     child: Child,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PtyExitStatus {
+    pub code: Option<i64>,
+    pub signal: Option<i32>,
+    pub success: bool,
+}
+
 impl PtyControl {
     pub fn resize(&self, columns: u16, rows: u16) -> io::Result<()> {
         if columns == 0 || rows == 0 {
@@ -82,8 +89,14 @@ impl PtyControl {
 }
 
 impl PtyWaiter {
-    pub fn wait(mut self) -> io::Result<()> {
-        self.child.wait().map(|_| ())
+    pub fn wait(mut self) -> io::Result<PtyExitStatus> {
+        use std::os::unix::process::ExitStatusExt;
+        let status = self.child.wait()?;
+        Ok(PtyExitStatus {
+            code: status.code().map(i64::from),
+            signal: status.signal(),
+            success: status.success(),
+        })
     }
 }
 

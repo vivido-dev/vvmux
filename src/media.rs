@@ -13,6 +13,7 @@ use vivid_protocol::messages::{
     ParsedVideoSourceConfig, RasterSourceConfig,
 };
 use vivid_protocol::wire::{ConnectionKind, Record};
+use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
 use crate::config::Media as MediaConfig;
 use crate::layout::PaneId;
@@ -547,7 +548,12 @@ impl VirtualVivid {
                 let _ = writer.write_record(
                     messages::NEED_KEYFRAME,
                     key.1,
-                    &messages::need_keyframe(key.1, minimum_epoch, 2, None),
+                    &messages::need_keyframe(
+                        key.1,
+                        minimum_epoch,
+                        messages::KEYFRAME_REASON_DECODER_ERROR,
+                        None,
+                    ),
                 );
             }
         }
@@ -777,32 +783,42 @@ fn handle_control(
     };
     mark_connection_pane(shared, connection_id, pane)?;
     reader.clear_read_deadline()?;
-    let unsupported = hello
-        .required_features
-        .iter()
-        .any(|feature| !supported_feature(*feature));
-    if unsupported {
+    if !offers_vivid_version(
+        hello.minimum_major,
+        hello.minimum_minor,
+        hello.maximum_major,
+        hello.maximum_minor,
+    ) {
         writer.write_record(
             messages::ERROR,
             0,
             &messages::error(
                 request_id,
-                messages::ERROR_UNSUPPORTED_FEATURE,
-                "required feature unsupported by vvmux",
+                messages::ERROR_UNSUPPORTED_VERSION,
+                "Vivid 1.0 is required",
             ),
         )?;
         return Ok(());
     }
-    let mut features = hello.required_features.clone();
-    features.extend(
-        hello
-            .optional_features
-            .iter()
-            .copied()
-            .filter(|feature| supported_feature(*feature)),
-    );
-    features.sort_unstable();
-    features.dedup();
+    let features = match messages::negotiate_features(
+        &hello.required_features,
+        &hello.optional_features,
+        supported_feature,
+    ) {
+        Ok(features) => features,
+        Err(_) => {
+            writer.write_record(
+                messages::ERROR,
+                0,
+                &messages::error(
+                    request_id,
+                    messages::ERROR_UNSUPPORTED_FEATURE,
+                    "required feature unsupported by vvmux",
+                ),
+            )?;
+            return Ok(());
+        }
+    };
     let (producer_id, tag, root_context, display) = {
         let mut state = shared
             .lock()
@@ -1155,7 +1171,7 @@ fn dispatch_control(
             writer.write_record(messages::OK, source_id, &messages::ok(envelope.request_id))?;
         }
         messages::FLUSH => {
-            let (envelope, source_id, epoch) = messages::parse_eos(&record.body)?;
+            let (envelope, source_id, epoch) = messages::parse_flush(&record.body)?;
             cancel_source_deliveries(shared, delivery_changed, (producer, source_id));
             let mut state = shared
                 .lock()
@@ -1465,7 +1481,7 @@ fn ingest_record(
         let new = new_retained.as_ref().map_or(0, |body| body.len());
         let forward = matches!(
             source.descriptor,
-            SourceDescriptor::Video(_) | SourceDescriptor::Audio(_)
+            SourceDescriptor::Raster(_) | SourceDescriptor::Video(_) | SourceDescriptor::Audio(_)
         ) && projected_source
             && !source.bridge_desynchronized;
         (old, new, source.last_pts_us, forward)
@@ -1486,13 +1502,17 @@ fn ingest_record(
         return Err(invalid("aggregate retained media quota exceeded"));
     }
     let source = state.sources.get_mut(&key).unwrap();
+    let retained_requires_revision = matches!(source.descriptor, SourceDescriptor::Image(_));
     if new_retained > 0 {
         source.retained = Some(Arc::from(record.body.clone()));
         source.retained_bytes = new_retained;
     }
     source.last_pts_us = pts;
     state.retained_bytes = projected;
-    if new_retained > 0 {
+    if retained_requires_revision && new_retained > 0 && old_retained == 0 {
+        // Immutable images have no live MediaEvent, so their first retained body must trigger
+        // hydration. Raster bodies are exclusively live while projected and are picked up from
+        // retained state only on an independently required source/layout rebuild.
         state.revision = state.revision.wrapping_add(1);
     }
     let headless_delay = (!projected_source)
@@ -1596,6 +1616,7 @@ fn apply_transaction(
             }
         }
     }
+    validate_scene_structure(state, &nodes)?;
     if nodes.len() > state.config.max_nodes {
         return Err(invalid("node quota exceeded"));
     }
@@ -1625,6 +1646,54 @@ fn validate_node(state: &State, producer: ProducerId, node: &SceneNode) -> io::R
         }
     }
     Ok(())
+}
+
+fn validate_scene_structure(
+    state: &State,
+    nodes: &HashMap<(ProducerId, u64), SceneNode>,
+) -> io::Result<()> {
+    let sources = state
+        .sources
+        .iter()
+        .map(
+            |(&(producer, source_id), source)| messages::SceneValidationSource {
+                key: messages::SceneValidationKey {
+                    owner_id: producer,
+                    object_id: source_id,
+                },
+                is_video: matches!(source.descriptor, SourceDescriptor::Video(_)),
+                linked_video: match &source.descriptor {
+                    SourceDescriptor::Audio(config) => {
+                        config.linked_video_source_id.map(|source_id| {
+                            messages::SceneValidationKey {
+                                owner_id: producer,
+                                object_id: source_id,
+                            }
+                        })
+                    }
+                    _ => None,
+                },
+            },
+        )
+        .collect::<Vec<_>>();
+    let nodes = nodes
+        .values()
+        .map(|node| messages::SceneValidationNode {
+            owner_id: node.producer,
+            node_id: node.config.node.node_id,
+            fragment_id: 0,
+            source: messages::SceneValidationKey {
+                owner_id: node.producer,
+                object_id: node.config.node.source_id,
+            },
+            x: node.config.node.x,
+            y: node.config.node.y,
+            width: node.config.node.width,
+            height: node.config.node.height,
+            clip: node.config.clip,
+        })
+        .collect::<Vec<_>>();
+    messages::validate_scene_snapshot(&sources, &nodes)
 }
 
 fn remove_source(state: &mut State, key: SourceKey) -> io::Result<()> {
@@ -1710,7 +1779,18 @@ fn supported_feature(feature: u64) -> bool {
             | messages::FEATURE_TEXT_ANCHORS_V2
             | messages::FEATURE_AUDIO_ACCESS_UNIT_V1
             | messages::FEATURE_NODE_CLIP_RECT_V1
+            | messages::FEATURE_DECODER_DESCRIPTION_V1
     )
+}
+
+fn offers_vivid_version(
+    minimum_major: u64,
+    minimum_minor: u64,
+    maximum_major: u64,
+    maximum_minor: u64,
+) -> bool {
+    let current = (u64::from(VIVID_MAJOR), u64::from(VIVID_MINOR));
+    (minimum_major, minimum_minor) <= current && (maximum_major, maximum_minor) >= current
 }
 
 fn authenticate_pane(capabilities: &HashMap<PaneId, [u8; 32]>, token: &[u8; 32]) -> Option<PaneId> {
@@ -1741,6 +1821,14 @@ fn invalid(message: &'static str) -> io::Error {
 mod tests {
     use super::*;
     use vivid_protocol::wire::{Connection, Endpoint};
+
+    #[test]
+    fn vivid_version_selection_accepts_only_ranges_containing_1_0() {
+        assert!(!offers_vivid_version(0, 9, 0, 9));
+        assert!(offers_vivid_version(1, 0, 1, 0));
+        assert!(offers_vivid_version(0, 9, 1, 0));
+        assert!(!offers_vivid_version(1, 1, 2, 0));
+    }
 
     fn test_virtual_endpoint(
         directory: &tempfile::TempDir,
@@ -1831,6 +1919,8 @@ mod tests {
     #[test]
     fn timed_media_has_no_retained_payload_contract() {
         let descriptor = SourceDescriptor::Video(ParsedVideoSourceConfig {
+            codec_string: None,
+            decoder_config: None,
             source_id: 1,
             codec: "h264".into(),
             packetization: "annex-b-au-v1".into(),
@@ -1882,6 +1972,36 @@ mod tests {
         service.update_metrics(7, 80, 22, (10, 20));
 
         let endpoint = service_endpoint(&service);
+        let mut unsupported = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        unsupported
+            .write_record(
+                messages::HELLO,
+                0,
+                0,
+                &messages::encode_hello(
+                    1,
+                    &messages::HelloConfig {
+                        minimum_major: 1,
+                        minimum_minor: 1,
+                        maximum_major: 1,
+                        maximum_minor: 1,
+                        token: &token,
+                        producer: "unsupported-version-test",
+                        producer_version: "test",
+                        required_features: &[],
+                        optional_features: &[],
+                        maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+                    },
+                ),
+            )
+            .unwrap();
+        let rejection = unsupported.read_record().unwrap();
+        assert_eq!(rejection.record_type, messages::ERROR);
+        assert_eq!(
+            messages::parse_error_reply(&rejection.body).unwrap().code,
+            messages::ERROR_UNSUPPORTED_VERSION
+        );
+
         let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
         control
             .write_record(messages::HELLO, 0, 0, &messages::hello(1, &token))
@@ -1892,6 +2012,8 @@ mod tests {
         );
 
         let video = messages::VideoSourceConfig {
+            codec_string: None,
+            decoder_config: None,
             source_id: 0,
             codec: "h264",
             packetization: "h264-annexb-au-v1",
@@ -1927,6 +2049,7 @@ mod tests {
         assert!(messages::parse_video_support(&support.body).unwrap());
 
         let audio = messages::AudioSourceConfig {
+            codec_string: None,
             source_id: 0,
             linked_video_source_id: None,
             codec: "pcm_s16le",
@@ -2025,6 +2148,97 @@ mod tests {
     }
 
     #[test]
+    fn projected_raster_frames_are_forwarded_and_bridge_paced() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = test_virtual_endpoint(&directory, "vivid-raster-paced.sock");
+        let (event_sender, event_receiver) = mpsc::sync_channel(8);
+        let service = match VirtualVivid::start_with_events(
+            socket,
+            MediaConfig::default(),
+            Some(event_sender),
+        ) {
+            Ok(service) => service,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping virtual presenter raster socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("virtual presenter start failed: {error}"),
+        };
+        let token = service.issue_pane_capability(7).unwrap();
+        service.update_metrics(7, 80, 22, (10, 20));
+        // Match the session actor: establish the active projection before the pane producer is
+        // born, so media arriving immediately after SOURCE_READY is bridge-eligible.
+        service.projection_snapshot(&HashSet::from([7]));
+
+        let endpoint = service_endpoint(&service);
+        let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        control
+            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &token))
+            .unwrap();
+        assert_eq!(
+            control.read_record().unwrap().record_type,
+            messages::WELCOME
+        );
+        control
+            .write_record(
+                messages::CREATE_RASTER,
+                0,
+                9,
+                &messages::create_raster(2, 9, 2, 1),
+            )
+            .unwrap();
+        let ready = messages::parse_source_ready(&control.read_record().unwrap().body).unwrap();
+        assert_eq!(ready.packet_credits, 1);
+        let mut raster = Connection::open(&endpoint, ConnectionKind::Raster).unwrap();
+        raster
+            .write_record(
+                messages::ATTACH_CHANNEL,
+                0,
+                9,
+                &messages::attach_channel(&ready.media_ticket),
+            )
+            .unwrap();
+
+        let revision_before_frames = service.revision();
+        let first = media::raster_frame_body(1, 1, 2, 1, &[255, 0, 0, 255, 0, 0, 0, 255]).unwrap();
+        raster
+            .write_record(messages::RASTER_FRAME, 0, 9, &first)
+            .unwrap();
+        let first_event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(first_event.record_type, messages::RASTER_FRAME);
+        assert_eq!(first_event.body, first);
+        assert!(first_event.delivery_id > 0);
+        assert!(!service.complete_bridge_delivery(first_event.delivery_id, true));
+        let first_credit = control.read_record().unwrap();
+        assert_eq!(first_credit.record_type, messages::CREDIT);
+        assert_eq!(first_credit.object_id, 9);
+        assert_eq!(service.revision(), revision_before_frames);
+
+        let second = media::raster_frame_body(1, 2, 2, 1, &[0, 255, 0, 255, 0, 0, 0, 255]).unwrap();
+        raster
+            .write_record(messages::RASTER_FRAME, 0, 9, &second)
+            .unwrap();
+        let second_event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(second_event.record_type, messages::RASTER_FRAME);
+        assert_eq!(second_event.body, second);
+        assert!(second_event.delivery_id > first_event.delivery_id);
+        assert_eq!(
+            service.revision(),
+            revision_before_frames,
+            "live raster content must not rebuild the outer projection per frame"
+        );
+        assert!(!service.complete_bridge_delivery(second_event.delivery_id, true));
+        assert_eq!(control.read_record().unwrap().record_type, messages::CREDIT);
+
+        let snapshot = service.projection_snapshot(&HashSet::from([7]));
+        assert_eq!(snapshot.sources.len(), 1);
+        assert_eq!(
+            snapshot.sources[0].retained.as_deref(),
+            Some(second.as_slice())
+        );
+    }
+
+    #[test]
     fn projected_video_credit_waits_for_bridge_and_hidden_audio_is_discarded() {
         let directory = tempfile::tempdir().unwrap();
         let socket = test_virtual_endpoint(&directory, "vivid-paced.sock");
@@ -2054,6 +2268,8 @@ mod tests {
             messages::WELCOME
         );
         let video = messages::VideoSourceConfig {
+            codec_string: None,
+            decoder_config: None,
             source_id: 9,
             codec: "h264",
             packetization: "h264-annexb-au-v1",
@@ -2131,6 +2347,7 @@ mod tests {
         assert_eq!(messages::request_id(&eos.body).unwrap(), 3);
 
         let audio = messages::AudioSourceConfig {
+            codec_string: None,
             source_id: 10,
             linked_video_source_id: None,
             codec: "pcm_s16le",
@@ -2512,6 +2729,8 @@ mod tests {
             messages::WELCOME
         );
         let video = messages::VideoSourceConfig {
+            codec_string: None,
+            decoder_config: None,
             source_id: 9,
             codec: "h264",
             packetization: "h264-annexb-au-v1",
