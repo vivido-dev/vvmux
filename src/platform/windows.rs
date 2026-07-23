@@ -59,9 +59,9 @@ use windows_sys::Win32::System::Pipes::{
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
-    DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
+    CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, DETACHED_PROCESS,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, SetEvent, UpdateProcThreadAttribute,
     WaitForMultipleObjects,
@@ -72,9 +72,11 @@ pub type SessionEndpoint = String;
 pub type VirtualPresenterEndpoint = PathBuf;
 
 const ENTER_TERMINAL: &[u8] =
-    b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h";
+    b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004l";
 const LEAVE_TERMINAL: &[u8] =
     b"\x1b[0m\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l";
+const DEFAULT_CELL_WIDTH_PX: u16 = 10;
+const DEFAULT_CELL_HEIGHT_PX: u16 = 20;
 
 static CONSOLE_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static CONSOLE_WAKE_EVENT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -247,14 +249,7 @@ impl ClientTerminal {
             ..CONSOLE_FONT_INFOEX::default()
         };
         let has_font = unsafe { GetCurrentConsoleFontEx(output, 0, &mut font) } != 0;
-        let cell_width = has_font
-            .then(|| u16::try_from(font.dwFontSize.X).ok())
-            .flatten()
-            .unwrap_or(0);
-        let cell_height = has_font
-            .then(|| u16::try_from(font.dwFontSize.Y).ok())
-            .flatten()
-            .unwrap_or(0);
+        let (cell_width, cell_height) = console_cell_size(has_font.then_some(font.dwFontSize));
         Ok(DisplayMetrics {
             columns,
             rows,
@@ -277,6 +272,20 @@ impl ClientTerminal {
             _ => Err(io::Error::last_os_error()),
         }
     }
+}
+
+fn console_cell_size(size: Option<COORD>) -> (u16, u16) {
+    // Pseudoconsole hosts may not expose a legacy console font. Vivid 1.0 requires nonzero cell
+    // and viewport dimensions, so use the same fallback geometry as Vivi on Windows.
+    let width = size
+        .and_then(|size| u16::try_from(size.X).ok())
+        .filter(|width| *width != 0)
+        .unwrap_or(DEFAULT_CELL_WIDTH_PX);
+    let height = size
+        .and_then(|size| u16::try_from(size.Y).ok())
+        .filter(|height| *height != 0)
+        .unwrap_or(DEFAULT_CELL_HEIGHT_PX);
+    (width, height)
 }
 
 impl Drop for ClientTerminal {
@@ -1681,6 +1690,41 @@ mod tests {
         assert_eq!(
             quote_windows(r"C:\path with space\"),
             r#""C:\path with space\\""#
+        );
+    }
+
+    #[test]
+    fn unavailable_console_font_uses_valid_vivid_cell_dimensions() {
+        assert_eq!(
+            console_cell_size(None),
+            (DEFAULT_CELL_WIDTH_PX, DEFAULT_CELL_HEIGHT_PX)
+        );
+        assert_eq!(
+            console_cell_size(Some(COORD { X: 0, Y: -1 })),
+            (DEFAULT_CELL_WIDTH_PX, DEFAULT_CELL_HEIGHT_PX)
+        );
+
+        let (cell_width, cell_height) = console_cell_size(None);
+        let display = vivid_protocol::messages::DisplayChanged {
+            display_generation: 1,
+            viewport_width: 80 * u32::from(cell_width),
+            viewport_height: 22 * u32::from(cell_height),
+            grid_columns: 80,
+            grid_rows: 22,
+            cell_width: u32::from(cell_width),
+            cell_height: u32::from(cell_height),
+        };
+        let welcome = vivid_protocol::messages::welcome(1, 1, &[1; 16], 1, display, &[]);
+        vivid_protocol::messages::parse_welcome(&welcome).unwrap();
+    }
+
+    #[test]
+    fn client_starts_with_outer_bracketed_paste_disabled() {
+        assert!(ENTER_TERMINAL.ends_with(b"\x1b[?2004l"));
+        assert!(
+            !ENTER_TERMINAL
+                .windows(b"\x1b[?2004h".len())
+                .any(|window| window == b"\x1b[?2004h")
         );
     }
 

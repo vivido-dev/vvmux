@@ -1,6 +1,10 @@
+mod automation;
 mod bridge;
 mod client;
+mod client_input;
 mod config;
+#[cfg(feature = "server-capability")]
+mod gateway;
 mod ipc;
 mod layout;
 mod media;
@@ -53,6 +57,29 @@ enum Command {
         #[arg(short = 't', long = "target")]
         target: String,
     },
+    /// Control and inspect individual panes in a running session.
+    Msg {
+        #[arg(short = 't', long = "target")]
+        target: Option<String>,
+        #[command(subcommand)]
+        command: automation::MsgCommand,
+    },
+    /// Run the authenticated loopback VVWS/1 session gateway.
+    #[cfg(feature = "server-capability")]
+    Serve {
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
+        #[arg(long = "allow-origin")]
+        allow_origins: Vec<String>,
+        #[arg(long)]
+        auth_file: Option<PathBuf>,
+    },
+    /// Manage the network gateway authentication token.
+    #[cfg(feature = "server-capability")]
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
     #[command(name = "__server", hide = true)]
     Server {
         #[arg(long)]
@@ -63,6 +90,18 @@ enum Command {
     #[cfg(windows)]
     #[command(name = "__console-self-test", hide = true)]
     ConsoleSelfTest,
+}
+
+#[cfg(feature = "server-capability")]
+#[derive(Debug, Subcommand)]
+enum TokenCommand {
+    /// Create a 256-bit bearer token, printing the token exactly once.
+    Create {
+        #[arg(long)]
+        rotate: bool,
+        #[arg(long)]
+        auth_file: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -105,6 +144,34 @@ fn run(cli: Cli) -> io::Result<()> {
             runtime::validate_session_name(&target)?;
             client::kill(&target)
         }
+        Some(Command::Msg { target, command }) => automation::run(target.as_deref(), command),
+        #[cfg(feature = "server-capability")]
+        Some(Command::Serve {
+            listen,
+            allow_origins,
+            auth_file,
+        }) => {
+            let config = config::Config::load(cli.config.as_deref())?;
+            gateway::run(
+                config,
+                cli.config,
+                gateway::ServeOverrides {
+                    listen,
+                    allowed_origins: allow_origins,
+                    auth_file,
+                },
+            )
+        }
+        #[cfg(feature = "server-capability")]
+        Some(Command::Token { command }) => match command {
+            TokenCommand::Create { rotate, auth_file } => {
+                let config = config::Config::load(cli.config.as_deref())?;
+                let path = auth_file.as_deref().or(config.server.auth_file.as_deref());
+                let token = gateway::auth::create_token(path, rotate)?;
+                println!("{}", token.as_str());
+                Ok(())
+            }
+        },
         Some(Command::Server {
             session,
             ready_handle,
@@ -114,5 +181,38 @@ fn run(cli: Cli) -> io::Result<()> {
         }
         #[cfg(windows)]
         Some(Command::ConsoleSelfTest) => platform::console_restoration_self_test(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pane_automation_commands_and_enforces_cli_bounds() {
+        assert!(
+            Cli::try_parse_from([
+                "vvmux",
+                "msg",
+                "--target",
+                "agent",
+                "get-grid",
+                "--start-line",
+                "-5",
+                "--row-count",
+                "5",
+                "--pane-id",
+                "7",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["vvmux", "msg", "key", "Enter", "--repeat", "1001",]).is_err()
+        );
+        assert!(Cli::try_parse_from(["vvmux", "msg", "get-grid", "--start-line", "0",]).is_err());
+        assert!(
+            Cli::try_parse_from(["vvmux", "msg", "wait", "screen-stable", "--quiet", "25h",])
+                .is_err()
+        );
     }
 }

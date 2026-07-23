@@ -55,5 +55,8 @@ fn ctrl_c_interrupts_conpty_child_process() {
     control.terminate_blocking();
     drop(receiver);
     reader_thread.join().unwrap();
-    assert!(interrupted, "Ctrl+C did not interrupt through direct ConPTY");
+    assert!(
+        interrupted,
+        "Ctrl+C did not interrupt through direct ConPTY"
+    );
 }

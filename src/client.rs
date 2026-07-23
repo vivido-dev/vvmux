@@ -13,11 +13,16 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use crate::client_input::parse_configured_action;
+use crate::client_input::{FloatEditScanner, ParsedInput, PrefixParser};
 #[cfg(all(test, unix))]
 use crate::ipc::DisplayMetrics;
+#[cfg(test)]
+use crate::ipc::{Action, Axis, Direction, MouseEvent, MouseKind};
 use crate::ipc::{
-    Action, Axis, BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind, ClientMessage,
-    Direction, FloatingEditCommand, MouseEvent, MouseKind, ServerMessage, SharedWriter,
+    BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind, ClientMessage,
+    FloatingEditCommand, ServerMessage, SharedWriter,
 };
 use crate::platform::ClientTerminal;
 
@@ -40,7 +45,7 @@ pub fn attach(
     };
 
     // Keep outer credentials exclusively in the foreground process. Zeroizing guarantees token
-    // bytes are overwritten when the future Vivid bridge or this text-only client closes.
+    // bytes are overwritten when the Vivid bridge or this text-only client closes.
     let outer_endpoint = std::env::var("VIVID_ENDPOINT").ok();
     let outer_bulk_endpoint = std::env::var("VIVID_ENDPOINT_BULK").ok();
     let outer_token = std::env::var("VIVID_TOKEN").ok().map(Zeroizing::new);
@@ -185,6 +190,7 @@ pub fn attach(
                     }
                     ServerMessage::Detached { .. } | ServerMessage::Error(_) => break,
                     ServerMessage::Pong => {}
+                    ServerMessage::Automation(_) | ServerMessage::AutomationChunk { .. } => break,
                 }
             }
             read_stopped.store(true, Ordering::Release);
@@ -343,25 +349,42 @@ impl Drop for ClientWorkers {
     }
 }
 
-struct BridgeSnapshot {
-    generation: u64,
-    sources: Vec<BridgeSource>,
-    nodes: Vec<BridgeNode>,
-    videos_needing_keyframes: Vec<BridgeSourceKey>,
+pub(crate) struct BridgeSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) sources: Vec<BridgeSource>,
+    pub(crate) nodes: Vec<BridgeNode>,
+    pub(crate) videos_needing_keyframes: Vec<BridgeSourceKey>,
 }
 
-struct BridgeMedia {
-    generation: u64,
-    delivery_id: u64,
-    source: BridgeSourceKey,
-    record_type: u16,
-    offset: u32,
-    total: u32,
-    last: bool,
-    bytes: Vec<u8>,
+pub(crate) struct BridgeMedia {
+    pub(crate) generation: u64,
+    pub(crate) delivery_id: u64,
+    pub(crate) source: BridgeSourceKey,
+    pub(crate) record_type: u16,
+    pub(crate) offset: u32,
+    pub(crate) total: u32,
+    pub(crate) last: bool,
+    pub(crate) bytes: Vec<u8>,
 }
 
-struct BridgeWorker {
+#[derive(Clone)]
+pub(crate) struct BridgeClientSender(
+    Arc<dyn Fn(ClientMessage) -> io::Result<()> + Send + Sync + 'static>,
+);
+
+impl BridgeClientSender {
+    pub(crate) fn new(
+        send: impl Fn(ClientMessage) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(send))
+    }
+
+    fn send(&self, message: ClientMessage) -> io::Result<()> {
+        (self.0)(message)
+    }
+}
+
+pub(crate) struct BridgeWorker {
     media: mpsc::SyncSender<BridgeMedia>,
     snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     dropped: Arc<Mutex<HashSet<u64>>>,
@@ -372,6 +395,18 @@ impl BridgeWorker {
     fn spawn(
         bridge: crate::bridge::OuterBridge,
         client_writer: SharedWriter,
+        queue_records: usize,
+    ) -> io::Result<Self> {
+        Self::spawn_with_sender(
+            bridge,
+            BridgeClientSender::new(move |message| send_client(&client_writer, &message)),
+            queue_records,
+        )
+    }
+
+    pub(crate) fn spawn_with_sender(
+        bridge: crate::bridge::OuterBridge,
+        client_writer: BridgeClientSender,
         queue_records: usize,
     ) -> io::Result<Self> {
         let (media, receiver) = mpsc::sync_channel(queue_records);
@@ -398,7 +433,7 @@ impl BridgeWorker {
         })
     }
 
-    fn replace_snapshot(&mut self, mut snapshot: BridgeSnapshot) {
+    pub(crate) fn replace_snapshot(&mut self, mut snapshot: BridgeSnapshot) {
         self.generation = self.generation.wrapping_add(1);
         snapshot.generation = self.generation;
         *self
@@ -407,7 +442,7 @@ impl BridgeWorker {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot);
     }
 
-    fn queue_media(&mut self, mut media: BridgeMedia) -> bool {
+    pub(crate) fn queue_media(&mut self, mut media: BridgeMedia) -> bool {
         media.generation = self.generation;
         let delivery_id = media.delivery_id;
         match self.media.try_send(media) {
@@ -433,7 +468,7 @@ impl BridgeWorker {
 
 fn run_bridge_worker(
     mut bridge: crate::bridge::OuterBridge,
-    client_writer: SharedWriter,
+    client_writer: BridgeClientSender,
     receiver: mpsc::Receiver<BridgeMedia>,
     snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     dropped: Arc<Mutex<HashSet<u64>>>,
@@ -456,16 +491,13 @@ fn run_bridge_worker(
         }
         let outer_keyframes = bridge.take_keyframe_requests();
         if !outer_keyframes.is_empty() {
-            let _ = send_client(
-                &client_writer,
-                &ClientMessage::BridgeNeedKeyframes(outer_keyframes),
-            );
+            let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(outer_keyframes));
         }
         let source_losses = bridge.take_source_losses();
         if !source_losses.is_empty() {
             desynchronized_sources.extend(source_losses);
             force_sources = true;
-            let _ = send_client(&client_writer, &ClientMessage::BridgeSnapshotRetry);
+            let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
         }
         let pending = snapshot
             .lock()
@@ -506,7 +538,7 @@ fn run_bridge_worker(
             if applied.is_err() {
                 force_sources = true;
                 force_replacement = true;
-                let _ = send_client(&client_writer, &ClientMessage::BridgeSnapshotRetry);
+                let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
                 continue;
             }
 
@@ -560,10 +592,7 @@ fn run_bridge_worker(
                     .map(|source| source.key),
             );
             if !keyframes.is_empty() {
-                let _ = send_client(
-                    &client_writer,
-                    &ClientMessage::BridgeNeedKeyframes(keyframes),
-                );
+                let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(keyframes));
             }
             continue;
         }
@@ -635,7 +664,10 @@ fn run_bridge_worker(
             media.bytes,
         ) {
             Ok(true) => {
-                if media.delivery_id == 0 {
+                if hydrates_retained_source(media.record_type) {
+                    // A live raster delivery can be the first body for a newly projected outer
+                    // source. It hydrates that source just as retained delivery 0 does, so later
+                    // authoritative snapshots must not replay the same frame ID.
                     retained_rehydration.remove(&media.source);
                 }
             }
@@ -648,6 +680,13 @@ fn run_bridge_worker(
             }
         }
     }
+}
+
+fn hydrates_retained_source(record_type: u16) -> bool {
+    matches!(
+        record_type,
+        vivid_protocol::messages::RASTER_FRAME | vivid_protocol::messages::IMAGE_DATA
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,7 +801,7 @@ fn source_is_playing(sources: &[BridgeSource], key: BridgeSourceKey) -> bool {
 }
 
 fn complete_dropped_deliveries(
-    client_writer: &SharedWriter,
+    client_writer: &BridgeClientSender,
     dropped: &Arc<Mutex<HashSet<u64>>>,
 ) -> bool {
     let delivery_ids = {
@@ -783,20 +822,21 @@ fn complete_dropped_deliveries(
         }
     }
     if retry_snapshot {
-        let _ = send_client(client_writer, &ClientMessage::BridgeSnapshotRetry);
+        let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
     }
     retry_snapshot
 }
 
-fn acknowledge_bridge_delivery(client_writer: &SharedWriter, delivery_id: u64, delivered: bool) {
+fn acknowledge_bridge_delivery(
+    client_writer: &BridgeClientSender,
+    delivery_id: u64,
+    delivered: bool,
+) {
     if delivery_id != 0 {
-        let _ = send_client(
-            client_writer,
-            &ClientMessage::BridgeMediaAck {
-                delivery_id,
-                delivered,
-            },
-        );
+        let _ = client_writer.send(ClientMessage::BridgeMediaAck {
+            delivery_id,
+            delivered,
+        });
     }
 }
 
@@ -895,334 +935,6 @@ fn write_title(output: &Arc<Mutex<Box<dyn Write + Send>>>, title: &str) -> io::R
     write_output(output, format!("\x1b]2;{sanitized}\x1b\\").as_bytes())
 }
 
-enum ParsedInput {
-    Input(Vec<u8>),
-    Action(Action),
-    Mouse(MouseEvent),
-    Detach,
-}
-
-/// Fragment-safe parser for the intentionally tiny floating-edit key language. A leading ESC is
-/// held briefly so an arrow split across terminal reads is not mistaken for a bare Escape. Any
-/// byte sequence outside the language is returned to the normal prefix/mouse/input parser.
-#[derive(Default)]
-struct FloatEditScanner {
-    pending: Vec<u8>,
-    pending_since: Option<Instant>,
-}
-
-impl FloatEditScanner {
-    const ESCAPE_DELAY: Duration = Duration::from_millis(25);
-
-    fn scan(&mut self, bytes: &[u8]) -> (Vec<FloatingEditCommand>, Vec<u8>) {
-        let mut commands = Vec::new();
-        let mut forward = Vec::new();
-        let mut index = 0;
-        while index < bytes.len() {
-            let byte = bytes[index];
-            if self.pending.is_empty() {
-                match byte {
-                    b'\r' | b'\n' => {
-                        commands.push(FloatingEditCommand::Commit);
-                        forward.extend_from_slice(&bytes[index + 1..]);
-                        break;
-                    }
-                    0x1b => {
-                        self.pending.push(byte);
-                        self.pending_since = Some(Instant::now());
-                    }
-                    _ => forward.push(byte),
-                }
-                index += 1;
-                continue;
-            }
-
-            self.pending.push(byte);
-            index += 1;
-            if let Some(command) = float_edit_sequence(&self.pending) {
-                let terminal = matches!(
-                    command,
-                    FloatingEditCommand::Commit | FloatingEditCommand::Cancel
-                );
-                commands.push(command);
-                self.pending.clear();
-                self.pending_since = None;
-                if terminal {
-                    forward.extend_from_slice(&bytes[index..]);
-                    break;
-                }
-            } else if !float_edit_sequence_prefix(&self.pending) {
-                forward.append(&mut self.pending);
-                self.pending_since = None;
-            }
-        }
-        (commands, forward)
-    }
-
-    fn expire(&mut self, now: Instant) -> Option<FloatingEditCommand> {
-        let since = self.pending_since?;
-        if self.pending == b"\x1b" && now.saturating_duration_since(since) >= Self::ESCAPE_DELAY {
-            self.pending.clear();
-            self.pending_since = None;
-            Some(FloatingEditCommand::Cancel)
-        } else {
-            None
-        }
-    }
-
-    /// Clear a no-longer-current mode and return any incomplete bytes for ordinary input.
-    fn reset(&mut self) -> Vec<u8> {
-        self.pending_since = None;
-        std::mem::take(&mut self.pending)
-    }
-}
-
-fn float_edit_sequence(sequence: &[u8]) -> Option<FloatingEditCommand> {
-    let (direction, cells) = match sequence {
-        b"\x1b[A" => (Direction::Up, 1),
-        b"\x1b[B" => (Direction::Down, 1),
-        b"\x1b[C" => (Direction::Right, 1),
-        b"\x1b[D" => (Direction::Left, 1),
-        b"\x1b[1;2A" => (Direction::Up, 5),
-        b"\x1b[1;2B" => (Direction::Down, 5),
-        b"\x1b[1;2C" => (Direction::Right, 5),
-        b"\x1b[1;2D" => (Direction::Left, 5),
-        _ => return None,
-    };
-    Some(FloatingEditCommand::Step { direction, cells })
-}
-
-fn float_edit_sequence_prefix(sequence: &[u8]) -> bool {
-    const SEQUENCES: [&[u8]; 8] = [
-        b"\x1b[A",
-        b"\x1b[B",
-        b"\x1b[C",
-        b"\x1b[D",
-        b"\x1b[1;2A",
-        b"\x1b[1;2B",
-        b"\x1b[1;2C",
-        b"\x1b[1;2D",
-    ];
-    SEQUENCES
-        .iter()
-        .any(|candidate| candidate.starts_with(sequence))
-}
-
-struct PrefixParser {
-    prefix_byte: u8,
-    bindings: HashMap<u8, Action>,
-    prefix: bool,
-    sequence: Vec<u8>,
-    mouse_sequence: Vec<u8>,
-    confirm_close: bool,
-}
-
-impl Default for PrefixParser {
-    fn default() -> Self {
-        Self::new(0x02, &std::collections::BTreeMap::new())
-    }
-}
-
-impl PrefixParser {
-    fn new(prefix_byte: u8, configured: &std::collections::BTreeMap<String, String>) -> Self {
-        let bindings = configured
-            .iter()
-            .filter_map(|(chord, action)| {
-                let bytes = chord.as_bytes();
-                (bytes.len() == 1)
-                    .then_some(bytes[0])
-                    .zip(parse_configured_action(action))
-            })
-            .collect();
-        Self {
-            prefix_byte,
-            bindings,
-            prefix: false,
-            sequence: Vec::new(),
-            mouse_sequence: Vec::new(),
-            confirm_close: false,
-        }
-    }
-
-    fn feed(&mut self, bytes: &[u8]) -> Vec<ParsedInput> {
-        let mut output = Vec::new();
-        let mut ordinary = Vec::new();
-        for &byte in bytes {
-            if self.confirm_close {
-                self.confirm_close = false;
-                if matches!(byte, b'y' | b'Y') {
-                    output.push(ParsedInput::Action(Action::ClosePane));
-                }
-                continue;
-            }
-            if !self.sequence.is_empty() {
-                self.sequence.push(byte);
-                if let Some(command) = prefix_sequence(&self.sequence) {
-                    output.push(ParsedInput::Action(command));
-                    self.sequence.clear();
-                    self.prefix = false;
-                } else if self.sequence.len() >= 7 {
-                    self.sequence.clear();
-                    self.prefix = false;
-                }
-                continue;
-            }
-            if !self.prefix {
-                if !self.mouse_sequence.is_empty() {
-                    self.mouse_sequence.push(byte);
-                    let valid_prefix = match self.mouse_sequence.len() {
-                        2 => self.mouse_sequence == b"\x1b[",
-                        3 => self.mouse_sequence == b"\x1b[<",
-                        _ => true,
-                    };
-                    if !valid_prefix {
-                        ordinary.extend_from_slice(&self.mouse_sequence);
-                        self.mouse_sequence.clear();
-                    } else if matches!(byte, b'M' | b'm') {
-                        if !ordinary.is_empty() {
-                            output.push(ParsedInput::Input(std::mem::take(&mut ordinary)));
-                        }
-                        if let Some(mouse) = parse_sgr_mouse(&self.mouse_sequence) {
-                            output.push(ParsedInput::Mouse(mouse));
-                        } else {
-                            ordinary.extend_from_slice(&self.mouse_sequence);
-                        }
-                        self.mouse_sequence.clear();
-                    } else if self.mouse_sequence.len() >= 64 {
-                        ordinary.extend_from_slice(&self.mouse_sequence);
-                        self.mouse_sequence.clear();
-                    }
-                    continue;
-                }
-                if byte == 0x1b {
-                    self.mouse_sequence.push(byte);
-                    continue;
-                }
-                if byte == self.prefix_byte {
-                    if !ordinary.is_empty() {
-                        output.push(ParsedInput::Input(std::mem::take(&mut ordinary)));
-                    }
-                    self.prefix = true;
-                } else {
-                    ordinary.push(byte);
-                }
-                continue;
-            }
-            if let Some(action) = self.bindings.get(&byte).cloned() {
-                output.push(ParsedInput::Action(action));
-                self.prefix = false;
-                continue;
-            }
-            match byte {
-                value if value == self.prefix_byte => {
-                    output.push(ParsedInput::Input(vec![self.prefix_byte]))
-                }
-                b'%' => output.push(ParsedInput::Action(Action::Split(Axis::Vertical))),
-                b'"' => output.push(ParsedInput::Action(Action::Split(Axis::Horizontal))),
-                b'c' => output.push(ParsedInput::Action(Action::NewTab)),
-                b'n' => output.push(ParsedInput::Action(Action::NextTab)),
-                b'p' => output.push(ParsedInput::Action(Action::PreviousTab)),
-                b'z' => output.push(ParsedInput::Action(Action::ToggleZoom)),
-                b'f' => output.push(ParsedInput::Action(Action::NewFloatingPane)),
-                b'F' => output.push(ParsedInput::Action(Action::ToggleFloatingPanes)),
-                b'P' => output.push(ParsedInput::Action(Action::TogglePanePinned)),
-                b'm' => output.push(ParsedInput::Action(Action::EnterFloatingMoveMode)),
-                b'r' => output.push(ParsedInput::Action(Action::EnterFloatingResizeMode)),
-                b'd' => output.push(ParsedInput::Detach),
-                b'[' => output.push(ParsedInput::Action(Action::EnterCopyMode)),
-                b']' => output.push(ParsedInput::Action(Action::Paste)),
-                b'x' => self.confirm_close = true,
-                b'0'..=b'9' => output.push(ParsedInput::Action(Action::SelectTab(
-                    (byte - b'0') as usize,
-                ))),
-                0x1b => {
-                    self.sequence.push(byte);
-                    continue;
-                }
-                _ => {}
-            }
-            self.prefix = false;
-        }
-        if !ordinary.is_empty() {
-            output.push(ParsedInput::Input(ordinary));
-        }
-        output
-    }
-}
-
-fn parse_configured_action(action: &str) -> Option<Action> {
-    match action {
-        "split-horizontal" => Some(Action::Split(Axis::Horizontal)),
-        "split-vertical" => Some(Action::Split(Axis::Vertical)),
-        "focus-left" => Some(Action::Focus(Direction::Left)),
-        "focus-right" => Some(Action::Focus(Direction::Right)),
-        "focus-up" => Some(Action::Focus(Direction::Up)),
-        "focus-down" => Some(Action::Focus(Direction::Down)),
-        "resize-left" => Some(Action::Resize(Direction::Left)),
-        "resize-right" => Some(Action::Resize(Direction::Right)),
-        "resize-up" => Some(Action::Resize(Direction::Up)),
-        "resize-down" => Some(Action::Resize(Direction::Down)),
-        "new-tab" => Some(Action::NewTab),
-        "next-tab" => Some(Action::NextTab),
-        "previous-tab" => Some(Action::PreviousTab),
-        "close-pane" => Some(Action::ClosePane),
-        "toggle-zoom" => Some(Action::ToggleZoom),
-        "copy-mode" => Some(Action::EnterCopyMode),
-        "paste" => Some(Action::Paste),
-        "new-floating-pane" => Some(Action::NewFloatingPane),
-        "toggle-floating-panes" => Some(Action::ToggleFloatingPanes),
-        "toggle-pane-pinned" => Some(Action::TogglePanePinned),
-        "enter-floating-move-mode" => Some(Action::EnterFloatingMoveMode),
-        "enter-floating-resize-mode" => Some(Action::EnterFloatingResizeMode),
-        _ => None,
-    }
-}
-
-fn parse_sgr_mouse(sequence: &[u8]) -> Option<MouseEvent> {
-    let text = std::str::from_utf8(sequence).ok()?;
-    let release = text.ends_with('m');
-    let fields = text.strip_prefix("\x1b[<")?.strip_suffix(['M', 'm'])?;
-    let mut fields = fields.split(';');
-    let raw = fields.next()?.parse::<u16>().ok()?;
-    let x = fields.next()?.parse::<u16>().ok()?.checked_sub(1)?;
-    let y = fields.next()?.parse::<u16>().ok()?.checked_sub(1)?;
-    if fields.next().is_some() {
-        return None;
-    }
-    let button = (raw & 0b11) as u8;
-    let kind = if raw & 64 != 0 {
-        MouseKind::Wheel
-    } else if release {
-        MouseKind::Release
-    } else if raw & 32 != 0 {
-        MouseKind::Move
-    } else {
-        MouseKind::Press
-    };
-    Some(MouseEvent {
-        button,
-        x,
-        y,
-        kind,
-        shift: raw & 4 != 0,
-    })
-}
-
-fn prefix_sequence(sequence: &[u8]) -> Option<Action> {
-    let direction = match sequence {
-        b"\x1b[A" | b"\x1b[1;5A" => Direction::Up,
-        b"\x1b[B" | b"\x1b[1;5B" => Direction::Down,
-        b"\x1b[C" | b"\x1b[1;5C" => Direction::Right,
-        b"\x1b[D" | b"\x1b[1;5D" => Direction::Left,
-        _ => return None,
-    };
-    if sequence.len() > 3 {
-        Some(Action::Resize(direction))
-    } else {
-        Some(Action::Focus(direction))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1263,6 +975,19 @@ mod tests {
             ParsedInput::Action(Action::Split(Axis::Vertical))
         ));
         assert!(matches!(&commands[3], ParsedInput::Input(bytes) if bytes == b"z"));
+    }
+
+    #[test]
+    fn live_raster_hydrates_a_new_outer_source() {
+        assert!(hydrates_retained_source(
+            vivid_protocol::messages::RASTER_FRAME
+        ));
+        assert!(hydrates_retained_source(
+            vivid_protocol::messages::IMAGE_DATA
+        ));
+        assert!(!hydrates_retained_source(
+            vivid_protocol::messages::VIDEO_PACKET
+        ));
     }
 
     #[test]
@@ -1421,6 +1146,137 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn bridge_delivers_consecutive_raster_frames_to_one_outer_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("outer-raster.sock");
+        let presenter = match VirtualVivid::start(socket.clone(), MediaConfig::default()) {
+            Ok(presenter) => presenter,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping bridge raster socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("virtual outer presenter start failed: {error}"),
+        };
+        let token = presenter.issue_pane_capability(7).unwrap();
+        presenter.update_metrics(7, 80, 22, (10, 20));
+        let bridge = crate::bridge::OuterBridge::connect(
+            format!("unix:{}", socket.display()),
+            Zeroizing::new(token),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let client_establish = thread::spawn(move || {
+            crate::ipc::establish(test_transport(client), ChannelKind::Control)
+        });
+        let (mut server_reader, _server_writer) =
+            establish(test_transport(server), ChannelKind::Control).unwrap();
+        let (_client_reader, client_writer) = client_establish.join().unwrap().unwrap();
+        let mut worker = BridgeWorker::spawn(bridge, client_writer, 8).unwrap();
+        let (ack_sender, ack_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(message) = server_reader.recv::<ClientMessage>() {
+                if let ClientMessage::BridgeMediaAck {
+                    delivery_id,
+                    delivered,
+                } = message
+                {
+                    let _ = ack_sender.send((delivery_id, delivered));
+                }
+            }
+        });
+
+        let key = BridgeSourceKey {
+            producer: 3,
+            source: 7,
+        };
+        let source = BridgeSource {
+            key,
+            kind: BridgeSourceKind::Raster {
+                width: 2,
+                height: 1,
+                alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
+                compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
+            },
+            playing: false,
+            play_request: crate::ipc::BridgePlayRequest {
+                start_pts_us: 0,
+                minimum_buffer_us: 0,
+                maximum_latency_us: 500_000,
+                rate_32_32: 1_i64 << 32,
+                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                loop_count: 0,
+                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+            },
+        };
+        let node = BridgeNode {
+            producer: key.producer,
+            node: 1,
+            fragment: 0,
+            source: key,
+            x: 0,
+            y: 0,
+            width: 2_i64 << 32,
+            height: 1_i64 << 32,
+            z_index: 0,
+            visible: true,
+            clip: crate::ipc::BridgeClipRect {
+                x: 0,
+                y: 0,
+                width: 2_i64 << 32,
+                height: 1_i64 << 32,
+            },
+        };
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            sources: vec![source],
+            nodes: vec![node],
+            videos_needing_keyframes: Vec::new(),
+        });
+
+        let frames = [
+            media::raster_frame_body(1, 1, 2, 1, &[255, 0, 0, 255, 0, 0, 0, 255]).unwrap(),
+            media::raster_frame_body(1, 2, 2, 1, &[0, 255, 0, 255, 0, 0, 0, 255]).unwrap(),
+        ];
+        for (index, frame) in frames.iter().enumerate() {
+            let delivery_id = 41 + index as u64;
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id,
+                source: key,
+                record_type: vivid_protocol::messages::RASTER_FRAME,
+                offset: 0,
+                total: frame.len() as u32,
+                last: true,
+                bytes: frame.clone(),
+            }));
+            assert_eq!(
+                ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                (delivery_id, true)
+            );
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+                if snapshot
+                    .sources
+                    .first()
+                    .and_then(|source| source.retained.as_deref())
+                    == Some(frame.as_slice())
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "outer raster frame was not updated"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn bridge_forwards_linked_preroll_and_applies_play_before_video() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("outer-vivid.sock");
@@ -1461,6 +1317,8 @@ mod tests {
         let video_source = BridgeSource {
             key: video_key,
             kind: BridgeSourceKind::Video {
+                codec_string: None,
+                decoder_config: None,
                 codec: "h264".into(),
                 packetization: "h264-annexb-au-v1".into(),
                 extradata: Vec::new(),
@@ -1491,6 +1349,7 @@ mod tests {
         let audio_source = BridgeSource {
             key,
             kind: BridgeSourceKind::Audio {
+                codec_string: None,
                 linked_video: Some(video_key),
                 codec: "pcm_s16le".into(),
                 packetization: "pcm-packet-v1".into(),
@@ -1656,6 +1515,8 @@ mod tests {
         let video_source = BridgeSource {
             key: video_key,
             kind: BridgeSourceKind::Video {
+                codec_string: None,
+                decoder_config: None,
                 codec: "h264".into(),
                 packetization: "h264-annexb-au-v1".into(),
                 extradata: Vec::new(),
@@ -1956,6 +1817,8 @@ mod tests {
         let video = |playing| BridgeSource {
             key: video_key,
             kind: crate::ipc::BridgeSourceKind::Video {
+                codec_string: None,
+                decoder_config: None,
                 codec: "h264".into(),
                 packetization: "h264-annexb-au-v1".into(),
                 extradata: Vec::new(),
@@ -1986,6 +1849,7 @@ mod tests {
         let audio = BridgeSource {
             key: audio_key,
             kind: crate::ipc::BridgeSourceKind::Audio {
+                codec_string: None,
                 linked_video: Some(video_key),
                 codec: "aac".into(),
                 packetization: "aac-raw-au-v1".into(),
