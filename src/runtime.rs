@@ -151,6 +151,19 @@ impl RuntimePaths {
         }
     }
 
+    /// The PID and VVMX version a session server recorded, without validating either.
+    ///
+    /// [`Self::read_registry`] rejects a registry whose `vvmx_version` is foreign, which is exactly
+    /// the case this has to describe. Diagnostics only: never decide whether a session is usable
+    /// from this, because the fields have not been checked.
+    pub fn foreign_registry_identity(&self) -> Option<(u32, Option<u16>)> {
+        let bytes = read_registry_bytes(&self.registry, false);
+        #[cfg(unix)]
+        let bytes = bytes.or_else(|_| read_registry_bytes(&self.legacy_registry, false));
+        let registry: SessionRegistry = serde_json::from_slice(&bytes.ok()?).ok()?;
+        Some((registry.pid, registry.vvmx_version))
+    }
+
     pub fn remove_instance(&self, expected: &SessionRegistry) {
         #[cfg(windows)]
         {
