@@ -1216,6 +1216,7 @@ mod tests {
                 compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
             },
             playing: false,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
@@ -1353,6 +1354,7 @@ mod tests {
                 max_access_unit_bytes: 1024,
             },
             playing: false,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 100_000,
@@ -1378,6 +1380,7 @@ mod tests {
                 max_access_unit_bytes: 1024,
             },
             playing: false,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
@@ -1553,6 +1556,7 @@ mod tests {
                 max_access_unit_bytes: 1024,
             },
             playing: true,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 33_000,
@@ -1675,6 +1679,7 @@ mod tests {
                 sha256: None,
             },
             playing: false,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
@@ -1827,6 +1832,7 @@ mod tests {
             key: replay_key,
             kind: video_source.kind,
             playing: true,
+            causation_id: None,
             play_request: video_source.play_request,
         };
         let replay_node = BridgeNode {
@@ -1899,6 +1905,7 @@ mod tests {
                 max_access_unit_bytes: 1_048_576,
             },
             playing,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 100_000,
@@ -1924,6 +1931,7 @@ mod tests {
                 max_access_unit_bytes: 4096,
             },
             playing: false,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
@@ -2015,6 +2023,7 @@ mod tests {
                 sha256: None,
             },
             playing: false,
+            causation_id: None,
             play_request: after[0].play_request,
         });
         assert_eq!(
