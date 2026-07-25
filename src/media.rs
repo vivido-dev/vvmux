@@ -105,6 +105,7 @@ pub struct SnapshotSource {
     #[allow(dead_code)] // Kept distinct from the outer sequence for the Stage 4 EOS barrier.
     pub last_inner_record_sequence: u64,
     pub causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
+    pub capture_policy: u64,
 }
 
 #[derive(Debug)]
@@ -164,12 +165,20 @@ struct Source {
     last_media_id: u64,
     milestones: u64,
     causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
+    capture_policy: u64,
 }
 
 struct Ticket {
     source: SourceKey,
     kind: ConnectionKind,
     maximum_body: u32,
+}
+
+struct SourceCreation {
+    request_id: u64,
+    object_id: u64,
+    causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
+    capture_policy: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -485,6 +494,7 @@ impl VirtualVivid {
                 play_request: source.play_request,
                 last_inner_record_sequence: source.last_inner_record_sequence,
                 causation_id: source.causation_id,
+                capture_policy: source.capture_policy,
             });
             if matches!(source.descriptor, SourceDescriptor::Video(_))
                 && source.playing
@@ -612,6 +622,7 @@ impl VirtualVivid {
                         })
                         .copied(),
                     visible: state.projected_sources.contains(&key),
+                    capture_policy: source.capture_policy,
                     retained_static: source.descriptor.is_static() && source.retained.is_some(),
                     keyframe_needed: source.bridge_desynchronized,
                     milestones: source.milestones,
@@ -1088,7 +1099,7 @@ fn source_status(state: &State, key: SourceKey) -> Option<messages::SourceStatus
         last_presented_pts_us: source.last_pts_us.unwrap_or(i64::MIN),
         last_presentation_id: source.last_media_id,
         visible,
-        capture_policy: 0,
+        capture_policy: source.capture_policy,
         linked_source_id,
         milestones: source.milestones,
         outstanding_byte_credit: maximum.saturating_sub(pending_bytes),
@@ -1896,7 +1907,7 @@ fn dispatch_control(
             }
         }
         messages::PROBE_VIDEO_CONFIG => {
-            let (envelope, config) = messages::parse_create_video(&record.body)?;
+            let (envelope, config) = messages::parse_probe_video_config(&record.body)?;
             if record.object_id != 0 || config.source_id != 0 {
                 return Err(invalid("video probes must be session-level"));
             }
@@ -1908,7 +1919,7 @@ fn dispatch_control(
             )?;
         }
         messages::PROBE_AUDIO_CONFIG => {
-            let (envelope, config) = messages::parse_create_audio(&record.body)?;
+            let (envelope, config) = messages::parse_probe_audio_config(&record.body)?;
             if record.object_id != 0 || config.source_id != 0 {
                 return Err(invalid("audio probes must be session-level"));
             }
@@ -1920,31 +1931,94 @@ fn dispatch_control(
             )?;
         }
         messages::CREATE_RASTER => {
-            let (envelope, config) = messages::parse_create_raster(&record.body)?;
+            let (envelope, config, capture_policy) =
+                messages::parse_create_raster_with_policy(&record.body)?;
+            if envelope.payload.map_value(9).is_some()
+                && !producer_has_feature(
+                    shared,
+                    producer,
+                    messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
+                )
+            {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "source capture policy was not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
             create_source(
                 shared,
                 producer,
                 SourceDescriptor::Raster(config.clone()),
                 writer,
-                envelope.request_id,
-                record.object_id,
-                envelope.causation_id,
+                SourceCreation {
+                    request_id: envelope.request_id,
+                    object_id: record.object_id,
+                    causation_id: envelope.causation_id,
+                    capture_policy,
+                },
             )?;
         }
         messages::CREATE_IMAGE => {
-            let (envelope, config) = messages::parse_create_image(&record.body)?;
+            let (envelope, config, capture_policy) =
+                messages::parse_create_image_with_policy(&record.body)?;
+            if envelope.payload.map_value(9).is_some()
+                && !producer_has_feature(
+                    shared,
+                    producer,
+                    messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
+                )
+            {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "source capture policy was not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
             create_source(
                 shared,
                 producer,
                 SourceDescriptor::Image(config.clone()),
                 writer,
-                envelope.request_id,
-                record.object_id,
-                envelope.causation_id,
+                SourceCreation {
+                    request_id: envelope.request_id,
+                    object_id: record.object_id,
+                    causation_id: envelope.causation_id,
+                    capture_policy,
+                },
             )?;
         }
         messages::CREATE_VIDEO => {
-            let (envelope, config) = messages::parse_create_video(&record.body)?;
+            let (envelope, config, capture_policy) =
+                messages::parse_create_video_with_policy(&record.body)?;
+            if envelope.payload.map_value(23).is_some()
+                && !producer_has_feature(
+                    shared,
+                    producer,
+                    messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
+                )
+            {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "source capture policy was not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
             if !media::is_portable_packetization(&config.codec, &config.packetization) {
                 return Err(invalid("unsupported video configuration"));
             }
@@ -1953,13 +2027,35 @@ fn dispatch_control(
                 producer,
                 SourceDescriptor::Video(config.clone()),
                 writer,
-                envelope.request_id,
-                record.object_id,
-                envelope.causation_id,
+                SourceCreation {
+                    request_id: envelope.request_id,
+                    object_id: record.object_id,
+                    causation_id: envelope.causation_id,
+                    capture_policy,
+                },
             )?;
         }
         messages::CREATE_AUDIO => {
-            let (envelope, config) = messages::parse_create_audio(&record.body)?;
+            let (envelope, config, capture_policy) =
+                messages::parse_create_audio_with_policy(&record.body)?;
+            if envelope.payload.map_value(12).is_some()
+                && !producer_has_feature(
+                    shared,
+                    producer,
+                    messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
+                )
+            {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "source capture policy was not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
             if !messages::audio_config_supported(&config) {
                 return Err(invalid("unsupported audio configuration"));
             }
@@ -1968,10 +2064,81 @@ fn dispatch_control(
                 producer,
                 SourceDescriptor::Audio(config.clone()),
                 writer,
-                envelope.request_id,
-                record.object_id,
-                envelope.causation_id,
+                SourceCreation {
+                    request_id: envelope.request_id,
+                    object_id: record.object_id,
+                    causation_id: envelope.causation_id,
+                    capture_policy,
+                },
             )?;
+        }
+        messages::SET_SOURCE_POLICY => {
+            let (envelope, source_id, requested) = messages::parse_set_source_policy(&record.body)?;
+            if record.object_id != source_id {
+                return Err(invalid("source policy object ID mismatch"));
+            }
+            if !producer_has_feature(shared, producer, messages::FEATURE_SOURCE_CAPTURE_POLICY_V1) {
+                writer.write_record(
+                    messages::ERROR,
+                    source_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "source capture policy was not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
+            let mut state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(current) = state
+                .sources
+                .get(&(producer, source_id))
+                .map(|source| source.capture_policy)
+            else {
+                drop(state);
+                writer.write_record(
+                    messages::ERROR,
+                    source_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_NOT_FOUND,
+                        "source does not exist in this pane context",
+                    ),
+                )?;
+                return Ok(true);
+            };
+            let tightened = match tightened_capture_policy(current, requested) {
+                Ok(tightened) => tightened,
+                Err(_) => {
+                    drop(state);
+                    writer.write_record(
+                        messages::ERROR,
+                        source_id,
+                        &messages::error(
+                            envelope.request_id,
+                            messages::ERROR_BAD_STATE,
+                            "capture policy cannot be relaxed",
+                        ),
+                    )?;
+                    return Ok(true);
+                }
+            };
+            if let Some(tightened) = tightened {
+                state
+                    .sources
+                    .get_mut(&(producer, source_id))
+                    .expect("source was resolved under the same lock")
+                    .capture_policy = tightened;
+                advance_source(
+                    &mut state,
+                    (producer, source_id),
+                    messages::SOURCE_CHANGED_CAPTURE_POLICY,
+                )?;
+                advance_projection(&mut state);
+            }
+            writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
         messages::BEGIN_TXN => {
             let envelope = messages::decode_control(&record.body)?;
@@ -2219,22 +2386,38 @@ fn dispatch_control(
     Ok(true)
 }
 
+fn tightened_capture_policy(current: u64, requested: u64) -> io::Result<Option<u64>> {
+    messages::validate_capture_policy(requested)?;
+    if requested & current != current {
+        return Err(invalid("capture policy cannot be relaxed"));
+    }
+    Ok((requested != current).then_some(requested))
+}
+
+fn producer_has_feature(shared: &Arc<Mutex<State>>, producer: ProducerId, feature: u64) -> bool {
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .producers
+        .get(&producer)
+        .is_some_and(|runtime| runtime.features.contains(&feature))
+}
+
 fn create_source(
     shared: &Arc<Mutex<State>>,
     producer: ProducerId,
     descriptor: SourceDescriptor,
     writer: &Arc<Writer>,
-    request_id: u64,
-    object_id: u64,
-    causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
+    creation: SourceCreation,
 ) -> io::Result<()> {
+    messages::validate_capture_policy(creation.capture_policy)?;
     let source_id = match &descriptor {
         SourceDescriptor::Raster(config) => config.source_id,
         SourceDescriptor::Image(config) => config.source_id,
         SourceDescriptor::Video(config) => config.source_id,
         SourceDescriptor::Audio(config) => config.source_id,
     };
-    if source_id == 0 || object_id != source_id {
+    if source_id == 0 || creation.object_id != source_id {
         return Err(invalid("source object ID mismatch"));
     }
     let maximum = descriptor.maximum_body()?;
@@ -2275,7 +2458,8 @@ fn create_source(
             attachment_generation: 0,
             last_media_id: 0,
             milestones: 0,
-            causation_id,
+            causation_id: creation.causation_id,
+            capture_policy: creation.capture_policy,
         },
     );
     state.tickets.insert(
@@ -2304,7 +2488,7 @@ fn create_source(
         messages::SOURCE_READY,
         source_id,
         &messages::source_ready_with_observability(
-            request_id,
+            creation.request_id,
             &SourceReady {
                 source_id,
                 media_ticket: ticket.to_vec(),
@@ -2814,7 +2998,11 @@ fn cleanup_producer(state: &mut State, producer: ProducerId, preserve_anchored_s
                     .sources
                     .get(&(producer, node.config.node.source_id))
                     .is_some_and(|source| {
-                        source.descriptor.is_static() && source.retained.is_some()
+                        source.descriptor.is_static()
+                            && source.retained.is_some()
+                            && source.capture_policy
+                                & messages::CAPTURE_POLICY_DENY_POSTER_RETENTION
+                                == 0
                     }))
     });
     prune_orphaned_sources(state);
@@ -2857,6 +3045,7 @@ fn supported_feature(feature: u64) -> bool {
             | messages::FEATURE_NODE_CLIP_RECT_V1
             | messages::FEATURE_DECODER_DESCRIPTION_V1
             | messages::FEATURE_OBSERVABILITY_CORE_V1
+            | messages::FEATURE_SOURCE_CAPTURE_POLICY_V1
     )
 }
 
@@ -2906,6 +3095,19 @@ mod tests {
         assert!(offers_vivid_version(1, 1, 1, 1));
         assert!(offers_vivid_version(1, 0, 1, 1));
         assert!(!offers_vivid_version(1, 2, 2, 0));
+    }
+
+    #[test]
+    fn nested_capture_policy_can_only_tighten() {
+        let capture = messages::CAPTURE_POLICY_DENY_CAPTURE;
+        let stricter = capture | messages::CAPTURE_POLICY_DENY_POSTER_RETENTION;
+        assert_eq!(
+            tightened_capture_policy(capture, stricter).unwrap(),
+            Some(stricter)
+        );
+        assert_eq!(tightened_capture_policy(stricter, stricter).unwrap(), None);
+        assert!(tightened_capture_policy(stricter, capture).is_err());
+        assert!(tightened_capture_policy(0, messages::CAPTURE_POLICY_MASK + 1).is_err());
     }
 
     fn test_virtual_endpoint(
