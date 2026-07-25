@@ -13,6 +13,7 @@ use vivid_protocol::messages::{
     ParsedVideoSourceConfig, RasterSourceConfig, SourceReady,
 };
 use vivid_protocol::revision::{ObservationSequence, SceneRevision, SourceRevision};
+use vivid_protocol::trace::{TraceComponent, TraceGuard, TraceHop};
 use vivid_protocol::wire::{BorrowedRecord, ConnectionKind, Record};
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
@@ -22,7 +23,7 @@ use crate::layout::PaneId;
 use crate::platform::{
     ConnectionCancel, Transport, VirtualPresenterEndpoint, VirtualPresenterListener,
 };
-use crate::vivid_transport::{Reader, Writer};
+use crate::vivid_transport::{Reader, TraceChannel, Writer};
 
 const MAX_PRODUCERS: usize = 16;
 const MAX_CONNECTIONS: usize = 64;
@@ -200,6 +201,8 @@ enum Mutation {
 
 struct State {
     config: MediaConfig,
+    capability_generation: u64,
+    trace: Option<vivid_protocol::trace::TraceEmitter>,
     capabilities: HashMap<PaneId, [u8; 32]>,
     metrics: HashMap<PaneId, DisplayChanged>,
     producers: HashMap<ProducerId, Producer>,
@@ -228,6 +231,7 @@ pub struct VirtualVivid {
     state: Arc<Mutex<State>>,
     delivery_changed: Arc<Condvar>,
     shutdown: Arc<AtomicBool>,
+    _trace_guard: Option<TraceGuard>,
 }
 
 impl VirtualVivid {
@@ -243,8 +247,12 @@ impl VirtualVivid {
     ) -> io::Result<Self> {
         let listener = VirtualPresenterListener::bind(endpoint)?;
         let advertised_endpoint = listener.endpoint();
+        let trace_guard = diagnostic_trace_guard()?;
+        let trace = trace_guard.as_ref().map(TraceGuard::emitter);
         let state = Arc::new(Mutex::new(State {
             config,
+            capability_generation: 1,
+            trace,
             capabilities: HashMap::new(),
             metrics: HashMap::new(),
             producers: HashMap::new(),
@@ -272,6 +280,7 @@ impl VirtualVivid {
             state: state.clone(),
             delivery_changed: delivery_changed.clone(),
             shutdown: shutdown.clone(),
+            _trace_guard: trace_guard,
         };
         thread::Builder::new()
             .name("vvmux-vivid-listener".into())
@@ -281,6 +290,32 @@ impl VirtualVivid {
 
     pub fn endpoint(&self) -> String {
         self.endpoint.clone()
+    }
+
+    pub fn notify_capabilities_changed(&self, reason_mask: u64) -> io::Result<u64> {
+        if reason_mask == 0 || reason_mask & !messages::CAPS_CHANGE_REASON_MASK != 0 {
+            return Err(invalid("invalid capability change reason"));
+        }
+        let (generation, writers) = {
+            let mut state = self.lock();
+            state.capability_generation = state
+                .capability_generation
+                .checked_add(1)
+                .ok_or_else(|| invalid("capability generation exhausted"))?;
+            (
+                state.capability_generation,
+                state
+                    .producers
+                    .values()
+                    .filter_map(|producer| producer.writer.upgrade())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let body = messages::caps_changed(generation, reason_mask)?;
+        for writer in writers {
+            let _ = writer.write_record(messages::CAPS_CHANGED, 0, &body);
+        }
+        Ok(generation)
     }
 
     pub fn issue_pane_capability(&self, pane: PaneId) -> io::Result<String> {
@@ -1312,6 +1347,14 @@ fn handle_connection(
 ) -> io::Result<()> {
     stream.set_read_deadline(Duration::from_secs(3))?;
     let (mut reader, preface) = Reader::new(stream)?;
+    if let Some(trace) = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .trace
+        .clone()
+    {
+        reader.set_trace(TraceChannel::new(trace));
+    }
     match preface.kind {
         ConnectionKind::Control => {
             handle_control(&mut reader, connection_id, state, delivery_changed)
@@ -1512,13 +1555,17 @@ fn handle_control(
     writer.write_record(
         messages::WELCOME,
         0,
-        &messages::welcome_preserving_at_scene_revision(
+        &messages::welcome_preserving_at_generations(
             request_id,
             producer_id,
             &tag,
             root_context,
             display,
             &features,
+            shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capability_generation,
             SceneRevision::ZERO,
             &hello.preserved_fields,
         ),
@@ -1938,10 +1985,19 @@ fn dispatch_control(
                 return Err(invalid("video probes must be session-level"));
             }
             let supported = media::is_portable_packetization(&config.codec, &config.packetization);
+            let capability_generation = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capability_generation;
             writer.write_record(
                 messages::VIDEO_SUPPORT,
                 0,
-                &messages::video_support(envelope.request_id, supported, &config.codec),
+                &messages::capability_support(
+                    envelope.request_id,
+                    supported,
+                    &config.codec,
+                    capability_generation,
+                ),
             )?;
         }
         messages::PROBE_AUDIO_CONFIG => {
@@ -1950,15 +2006,25 @@ fn dispatch_control(
                 return Err(invalid("audio probes must be session-level"));
             }
             let supported = messages::audio_config_supported(&config);
+            let capability_generation = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capability_generation;
             writer.write_record(
                 messages::AUDIO_SUPPORT,
                 0,
-                &messages::audio_support(envelope.request_id, supported, &config.codec),
+                &messages::capability_support(
+                    envelope.request_id,
+                    supported,
+                    &config.codec,
+                    capability_generation,
+                ),
             )?;
         }
         messages::CREATE_RASTER => {
             let (envelope, config, capture_policy, semantic_descriptor) =
                 messages::parse_create_raster_with_extensions(&record.body)?;
+            writer.mark_source_policy(config.source_id, capture_policy);
             if envelope.payload.map_value(9).is_some()
                 && !producer_has_feature(
                     shared,
@@ -2008,6 +2074,7 @@ fn dispatch_control(
         messages::CREATE_IMAGE => {
             let (envelope, config, capture_policy, semantic_descriptor) =
                 messages::parse_create_image_with_extensions(&record.body)?;
+            writer.mark_source_policy(config.source_id, capture_policy);
             if envelope.payload.map_value(9).is_some()
                 && !producer_has_feature(
                     shared,
@@ -2057,6 +2124,7 @@ fn dispatch_control(
         messages::CREATE_VIDEO => {
             let (envelope, config, capture_policy, semantic_descriptor) =
                 messages::parse_create_video_with_extensions(&record.body)?;
+            writer.mark_source_policy(config.source_id, capture_policy);
             if envelope.payload.map_value(23).is_some()
                 && !producer_has_feature(
                     shared,
@@ -2109,6 +2177,7 @@ fn dispatch_control(
         messages::CREATE_AUDIO => {
             let (envelope, config, capture_policy, semantic_descriptor) =
                 messages::parse_create_audio_with_extensions(&record.body)?;
+            writer.mark_source_policy(config.source_id, capture_policy);
             if envelope.payload.map_value(12).is_some()
                 && !producer_has_feature(
                     shared,
@@ -2160,6 +2229,7 @@ fn dispatch_control(
         }
         messages::SET_SOURCE_POLICY => {
             let (envelope, source_id, requested) = messages::parse_set_source_policy(&record.body)?;
+            writer.mark_source_policy(source_id, requested);
             if record.object_id != source_id {
                 return Err(invalid("source policy object ID mismatch"));
             }
@@ -2699,7 +2769,7 @@ fn handle_media(
     if ticket.kind != kind {
         return Err(invalid("media channel kind does not match ticket"));
     }
-    {
+    let capture_policy = {
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2713,12 +2783,15 @@ fn handle_media(
             .ok_or_else(|| invalid("attachment generation exhausted"))?;
         source.attachment_state = messages::ATTACHMENT_ATTACHED;
         source.milestones |= messages::MILESTONE_MEDIA_ATTACHED;
+        let capture_policy = source.capture_policy;
         advance_source(
             &mut state,
             ticket.source,
             messages::SOURCE_CHANGED_ATTACHMENT | messages::SOURCE_CHANGED_MILESTONES,
         )?;
-    }
+        capture_policy
+    };
+    reader.mark_source_policy(ticket.source.1, capture_policy);
     mark_connection_pane(shared, connection_id, pane)?;
     reader.clear_read_deadline()?;
     reader.set_maximum(ticket.maximum_body);
@@ -3234,6 +3307,18 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn diagnostic_trace_guard() -> io::Result<Option<TraceGuard>> {
+    let Some(directory) = std::env::var_os("VIVID_DIAGNOSTIC_TRACE_DIR") else {
+        return Ok(None);
+    };
+    let mut hint = [0_u8; 16];
+    getrandom::fill(&mut hint)
+        .map_err(|error| io::Error::other(format!("trace hint generation failed: {error}")))?;
+    let path =
+        std::path::PathBuf::from(directory).join(format!("vvmux-{}.ndjson", std::process::id()));
+    TraceGuard::file(&path, TraceComponent::Vvmux, TraceHop::Inner, hint).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3308,6 +3393,8 @@ mod tests {
     fn state() -> State {
         State {
             config: MediaConfig::default(),
+            capability_generation: 1,
+            trace: None,
             capabilities: HashMap::new(),
             metrics: HashMap::new(),
             producers: HashMap::new(),
@@ -3328,6 +3415,59 @@ mod tests {
             next_connection: 0,
             connection_cancellers: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn capability_generation_is_reoriginated_without_feature_removal() {
+        let mut initial = state();
+        let (observation_sender, _observation_receiver) = mpsc::sync_channel(1);
+        let accepted_features = HashSet::from([
+            messages::FEATURE_RASTER_RGBA8,
+            messages::FEATURE_VIDEO_ACCESS_UNIT_V1,
+        ]);
+        initial.producers.insert(
+            1,
+            Producer {
+                pane: 7,
+                tag: [0; 16],
+                anchor_key: anchor::derive_key(&[0; 32], &[0; 16]),
+                writer: Weak::new(),
+                observation_sender,
+                features: accepted_features.clone(),
+                anchors: HashMap::new(),
+                seen_anchors: HashSet::new(),
+                scene_revision: SceneRevision::ZERO,
+                observation_mask: 0,
+                observation_sequence: ObservationSequence::ZERO,
+                first_lost_source_sequence: None,
+                first_lost_scene_sequence: None,
+                waits: HashMap::new(),
+            },
+        );
+        let state = Arc::new(Mutex::new(initial));
+        let service = VirtualVivid {
+            endpoint: String::new(),
+            state: state.clone(),
+            delivery_changed: Arc::new(Condvar::new()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            _trace_guard: None,
+        };
+
+        assert!(
+            service
+                .notify_capabilities_changed(messages::CAPS_CHANGE_REASON_MASK << 1)
+                .is_err()
+        );
+        assert_eq!(state.lock().unwrap().capability_generation, 1);
+        assert_eq!(
+            service
+                .notify_capabilities_changed(messages::CAPS_CHANGE_PRESENTER_POLICY)
+                .unwrap(),
+            2
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(state.capability_generation, 2);
+        assert_eq!(state.producers[&1].features, accepted_features);
     }
 
     #[test]

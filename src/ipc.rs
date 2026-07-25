@@ -411,6 +411,9 @@ pub enum ClientMessage {
     Action(Action),
     RenderAck(u64),
     BridgeNeedKeyframes(Vec<BridgeSourceKey>),
+    BridgeCapabilitiesChanged {
+        reason_mask: u64,
+    },
     BridgeMediaAck {
         delivery_id: u64,
         delivered: bool,

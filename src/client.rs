@@ -501,6 +501,11 @@ fn run_bridge_worker(
             force_sources = true;
             let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
         }
+        for changed in bridge.take_capability_changes() {
+            let _ = client_writer.send(ClientMessage::BridgeCapabilitiesChanged {
+                reason_mask: changed.reason_mask,
+            });
+        }
         for (source, playback) in bridge.take_playback_states() {
             let _ = client_writer.send(ClientMessage::BridgePlaybackState {
                 source,

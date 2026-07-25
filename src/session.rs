@@ -923,6 +923,11 @@ impl SessionActor {
                     );
                 }
             }
+            ClientMessage::BridgeCapabilitiesChanged { reason_mask } => {
+                if self.client_is(id) {
+                    let _ = self.vivid.notify_capabilities_changed(reason_mask);
+                }
+            }
             ClientMessage::BridgeMediaAck {
                 delivery_id,
                 delivered,

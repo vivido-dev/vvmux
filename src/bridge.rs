@@ -51,6 +51,8 @@ struct ControlState {
     source_losses: Vec<u64>,
     playback_states: Vec<messages::PlaybackState>,
     display_generation: u64,
+    capability_generation: u64,
+    capability_changes: Vec<messages::CapsChanged>,
     closed: Option<String>,
     last_inbound: Instant,
     last_probe_sent: Option<Instant>,
@@ -72,6 +74,8 @@ impl Default for ControlState {
             source_losses: Vec::new(),
             playback_states: Vec::new(),
             display_generation: 0,
+            capability_generation: 1,
+            capability_changes: Vec::new(),
             closed: None,
             last_inbound: Instant::now(),
             last_probe_sent: None,
@@ -85,6 +89,21 @@ impl Default for ControlState {
     }
 }
 
+fn apply_capability_change(
+    state: &mut ControlState,
+    changed: messages::CapsChanged,
+) -> io::Result<()> {
+    if changed.capability_generation <= state.capability_generation {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "outer capability generation did not advance",
+        ));
+    }
+    state.capability_generation = changed.capability_generation;
+    state.capability_changes.push(changed);
+    Ok(())
+}
+
 struct SharedControl {
     state: Mutex<ControlState>,
     changed: Condvar,
@@ -96,11 +115,16 @@ struct ControlDispatcher {
 }
 
 impl ControlDispatcher {
-    fn start(connection: Connection, display_generation: u64) -> io::Result<Self> {
+    fn start(
+        connection: Connection,
+        display_generation: u64,
+        capability_generation: u64,
+    ) -> io::Result<Self> {
         let (mut reader, writer) = connection.split()?;
         let shared = Arc::new(SharedControl {
             state: Mutex::new(ControlState {
                 display_generation,
+                capability_generation,
                 last_inbound: Instant::now(),
                 last_probe_sent: None,
                 unanswered_probes: 0,
@@ -199,6 +223,8 @@ impl ControlDispatcher {
                             }),
                         messages::DISPLAY_CHANGED => messages::parse_display_changed(&record.body)
                             .map(|display| state.display_generation = display.display_generation),
+                        messages::CAPS_CHANGED => messages::parse_caps_changed(&record.body)
+                            .and_then(|changed| apply_capability_change(&mut state, changed)),
                         messages::SOURCE_CHANGED => messages::parse_source_changed(&record.body)
                             .and_then(|event| {
                                 if event.source_id != record.object_id {
@@ -479,6 +505,17 @@ impl ControlDispatcher {
         )
     }
 
+    fn take_capability_changes(&self) -> Vec<messages::CapsChanged> {
+        std::mem::take(
+            &mut self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capability_changes,
+        )
+    }
+
     fn adjusted_minimum_buffer(&self, requested_us: u64) -> u64 {
         let state = self
             .shared
@@ -678,7 +715,11 @@ impl OuterBridge {
         let source_descriptors =
             accepted_features.contains(&messages::FEATURE_SOURCE_DESCRIPTOR_V1);
         connection.set_send_body_limit(welcome.maximum_control_body)?;
-        let control = ControlDispatcher::start(connection, welcome.display_generation)?;
+        let control = ControlDispatcher::start(
+            connection,
+            welcome.display_generation,
+            welcome.capability_generation,
+        )?;
         let (completions_tx, completions_rx) = mpsc::channel();
         let mut bridge = Self {
             connection_factory,
@@ -1274,6 +1315,10 @@ impl OuterBridge {
             .collect()
     }
 
+    pub fn take_capability_changes(&self) -> Vec<messages::CapsChanged> {
+        self.control.take_capability_changes()
+    }
+
     fn create_sources(&mut self, sources: &[BridgeSource]) -> io::Result<()> {
         let mut ordered = sources.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|source| match source.kind {
@@ -1852,6 +1897,20 @@ mod tests {
     use crate::config::Media as MediaConfig;
     #[cfg(unix)]
     use crate::media::VirtualVivid;
+
+    #[test]
+    fn outer_capability_changes_must_strictly_advance() {
+        let mut state = ControlState::default();
+        let changed = messages::CapsChanged {
+            capability_generation: 3,
+            reason_mask: messages::CAPS_CHANGE_DEVICE_AVAILABILITY,
+        };
+        apply_capability_change(&mut state, changed).unwrap();
+        assert_eq!(state.capability_generation, 3);
+        assert_eq!(state.capability_changes, vec![changed]);
+        assert!(apply_capability_change(&mut state, changed).is_err());
+        assert_eq!(state.capability_changes, vec![changed]);
+    }
 
     fn test_raster_source() -> BridgeSource {
         BridgeSource {
