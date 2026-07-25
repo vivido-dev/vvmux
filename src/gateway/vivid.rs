@@ -317,6 +317,9 @@ pub(crate) async fn serve_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+    use vivid_protocol::cbor::PreservedField;
+    use vivid_protocol::messages;
 
     #[test]
     fn route_tokens_are_exact_and_constant_time_compared() {
@@ -325,5 +328,62 @@ mod tests {
         assert!(broker.authenticate(&token));
         assert!(!broker.authenticate(&"A".repeat(token.len())));
         assert!(!broker.authenticate("invalid"));
+    }
+
+    #[test]
+    fn gateway_transport_preserves_negotiation_bytes_exactly() {
+        let preserved = [PreservedField {
+            key: 42,
+            encoded_value: vec![0x82, 0x01, 0xf5],
+        }];
+        let hello = messages::encode_hello(
+            1,
+            &messages::HelloConfig {
+                minimum_major: 1,
+                minimum_minor: 1,
+                maximum_major: 1,
+                maximum_minor: 1,
+                token: "0000000000000000000000000000000000000000000000000000000000000000",
+                producer: "gateway-test",
+                producer_version: "1",
+                required_features: &[],
+                optional_features: &[],
+                maximum_record_body: 4096,
+                authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
+                preserved_fields: &preserved,
+            },
+        );
+
+        let (incoming_sender, incoming_receiver) = std_mpsc::sync_channel(hello.len().div_ceil(7));
+        for chunk in hello.chunks(7) {
+            incoming_sender
+                .send(IncomingChunk {
+                    bytes: chunk.to_vec(),
+                })
+                .unwrap();
+        }
+        let mut reader = SocketReader {
+            receiver: incoming_receiver,
+            current: Vec::new(),
+            offset: 0,
+        };
+        let mut read = vec![0; hello.len()];
+        reader.read_exact(&mut read).unwrap();
+        assert_eq!(read, hello);
+        drop(incoming_sender);
+
+        let (outgoing_sender, mut outgoing_receiver) =
+            mpsc::channel::<OutgoingChunk>(CHANNEL_CHUNKS);
+        let expected = hello.clone();
+        let relay = thread::spawn(move || {
+            let chunk = outgoing_receiver.blocking_recv().unwrap();
+            assert_eq!(chunk.bytes, expected);
+            chunk.completion.send(Ok(())).unwrap();
+        });
+        let mut writer = SocketWriter {
+            sender: outgoing_sender,
+        };
+        writer.write_all(&hello).unwrap();
+        relay.join().unwrap();
     }
 }
