@@ -32,6 +32,7 @@ const OPTIONAL_FEATURES: &[u64] = &[
     messages::FEATURE_AUDIO_ACCESS_UNIT_V1,
     messages::FEATURE_DECODER_DESCRIPTION_V1,
     messages::FEATURE_OBSERVABILITY_CORE_V1,
+    messages::FEATURE_ATOMIC_CONTROL_V1,
 ];
 const MAX_PENDING_CONTROL_REPLIES: usize = 4096;
 const MEDIA_WRITER_QUEUE: usize = 32;
@@ -1168,6 +1169,7 @@ impl OuterBridge {
                     )
                 }
             };
+            let body = with_causation(&body, source.causation_id)?;
             self.control.write_record(record_type, 0, upstream, &body)?;
             pending.push((source.clone(), request, upstream, kind));
         }
@@ -1320,26 +1322,27 @@ impl OuterBridge {
         let minimum_buffer_us = self
             .control
             .adjusted_minimum_buffer(source.play_request.minimum_buffer_us);
+        let body = messages::play_request(
+            request,
+            &messages::PlayRequest {
+                source_id: upstream,
+                start_pts_us: source.play_request.start_pts_us,
+                minimum_buffer_us,
+                maximum_latency_us: source
+                    .play_request
+                    .maximum_latency_us
+                    .max(minimum_buffer_us),
+                rate_32_32: source.play_request.rate_32_32,
+                late_policy: source.play_request.late_policy,
+                loop_count: source.play_request.loop_count,
+                start_policy: source.play_request.start_policy,
+            },
+        );
         self.control.write_record(
             messages::PLAY,
             0,
             upstream,
-            &messages::play_request(
-                request,
-                &messages::PlayRequest {
-                    source_id: upstream,
-                    start_pts_us: source.play_request.start_pts_us,
-                    minimum_buffer_us,
-                    maximum_latency_us: source
-                        .play_request
-                        .maximum_latency_us
-                        .max(minimum_buffer_us),
-                    rate_32_32: source.play_request.rate_32_32,
-                    late_policy: source.play_request.late_policy,
-                    loop_count: source.play_request.loop_count,
-                    start_policy: source.play_request.start_policy,
-                },
-            ),
+            &with_causation(&body, source.causation_id)?,
         )?;
         self.wait_for(request, messages::OK, upstream)
     }
@@ -1356,11 +1359,12 @@ impl OuterBridge {
             .get(&source.key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "playback source missing"))?;
         let request = self.request_id()?;
+        let body = messages::pause(request, upstream);
         self.control.write_record(
             messages::PAUSE,
             0,
             upstream,
-            &messages::pause(request, upstream),
+            &with_causation(&body, source.causation_id)?,
         )?;
         self.wait_for(request, messages::OK, upstream)
     }
@@ -1514,6 +1518,23 @@ fn protocol_error(body: &[u8]) -> io::Error {
     io::Error::other(message)
 }
 
+fn with_causation(
+    body: &[u8],
+    causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
+) -> io::Result<Vec<u8>> {
+    let Some(causation_id) = causation_id else {
+        return Ok(body.to_vec());
+    };
+    messages::with_request_metadata(
+        body,
+        &messages::RequestMetadata {
+            preconditions: Default::default(),
+            idempotency_key: None,
+            causation_id: Some(causation_id),
+        },
+    )
+}
+
 fn exhausted(kind: &'static str) -> io::Error {
     io::Error::other(format!("outer Vivid {kind} ID space exhausted"))
 }
@@ -1548,6 +1569,7 @@ mod tests {
                 compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
             },
             playing: false,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
@@ -1558,6 +1580,17 @@ mod tests {
                 start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
             },
         }
+    }
+
+    #[test]
+    fn nested_bridge_preserves_causation_without_deriving_it_from_credentials() {
+        let causation_id = [0xa5; messages::CAUSATION_ID_BYTES];
+        let body = messages::destroy_source(7, 9);
+        let forwarded = with_causation(&body, Some(causation_id)).unwrap();
+        let envelope = messages::decode_control(&forwarded).unwrap();
+        assert_eq!(envelope.causation_id, Some(causation_id));
+        assert!(envelope.idempotency_key.is_none());
+        assert!(envelope.preconditions.is_empty());
     }
 
     fn test_fragment(logical: u64, fragment: u8, x: i64) -> BridgeNode {
@@ -2124,6 +2157,7 @@ mod tests {
                 max_access_unit_bytes: 1024,
             },
             playing: true,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
@@ -2208,6 +2242,7 @@ mod tests {
                 max_access_unit_bytes: 1_048_576,
             },
             playing: true,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 33_000,

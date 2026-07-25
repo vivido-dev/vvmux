@@ -331,6 +331,8 @@ pub struct BridgeSource {
     pub kind: BridgeSourceKind,
     pub playing: bool,
     pub play_request: BridgePlayRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

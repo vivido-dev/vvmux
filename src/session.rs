@@ -3167,6 +3167,7 @@ impl SessionActor {
                 kind: bridge_source_kind(source.key, &source.descriptor),
                 playing: source.playing,
                 play_request: bridge_play_request(source.play_request),
+                causation_id: source.causation_id,
             })
             .collect::<Vec<_>>();
         let pane_rank = pane_priority

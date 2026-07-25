@@ -104,6 +104,7 @@ pub struct SnapshotSource {
     pub play_request: messages::PlayRequest,
     #[allow(dead_code)] // Kept distinct from the outer sequence for the Stage 4 EOS barrier.
     pub last_inner_record_sequence: u64,
+    pub causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
 }
 
 #[derive(Debug)]
@@ -162,6 +163,7 @@ struct Source {
     attachment_generation: u64,
     last_media_id: u64,
     milestones: u64,
+    causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
 }
 
 struct Ticket {
@@ -482,6 +484,7 @@ impl VirtualVivid {
                 playing: source.playing,
                 play_request: source.play_request,
                 last_inner_record_sequence: source.last_inner_record_sequence,
+                causation_id: source.causation_id,
             });
             if matches!(source.descriptor, SourceDescriptor::Video(_))
                 && source.playing
@@ -1925,6 +1928,7 @@ fn dispatch_control(
                 writer,
                 envelope.request_id,
                 record.object_id,
+                envelope.causation_id,
             )?;
         }
         messages::CREATE_IMAGE => {
@@ -1936,6 +1940,7 @@ fn dispatch_control(
                 writer,
                 envelope.request_id,
                 record.object_id,
+                envelope.causation_id,
             )?;
         }
         messages::CREATE_VIDEO => {
@@ -1950,6 +1955,7 @@ fn dispatch_control(
                 writer,
                 envelope.request_id,
                 record.object_id,
+                envelope.causation_id,
             )?;
         }
         messages::CREATE_AUDIO => {
@@ -1964,6 +1970,7 @@ fn dispatch_control(
                 writer,
                 envelope.request_id,
                 record.object_id,
+                envelope.causation_id,
             )?;
         }
         messages::BEGIN_TXN => {
@@ -2112,6 +2119,7 @@ fn dispatch_control(
             let changed = source.playing != playing
                 || play_request.is_some_and(|request| request != source.play_request);
             source.playing = playing;
+            source.causation_id = envelope.causation_id;
             if let Some(play_request) = play_request {
                 source.play_request = play_request;
                 if changed || source.clock_started.is_none() {
@@ -2154,6 +2162,7 @@ fn dispatch_control(
             source.last_media_id = 0;
             source.last_pts_us = None;
             source.milestones &= messages::MILESTONE_MEDIA_ATTACHED;
+            source.causation_id = envelope.causation_id;
             advance_source(
                 &mut state,
                 (producer, source_id),
@@ -2172,6 +2181,7 @@ fn dispatch_control(
                 .get_mut(&(producer, source_id))
                 .ok_or_else(|| invalid("source missing"))?;
             source.ended = true;
+            source.causation_id = envelope.causation_id;
             source.milestones |= messages::MILESTONE_EOS_ACCEPTED;
             // EOS closes ingress but does not pause presentation. Vivi submits ahead, then keeps
             // the session alive while already-buffered media plays. Retain the current PLAY state
@@ -2216,6 +2226,7 @@ fn create_source(
     writer: &Arc<Writer>,
     request_id: u64,
     object_id: u64,
+    causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
 ) -> io::Result<()> {
     let source_id = match &descriptor {
         SourceDescriptor::Raster(config) => config.source_id,
@@ -2264,6 +2275,7 @@ fn create_source(
             attachment_generation: 0,
             last_media_id: 0,
             milestones: 0,
+            causation_id,
         },
     );
     state.tickets.insert(
