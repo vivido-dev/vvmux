@@ -4,6 +4,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use vivid_protocol::cbor::PreservedField;
 use vivid_protocol::messages::{
     self, AudioSourceConfig, ClipRect, HelloConfig, ImageSourceConfig, RasterSourceConfig,
     SceneNodeConfig, VideoSourceConfig,
@@ -518,6 +519,9 @@ pub struct OuterBridge {
     /// Outer presenter accepted `decoder-description-v1`; forwarding the optional CREATE fields
     /// without acceptance would violate the specification.
     decoder_description: bool,
+    hello_extensions: Vec<PreservedField>,
+    #[allow(dead_code)] // Retained for negotiation-aware gateway consumers and conformance tests.
+    welcome_extensions: Vec<PreservedField>,
 }
 
 struct PendingBody {
@@ -554,6 +558,15 @@ impl OuterBridge {
         token: Zeroizing<String>,
         display: DisplayMetrics,
     ) -> io::Result<Self> {
+        Self::connect_with_factory_and_extensions(connection_factory, token, display, &[])
+    }
+
+    pub(crate) fn connect_with_factory_and_extensions(
+        connection_factory: Arc<dyn ConnectionFactory>,
+        token: Zeroizing<String>,
+        display: DisplayMetrics,
+        hello_extensions: &[PreservedField],
+    ) -> io::Result<Self> {
         let mut connection = connection_factory.open(ConnectionKind::Control)?;
         let hello_request = 1;
         let body = messages::encode_hello(
@@ -570,7 +583,7 @@ impl OuterBridge {
                 optional_features: OPTIONAL_FEATURES,
                 maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
                 authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
-                preserved_fields: &[],
+                preserved_fields: hello_extensions,
             },
         );
         connection.write_record(messages::HELLO, 0, 0, &body)?;
@@ -623,6 +636,8 @@ impl OuterBridge {
             node_ids: HashMap::new(),
             display,
             decoder_description,
+            hello_extensions: hello_extensions.to_vec(),
+            welcome_extensions: welcome.preserved_fields,
         })
     }
 
@@ -641,10 +656,11 @@ impl OuterBridge {
         // playing source.
         let previous = self.active_sources.values().cloned().collect::<Vec<_>>();
         let _ = self.pause_playing_sources(&previous);
-        let mut replacement = Self::connect_with_factory(
+        let mut replacement = Self::connect_with_factory_and_extensions(
             self.connection_factory.clone(),
             Zeroizing::new((*self.token).clone()),
             self.display,
+            &self.hello_extensions,
         )?;
         let recreated = replacement.reconcile(sources, nodes)?;
         *self = replacement;
@@ -661,10 +677,11 @@ impl OuterBridge {
         validate_snapshot(sources, nodes)?;
         let previous = self.active_sources.values().cloned().collect::<Vec<_>>();
         let _ = self.pause_playing_sources(&previous);
-        let mut replacement = Self::connect_with_factory(
+        let mut replacement = Self::connect_with_factory_and_extensions(
             self.connection_factory.clone(),
             Zeroizing::new((*self.token).clone()),
             self.display,
+            &self.hello_extensions,
         )?;
         let recreated = replacement.reconcile(sources, nodes)?;
         *self = replacement;
@@ -1639,6 +1656,79 @@ mod tests {
         )?;
         stream.write_all(body)?;
         stream.flush()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outer_negotiation_emits_and_retains_preserved_fields() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("outer-negotiation-preservation.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping outer negotiation preservation socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("fake outer presenter bind failed: {error}"),
+        };
+        let hello_extensions = vec![PreservedField {
+            key: 42,
+            encoded_value: vec![0x82, 0x01, 0xf5],
+        }];
+        let welcome_extensions = vec![PreservedField {
+            key: 43,
+            encoded_value: vec![0xa1, 0x00, 0x07],
+        }];
+        let expected_hello = hello_extensions.clone();
+        let sent_welcome = welcome_extensions.clone();
+        let server = thread::spawn(move || -> io::Result<()> {
+            let (mut control, _) = listener.accept()?;
+            let mut preface = [0; PREFACE_SIZE];
+            control.read_exact(&mut preface)?;
+            let hello_record = read_client_record(&mut control)?;
+            let (request, hello) = messages::parse_hello(&hello_record.body)?;
+            assert_eq!(hello.preserved_fields, expected_hello);
+            let mut sequence = 0;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::WELCOME,
+                0,
+                &messages::welcome_preserving(
+                    request,
+                    1,
+                    &[1; 16],
+                    1,
+                    messages::DisplayChanged {
+                        display_generation: 1,
+                        viewport_width: 800,
+                        viewport_height: 600,
+                        grid_columns: 80,
+                        grid_rows: 24,
+                        cell_width: 10,
+                        cell_height: 25,
+                    },
+                    REQUIRED_FEATURES,
+                    &sent_welcome,
+                ),
+            )
+        });
+        let factory = Arc::new(EndpointConnectionFactory {
+            primary: Endpoint::parse(&format!("unix:{}", socket.display())).unwrap(),
+            bulk: None,
+        });
+        let bridge = OuterBridge::connect_with_factory_and_extensions(
+            factory,
+            Zeroizing::new("11".repeat(32)),
+            DisplayMetrics::default(),
+            &hello_extensions,
+        )
+        .unwrap();
+        assert_eq!(bridge.hello_extensions, hello_extensions);
+        assert_eq!(bridge.welcome_extensions, welcome_extensions);
+        server.join().unwrap().unwrap();
     }
 
     #[cfg(unix)]

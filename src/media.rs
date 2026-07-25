@@ -797,14 +797,20 @@ fn handle_control(
         hello.maximum_major,
         hello.maximum_minor,
     ) {
+        let detail = messages::ErrorDetail::supported_version(
+            u64::from(VIVID_MAJOR),
+            u64::from(VIVID_MINOR),
+        );
         writer.write_record(
             messages::ERROR,
             0,
-            &messages::error(
+            &messages::error_with_detail(
                 request_id,
                 messages::ERROR_UNSUPPORTED_VERSION,
+                false,
+                &detail,
                 "Vivid 1.1 is required",
-            ),
+            )?,
         )?;
         return Ok(());
     }
@@ -832,14 +838,21 @@ fn handle_control(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.producers.len() >= MAX_PRODUCERS {
+            let detail = messages::ErrorDetail::limit(
+                messages::LIMIT_CONCURRENT_SESSIONS,
+                state.producers.len() as u64,
+                MAX_PRODUCERS as u64,
+            );
             writer.write_record(
                 messages::ERROR,
                 0,
-                &messages::error(
+                &messages::error_with_detail(
                     request_id,
                     messages::ERROR_LIMIT_EXCEEDED,
+                    false,
+                    &detail,
                     "producer quota exceeded",
-                ),
+                )?,
             )?;
             return Ok(());
         }
@@ -877,13 +890,14 @@ fn handle_control(
     writer.write_record(
         messages::WELCOME,
         0,
-        &messages::welcome(
+        &messages::welcome_preserving(
             request_id,
             producer_id,
             &tag,
             root_context,
             display,
             &features,
+            &hello.preserved_fields,
         ),
     )?;
     reader.set_maximum(hello.maximum_record_body);
@@ -1999,18 +2013,47 @@ mod tests {
             .unwrap();
         let rejection = unsupported.read_record().unwrap();
         assert_eq!(rejection.record_type, messages::ERROR);
-        assert_eq!(
-            messages::parse_error_reply(&rejection.body).unwrap().code,
-            messages::ERROR_UNSUPPORTED_VERSION
-        );
+        let rejection = messages::parse_error_reply(&rejection.body).unwrap();
+        assert_eq!(rejection.code, messages::ERROR_UNSUPPORTED_VERSION);
+        assert_eq!(rejection.supported_version, Some((1, 1)));
 
         let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        let preserved = [vivid_protocol::cbor::PreservedField {
+            key: 42,
+            encoded_value: vec![0x82, 0x01, 0xf5],
+        }];
+        let (_, baseline_hello) = messages::parse_hello(&messages::hello(1, &token)).unwrap();
         control
-            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &token))
+            .write_record(
+                messages::HELLO,
+                0,
+                0,
+                &messages::encode_hello(
+                    1,
+                    &messages::HelloConfig {
+                        minimum_major: 1,
+                        minimum_minor: 1,
+                        maximum_major: 1,
+                        maximum_minor: 1,
+                        token: &token,
+                        producer: &baseline_hello.producer,
+                        producer_version: &baseline_hello.producer_version,
+                        required_features: &baseline_hello.required_features,
+                        optional_features: &baseline_hello.optional_features,
+                        maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+                        authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
+                        preserved_fields: &preserved,
+                    },
+                ),
+            )
             .unwrap();
+        let welcome = control.read_record().unwrap();
+        assert_eq!(welcome.record_type, messages::WELCOME);
         assert_eq!(
-            control.read_record().unwrap().record_type,
-            messages::WELCOME
+            messages::parse_welcome(&welcome.body)
+                .unwrap()
+                .preserved_fields,
+            preserved
         );
 
         let video = messages::VideoSourceConfig {
