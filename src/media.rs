@@ -32,6 +32,7 @@ const MAX_SEEN_ANCHORS: usize = 4096;
 // forces Vivi to observe an unsolicited NEED_KEYFRAME within one discarded packet after a pane is
 // projected again instead of consuming a large local credit window before reading control events.
 const INITIAL_PACKET_CREDITS: u64 = 1;
+const ROLLING_PACKET_CREDITS: u64 = 8;
 const MAX_REGISTERED_WAITS: usize = 64;
 const MAX_PENDING_MEDIA_BARRIERS: usize = 64;
 const MEDIA_ORDER_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -173,6 +174,12 @@ struct Source {
     revision: SourceRevision,
     attachment_state: u64,
     attachment_generation: u64,
+    credit_window_bytes: u64,
+    credit_window_packets: u64,
+    outstanding_byte_credit: u64,
+    outstanding_packet_credit: u64,
+    charged_bytes: u64,
+    charged_packets: u64,
     last_media_id: u64,
     milestones: u64,
     causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
@@ -566,13 +573,13 @@ impl VirtualVivid {
                 (!projected_sources.contains(&pending.source)).then_some(*delivery_id)
             })
             .collect::<Vec<_>>();
-        let released = take_deliveries(&mut state, &hidden_deliveries);
         let visibility_changes = state
             .projected_sources
             .symmetric_difference(&projected_sources)
             .copied()
             .collect::<Vec<_>>();
         state.projected_sources = projected_sources;
+        let released = take_deliveries(&mut state, &hidden_deliveries);
         state.active_panes = panes.clone();
         for key in visibility_changes {
             let _ = advance_source(&mut state, key, messages::SOURCE_CHANGED_VISIBILITY);
@@ -636,12 +643,6 @@ impl VirtualVivid {
                     .filter(|delivery| delivery.source == key)
                     .collect::<Vec<_>>();
                 let queued_bytes = queued.iter().map(|delivery| delivery.bytes).sum::<u64>();
-                let maximum = source
-                    .descriptor
-                    .maximum_body()
-                    .ok()
-                    .map(u64::from)
-                    .unwrap_or(0);
                 PaneMediaSourceStatus {
                     producer_id: key.0,
                     source_id: key.1,
@@ -693,9 +694,8 @@ impl VirtualVivid {
                     milestones: source.milestones,
                     queued_packets: queued.len() as u64,
                     queued_bytes,
-                    available_packet_credit: INITIAL_PACKET_CREDITS
-                        .saturating_sub(queued.len() as u64),
-                    available_byte_credit: maximum.saturating_sub(queued_bytes),
+                    available_packet_credit: source.outstanding_packet_credit,
+                    available_byte_credit: source.outstanding_byte_credit,
                 }
             })
             .collect::<Vec<_>>();
@@ -746,7 +746,7 @@ impl VirtualVivid {
     }
 
     pub fn complete_bridge_delivery(&self, delivery_id: u64, delivered: bool) -> bool {
-        let (writer, pending, request_keyframe) = {
+        let (credit, request_keyframe) = {
             let mut state = self.lock();
             let Some(pending) = state.deliveries.remove(&delivery_id) else {
                 return false;
@@ -784,14 +784,14 @@ impl VirtualVivid {
                 messages::SOURCE_CHANGED_CREDIT_ACCOUNTING
             };
             let _ = advance_source(&mut state, pending.source, changed_fields);
-            (writer, pending, request_keyframe)
+            let credits = prepare_credit_return(&mut state, pending.source, pending.bytes, 1);
+            ((writer, pending.source, credits), request_keyframe)
         };
         self.delivery_changed.notify_all();
-        if let Some(writer) = writer {
-            let _ = writer.write_credit(pending.source.1, pending.bytes, 1, 0);
-        }
+        let source = credit.1;
+        return_delivery_credits(vec![credit]);
         if request_keyframe {
-            self.request_keyframes(&[pending.source]);
+            self.request_keyframes(&[source]);
         }
         request_keyframe
     }
@@ -1133,18 +1133,11 @@ fn evaluate_wait(source: &Source, visible: bool, wait: PendingSourceWait) -> Opt
 fn source_status(state: &State, key: SourceKey) -> Option<messages::SourceStatus> {
     let source = state.sources.get(&key)?;
     let visible = state.projected_sources.contains(&key);
-    let pending = state
+    let pending_packets = state
         .deliveries
         .values()
-        .filter(|delivery| delivery.source == key);
-    let pending_packets = pending.clone().count() as u64;
-    let pending_bytes = pending.map(|delivery| delivery.bytes).sum::<u64>();
-    let maximum = source
-        .descriptor
-        .maximum_body()
-        .ok()
-        .map(u64::from)
-        .unwrap_or(0);
+        .filter(|delivery| delivery.source == key)
+        .count() as u64;
     let (kind, linked_source_id) = match &source.descriptor {
         SourceDescriptor::Video(_) => (messages::SOURCE_KIND_VIDEO, 0),
         SourceDescriptor::Raster(_) => (messages::SOURCE_KIND_RASTER, 0),
@@ -1181,8 +1174,8 @@ fn source_status(state: &State, key: SourceKey) -> Option<messages::SourceStatus
         capture_policy: source.capture_policy,
         linked_source_id,
         milestones: source.milestones,
-        outstanding_byte_credit: maximum.saturating_sub(pending_bytes),
-        outstanding_packet_credit: INITIAL_PACKET_CREDITS.saturating_sub(pending_packets),
+        outstanding_byte_credit: source.outstanding_byte_credit,
+        outstanding_packet_credit: source.outstanding_packet_credit,
         ingress_queue_depth: pending_packets.min(messages::QUEUE_DEPTH_CAPACITY),
         descriptor: source.semantic_descriptor.clone().map(|descriptor| {
             if source.capture_policy & messages::CAPTURE_POLICY_DENY_SEMANTIC_EXPORT != 0 {
@@ -1226,7 +1219,98 @@ fn playback_snapshot(source: &Source) -> Option<messages::PlaybackSnapshot> {
     })
 }
 
-type DeliveryCredit = (Option<Arc<Writer>>, PendingDelivery);
+type DeliveryCredit = (Option<Arc<Writer>>, SourceKey, messages::Credits);
+
+fn consume_source_credit(state: &mut State, key: SourceKey, bytes: u64) -> io::Result<()> {
+    let source = state
+        .sources
+        .get_mut(&key)
+        .ok_or_else(|| invalid("source no longer exists"))?;
+    if bytes == 0 || source.outstanding_byte_credit < bytes || source.outstanding_packet_credit == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "media record exceeds outstanding source credit",
+        ));
+    }
+    source.outstanding_byte_credit -= bytes;
+    source.outstanding_packet_credit -= 1;
+    source.charged_bytes = source
+        .charged_bytes
+        .checked_add(bytes)
+        .ok_or_else(|| invalid("charged byte credit overflow"))?;
+    source.charged_packets = source
+        .charged_packets
+        .checked_add(1)
+        .ok_or_else(|| invalid("charged packet credit overflow"))?;
+    Ok(())
+}
+
+fn prepare_credit_return(
+    state: &mut State,
+    key: SourceKey,
+    bytes: u64,
+    packets: u64,
+) -> messages::Credits {
+    let projected = state.projected_sources.contains(&key);
+    let Some(source) = state.sources.get_mut(&key) else {
+        return messages::Credits {
+            bytes,
+            packets,
+            fragments: 0,
+        };
+    };
+    if source.charged_bytes < bytes || source.charged_packets < packets {
+        return messages::Credits {
+            bytes: 0,
+            packets: 0,
+            fragments: 0,
+        };
+    }
+    source.charged_bytes -= bytes;
+    source.charged_packets -= packets;
+    source.outstanding_byte_credit = source.outstanding_byte_credit.saturating_add(bytes);
+    source.outstanding_packet_credit = source.outstanding_packet_credit.saturating_add(packets);
+    let mut grant = messages::Credits {
+        bytes,
+        packets,
+        fragments: 0,
+    };
+    if projected {
+        let top_up_bytes = source.credit_window_bytes.saturating_sub(
+            source
+                .outstanding_byte_credit
+                .saturating_add(source.charged_bytes),
+        );
+        let top_up_packets = source.credit_window_packets.saturating_sub(
+            source
+                .outstanding_packet_credit
+                .saturating_add(source.charged_packets),
+        );
+        source.outstanding_byte_credit =
+            source.outstanding_byte_credit.saturating_add(top_up_bytes);
+        source.outstanding_packet_credit = source
+            .outstanding_packet_credit
+            .saturating_add(top_up_packets);
+        grant.bytes = grant.bytes.saturating_add(top_up_bytes);
+        grant.packets = grant.packets.saturating_add(top_up_packets);
+    }
+    grant
+}
+
+fn prepare_credit_write(
+    state: &mut State,
+    key: SourceKey,
+    bytes: u64,
+    packets: u64,
+) -> DeliveryCredit {
+    let writer = state
+        .producers
+        .get(&key.0)
+        .and_then(|producer| producer.writer.upgrade());
+    let credits = prepare_credit_return(state, key, bytes, packets);
+    (writer, key, credits)
+}
 
 fn take_deliveries(state: &mut State, delivery_ids: &[u64]) -> Vec<DeliveryCredit> {
     let mut released = Vec::with_capacity(delivery_ids.len());
@@ -1237,21 +1321,29 @@ fn take_deliveries(state: &mut State, delivery_ids: &[u64]) -> Vec<DeliveryCredi
         state.queued_bridge_bytes = state
             .queued_bridge_bytes
             .saturating_sub(pending.bytes as usize);
-        let writer = state
-            .producers
-            .get(&pending.source.0)
-            .and_then(|producer| producer.writer.upgrade());
-        released.push((writer, pending));
+        released.push(prepare_credit_write(
+            state,
+            pending.source,
+            pending.bytes,
+            1,
+        ));
     }
     released
 }
 
 fn return_delivery_credits(released: Vec<DeliveryCredit>) {
-    for (writer, pending) in released {
-        if let Some(writer) = writer {
-            let _ = writer.write_credit(pending.source.1, pending.bytes, 1, 0);
-        }
+    for credit in released {
+        let _ = write_delivery_credit(credit);
     }
+}
+
+fn write_delivery_credit((writer, source, credits): DeliveryCredit) -> io::Result<()> {
+    if let Some(writer) = writer
+        && (credits.bytes != 0 || credits.packets != 0)
+    {
+        writer.write_credit(source.1, credits.bytes, credits.packets, credits.fragments)?;
+    }
+    Ok(())
 }
 
 fn cancel_source_deliveries(
@@ -1963,7 +2055,7 @@ fn dispatch_control(
                     maximum_waits: MAX_REGISTERED_WAITS as u64,
                     maximum_pending_requests: MAX_REGISTERED_WAITS as u64,
                     rolling_byte_window: u64::from(vivid_protocol::HARD_MAX_RECORD_BODY),
-                    rolling_packet_window: INITIAL_PACKET_CREDITS,
+                    rolling_packet_window: ROLLING_PACKET_CREDITS,
                     retained_pixel_budget: state.config.aggregate_retained_bytes / 4,
                     current_sources,
                     current_nodes,
@@ -2908,6 +3000,12 @@ fn create_source(
             revision: SourceRevision::new(1),
             attachment_state: messages::ATTACHMENT_NEVER,
             attachment_generation: 0,
+            credit_window_bytes: u64::from(maximum),
+            credit_window_packets: ROLLING_PACKET_CREDITS,
+            outstanding_byte_credit: u64::from(maximum),
+            outstanding_packet_credit: INITIAL_PACKET_CREDITS,
+            charged_bytes: 0,
+            charged_packets: 0,
             last_media_id: 0,
             milestones: 0,
             causation_id: creation.causation_id,
@@ -2950,7 +3048,7 @@ fn create_source(
                 fragment_credits: 0,
                 max_media_body: maximum,
                 rolling_byte_window: u64::from(maximum),
-                rolling_packet_window: INITIAL_PACKET_CREDITS,
+                rolling_packet_window: ROLLING_PACKET_CREDITS,
                 initial_source_revision: SourceRevision::new(1),
                 media_connection_required: true,
                 delta_operation_limit: None,
@@ -3098,13 +3196,10 @@ fn ingest_record(
     let mut state = shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    consume_source_credit(&mut state, key, record.body.len() as u64)?;
     let projected_source = state.projected_sources.contains(&key);
     let limit = state.config.aggregate_retained_bytes as usize;
     let bridge_queue_limit = state.config.ipc_queue_bytes;
-    let writer = state
-        .producers
-        .get(&key.0)
-        .and_then(|producer| producer.writer.upgrade());
     let (old_retained, retained_body, new_retained, pts, candidate_forward) = {
         let source = state
             .sources
@@ -3263,6 +3358,9 @@ fn ingest_record(
         }
         None
     };
+    let immediate_credit = delivery
+        .is_none()
+        .then(|| prepare_credit_write(&mut state, key, record.body.len() as u64, 1));
     drop(state);
     delivery_changed.notify_all();
     if let Some(delay) = headless_delay {
@@ -3277,25 +3375,39 @@ fn ingest_record(
         }) {
             Ok(()) => return Ok(()),
             Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
-                let mut state = shared
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(pending) = state.deliveries.remove(&delivery_id) {
-                    state.queued_bridge_bytes = state
-                        .queued_bridge_bytes
-                        .saturating_sub(pending.bytes as usize);
-                    delivery_changed.notify_all();
-                }
-                if let Some(source) = state.sources.get_mut(&key)
-                    && matches!(source.descriptor, SourceDescriptor::Video(_))
-                {
-                    source.bridge_desynchronized = true;
+                let credit = {
+                    let mut state = shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let credit = if let Some(pending) = state.deliveries.remove(&delivery_id) {
+                        state.queued_bridge_bytes = state
+                            .queued_bridge_bytes
+                            .saturating_sub(pending.bytes as usize);
+                        delivery_changed.notify_all();
+                        Some(prepare_credit_write(
+                            &mut state,
+                            pending.source,
+                            pending.bytes,
+                            1,
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(source) = state.sources.get_mut(&key)
+                        && matches!(source.descriptor, SourceDescriptor::Video(_))
+                    {
+                        source.bridge_desynchronized = true;
+                    }
+                    credit
+                };
+                if let Some(credit) = credit {
+                    write_delivery_credit(credit)?;
                 }
             }
         }
     }
-    if let Some(writer) = writer {
-        writer.write_credit(key.1, record.body.len() as u64, 1, 0)?;
+    if let Some(credit) = immediate_credit {
+        write_delivery_credit(credit)?;
     }
     Ok(())
 }
@@ -3816,12 +3928,50 @@ mod tests {
             revision: SourceRevision::new(1),
             attachment_state: messages::ATTACHMENT_ATTACHED,
             attachment_generation: generation,
+            credit_window_bytes: 1024,
+            credit_window_packets: ROLLING_PACKET_CREDITS,
+            outstanding_byte_credit: 1024,
+            outstanding_packet_credit: INITIAL_PACKET_CREDITS,
+            charged_bytes: 0,
+            charged_packets: 0,
             last_media_id: 0,
             milestones: messages::MILESTONE_MEDIA_ATTACHED,
             causation_id: None,
             capture_policy: 0,
             semantic_descriptor: None,
         }
+    }
+
+    #[test]
+    fn active_source_credit_converges_from_cold_start_to_rolling_window() {
+        let mut state = state();
+        state.sources.insert((1, 1), barrier_source(1));
+        state.projected_sources.insert((1, 1));
+
+        consume_source_credit(&mut state, (1, 1), 100).unwrap();
+        let source = state.sources.get(&(1, 1)).unwrap();
+        assert_eq!(
+            (
+                source.outstanding_byte_credit,
+                source.outstanding_packet_credit
+            ),
+            (924, 0)
+        );
+
+        let returned = prepare_credit_return(&mut state, (1, 1), 100, 1);
+        assert_eq!(
+            (returned.bytes, returned.packets),
+            (100, ROLLING_PACKET_CREDITS)
+        );
+        let source = state.sources.get(&(1, 1)).unwrap();
+        assert_eq!(
+            (
+                source.outstanding_byte_credit,
+                source.outstanding_packet_credit
+            ),
+            (1024, ROLLING_PACKET_CREDITS)
+        );
+        assert!(consume_source_credit(&mut state, (1, 1), 1025).is_err());
     }
 
     #[test]
@@ -4205,6 +4355,7 @@ mod tests {
             .unwrap();
         let ready = messages::parse_source_ready(&control.read_record().unwrap().body).unwrap();
         assert_eq!(ready.packet_credits, 1);
+        assert_eq!(ready.rolling_packet_window, ROLLING_PACKET_CREDITS);
         let mut raster = Connection::open(&endpoint, ConnectionKind::Raster).unwrap();
         raster
             .write_record(
@@ -4228,6 +4379,8 @@ mod tests {
         let first_credit = control.read_record().unwrap();
         assert_eq!(first_credit.record_type, messages::CREDIT);
         assert_eq!(first_credit.object_id, 9);
+        let first_credit_body = messages::parse_credit(&first_credit.body).unwrap();
+        assert_eq!(first_credit_body.packets, ROLLING_PACKET_CREDITS);
         assert_eq!(service.revision(), revision_before_frames);
 
         let second = media::raster_frame_body(1, 2, 2, 1, &[0, 255, 0, 255, 0, 0, 0, 255]).unwrap();
