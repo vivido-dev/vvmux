@@ -137,6 +137,10 @@ enum AutomationWaitKind {
         after_session: u64,
     },
     Exit,
+    Media {
+        after_virtual_revision: Option<u64>,
+        after_outer_revision: Option<u64>,
+    },
 }
 
 enum AutomationTextPattern {
@@ -476,6 +480,9 @@ struct SessionActor {
     layout_revision: u64,
     last_media_projection: Option<MediaProjectionKey>,
     media_projection_revision: u64,
+    outer_virtual_revision: u64,
+    outer_projection_revision: u64,
+    outer_attachment_generations: HashMap<BridgeSourceKey, u64>,
     fragment_assignments: HashMap<(u64, u64), FragmentMap>,
     last_projection_warning: Option<MediaProjectionKey>,
     pointer_drag: Option<PointerDrag>,
@@ -561,6 +568,9 @@ pub fn start(
         layout_revision: 0,
         last_media_projection: None,
         media_projection_revision: 0,
+        outer_virtual_revision: 0,
+        outer_projection_revision: 0,
+        outer_attachment_generations: HashMap::new(),
         fragment_assignments: HashMap::new(),
         last_projection_warning: None,
         pointer_drag: None,
@@ -934,6 +944,22 @@ impl SessionActor {
                     self.sync_media(true);
                 }
             }
+            ClientMessage::BridgeApplied {
+                virtual_revision,
+                outer_revision,
+                outer_attachment_generations,
+            } => {
+                if self.client_is(id)
+                    && virtual_revision >= self.outer_virtual_revision
+                    && outer_revision >= self.outer_projection_revision
+                {
+                    self.outer_virtual_revision = virtual_revision;
+                    self.outer_projection_revision = outer_revision;
+                    self.outer_attachment_generations =
+                        outer_attachment_generations.into_iter().collect();
+                    self.check_automation_waiters();
+                }
+            }
             ClientMessage::Detach => {
                 if self.client_is(id) {
                     self.cancel_pointer_drag(true);
@@ -1078,6 +1104,15 @@ impl SessionActor {
                         "limits": automation_limits(),
                     }),
                 );
+            }
+            AutomationMethod::InspectMedia => {
+                let pane_id = pane_id.unwrap();
+                let status = self.vivid.pane_status(
+                    pane_id,
+                    self.outer_projection_revision,
+                    &self.outer_attachment_generations,
+                );
+                self.reply_automation(target, serde_json::to_value(status).unwrap());
             }
             AutomationMethod::Split { axis } => {
                 let pane_id = pane_id.unwrap();
@@ -1305,6 +1340,21 @@ impl SessionActor {
                     deadline: deadline(timeout_ms),
                     kind: AutomationWaitKind::Exit,
                 })
+            }
+            AutomationMethod::WaitMedia {
+                after_virtual_revision,
+                after_outer_revision,
+                timeout_ms,
+            } => {
+                self.add_automation_waiter(AutomationWaiter {
+                    reply: target,
+                    pane_id,
+                    deadline: deadline(timeout_ms),
+                    kind: AutomationWaitKind::Media {
+                        after_virtual_revision,
+                        after_outer_revision,
+                    },
+                });
             }
         }
     }
@@ -1849,6 +1899,26 @@ impl SessionActor {
         now: Instant,
     ) -> Option<Result<serde_json::Value, AutomationError>> {
         match &waiter.kind {
+            AutomationWaitKind::Media {
+                after_virtual_revision,
+                after_outer_revision,
+            } => {
+                let pane_id = waiter.pane_id?;
+                let status = self.vivid.pane_status(
+                    pane_id,
+                    self.outer_projection_revision,
+                    &self.outer_attachment_generations,
+                );
+                let virtual_ready = after_virtual_revision
+                    .is_none_or(|revision| status.virtual_projection_revision > revision);
+                let outer_ready = after_outer_revision
+                    .is_none_or(|revision| status.outer_projection_revision > revision);
+                (virtual_ready && outer_ready).then(|| {
+                    serde_json::to_value(status).map_err(|error| {
+                        AutomationError::new("serialization_failed", error.to_string())
+                    })
+                })
+            }
             AutomationWaitKind::Rendered { after_session } => {
                 let Some(client) = self.attached.as_ref() else {
                     return Some(Err(AutomationError::new(
@@ -3487,7 +3557,8 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 | AutomationMethod::WaitScreenChange { timeout_ms, .. }
                 | AutomationMethod::WaitScreenStable { timeout_ms, .. }
                 | AutomationMethod::WaitRendered { timeout_ms, .. }
-                | AutomationMethod::WaitExit { timeout_ms } => Some(*timeout_ms),
+                | AutomationMethod::WaitExit { timeout_ms }
+                | AutomationMethod::WaitMedia { timeout_ms, .. } => Some(*timeout_ms),
                 _ => None,
             };
             if timeout.is_some_and(|timeout| !(1..=24 * 60 * 60 * 1000).contains(&timeout)) {
@@ -3507,9 +3578,9 @@ fn automation_capabilities() -> serde_json::Value {
         "protocol": "VVMX",
         "protocol_version": crate::ipc::VERSION,
         "methods": [
-            "capabilities", "list_panes", "inspect", "split", "focus", "close_pane",
+            "capabilities", "list_panes", "inspect", "inspect_media", "split", "focus", "close_pane",
             "typing", "key", "paste", "get_text", "get_grid", "wait_text",
-            "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit"
+            "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media"
         ],
         "limits": automation_limits(),
         "render_acknowledgment": "attached_client_write",
@@ -4734,6 +4805,9 @@ mod tests {
             layout_revision: 1,
             last_media_projection: None,
             media_projection_revision: 0,
+            outer_virtual_revision: 0,
+            outer_projection_revision: 0,
+            outer_attachment_generations: HashMap::new(),
             fragment_assignments: HashMap::new(),
             last_projection_warning: None,
             pointer_drag: None,

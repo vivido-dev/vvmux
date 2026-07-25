@@ -214,5 +214,21 @@ mod tests {
             Cli::try_parse_from(["vvmux", "msg", "wait", "screen-stable", "--quiet", "25h",])
                 .is_err()
         );
+        assert!(Cli::try_parse_from(["vvmux", "msg", "inspect-media", "--pane-id", "7"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "vvmux",
+                "msg",
+                "wait",
+                "media",
+                "--after-virtual",
+                "4",
+                "--after-outer",
+                "9",
+                "--pane-id",
+                "7",
+            ])
+            .is_ok()
+        );
     }
 }

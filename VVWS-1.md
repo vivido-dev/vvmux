@@ -61,6 +61,15 @@ ordinary binary Vivid connection; the producer-side preface is the first bytes s
 VVWS/1 has no direct-network TLS mode. `vvmux serve` binds only an IPv4 or IPv6 loopback address;
 remote deployments use an SSH tunnel or a trusted TLS reverse proxy.
 
+### Private IPC compatibility
+
+VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 5,
+which is a hard cutover from VVMX 4. VVMX 5 adds pane-scoped sanitized media inspection/waits and
+the bridge-applied acknowledgement carrying separate virtual and outer projection revisions.
+These fields never enter VVWS JSON control messages and never contain Vivid tokens, media tickets,
+payloads, hashes, or derived capability material. Gateway/session processes from different VVMX
+versions must reject one another and the older session must be restarted.
+
 ## Connection states and terminal data
 
 After authentication a connection is detached. It may list or create sessions and attach to one

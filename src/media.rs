@@ -9,13 +9,15 @@ use sha2::{Digest, Sha256};
 use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::media::{self, MediaSequence};
 use vivid_protocol::messages::{
-    self, Credits, DisplayChanged, ImageSourceConfig, ParsedAudioSourceConfig, ParsedSceneNode,
-    ParsedVideoSourceConfig, RasterSourceConfig,
+    self, DisplayChanged, ImageSourceConfig, ParsedAudioSourceConfig, ParsedSceneNode,
+    ParsedVideoSourceConfig, RasterSourceConfig, SourceReady,
 };
+use vivid_protocol::revision::{ObservationSequence, SceneRevision, SourceRevision};
 use vivid_protocol::wire::{BorrowedRecord, ConnectionKind, Record};
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
 use crate::config::Media as MediaConfig;
+use crate::ipc::{PaneMediaNodeStatus, PaneMediaSourceStatus, PaneMediaStatus};
 use crate::layout::PaneId;
 use crate::platform::{
     ConnectionCancel, Transport, VirtualPresenterEndpoint, VirtualPresenterListener,
@@ -29,6 +31,9 @@ const MAX_SEEN_ANCHORS: usize = 4096;
 // forces Vivi to observe an unsolicited NEED_KEYFRAME within one discarded packet after a pane is
 // projected again instead of consuming a large local credit window before reading control events.
 const INITIAL_PACKET_CREDITS: u64 = 1;
+const MAX_REGISTERED_WAITS: usize = 64;
+const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const OBSERVATION_QUEUE: usize = 64;
 
 pub type ProducerId = u64;
 pub type SourceKey = (ProducerId, u64);
@@ -119,9 +124,22 @@ struct Producer {
     tag: [u8; 16],
     anchor_key: AnchorKey,
     writer: Weak<Writer>,
+    observation_sender: mpsc::SyncSender<ObservationWrite>,
     features: HashSet<u64>,
     anchors: HashMap<u64, (i32, usize)>,
     seen_anchors: HashSet<u64>,
+    scene_revision: SceneRevision,
+    observation_mask: u64,
+    observation_sequence: ObservationSequence,
+    first_lost_source_sequence: Option<ObservationSequence>,
+    first_lost_scene_sequence: Option<ObservationSequence>,
+    waits: HashMap<u64, PendingSourceWait>,
+}
+
+struct ObservationWrite {
+    record_type: u16,
+    object_id: u64,
+    body: Vec<u8>,
 }
 
 struct Source {
@@ -139,12 +157,24 @@ struct Source {
     clock_started: Option<Instant>,
     clock_origin_pts_us: Option<i64>,
     last_inner_record_sequence: u64,
+    revision: SourceRevision,
+    attachment_state: u64,
+    attachment_generation: u64,
+    last_media_id: u64,
+    milestones: u64,
 }
 
 struct Ticket {
     source: SourceKey,
     kind: ConnectionKind,
     maximum_body: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PendingSourceWait {
+    source_id: u64,
+    condition: u64,
+    value: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -166,7 +196,9 @@ struct State {
     next_producer: ProducerId,
     retained_bytes: usize,
     connections: usize,
-    revision: u64,
+    /// Revision of the virtual-to-outer projection snapshot. This is deliberately not a
+    /// producer scene revision and is never overwritten by an outer presenter revision.
+    projection_revision: u64,
     projected_sources: HashSet<SourceKey>,
     active_panes: HashSet<PaneId>,
     deliveries: HashMap<u64, PendingDelivery>,
@@ -209,7 +241,7 @@ impl VirtualVivid {
             next_producer: 0,
             retained_bytes: 0,
             connections: 0,
-            revision: 0,
+            projection_revision: 0,
             projected_sources: HashSet::new(),
             active_panes: HashSet::new(),
             deliveries: HashMap::new(),
@@ -259,7 +291,7 @@ impl VirtualVivid {
         state.nodes.retain(|_, node| node.pane != pane);
         prune_orphaned_sources(&mut state);
         state.metrics.remove(&pane);
-        state.revision = state.revision.wrapping_add(1);
+        advance_projection(&mut state);
         let cancellers = state
             .connection_cancellers
             .values()
@@ -327,7 +359,12 @@ impl VirtualVivid {
             };
             producer.seen_anchors.insert(parsed.anchor_id);
             producer.anchors.insert(parsed.anchor_id, (line, column));
-            state.revision = state.revision.wrapping_add(1);
+            let _ = advance_scene(
+                &mut state,
+                producer_id,
+                messages::SCENE_CHANGED_PRODUCER_COMMIT,
+            );
+            advance_projection(&mut state);
             writer
         };
         writer
@@ -341,6 +378,11 @@ impl VirtualVivid {
 
     pub fn scroll_anchors(&self, pane: PaneId, lines: i32) {
         let mut state = self.lock();
+        let producers = state
+            .producers
+            .iter()
+            .filter_map(|(&id, producer)| (producer.pane == pane).then_some(id))
+            .collect::<Vec<_>>();
         for producer in state
             .producers
             .values_mut()
@@ -355,11 +397,23 @@ impl VirtualVivid {
                 *line = line.saturating_sub(lines);
             }
         }
-        state.revision = state.revision.wrapping_add(1);
+        for producer in producers {
+            let _ = advance_scene(
+                &mut state,
+                producer,
+                messages::SCENE_CHANGED_PRODUCER_COMMIT,
+            );
+        }
+        advance_projection(&mut state);
     }
 
     pub fn clear_anchors(&self, pane: PaneId) {
         let mut state = self.lock();
+        let producers = state
+            .producers
+            .iter()
+            .filter_map(|(&id, producer)| (producer.pane == pane).then_some(id))
+            .collect::<Vec<_>>();
         for producer in state
             .producers
             .values_mut()
@@ -371,7 +425,10 @@ impl VirtualVivid {
             .nodes
             .retain(|_, node| node.pane != pane || node.retained_anchor.is_none());
         prune_orphaned_sources(&mut state);
-        state.revision = state.revision.wrapping_add(1);
+        for producer in producers {
+            let _ = advance_scene(&mut state, producer, messages::SCENE_CHANGED_ANCHOR_GONE);
+        }
+        advance_projection(&mut state);
     }
 
     pub fn projection_snapshot(&self, panes: &HashSet<PaneId>) -> ProjectionSnapshot {
@@ -446,10 +503,18 @@ impl VirtualVivid {
             })
             .collect::<Vec<_>>();
         let released = take_deliveries(&mut state, &hidden_deliveries);
+        let visibility_changes = state
+            .projected_sources
+            .symmetric_difference(&projected_sources)
+            .copied()
+            .collect::<Vec<_>>();
         state.projected_sources = projected_sources;
         state.active_panes = panes.clone();
+        for key in visibility_changes {
+            let _ = advance_source(&mut state, key, messages::SOURCE_CHANGED_VISIBILITY);
+        }
         let snapshot = ProjectionSnapshot {
-            revision: state.revision,
+            revision: state.projection_revision,
             sources,
             nodes,
             live_nodes,
@@ -464,7 +529,123 @@ impl VirtualVivid {
     }
 
     pub fn revision(&self) -> u64 {
-        self.lock().revision
+        self.lock().projection_revision
+    }
+
+    pub fn pane_status(
+        &self,
+        pane: PaneId,
+        outer_projection_revision: u64,
+        outer_attachment_generations: &HashMap<crate::ipc::BridgeSourceKey, u64>,
+    ) -> PaneMediaStatus {
+        let state = self.lock();
+        let mut owners = state
+            .producers
+            .iter()
+            .filter_map(|(&id, producer)| (producer.pane == pane).then_some(id))
+            .collect::<HashSet<_>>();
+        owners.extend(
+            state
+                .nodes
+                .values()
+                .filter_map(|node| (node.pane == pane).then_some(node.producer)),
+        );
+        let virtual_scene_revision = owners
+            .iter()
+            .filter_map(|owner| {
+                state
+                    .producers
+                    .get(owner)
+                    .map(|producer| producer.scene_revision)
+            })
+            .map(SceneRevision::get)
+            .max()
+            .unwrap_or(0);
+        let mut sources = state
+            .sources
+            .iter()
+            .filter(|(key, _)| owners.contains(&key.0))
+            .map(|(&key, source)| {
+                let queued = state
+                    .deliveries
+                    .values()
+                    .filter(|delivery| delivery.source == key)
+                    .collect::<Vec<_>>();
+                let queued_bytes = queued.iter().map(|delivery| delivery.bytes).sum::<u64>();
+                let maximum = source
+                    .descriptor
+                    .maximum_body()
+                    .ok()
+                    .map(u64::from)
+                    .unwrap_or(0);
+                PaneMediaSourceStatus {
+                    producer_id: key.0,
+                    source_id: key.1,
+                    kind: match &source.descriptor {
+                        SourceDescriptor::Raster(_) => "raster",
+                        SourceDescriptor::Image(_) => "image",
+                        SourceDescriptor::Video(_) => "video",
+                        SourceDescriptor::Audio(_) => "audio",
+                    }
+                    .into(),
+                    lifecycle: if source.ended {
+                        "ended"
+                    } else if source.playing {
+                        "playing"
+                    } else if source.attachment_state == messages::ATTACHMENT_NEVER {
+                        "created"
+                    } else {
+                        "paused"
+                    }
+                    .into(),
+                    source_revision: source.revision.get(),
+                    epoch: source.sequence.epoch(),
+                    attachment_state: source.attachment_state,
+                    attachment_generation: source.attachment_generation,
+                    outer_attachment_generation: outer_attachment_generations
+                        .get(&crate::ipc::BridgeSourceKey {
+                            producer: key.0,
+                            source: key.1,
+                        })
+                        .copied(),
+                    visible: state.projected_sources.contains(&key),
+                    retained_static: source.descriptor.is_static() && source.retained.is_some(),
+                    keyframe_needed: source.bridge_desynchronized,
+                    milestones: source.milestones,
+                    queued_packets: queued.len() as u64,
+                    queued_bytes,
+                    available_packet_credit: INITIAL_PACKET_CREDITS
+                        .saturating_sub(queued.len() as u64),
+                    available_byte_credit: maximum.saturating_sub(queued_bytes),
+                }
+            })
+            .collect::<Vec<_>>();
+        sources.sort_by_key(|source| (source.producer_id, source.source_id));
+        let mut nodes = state
+            .nodes
+            .values()
+            .filter(|node| node.pane == pane)
+            .map(|node| PaneMediaNodeStatus {
+                producer_id: node.producer,
+                node_id: node.config.node.node_id,
+                source_id: node.config.node.source_id,
+                visible: state
+                    .projected_sources
+                    .contains(&(node.producer, node.config.node.source_id)),
+                x: node.config.node.x,
+                y: node.config.node.y,
+                width: node.config.node.width,
+                height: node.config.node.height,
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| (node.producer_id, node.node_id));
+        PaneMediaStatus {
+            virtual_projection_revision: state.projection_revision,
+            virtual_scene_revision,
+            outer_projection_revision,
+            sources,
+            nodes,
+        }
     }
 
     pub fn deactivate_bridge(&self) {
@@ -512,6 +693,18 @@ impl VirtualVivid {
                             false
                         }
                     });
+            if delivered
+                && state.projected_sources.contains(&pending.source)
+                && let Some(source) = state.sources.get_mut(&pending.source)
+            {
+                source.milestones |= messages::MILESTONE_FIRST_VISIBLE_PRESENTATION;
+            }
+            let changed_fields = if delivered {
+                messages::SOURCE_CHANGED_MILESTONES | messages::SOURCE_CHANGED_CREDIT_ACCOUNTING
+            } else {
+                messages::SOURCE_CHANGED_CREDIT_ACCOUNTING
+            };
+            let _ = advance_source(&mut state, pending.source, changed_fields);
             (writer, pending, request_keyframe)
         };
         self.delivery_changed.notify_all();
@@ -565,6 +758,352 @@ impl VirtualVivid {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn advance_projection(state: &mut State) {
+    state.projection_revision = state.projection_revision.saturating_add(1);
+}
+
+fn advance_scene(state: &mut State, producer_id: ProducerId, reason_mask: u64) -> io::Result<()> {
+    let (sender, body, sequence) = {
+        let producer = state
+            .producers
+            .get_mut(&producer_id)
+            .ok_or_else(|| invalid("producer missing"))?;
+        producer.scene_revision = producer
+            .scene_revision
+            .advance()
+            .map_err(|_| invalid("scene revision exhausted"))?;
+        if producer.observation_mask & messages::OBSERVE_SCENE_CHANGES == 0 {
+            return Ok(());
+        }
+        producer.observation_sequence = producer
+            .observation_sequence
+            .advance()
+            .map_err(|_| invalid("observation sequence exhausted"))?;
+        let event = messages::SceneChanged {
+            scene_revision: producer.scene_revision,
+            reason_mask,
+            observation_sequence: producer.observation_sequence,
+            first_lost_sequence: producer.first_lost_scene_sequence.take(),
+        };
+        (
+            producer.observation_sender.clone(),
+            messages::scene_changed(event)?,
+            producer.observation_sequence,
+        )
+    };
+    if sender
+        .try_send(ObservationWrite {
+            record_type: messages::SCENE_CHANGED,
+            object_id: 0,
+            body,
+        })
+        .is_err()
+        && let Some(producer) = state.producers.get_mut(&producer_id)
+    {
+        producer.first_lost_scene_sequence.get_or_insert(sequence);
+    }
+    Ok(())
+}
+
+fn advance_source(
+    state: &mut State,
+    key: SourceKey,
+    changed_fields: u64,
+) -> io::Result<SourceRevision> {
+    let revision = {
+        let source = state
+            .sources
+            .get_mut(&key)
+            .ok_or_else(|| invalid("source missing"))?;
+        source.revision = source
+            .revision
+            .advance()
+            .map_err(|_| invalid("source revision exhausted"))?;
+        source.revision
+    };
+    let (
+        writer,
+        observation_sender,
+        event_body,
+        event_sequence,
+        playback_body,
+        playback_sequence,
+        wait_replies,
+    ) = {
+        let visible = state.projected_sources.contains(&key);
+        let source = state.sources.get(&key).unwrap();
+        let producer = state
+            .producers
+            .get_mut(&key.0)
+            .ok_or_else(|| invalid("producer missing"))?;
+        let writer = producer.writer.upgrade();
+        let event_body = if producer.observation_mask & messages::OBSERVE_SOURCE_TRANSITIONS != 0 {
+            producer.observation_sequence = producer
+                .observation_sequence
+                .advance()
+                .map_err(|_| invalid("observation sequence exhausted"))?;
+            Some(messages::source_changed(messages::SourceChanged {
+                source_id: key.1,
+                source_revision: revision,
+                changed_fields,
+                observation_sequence: producer.observation_sequence,
+                first_lost_sequence: producer.first_lost_source_sequence.take(),
+            })?)
+        } else {
+            None
+        };
+        let event_sequence = producer.observation_sequence;
+        let playback_body = if changed_fields & messages::SOURCE_CHANGED_PLAYBACK != 0
+            && producer.observation_mask & messages::OBSERVE_PLAYBACK_TRANSITIONS != 0
+            && let Some(snapshot) = playback_snapshot(source)
+        {
+            producer.observation_sequence = producer
+                .observation_sequence
+                .advance()
+                .map_err(|_| invalid("observation sequence exhausted"))?;
+            Some(messages::playback_state(messages::PlaybackState {
+                source_id: key.1,
+                snapshot,
+                source_revision: revision,
+                observation_sequence: producer.observation_sequence,
+            })?)
+        } else {
+            None
+        };
+        let playback_sequence = producer.observation_sequence;
+        let satisfied = producer
+            .waits
+            .iter()
+            .filter_map(|(&request_id, wait)| {
+                evaluate_wait(source, visible, *wait).map(|observed_value| {
+                    (
+                        request_id,
+                        messages::wait_satisfied(
+                            request_id,
+                            messages::WaitSatisfied {
+                                source_id: key.1,
+                                source_revision: revision,
+                                condition: wait.condition,
+                                observed_value,
+                            },
+                        ),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (request_id, _) in &satisfied {
+            producer.waits.remove(request_id);
+        }
+        (
+            writer,
+            producer.observation_sender.clone(),
+            event_body,
+            event_sequence,
+            playback_body,
+            playback_sequence,
+            satisfied,
+        )
+    };
+    if let Some(body) = event_body
+        && observation_sender
+            .try_send(ObservationWrite {
+                record_type: messages::SOURCE_CHANGED,
+                object_id: key.1,
+                body,
+            })
+            .is_err()
+        && let Some(producer) = state.producers.get_mut(&key.0)
+    {
+        producer
+            .first_lost_source_sequence
+            .get_or_insert(event_sequence);
+    }
+    if let Some(body) = playback_body
+        && observation_sender
+            .try_send(ObservationWrite {
+                record_type: messages::PLAYBACK_STATE,
+                object_id: key.1,
+                body,
+            })
+            .is_err()
+        && let Some(producer) = state.producers.get_mut(&key.0)
+    {
+        producer
+            .first_lost_source_sequence
+            .get_or_insert(playback_sequence);
+    }
+    if let Some(writer) = writer {
+        for (_, body) in wait_replies {
+            if let Ok(body) = body {
+                let _ = writer.write_record(messages::WAIT_SATISFIED, key.1, &body);
+            }
+        }
+    }
+    Ok(revision)
+}
+
+fn emit_source_event(state: &mut State, key: SourceKey, changed_fields: u64) -> io::Result<()> {
+    let revision = state
+        .sources
+        .get(&key)
+        .ok_or_else(|| invalid("source missing"))?
+        .revision;
+    let producer = state
+        .producers
+        .get_mut(&key.0)
+        .ok_or_else(|| invalid("producer missing"))?;
+    if producer.observation_mask & messages::OBSERVE_SOURCE_TRANSITIONS == 0 {
+        return Ok(());
+    }
+    producer.observation_sequence = producer
+        .observation_sequence
+        .advance()
+        .map_err(|_| invalid("observation sequence exhausted"))?;
+    let body = messages::source_changed(messages::SourceChanged {
+        source_id: key.1,
+        source_revision: revision,
+        changed_fields,
+        observation_sequence: producer.observation_sequence,
+        first_lost_sequence: producer.first_lost_source_sequence.take(),
+    })?;
+    if producer
+        .observation_sender
+        .try_send(ObservationWrite {
+            record_type: messages::SOURCE_CHANGED,
+            object_id: key.1,
+            body,
+        })
+        .is_err()
+    {
+        producer
+            .first_lost_source_sequence
+            .get_or_insert(producer.observation_sequence);
+    }
+    Ok(())
+}
+
+fn evaluate_wait(source: &Source, visible: bool, wait: PendingSourceWait) -> Option<Option<u64>> {
+    let reached = match wait.condition {
+        messages::WAIT_SOURCE_REVISION => source.revision.get() >= wait.value.unwrap_or(u64::MAX),
+        messages::WAIT_FIRST_VISIBLE_PRESENTATION => {
+            source.milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION != 0
+        }
+        messages::WAIT_RASTER_FRAME => {
+            matches!(source.descriptor, SourceDescriptor::Raster(_))
+                && source.last_media_id >= wait.value.unwrap_or(u64::MAX)
+        }
+        messages::WAIT_VIDEO_PTS => {
+            matches!(source.descriptor, SourceDescriptor::Video(_))
+                && source.last_pts_us.unwrap_or(i64::MIN) >= wait.value.unwrap_or(u64::MAX) as i64
+        }
+        messages::WAIT_PLAYBACK_STARTED => {
+            source.milestones & messages::MILESTONE_PLAYBACK_STARTED != 0
+        }
+        messages::WAIT_PLAYBACK_ENDED => {
+            source.milestones & messages::MILESTONE_PLAYBACK_ENDED != 0
+        }
+        messages::WAIT_MEDIA_ATTACHED => source.attachment_state >= messages::ATTACHMENT_ATTACHED,
+        messages::WAIT_MEDIA_CLOSED => source.attachment_state == messages::ATTACHMENT_CLOSED,
+        messages::WAIT_SOURCE_LOST => source.milestones & messages::MILESTONE_SOURCE_LOST != 0,
+        _ => false,
+    };
+    reached.then(|| match wait.condition {
+        messages::WAIT_SOURCE_REVISION => Some(source.revision.get()),
+        messages::WAIT_RASTER_FRAME => Some(source.last_media_id),
+        messages::WAIT_VIDEO_PTS => source.last_pts_us.map(|pts| pts.max(0) as u64),
+        messages::WAIT_FIRST_VISIBLE_PRESENTATION if !visible => None,
+        _ => None,
+    })
+}
+
+fn source_status(state: &State, key: SourceKey) -> Option<messages::SourceStatus> {
+    let source = state.sources.get(&key)?;
+    let visible = state.projected_sources.contains(&key);
+    let pending = state
+        .deliveries
+        .values()
+        .filter(|delivery| delivery.source == key);
+    let pending_packets = pending.clone().count() as u64;
+    let pending_bytes = pending.map(|delivery| delivery.bytes).sum::<u64>();
+    let maximum = source
+        .descriptor
+        .maximum_body()
+        .ok()
+        .map(u64::from)
+        .unwrap_or(0);
+    let (kind, linked_source_id) = match &source.descriptor {
+        SourceDescriptor::Video(_) => (messages::SOURCE_KIND_VIDEO, 0),
+        SourceDescriptor::Raster(_) => (messages::SOURCE_KIND_RASTER, 0),
+        SourceDescriptor::Image(_) => (messages::SOURCE_KIND_IMAGE, 0),
+        SourceDescriptor::Audio(config) => (
+            messages::SOURCE_KIND_AUDIO,
+            config.linked_video_source_id.unwrap_or(0),
+        ),
+    };
+    let lifecycle = if source.playing {
+        messages::SOURCE_LIFECYCLE_ACTIVE
+    } else if source.ended {
+        messages::SOURCE_LIFECYCLE_ENDED
+    } else if source.attachment_state == messages::ATTACHMENT_NEVER {
+        messages::SOURCE_LIFECYCLE_CREATED
+    } else {
+        messages::SOURCE_LIFECYCLE_PAUSED
+    };
+    let playback = playback_snapshot(source);
+    Some(messages::SourceStatus {
+        source_id: key.1,
+        source_revision: source.revision,
+        kind,
+        lifecycle,
+        epoch: source.sequence.epoch(),
+        attachment_state: source.attachment_state,
+        attachment_generation: source.attachment_generation,
+        last_media_id: source.last_media_id,
+        last_media_sequence: source.last_inner_record_sequence,
+        last_decoded_pts_us: source.last_pts_us.unwrap_or(i64::MIN),
+        last_presented_pts_us: source.last_pts_us.unwrap_or(i64::MIN),
+        last_presentation_id: source.last_media_id,
+        visible,
+        capture_policy: 0,
+        linked_source_id,
+        milestones: source.milestones,
+        outstanding_byte_credit: maximum.saturating_sub(pending_bytes),
+        outstanding_packet_credit: INITIAL_PACKET_CREDITS.saturating_sub(pending_packets),
+        ingress_queue_depth: pending_packets.min(messages::QUEUE_DEPTH_CAPACITY),
+        descriptor: None,
+        playback,
+        terminal_loss_code: None,
+    })
+}
+
+fn playback_snapshot(source: &Source) -> Option<messages::PlaybackSnapshot> {
+    matches!(
+        source.descriptor,
+        SourceDescriptor::Video(_) | SourceDescriptor::Audio(_)
+    )
+    .then_some(messages::PlaybackSnapshot {
+        state: if source.playing {
+            messages::PLAYBACK_PLAYING
+        } else if source.ended {
+            messages::PLAYBACK_ENDED
+        } else {
+            messages::PLAYBACK_PAUSED
+        },
+        clock_pts_us: source
+            .last_pts_us
+            .unwrap_or(source.play_request.start_pts_us),
+        epoch: source.sequence.epoch(),
+        buffered_ahead_us: 0,
+        underrun_count: 0,
+        late_drop_count: 0,
+        eos_state: if source.ended {
+            messages::EOS_ACCEPTED
+        } else {
+            messages::EOS_NOT_RECEIVED
+        },
+    })
 }
 
 type DeliveryCredit = (Option<Arc<Writer>>, PendingDelivery);
@@ -865,6 +1404,21 @@ fn handle_control(
         let mut tag = [0; 16];
         getrandom::fill(&mut tag).map_err(|error| io::Error::other(error.to_string()))?;
         let anchor_key = anchor::derive_key(&token, &tag);
+        let (observation_sender, observation_receiver) =
+            mpsc::sync_channel::<ObservationWrite>(OBSERVATION_QUEUE);
+        let observation_writer = writer.clone();
+        thread::Builder::new()
+            .name(format!("vvmux-observation-{producer_id}"))
+            .spawn(move || {
+                while let Ok(event) = observation_receiver.recv() {
+                    if observation_writer
+                        .write_record(event.record_type, event.object_id, &event.body)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })?;
         state.producers.insert(
             producer_id,
             Producer {
@@ -872,9 +1426,16 @@ fn handle_control(
                 tag,
                 anchor_key,
                 writer: Arc::downgrade(&writer),
+                observation_sender,
                 features: features.iter().copied().collect(),
                 anchors: HashMap::new(),
                 seen_anchors: HashSet::new(),
+                scene_revision: SceneRevision::ZERO,
+                observation_mask: 0,
+                observation_sequence: ObservationSequence::ZERO,
+                first_lost_source_sequence: None,
+                first_lost_scene_sequence: None,
+                waits: HashMap::new(),
             },
         );
         let display = state.metrics.get(&pane).copied().unwrap_or(DisplayChanged {
@@ -892,13 +1453,14 @@ fn handle_control(
     writer.write_record(
         messages::WELCOME,
         0,
-        &messages::welcome_preserving(
+        &messages::welcome_preserving_at_scene_revision(
             request_id,
             producer_id,
             &tag,
             root_context,
             display,
             &features,
+            SceneRevision::ZERO,
             &hello.preserved_fields,
         ),
     )?;
@@ -950,7 +1512,367 @@ fn dispatch_control(
     delivery_changed: &Condvar,
     writer: &Arc<Writer>,
 ) -> io::Result<bool> {
+    let observability_record = matches!(
+        record.record_type,
+        messages::SET_OBSERVATION
+            | messages::QUERY_SOURCE
+            | messages::QUERY_SCENE
+            | messages::QUERY_ANCHOR
+            | messages::QUERY_LIMITS
+            | messages::WAIT_SOURCE
+            | messages::CANCEL_WAIT
+    );
+    if observability_record
+        && !shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .producers
+            .get(&producer)
+            .is_some_and(|runtime| {
+                runtime
+                    .features
+                    .contains(&messages::FEATURE_OBSERVABILITY_CORE_V1)
+            })
+    {
+        let request_id = messages::decode_control(&record.body)
+            .map(|envelope| envelope.request_id)
+            .unwrap_or(0);
+        writer.write_record(
+            messages::ERROR,
+            record.object_id,
+            &messages::error(
+                request_id,
+                messages::ERROR_UNSUPPORTED_FEATURE,
+                "observability was not negotiated",
+            ),
+        )?;
+        return Ok(true);
+    }
     match record.record_type {
+        messages::SET_OBSERVATION => {
+            let (envelope, mask) = messages::parse_set_observation(&record.body)?;
+            if record.object_id != 0 {
+                return Err(invalid("SET_OBSERVATION must be session-level"));
+            }
+            let mut state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let runtime = state
+                .producers
+                .get_mut(&producer)
+                .ok_or_else(|| invalid("producer missing"))?;
+            if !runtime
+                .features
+                .contains(&messages::FEATURE_OBSERVABILITY_CORE_V1)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "observability was not negotiated",
+                ));
+            }
+            runtime.observation_mask = mask;
+            runtime.first_lost_source_sequence = None;
+            runtime.first_lost_scene_sequence = None;
+            drop(state);
+            writer.write_ok(messages::OK, 0, envelope.request_id)?;
+        }
+        messages::QUERY_SOURCE => {
+            let (envelope, source_id) = messages::parse_query_source(&record.body)?;
+            if record.object_id != source_id {
+                return Err(invalid("QUERY_SOURCE object ID mismatch"));
+            }
+            let state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(status) = source_status(&state, (producer, source_id)) else {
+                let body = messages::error(
+                    envelope.request_id,
+                    messages::ERROR_NOT_FOUND,
+                    "source does not exist in this pane context",
+                );
+                drop(state);
+                writer.write_record(messages::ERROR, source_id, &body)?;
+                return Ok(true);
+            };
+            let body = messages::source_status(envelope.request_id, &status)?;
+            drop(state);
+            writer.write_record(messages::SOURCE_STATUS, source_id, &body)?;
+        }
+        messages::QUERY_SCENE => {
+            let (envelope, query) = messages::parse_query_scene(&record.body)?;
+            if record.object_id != 0 {
+                return Err(invalid("QUERY_SCENE must be session-level"));
+            }
+            let state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let revision = state
+                .producers
+                .get(&producer)
+                .ok_or_else(|| invalid("producer missing"))?
+                .scene_revision;
+            if query
+                .expected_revision
+                .is_some_and(|expected| expected != revision)
+                || query
+                    .cursor
+                    .is_some_and(|cursor| cursor.scene_revision != revision)
+            {
+                let mut detail = messages::ErrorDetail::new();
+                detail.insert_u64(messages::ERROR_DETAIL_SCENE_REVISION, revision.get());
+                let body = messages::error_with_detail(
+                    envelope.request_id,
+                    messages::ERROR_PRECONDITION_FAILED,
+                    false,
+                    &detail,
+                    "virtual scene revision changed",
+                )?;
+                drop(state);
+                writer.write_record(messages::ERROR, 0, &body)?;
+                return Ok(true);
+            }
+            let mut nodes = state
+                .nodes
+                .values()
+                .filter(|node| node.producer == producer)
+                .map(|node| node.config.clone())
+                .collect::<Vec<_>>();
+            nodes.sort_by_key(|node| node.node.node_id);
+            let total_nodes = nodes.len() as u64;
+            let offset = query.cursor.map_or(0, |cursor| cursor.offset) as usize;
+            if offset > nodes.len() {
+                return Err(invalid("scene cursor offset exceeds node count"));
+            }
+            let maximum = query
+                .maximum_nodes
+                .unwrap_or(messages::MAX_SCENE_NODES as u64)
+                .min(messages::MAX_SCENE_NODES as u64) as usize;
+            let end = offset.saturating_add(maximum).min(nodes.len());
+            let page = nodes[offset..end].to_vec();
+            let cursor = (end < nodes.len()).then_some(messages::SceneCursor {
+                scene_revision: revision,
+                offset: end as u64,
+            });
+            let body = messages::scene_status(
+                envelope.request_id,
+                &messages::SceneStatus {
+                    scene_revision: revision,
+                    nodes: page,
+                    cursor,
+                    total_nodes,
+                },
+            )?;
+            drop(state);
+            writer.write_record(messages::SCENE_STATUS, 0, &body)?;
+        }
+        messages::QUERY_ANCHOR => {
+            let (envelope, anchor_id) = messages::parse_query_anchor(&record.body)?;
+            if record.object_id != anchor_id {
+                return Err(invalid("QUERY_ANCHOR object ID mismatch"));
+            }
+            let state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let runtime = state
+                .producers
+                .get(&producer)
+                .ok_or_else(|| invalid("producer missing"))?;
+            let display = state
+                .metrics
+                .get(&runtime.pane)
+                .copied()
+                .unwrap_or(DisplayChanged {
+                    display_generation: 0,
+                    viewport_width: 0,
+                    viewport_height: 0,
+                    grid_columns: 0,
+                    grid_rows: 0,
+                    cell_width: 0,
+                    cell_height: 0,
+                    settled: true,
+                });
+            let (state_kind, row, column) = runtime.anchors.get(&anchor_id).map_or(
+                (messages::ANCHOR_STATE_UNKNOWN, 0, 0),
+                |(line, column)| {
+                    (
+                        messages::ANCHOR_STATE_READY,
+                        (*line).max(0) as u64,
+                        *column as u64,
+                    )
+                },
+            );
+            let body = messages::anchor_status(
+                envelope.request_id,
+                messages::AnchorStatus {
+                    anchor_id,
+                    state: state_kind,
+                    column,
+                    row,
+                    visible: state_kind == messages::ANCHOR_STATE_READY
+                        && state.active_panes.contains(&runtime.pane),
+                    display_generation: display.display_generation,
+                },
+            )?;
+            drop(state);
+            writer.write_record(messages::ANCHOR_STATUS, anchor_id, &body)?;
+        }
+        messages::QUERY_LIMITS => {
+            let envelope = messages::parse_query_limits(&record.body)?;
+            if record.object_id != 0 {
+                return Err(invalid("QUERY_LIMITS must be session-level"));
+            }
+            let state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current_sources = state
+                .sources
+                .keys()
+                .filter(|(owner, _)| *owner == producer)
+                .count() as u64;
+            let current_nodes = state
+                .nodes
+                .keys()
+                .filter(|(owner, _)| *owner == producer)
+                .count() as u64;
+            let body = messages::limits_status(
+                envelope.request_id,
+                messages::LimitsStatus {
+                    maximum_sources: state.config.max_sources as u64,
+                    maximum_nodes: state.config.max_nodes as u64,
+                    maximum_transactions: state.config.max_nodes as u64,
+                    maximum_anchors: state.config.max_anchors as u64,
+                    maximum_control_body: u64::from(vivid_protocol::CONTROL_MAX_RECORD_BODY),
+                    maximum_media_body: u64::from(vivid_protocol::HARD_MAX_RECORD_BODY),
+                    maximum_waits: MAX_REGISTERED_WAITS as u64,
+                    maximum_pending_requests: MAX_REGISTERED_WAITS as u64,
+                    rolling_byte_window: u64::from(vivid_protocol::HARD_MAX_RECORD_BODY),
+                    rolling_packet_window: INITIAL_PACKET_CREDITS,
+                    retained_pixel_budget: state.config.aggregate_retained_bytes / 4,
+                    current_sources,
+                    current_nodes,
+                    current_retained_pixels: state.retained_bytes as u64 / 4,
+                    image_cache_budget: None,
+                },
+            )?;
+            drop(state);
+            writer.write_record(messages::LIMITS_STATUS, 0, &body)?;
+        }
+        messages::WAIT_SOURCE => {
+            let (envelope, wait) = messages::parse_wait_source(&record.body)?;
+            if record.object_id != wait.source_id {
+                return Err(invalid("WAIT_SOURCE object ID mismatch"));
+            }
+            let duration = Duration::from_micros(wait.timeout_us);
+            if duration > MAX_WAIT_TIMEOUT {
+                return Err(invalid("WAIT_SOURCE timeout exceeds limit"));
+            }
+            let pending = PendingSourceWait {
+                source_id: wait.source_id,
+                condition: wait.condition,
+                value: wait.value,
+            };
+            let mut state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(source) = state.sources.get(&(producer, wait.source_id)) else {
+                let body = messages::error(
+                    envelope.request_id,
+                    messages::ERROR_NOT_FOUND,
+                    "source does not exist in this pane context",
+                );
+                drop(state);
+                writer.write_record(messages::ERROR, wait.source_id, &body)?;
+                return Ok(true);
+            };
+            let visible = state
+                .projected_sources
+                .contains(&(producer, wait.source_id));
+            if wait.condition == messages::WAIT_FIRST_VISIBLE_PRESENTATION && !visible {
+                let body = messages::error(
+                    envelope.request_id,
+                    messages::ERROR_NOT_VISIBLE,
+                    "pane source is not projected to the outer presenter",
+                );
+                drop(state);
+                writer.write_record(messages::ERROR, wait.source_id, &body)?;
+                return Ok(true);
+            }
+            if let Some(observed_value) = evaluate_wait(source, visible, pending) {
+                let body = messages::wait_satisfied(
+                    envelope.request_id,
+                    messages::WaitSatisfied {
+                        source_id: wait.source_id,
+                        source_revision: source.revision,
+                        condition: wait.condition,
+                        observed_value,
+                    },
+                )?;
+                drop(state);
+                writer.write_record(messages::WAIT_SATISFIED, wait.source_id, &body)?;
+                return Ok(true);
+            }
+            let runtime = state
+                .producers
+                .get_mut(&producer)
+                .ok_or_else(|| invalid("producer missing"))?;
+            if runtime.waits.len() >= MAX_REGISTERED_WAITS {
+                return Err(invalid("source wait quota exceeded"));
+            }
+            if runtime.waits.insert(envelope.request_id, pending).is_some() {
+                return Err(invalid("wait request ID is already registered"));
+            }
+            drop(state);
+            let shared = shared.clone();
+            let timeout_writer = writer.clone();
+            let request_id = envelope.request_id;
+            thread::spawn(move || {
+                thread::sleep(duration);
+                let expired = {
+                    let mut state = shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state
+                        .producers
+                        .get_mut(&producer)
+                        .and_then(|runtime| runtime.waits.remove(&request_id))
+                };
+                if let Some(wait) = expired {
+                    let _ = timeout_writer.write_record(
+                        messages::ERROR,
+                        wait.source_id,
+                        &messages::error(
+                            request_id,
+                            messages::ERROR_TIMEOUT,
+                            "source wait timed out",
+                        ),
+                    );
+                }
+            });
+        }
+        messages::CANCEL_WAIT => {
+            let (envelope, wait_request_id) = messages::parse_cancel_wait(&record.body)?;
+            if record.object_id != 0 {
+                return Err(invalid("CANCEL_WAIT must be session-level"));
+            }
+            let wait = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .producers
+                .get_mut(&producer)
+                .and_then(|runtime| runtime.waits.remove(&wait_request_id));
+            writer.write_ok(messages::OK, 0, envelope.request_id)?;
+            if let Some(wait) = wait {
+                writer.write_record(
+                    messages::ERROR,
+                    wait.source_id,
+                    &messages::error(
+                        wait_request_id,
+                        messages::ERROR_CANCELLED,
+                        "source wait was cancelled",
+                    ),
+                )?;
+            }
+        }
         messages::PROBE_VIDEO_CONFIG => {
             let (envelope, config) = messages::parse_create_video(&record.body)?;
             if record.object_id != 0 || config.source_id != 0 {
@@ -1182,7 +2104,16 @@ fn dispatch_control(
                 source.clock_origin_pts_us = None;
             }
             if changed {
-                state.revision = state.revision.wrapping_add(1);
+                let source = state.sources.get_mut(&(producer, source_id)).unwrap();
+                if playing {
+                    source.milestones |= messages::MILESTONE_PLAYBACK_STARTED;
+                }
+                advance_source(
+                    &mut state,
+                    (producer, source_id),
+                    messages::SOURCE_CHANGED_PLAYBACK | messages::SOURCE_CHANGED_MILESTONES,
+                )?;
+                advance_projection(&mut state);
             }
             writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
@@ -1200,6 +2131,14 @@ fn dispatch_control(
             source.minimum_epoch = epoch;
             source.ended = false;
             source.bridge_desynchronized = true;
+            source.last_media_id = 0;
+            source.last_pts_us = None;
+            source.milestones &= messages::MILESTONE_MEDIA_ATTACHED;
+            advance_source(
+                &mut state,
+                (producer, source_id),
+                messages::SOURCE_CHANGED_EPOCH | messages::SOURCE_CHANGED_MILESTONES,
+            )?;
             writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
         messages::EOS => {
@@ -1213,6 +2152,7 @@ fn dispatch_control(
                 .get_mut(&(producer, source_id))
                 .ok_or_else(|| invalid("source missing"))?;
             source.ended = true;
+            source.milestones |= messages::MILESTONE_EOS_ACCEPTED;
             // EOS closes ingress but does not pause presentation. Vivi submits ahead, then keeps
             // the session alive while already-buffered media plays. Retain the current PLAY state
             // so projection reconciliation does not translate EOS into an outer PAUSE that stops
@@ -1221,7 +2161,14 @@ fn dispatch_control(
                 source.retained = None;
                 source.retained_bytes = 0;
             }
-            state.revision = state.revision.wrapping_add(1);
+            advance_source(
+                &mut state,
+                (producer, source_id),
+                messages::SOURCE_CHANGED_LIFECYCLE
+                    | messages::SOURCE_CHANGED_PLAYBACK
+                    | messages::SOURCE_CHANGED_MILESTONES,
+            )?;
+            advance_projection(&mut state);
             writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
         messages::PING => {
@@ -1292,6 +2239,11 @@ fn create_source(
             clock_started: None,
             clock_origin_pts_us: None,
             last_inner_record_sequence: 0,
+            revision: SourceRevision::new(1),
+            attachment_state: messages::ATTACHMENT_NEVER,
+            attachment_generation: 0,
+            last_media_id: 0,
+            milestones: 0,
         },
     );
     state.tickets.insert(
@@ -1314,22 +2266,37 @@ fn create_source(
     {
         state.projected_sources.insert((producer, source_id));
     }
-    state.revision = state.revision.wrapping_add(1);
+    advance_projection(&mut state);
     drop(state);
     writer.write_record(
         messages::SOURCE_READY,
         source_id,
-        &messages::source_ready(
+        &messages::source_ready_with_observability(
             request_id,
-            source_id,
-            &ticket,
-            Credits {
-                bytes: u64::from(maximum),
-                packets: INITIAL_PACKET_CREDITS,
-                fragments: 0,
+            &SourceReady {
+                source_id,
+                media_ticket: ticket.to_vec(),
+                byte_credits: u64::from(maximum),
+                packet_credits: INITIAL_PACKET_CREDITS,
+                fragment_credits: 0,
+                max_media_body: maximum,
+                rolling_byte_window: u64::from(maximum),
+                rolling_packet_window: INITIAL_PACKET_CREDITS,
+                initial_source_revision: SourceRevision::new(1),
+                media_connection_required: true,
+                delta_operation_limit: None,
             },
-            maximum,
-        ),
+        )?,
+    )?;
+    let mut state = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    emit_source_event(
+        &mut state,
+        (producer, source_id),
+        messages::SOURCE_CHANGED_LIFECYCLE
+            | messages::SOURCE_CHANGED_ATTACHMENT
+            | messages::SOURCE_CHANGED_DESCRIPTOR,
     )
 }
 
@@ -1366,21 +2333,57 @@ fn handle_media(
     if ticket.kind != kind {
         return Err(invalid("media channel kind does not match ticket"));
     }
+    {
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source = state
+            .sources
+            .get_mut(&ticket.source)
+            .ok_or_else(|| invalid("source missing"))?;
+        source.attachment_generation = source
+            .attachment_generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("attachment generation exhausted"))?;
+        source.attachment_state = messages::ATTACHMENT_ATTACHED;
+        source.milestones |= messages::MILESTONE_MEDIA_ATTACHED;
+        advance_source(
+            &mut state,
+            ticket.source,
+            messages::SOURCE_CHANGED_ATTACHMENT | messages::SOURCE_CHANGED_MILESTONES,
+        )?;
+    }
     mark_connection_pane(shared, connection_id, pane)?;
     reader.clear_read_deadline()?;
     reader.set_maximum(ticket.maximum_body);
     let mut body = Vec::new();
-    loop {
+    let result = loop {
         let record = match reader.read_record_into(&mut body) {
             Ok(record) => record,
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(error),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
+            Err(error) => break Err(error),
         };
         if record.object_id != ticket.source.1 {
-            return Err(invalid("media object ID mismatch"));
+            break Err(invalid("media object ID mismatch"));
         }
-        ingest_record(shared, delivery_changed, ticket.source, &record)?;
+        if let Err(error) = ingest_record(shared, delivery_changed, ticket.source, &record) {
+            break Err(error);
+        }
+    };
+    {
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(source) = state.sources.get_mut(&ticket.source) {
+            source.attachment_state = messages::ATTACHMENT_CLOSED;
+            let _ = advance_source(
+                &mut state,
+                ticket.source,
+                messages::SOURCE_CHANGED_ATTACHMENT,
+            );
+        }
     }
+    result
 }
 
 fn headless_playback_delay(
@@ -1443,6 +2446,7 @@ fn ingest_record(
                 source.sequence.accept(parsed.frame_id, parsed.epoch)?;
                 media::decode_raster_pixels(parsed)?;
                 source.last_pts_us = Some(parsed.pts_us);
+                source.last_media_id = parsed.frame_id;
                 Some(Arc::<[u8]>::from(record.body))
             }
             (SourceDescriptor::Image(config), messages::IMAGE_DATA) => {
@@ -1465,6 +2469,7 @@ fn ingest_record(
                 if (decoded.width(), decoded.height()) != (config.width, config.height) {
                     return Err(invalid("decoded image dimensions mismatch"));
                 }
+                source.last_media_id = 1;
                 Some(Arc::<[u8]>::from(record.body))
             }
             (SourceDescriptor::Video(config), messages::VIDEO_PACKET) => {
@@ -1474,6 +2479,7 @@ fn ingest_record(
                 }
                 source.sequence.accept(packet.packet_id, packet.epoch)?;
                 source.last_pts_us = Some(packet.pts_us);
+                source.last_media_id = packet.packet_id;
                 let recovered = source.bridge_desynchronized
                     && packet.epoch >= source.minimum_epoch
                     && packet.flags & media::VIDEO_PACKET_KEY != 0;
@@ -1491,6 +2497,7 @@ fn ingest_record(
                 }
                 source.sequence.accept(packet.packet_id, packet.epoch)?;
                 source.last_pts_us = Some(packet.pts_us);
+                source.last_media_id = packet.packet_id;
                 None
             }
             _ => return Err(invalid("media record type does not match source")),
@@ -1527,13 +2534,31 @@ fn ingest_record(
     }
     source.last_pts_us = pts;
     source.last_inner_record_sequence = record.sequence;
+    source.milestones |= messages::MILESTONE_FIRST_MEDIA_RECORD
+        | messages::MILESTONE_DECODER_INITIALIZED
+        | messages::MILESTONE_FIRST_DECODED_OUTPUT;
+    if projected_source {
+        source.milestones |= messages::MILESTONE_FIRST_VISIBLE_PRESENTATION;
+    }
+    if record.record_type == messages::VIDEO_PACKET
+        && media::parse_video_packet(record.body)?.flags & media::VIDEO_PACKET_KEY != 0
+    {
+        source.milestones |= messages::MILESTONE_RANDOM_ACCESS_ACCEPTED;
+    }
     state.retained_bytes = projected;
     if retained_requires_revision && new_retained > 0 && old_retained == 0 {
         // Immutable images have no live MediaEvent, so their first retained body must trigger
         // hydration. Raster bodies are exclusively live while projected and are picked up from
         // retained state only on an independently required source/layout rebuild.
-        state.revision = state.revision.wrapping_add(1);
+        advance_projection(&mut state);
     }
+    advance_source(
+        &mut state,
+        key,
+        messages::SOURCE_CHANGED_EPOCH
+            | messages::SOURCE_CHANGED_MILESTONES
+            | messages::SOURCE_CHANGED_CREDIT_ACCOUNTING,
+    )?;
     let headless_delay = (!projected_source)
         .then(|| headless_playback_delay(&mut state, key, pts))
         .flatten();
@@ -1636,7 +2661,8 @@ fn apply_transaction(
         return Err(invalid("node quota exceeded"));
     }
     state.nodes = nodes;
-    state.revision = state.revision.wrapping_add(1);
+    advance_scene(state, producer, messages::SCENE_CHANGED_PRODUCER_COMMIT)?;
+    advance_projection(state);
     Ok(())
 }
 
@@ -1720,7 +2746,10 @@ fn remove_source(state: &mut State, key: SourceKey) -> io::Result<()> {
     state
         .nodes
         .retain(|_, node| node.producer != key.0 || node.config.node.source_id != key.1);
-    state.revision = state.revision.wrapping_add(1);
+    if state.producers.contains_key(&key.0) {
+        advance_scene(state, key.0, messages::SCENE_CHANGED_SOURCE_LOSS)?;
+    }
+    advance_projection(state);
     Ok(())
 }
 
@@ -1757,7 +2786,7 @@ fn cleanup_producer(state: &mut State, producer: ProducerId, preserve_anchored_s
                     }))
     });
     prune_orphaned_sources(state);
-    state.revision = state.revision.wrapping_add(1);
+    advance_projection(state);
 }
 
 fn prune_orphaned_sources(state: &mut State) {
@@ -1795,6 +2824,7 @@ fn supported_feature(feature: u64) -> bool {
             | messages::FEATURE_AUDIO_ACCESS_UNIT_V1
             | messages::FEATURE_NODE_CLIP_RECT_V1
             | messages::FEATURE_DECODER_DESCRIPTION_V1
+            | messages::FEATURE_OBSERVABILITY_CORE_V1
     )
 }
 
@@ -1878,7 +2908,7 @@ mod tests {
             next_producer: 0,
             retained_bytes: 0,
             connections: 0,
-            revision: 0,
+            projection_revision: 0,
             projected_sources: HashSet::new(),
             active_panes: HashSet::new(),
             deliveries: HashMap::new(),
@@ -2958,5 +3988,130 @@ mod tests {
         assert_eq!(resolved.nodes[0].config.node.anchor_id, None);
         assert_eq!(resolved.nodes[0].config.node.x, 6_i64 << 32);
         assert_eq!(resolved.nodes[0].config.node.y, 5_i64 << 32);
+    }
+
+    #[test]
+    fn observability_is_pane_scoped_and_outer_revision_is_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = test_virtual_endpoint(&directory, "observability.sock");
+        let service = match VirtualVivid::start(socket, MediaConfig::default()) {
+            Ok(service) => service,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping virtual presenter socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("virtual presenter start failed: {error}"),
+        };
+        let token_one = service.issue_pane_capability(7).unwrap();
+        let token_two = service.issue_pane_capability(8).unwrap();
+        let endpoint = service_endpoint(&service);
+
+        let mut owner = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        owner
+            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &token_one))
+            .unwrap();
+        assert_eq!(owner.read_record().unwrap().record_type, messages::WELCOME);
+        owner
+            .write_record(
+                messages::SET_OBSERVATION,
+                0,
+                0,
+                &messages::set_observation(
+                    2,
+                    messages::OBSERVE_SOURCE_TRANSITIONS | messages::OBSERVE_SCENE_CHANGES,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(owner.read_record().unwrap().record_type, messages::OK);
+        owner
+            .write_record(
+                messages::CREATE_IMAGE,
+                0,
+                1,
+                &messages::create_image(
+                    3,
+                    &messages::ImageSourceConfig {
+                        source_id: 1,
+                        encoding: messages::IMAGE_PNG,
+                        width: 1,
+                        height: 1,
+                        encoded_length: 1,
+                        sha256: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let ready = owner.read_record().unwrap();
+        assert_eq!(ready.record_type, messages::SOURCE_READY);
+        let ready = messages::parse_source_ready(&ready.body).unwrap();
+        assert_eq!(ready.initial_source_revision, SourceRevision::new(1));
+        let changed = owner.read_record().unwrap();
+        assert_eq!(changed.record_type, messages::SOURCE_CHANGED);
+        let changed = messages::parse_source_changed(&changed.body).unwrap();
+        assert_eq!(changed.source_id, 1);
+        assert_eq!(changed.source_revision, SourceRevision::new(1));
+
+        let mut other = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        other
+            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &token_two))
+            .unwrap();
+        assert_eq!(other.read_record().unwrap().record_type, messages::WELCOME);
+        other
+            .write_record(
+                messages::QUERY_SOURCE,
+                0,
+                1,
+                &messages::query_source(2, 1).unwrap(),
+            )
+            .unwrap();
+        let rejected = other.read_record().unwrap();
+        assert_eq!(rejected.record_type, messages::ERROR);
+        assert_eq!(
+            messages::parse_error_reply(&rejected.body).unwrap().code,
+            messages::ERROR_NOT_FOUND
+        );
+
+        owner
+            .write_record(
+                messages::WAIT_SOURCE,
+                0,
+                1,
+                &messages::wait_source(
+                    4,
+                    messages::WaitSource {
+                        source_id: 1,
+                        condition: messages::WAIT_FIRST_VISIBLE_PRESENTATION,
+                        value: None,
+                        timeout_us: 1_000_000,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let not_visible = owner.read_record().unwrap();
+        assert_eq!(not_visible.record_type, messages::ERROR);
+        assert_eq!(
+            messages::parse_error_reply(&not_visible.body).unwrap().code,
+            messages::ERROR_NOT_VISIBLE
+        );
+
+        let outer_generations = HashMap::from([(
+            crate::ipc::BridgeSourceKey {
+                producer: 1,
+                source: 1,
+            },
+            7,
+        )]);
+        let first = service.pane_status(7, 41, &outer_generations);
+        let second = service.pane_status(7, 42, &outer_generations);
+        assert_eq!(first.virtual_scene_revision, second.virtual_scene_revision);
+        assert_eq!(
+            first.sources[0].source_revision, second.sources[0].source_revision,
+            "outer applied revision must not perturb virtual source revision"
+        );
+        assert_eq!(first.sources[0].attachment_generation, 0);
+        assert_eq!(first.sources[0].outer_attachment_generation, Some(7));
+        assert_eq!(second.outer_projection_revision, 42);
     }
 }
