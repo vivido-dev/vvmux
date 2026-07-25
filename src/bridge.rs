@@ -39,6 +39,7 @@ const OPTIONAL_FEATURES: &[u64] = &[
     messages::FEATURE_SOURCE_DESCRIPTOR_V1,
     messages::FEATURE_DELEGATED_CONTEXT_V1,
     messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
+    messages::FEATURE_MEDIA_ORDER_BARRIER_V1,
 ];
 const MAX_PENDING_CONTROL_REPLIES: usize = 4096;
 const MEDIA_WRITER_QUEUE: usize = 32;
@@ -547,6 +548,11 @@ struct MediaWrite {
     body: Vec<u8>,
 }
 
+enum MediaWriterCommand {
+    Write(MediaWrite),
+    Barrier(mpsc::SyncSender<u64>),
+}
+
 struct MediaCompletion {
     delivery_id: u64,
     delivered: bool,
@@ -554,7 +560,7 @@ struct MediaCompletion {
 }
 
 struct SourceMediaWriter {
-    sender: mpsc::SyncSender<MediaWrite>,
+    sender: mpsc::SyncSender<MediaWriterCommand>,
 }
 
 pub(crate) trait ConnectionFactory: Send + Sync {
@@ -609,6 +615,7 @@ pub struct OuterBridge {
     delegated_contexts: bool,
     capture_policy: bool,
     source_descriptors: bool,
+    media_order_barrier: bool,
     pane_contexts: HashMap<u64, PaneContextMapping>,
 }
 
@@ -714,6 +721,8 @@ impl OuterBridge {
             accepted_features.contains(&messages::FEATURE_SOURCE_CAPTURE_POLICY_V1);
         let source_descriptors =
             accepted_features.contains(&messages::FEATURE_SOURCE_DESCRIPTOR_V1);
+        let media_order_barrier =
+            accepted_features.contains(&messages::FEATURE_MEDIA_ORDER_BARRIER_V1);
         connection.set_send_body_limit(welcome.maximum_control_body)?;
         let control = ControlDispatcher::start(
             connection,
@@ -749,6 +758,7 @@ impl OuterBridge {
             delegated_contexts,
             capture_policy,
             source_descriptors,
+            media_order_barrier,
             pane_contexts: HashMap::new(),
         };
         if accepted_features.contains(&messages::FEATURE_OBSERVABILITY_CORE_V1) {
@@ -1256,12 +1266,12 @@ impl OuterBridge {
                     io::Error::new(io::ErrorKind::NotFound, "projection media channel missing")
                 })?
                 .sender
-                .try_send(MediaWrite {
+                .try_send(MediaWriterCommand::Write(MediaWrite {
                     delivery_id,
                     record_type: pending.record_type,
                     object_id: upstream,
                     body: pending.bytes,
-                })
+                }))
                 .map_err(|error| match error {
                     mpsc::TrySendError::Full(_) => io::Error::new(
                         io::ErrorKind::WouldBlock,
@@ -1682,7 +1692,47 @@ impl OuterBridge {
             .get(&source.key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ended source missing"))?;
         let request = self.request_id()?;
-        let body = messages::eos(request, upstream, epoch);
+        let body = if self.media_order_barrier {
+            let media = self.media.get(&source.key).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "ended source media channel missing",
+                )
+            })?;
+            let (reply, sequence) = mpsc::sync_channel(1);
+            media
+                .sender
+                .send(MediaWriterCommand::Barrier(reply))
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "media writer stopped"))?;
+            let final_record_sequence = sequence.recv().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "media writer did not report sequence",
+                )
+            })?;
+            let attachment_generation = *self
+                .outer_attachment_generations
+                .get(&source.key)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "ended source attachment generation missing",
+                    )
+                })?;
+            if final_record_sequence > 1 {
+                messages::eos_with_barrier(
+                    request,
+                    upstream,
+                    epoch,
+                    attachment_generation,
+                    final_record_sequence,
+                )
+            } else {
+                messages::eos(request, upstream, epoch)
+            }
+        } else {
+            messages::eos(request, upstream, epoch)
+        };
         self.control.write_record(
             messages::EOS,
             0,
@@ -1832,10 +1882,18 @@ fn validate_snapshot(sources: &[BridgeSource], nodes: &[BridgeNode]) -> io::Resu
 fn run_media_writer(
     mut connection: Connection,
     shared: Arc<SharedControl>,
-    receiver: mpsc::Receiver<MediaWrite>,
+    receiver: mpsc::Receiver<MediaWriterCommand>,
     completions: mpsc::Sender<MediaCompletion>,
 ) {
-    while let Ok(write) = receiver.recv() {
+    let mut last_record_sequence = 1;
+    while let Ok(command) = receiver.recv() {
+        let write = match command {
+            MediaWriterCommand::Write(write) => write,
+            MediaWriterCommand::Barrier(reply) => {
+                let _ = reply.send(last_record_sequence);
+                continue;
+            }
+        };
         let written = reserve_outer_credit(&shared, write.object_id, write.body.len() as u64)
             .and_then(|()| {
                 connection.write_record_parts(
@@ -1847,6 +1905,9 @@ fn run_media_writer(
             });
         let delivered = written.is_ok();
         let record_sequence = written.unwrap_or(0);
+        if delivered {
+            last_record_sequence = record_sequence;
+        }
         if completions
             .send(MediaCompletion {
                 delivery_id: write.delivery_id,
@@ -2549,7 +2610,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn outer_initial_window_is_filled_without_credit_return() {
+    fn outer_initial_window_and_reoriginated_eos_barrier_use_outer_sequences() {
         use std::os::unix::net::UnixListener;
 
         let directory = tempfile::tempdir().unwrap();
@@ -2578,6 +2639,7 @@ mod tests {
                 messages::FEATURE_VIDEO_CONTROL_V1,
                 messages::FEATURE_AUDIO_ACCESS_UNIT_V1,
                 messages::FEATURE_NODE_CLIP_RECT_V1,
+                messages::FEATURE_MEDIA_ORDER_BARRIER_V1,
             ];
             let mut sequence = 0;
             write_server_record(
@@ -2660,7 +2722,25 @@ mod tests {
                     &messages::ok(request),
                 )?;
             }
-            media_reader.join().unwrap()
+            media_reader.join().unwrap()?;
+            let eos = read_client_record(&mut control)?;
+            assert_eq!(eos.record_type, messages::EOS);
+            let (envelope, request) = messages::parse_eos(&eos.body)?;
+            assert_eq!(
+                request.barrier,
+                Some(messages::MediaOrderBarrier {
+                    attachment_generation: 1,
+                    final_record_sequence: 4,
+                }),
+                "the outer EOS must name the outer attachment and its own final record sequence"
+            );
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                eos.object_id,
+                &messages::ok(envelope.request_id),
+            )
         });
 
         let mut bridge = OuterBridge::connect(
@@ -2734,6 +2814,11 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(completed, HashMap::from([(1, 2), (2, 3), (3, 4)]));
+        let mut ended = source.clone();
+        ended.eos_epoch = Some(1);
+        bridge
+            .update_playback(std::slice::from_ref(&source), std::slice::from_ref(&ended))
+            .unwrap();
         server.join().unwrap().unwrap();
     }
 

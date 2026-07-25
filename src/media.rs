@@ -33,6 +33,8 @@ const MAX_SEEN_ANCHORS: usize = 4096;
 // projected again instead of consuming a large local credit window before reading control events.
 const INITIAL_PACKET_CREDITS: u64 = 1;
 const MAX_REGISTERED_WAITS: usize = 64;
+const MAX_PENDING_MEDIA_BARRIERS: usize = 64;
+const MEDIA_ORDER_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const OBSERVATION_QUEUE: usize = 64;
 
@@ -226,6 +228,7 @@ struct State {
     projected_sources: HashSet<SourceKey>,
     active_panes: HashSet<PaneId>,
     deliveries: HashMap<u64, PendingDelivery>,
+    pending_media_barriers: HashSet<(ProducerId, u64)>,
     next_delivery_id: u64,
     queued_bridge_bytes: usize,
     events: Option<mpsc::SyncSender<MediaEvent>>,
@@ -274,6 +277,7 @@ impl VirtualVivid {
             projected_sources: HashSet::new(),
             active_panes: HashSet::new(),
             deliveries: HashMap::new(),
+            pending_media_barriers: HashSet::new(),
             next_delivery_id: 0,
             queued_bridge_bytes: 0,
             events,
@@ -1291,6 +1295,82 @@ fn wait_for_source_deliveries(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaBarrierWait {
+    Accepted,
+    AttachmentChanged,
+    AttachmentClosed,
+    SourceLost,
+    TimedOut,
+}
+
+fn wait_for_media_barrier(
+    shared: &Arc<Mutex<State>>,
+    changed: &Condvar,
+    source: SourceKey,
+    attachment_generation: u64,
+    final_record_sequence: u64,
+    timeout: Duration,
+) -> MediaBarrierWait {
+    let deadline = Instant::now() + timeout;
+    let mut state = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        let Some(current) = state.sources.get(&source) else {
+            return MediaBarrierWait::SourceLost;
+        };
+        if current.attachment_generation != attachment_generation {
+            return MediaBarrierWait::AttachmentChanged;
+        }
+        if current.last_inner_record_sequence >= final_record_sequence {
+            return MediaBarrierWait::Accepted;
+        }
+        if current.attachment_state == messages::ATTACHMENT_CLOSED {
+            return MediaBarrierWait::AttachmentClosed;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return MediaBarrierWait::TimedOut;
+        };
+        let (next, result) = changed
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = next;
+        if result.timed_out() {
+            return MediaBarrierWait::TimedOut;
+        }
+    }
+}
+
+fn apply_inner_eos(
+    state: &mut State,
+    source: SourceKey,
+    eos_epoch: u32,
+    causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
+) -> io::Result<()> {
+    let current = state
+        .sources
+        .get_mut(&source)
+        .ok_or_else(|| invalid("source missing"))?;
+    current.ended = true;
+    current.eos_epoch = Some(eos_epoch);
+    current.causation_id = causation_id;
+    current.milestones |= messages::MILESTONE_EOS_ACCEPTED;
+    if !current.descriptor.is_static() {
+        current.retained = None;
+        current.retained_bytes = 0;
+    }
+    advance_source(
+        state,
+        source,
+        messages::SOURCE_CHANGED_LIFECYCLE
+            | messages::SOURCE_CHANGED_PLAYBACK
+            | messages::SOURCE_CHANGED_MILESTONES,
+    )?;
+    advance_projection(state);
+    Ok(())
+}
+
 impl Drop for VirtualVivid {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -1365,7 +1445,7 @@ fn handle_connection(
     stream: Transport,
     connection_id: u64,
     state: &Arc<Mutex<State>>,
-    delivery_changed: &Condvar,
+    delivery_changed: &Arc<Condvar>,
 ) -> io::Result<()> {
     stream.set_read_deadline(Duration::from_secs(3))?;
     let (mut reader, preface) = Reader::new(stream)?;
@@ -1413,7 +1493,7 @@ fn handle_control(
     reader: &mut Reader,
     connection_id: u64,
     shared: &Arc<Mutex<State>>,
-    delivery_changed: &Condvar,
+    delivery_changed: &Arc<Condvar>,
 ) -> io::Result<()> {
     let writer = Arc::new(reader.writer()?);
     let hello_record = reader.read_record()?;
@@ -1646,7 +1726,7 @@ fn dispatch_control(
     producer: ProducerId,
     root_context: u64,
     shared: &Arc<Mutex<State>>,
-    delivery_changed: &Condvar,
+    delivery_changed: &Arc<Condvar>,
     writer: &Arc<Writer>,
 ) -> io::Result<bool> {
     let observability_record = matches!(
@@ -2586,39 +2666,155 @@ fn dispatch_control(
             writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
         messages::EOS => {
-            let (envelope, source_id, eos_epoch) = messages::parse_eos(&record.body)?;
-            wait_for_source_deliveries(shared, delivery_changed, (producer, source_id));
-            let mut state = shared
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let source = state
-                .sources
-                .get_mut(&(producer, source_id))
-                .ok_or_else(|| invalid("source missing"))?;
-            source.ended = true;
-            // `wait_for_source_deliveries` above already drained this source's outstanding bridge
-            // deliveries, so publishing the epoch now orders the outer EOS strictly after the last
-            // forwarded media record.
-            source.eos_epoch = Some(eos_epoch);
-            source.causation_id = envelope.causation_id;
-            source.milestones |= messages::MILESTONE_EOS_ACCEPTED;
-            // EOS closes ingress but does not pause presentation. Vivi submits ahead, then keeps
-            // the session alive while already-buffered media plays. Retain the current PLAY state
-            // so projection reconciliation does not translate EOS into an outer PAUSE that stops
-            // both video and linked audio before their queues are presented.
-            if !source.descriptor.is_static() {
-                source.retained = None;
-                source.retained_bytes = 0;
+            let (envelope, request) = messages::parse_eos(&record.body)?;
+            if record.object_id != request.source_id {
+                return Err(invalid("EOS object ID mismatch"));
             }
-            advance_source(
-                &mut state,
-                (producer, source_id),
-                messages::SOURCE_CHANGED_LIFECYCLE
-                    | messages::SOURCE_CHANGED_PLAYBACK
-                    | messages::SOURCE_CHANGED_MILESTONES,
-            )?;
-            advance_projection(&mut state);
-            writer.write_ok(messages::OK, source_id, envelope.request_id)?;
+            let source_key = (producer, request.source_id);
+            if let Some(barrier) = request.barrier {
+                {
+                    let mut state = shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let negotiated = state.producers.get(&producer).is_some_and(|producer| {
+                        producer
+                            .features
+                            .contains(&messages::FEATURE_MEDIA_ORDER_BARRIER_V1)
+                    });
+                    if !negotiated {
+                        writer.write_record(
+                            messages::ERROR,
+                            request.source_id,
+                            &messages::error(
+                                envelope.request_id,
+                                messages::ERROR_UNSUPPORTED_FEATURE,
+                                "media-order barrier was not negotiated",
+                            ),
+                        )?;
+                        return Ok(true);
+                    }
+                    let Some(source) = state.sources.get(&source_key) else {
+                        writer.write_record(
+                            messages::ERROR,
+                            request.source_id,
+                            &messages::error(
+                                envelope.request_id,
+                                messages::ERROR_NOT_FOUND,
+                                "source missing",
+                            ),
+                        )?;
+                        return Ok(true);
+                    };
+                    if source.attachment_generation != barrier.attachment_generation {
+                        writer.write_record(
+                            messages::ERROR,
+                            request.source_id,
+                            &messages::error(
+                                envelope.request_id,
+                                messages::ERROR_BAD_STATE,
+                                "EOS attachment generation is not current",
+                            ),
+                        )?;
+                        return Ok(true);
+                    }
+                    if state.pending_media_barriers.len() >= MAX_PENDING_MEDIA_BARRIERS
+                        || !state
+                            .pending_media_barriers
+                            .insert((producer, envelope.request_id))
+                    {
+                        writer.write_record(
+                            messages::ERROR,
+                            request.source_id,
+                            &messages::error(
+                                envelope.request_id,
+                                messages::ERROR_LIMIT_EXCEEDED,
+                                "media-order barrier quota exceeded",
+                            ),
+                        )?;
+                        return Ok(true);
+                    }
+                }
+                let worker_state = shared.clone();
+                let worker_changed = delivery_changed.clone();
+                let worker_writer = writer.clone();
+                let barrier_request_id = envelope.request_id;
+                let spawn_result = thread::Builder::new()
+                    .name("vvmux-media-order-barrier".into())
+                    .spawn(move || {
+                        let result = wait_for_media_barrier(
+                            &worker_state,
+                            &worker_changed,
+                            source_key,
+                            barrier.attachment_generation,
+                            barrier.final_record_sequence,
+                            MEDIA_ORDER_BARRIER_TIMEOUT,
+                        );
+                        let response = match result {
+                            MediaBarrierWait::Accepted => {
+                                let mut state = worker_state
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                apply_inner_eos(
+                                    &mut state,
+                                    source_key,
+                                    request.epoch,
+                                    envelope.causation_id,
+                                )
+                                .map(|_| (messages::OK, messages::ok(envelope.request_id)))
+                                .unwrap_or_else(|_| {
+                                    (
+                                        messages::ERROR,
+                                        messages::error(
+                                            envelope.request_id,
+                                            messages::ERROR_BAD_STATE,
+                                            "source ended before EOS was applied",
+                                        ),
+                                    )
+                                })
+                            }
+                            MediaBarrierWait::TimedOut => (
+                                messages::ERROR,
+                                messages::error(
+                                    envelope.request_id,
+                                    messages::ERROR_TIMEOUT,
+                                    "EOS media-order barrier timed out",
+                                ),
+                            ),
+                            MediaBarrierWait::AttachmentChanged
+                            | MediaBarrierWait::AttachmentClosed
+                            | MediaBarrierWait::SourceLost => (
+                                messages::ERROR,
+                                messages::error(
+                                    envelope.request_id,
+                                    messages::ERROR_BAD_STATE,
+                                    "media attachment ended before EOS barrier",
+                                ),
+                            ),
+                        };
+                        worker_state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .pending_media_barriers
+                            .remove(&(producer, envelope.request_id));
+                        let _ =
+                            worker_writer.write_record(response.0, request.source_id, &response.1);
+                    });
+                if let Err(error) = spawn_result {
+                    shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pending_media_barriers
+                        .remove(&(producer, barrier_request_id));
+                    return Err(error);
+                }
+            } else {
+                wait_for_source_deliveries(shared, delivery_changed, source_key);
+                let mut state = shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                apply_inner_eos(&mut state, source_key, request.epoch, envelope.causation_id)?;
+                writer.write_ok(messages::OK, request.source_id, envelope.request_id)?;
+            }
         }
         messages::PING => {
             let envelope = messages::decode_control(&record.body)?;
@@ -2859,6 +3055,7 @@ fn handle_media(
             );
         }
     }
+    delivery_changed.notify_all();
     result
 }
 
@@ -3067,6 +3264,7 @@ fn ingest_record(
         None
     };
     drop(state);
+    delivery_changed.notify_all();
     if let Some(delay) = headless_delay {
         thread::sleep(delay);
     }
@@ -3239,6 +3437,9 @@ fn cleanup_producer(state: &mut State, producer: ProducerId, preserve_anchored_s
     state
         .tickets
         .retain(|_, ticket| ticket.source.0 != producer);
+    state
+        .pending_media_barriers
+        .retain(|(owner, _)| *owner != producer);
     for node in state
         .nodes
         .values_mut()
@@ -3307,6 +3508,7 @@ fn supported_feature(feature: u64) -> bool {
             | messages::FEATURE_OBSERVABILITY_CORE_V1
             | messages::FEATURE_SOURCE_CAPTURE_POLICY_V1
             | messages::FEATURE_SOURCE_DESCRIPTOR_V1
+            | messages::FEATURE_MEDIA_ORDER_BARRIER_V1
     )
 }
 
@@ -3446,6 +3648,7 @@ mod tests {
             projected_sources: HashSet::new(),
             active_panes: HashSet::new(),
             deliveries: HashMap::new(),
+            pending_media_barriers: HashSet::new(),
             next_delivery_id: 0,
             queued_bridge_bytes: 0,
             events: None,
@@ -3572,6 +3775,107 @@ mod tests {
             max_access_unit_bytes: 1024,
         });
         assert!(!descriptor.is_static());
+    }
+
+    fn barrier_source(generation: u64) -> Source {
+        Source {
+            owner: 1,
+            descriptor: SourceDescriptor::Video(ParsedVideoSourceConfig {
+                codec_string: None,
+                decoder_config: None,
+                source_id: 1,
+                codec: "h264".into(),
+                packetization: "annex-b-au-v1".into(),
+                extradata: Vec::new(),
+                width: 10,
+                height: 10,
+                profile: 0,
+                level: 0,
+                bitrate: 0,
+                color_primaries: 0,
+                transfer: 0,
+                matrix: 0,
+                range: 0,
+                sar_num: 1,
+                sar_den: 1,
+                max_access_unit_bytes: 1024,
+            }),
+            retained: None,
+            sequence: MediaSequence::default(),
+            retained_bytes: 0,
+            playing: false,
+            play_request: messages::PlayRequest::baseline(1, 0),
+            ended: false,
+            eos_epoch: None,
+            bridge_desynchronized: false,
+            minimum_epoch: 0,
+            last_pts_us: None,
+            clock_started: None,
+            clock_origin_pts_us: None,
+            last_inner_record_sequence: 0,
+            revision: SourceRevision::new(1),
+            attachment_state: messages::ATTACHMENT_ATTACHED,
+            attachment_generation: generation,
+            last_media_id: 0,
+            milestones: messages::MILESTONE_MEDIA_ATTACHED,
+            causation_id: None,
+            capture_policy: 0,
+            semantic_descriptor: None,
+        }
+    }
+
+    #[test]
+    fn media_order_barrier_wait_covers_accept_mismatch_close_loss_and_timeout() {
+        let mut initial = state();
+        initial.sources.insert((1, 1), barrier_source(1));
+        let shared = Arc::new(Mutex::new(initial));
+        let changed = Arc::new(Condvar::new());
+        let waiter = {
+            let state = shared.clone();
+            let changed = changed.clone();
+            thread::spawn(move || {
+                wait_for_media_barrier(&state, &changed, (1, 1), 1, 2, Duration::from_secs(1))
+            })
+        };
+        shared
+            .lock()
+            .unwrap()
+            .sources
+            .get_mut(&(1, 1))
+            .unwrap()
+            .last_inner_record_sequence = 2;
+        changed.notify_all();
+        assert_eq!(waiter.join().unwrap(), MediaBarrierWait::Accepted);
+
+        assert_eq!(
+            wait_for_media_barrier(&shared, &changed, (1, 1), 2, 3, Duration::ZERO),
+            MediaBarrierWait::AttachmentChanged
+        );
+        shared
+            .lock()
+            .unwrap()
+            .sources
+            .get_mut(&(1, 1))
+            .unwrap()
+            .attachment_state = messages::ATTACHMENT_CLOSED;
+        assert_eq!(
+            wait_for_media_barrier(&shared, &changed, (1, 1), 1, 3, Duration::from_secs(1)),
+            MediaBarrierWait::AttachmentClosed
+        );
+        shared.lock().unwrap().sources.remove(&(1, 1));
+        assert_eq!(
+            wait_for_media_barrier(&shared, &changed, (1, 1), 1, 3, Duration::from_secs(1)),
+            MediaBarrierWait::SourceLost
+        );
+        shared
+            .lock()
+            .unwrap()
+            .sources
+            .insert((1, 1), barrier_source(1));
+        assert_eq!(
+            wait_for_media_barrier(&shared, &changed, (1, 1), 1, 3, Duration::ZERO),
+            MediaBarrierWait::TimedOut
+        );
     }
 
     #[test]
