@@ -34,6 +34,7 @@ const OPTIONAL_FEATURES: &[u64] = &[
     messages::FEATURE_OBSERVABILITY_CORE_V1,
     messages::FEATURE_ATOMIC_CONTROL_V1,
     messages::FEATURE_DELEGATED_CONTEXT_V1,
+    messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
 ];
 const MAX_PENDING_CONTROL_REPLIES: usize = 4096;
 const MEDIA_WRITER_QUEUE: usize = 32;
@@ -565,6 +566,7 @@ pub struct OuterBridge {
     outer_applied_revision: u64,
     outer_attachment_generations: HashMap<BridgeSourceKey, u64>,
     delegated_contexts: bool,
+    capture_policy: bool,
     pane_contexts: HashMap<u64, PaneContextMapping>,
 }
 
@@ -666,6 +668,8 @@ impl OuterBridge {
             accepted_features.contains(&messages::FEATURE_DECODER_DESCRIPTION_V1);
         let delegated_contexts =
             accepted_features.contains(&messages::FEATURE_DELEGATED_CONTEXT_V1);
+        let capture_policy =
+            accepted_features.contains(&messages::FEATURE_SOURCE_CAPTURE_POLICY_V1);
         connection.set_send_body_limit(welcome.maximum_control_body)?;
         let control = ControlDispatcher::start(connection, welcome.display_generation)?;
         let (completions_tx, completions_rx) = mpsc::channel();
@@ -695,6 +699,7 @@ impl OuterBridge {
             outer_applied_revision: 0,
             outer_attachment_generations: HashMap::new(),
             delegated_contexts,
+            capture_policy,
             pane_contexts: HashMap::new(),
         };
         if accepted_features.contains(&messages::FEATURE_OBSERVABILITY_CORE_V1) {
@@ -777,6 +782,23 @@ impl OuterBridge {
         sources: &[BridgeSource],
         nodes: &[BridgeNode],
     ) -> io::Result<std::collections::HashSet<BridgeSourceKey>> {
+        for source in sources {
+            messages::validate_capture_policy(source.capture_policy)?;
+            if source.capture_policy != 0 && !self.capture_policy {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "outer presenter lacks source-capture-policy-v1",
+                ));
+            }
+            if let Some(previous) = self.active_sources.get(&source.key)
+                && source.capture_policy & previous.capture_policy != previous.capture_policy
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "capture policy cannot be relaxed across the bridge",
+                ));
+            }
+        }
         self.sync_pane_contexts(sources, nodes)?;
         let requested = sources
             .iter()
@@ -835,6 +857,26 @@ impl OuterBridge {
             .cloned()
             .collect::<Vec<_>>();
         self.create_sources(&new_sources)?;
+        for source in sources
+            .iter()
+            .filter(|source| !recreate.contains(&source.key))
+        {
+            let Some(previous) = self.active_sources.get(&source.key) else {
+                continue;
+            };
+            if source.capture_policy == previous.capture_policy {
+                continue;
+            }
+            let upstream = self.source_ids[&source.key];
+            let request = self.request_id()?;
+            self.control.write_record(
+                messages::SET_SOURCE_POLICY,
+                0,
+                upstream,
+                &messages::set_source_policy(request, upstream, source.capture_policy),
+            )?;
+            self.wait_for(request, messages::OK, upstream)?;
+        }
         self.reconcile_nodes(nodes)?;
 
         let previous_sources = self.active_sources.values().cloned().collect::<Vec<_>>();
@@ -1194,7 +1236,7 @@ impl OuterBridge {
                 } => (
                     messages::CREATE_RASTER,
                     ConnectionKind::Raster,
-                    messages::create_raster_config(
+                    messages::create_raster_with_policy(
                         request,
                         &RasterSourceConfig {
                             source_id: upstream,
@@ -1203,6 +1245,7 @@ impl OuterBridge {
                             alpha_mode: *alpha_mode,
                             compression_mode: *compression_mode,
                         },
+                        source.capture_policy,
                     ),
                 ),
                 BridgeSourceKind::Image {
@@ -1214,7 +1257,7 @@ impl OuterBridge {
                 } => (
                     messages::CREATE_IMAGE,
                     ConnectionKind::Blob,
-                    messages::create_image(
+                    messages::create_image_with_policy(
                         request,
                         &ImageSourceConfig {
                             source_id: upstream,
@@ -1224,6 +1267,7 @@ impl OuterBridge {
                             encoded_length: *encoded_length,
                             sha256: *sha256,
                         },
+                        source.capture_policy,
                     ),
                 ),
                 BridgeSourceKind::Video {
@@ -1247,7 +1291,7 @@ impl OuterBridge {
                 } => (
                     messages::CREATE_VIDEO,
                     ConnectionKind::Video,
-                    messages::create_video(
+                    messages::create_video_with_policy(
                         request,
                         &VideoSourceConfig {
                             source_id: upstream,
@@ -1275,6 +1319,7 @@ impl OuterBridge {
                                 .then_some(decoder_config.as_deref())
                                 .flatten(),
                         },
+                        source.capture_policy,
                     ),
                 ),
                 BridgeSourceKind::Audio {
@@ -1293,7 +1338,7 @@ impl OuterBridge {
                     (
                         messages::CREATE_AUDIO,
                         ConnectionKind::Audio,
-                        messages::create_audio(
+                        messages::create_audio_with_policy(
                             request,
                             &AudioSourceConfig {
                                 source_id: upstream,
@@ -1311,6 +1356,7 @@ impl OuterBridge {
                                     .then_some(codec_string.as_deref())
                                     .flatten(),
                             },
+                            source.capture_policy,
                         ),
                     )
                 }
@@ -1741,6 +1787,7 @@ mod tests {
                 alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                 compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
             },
+            capture_policy: 0,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1757,13 +1804,19 @@ mod tests {
 
     #[test]
     fn pane_projection_ipc_has_no_outer_capability_field_or_bytes() {
-        let source = test_raster_source();
+        let mut source = test_raster_source();
+        source.capture_policy = messages::CAPTURE_POLICY_DENY_CAPTURE;
         let capability = [0xa5_u8; messages::CONTEXT_CAPABILITY_BYTES];
         let encoded = serde_json::to_vec(&source).unwrap();
         assert!(
             !encoded
                 .windows(capability.len())
                 .any(|window| window == capability)
+        );
+        let decoded: BridgeSource = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            decoded.capture_policy,
+            messages::CAPTURE_POLICY_DENY_CAPTURE
         );
         let text = String::from_utf8(encoded).unwrap();
         assert!(!text.contains("capability"));
@@ -2461,6 +2514,7 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1024,
             },
+            capture_policy: 0,
             playing: true,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -2546,6 +2600,7 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1_048_576,
             },
+            capture_policy: 0,
             playing: true,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {

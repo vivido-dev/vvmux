@@ -104,6 +104,7 @@ pub struct PaneMediaSourceStatus {
     pub attachment_generation: u64,
     pub outer_attachment_generation: Option<u64>,
     pub visible: bool,
+    pub capture_policy: u64,
     pub retained_static: bool,
     pub keyframe_needed: bool,
     pub milestones: u64,
@@ -329,6 +330,8 @@ pub enum BridgeSourceKind {
 pub struct BridgeSource {
     pub key: BridgeSourceKey,
     pub kind: BridgeSourceKind,
+    #[serde(default)]
+    pub capture_policy: u64,
     pub playing: bool,
     pub play_request: BridgePlayRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]

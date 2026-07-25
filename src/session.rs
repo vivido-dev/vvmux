@@ -3165,6 +3165,7 @@ impl SessionActor {
             .map(|source| BridgeSource {
                 key: bridge_key(source.key),
                 kind: bridge_source_kind(source.key, &source.descriptor),
+                capture_policy: source.capture_policy,
                 playing: source.playing,
                 play_request: bridge_play_request(source.play_request),
                 causation_id: source.causation_id,

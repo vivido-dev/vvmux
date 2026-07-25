@@ -1215,6 +1215,7 @@ mod tests {
                 alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                 compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
             },
+            capture_policy: 0,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1353,6 +1354,7 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1024,
             },
+            capture_policy: 0,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1379,6 +1381,7 @@ mod tests {
                 bitrate: 0,
                 max_access_unit_bytes: 1024,
             },
+            capture_policy: 0,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1555,6 +1558,7 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1024,
             },
+            capture_policy: 0,
             playing: true,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1678,6 +1682,7 @@ mod tests {
                 encoded_length: u32::try_from(encoded.len()).unwrap(),
                 sha256: None,
             },
+            capture_policy: 0,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1831,6 +1836,7 @@ mod tests {
         let replay_video = BridgeSource {
             key: replay_key,
             kind: video_source.kind,
+            capture_policy: 0,
             playing: true,
             causation_id: None,
             play_request: video_source.play_request,
@@ -1904,6 +1910,7 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1_048_576,
             },
+            capture_policy: 0,
             playing,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1930,6 +1937,7 @@ mod tests {
                 bitrate: 128_000,
                 max_access_unit_bytes: 4096,
             },
+            capture_policy: 0,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -2022,6 +2030,7 @@ mod tests {
                 encoded_length: 32,
                 sha256: None,
             },
+            capture_policy: 0,
             playing: false,
             causation_id: None,
             play_request: after[0].play_request,
