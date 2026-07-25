@@ -283,6 +283,7 @@ impl VirtualVivid {
             grid_rows: u32::from(rows),
             cell_width: u32::from(cell.0),
             cell_height: u32::from(cell.1),
+            settled: true,
         };
         state.metrics.insert(pane, display);
         for producer in state
@@ -884,6 +885,7 @@ fn handle_control(
             grid_rows: 22,
             cell_width: 0,
             cell_height: 0,
+            settled: true,
         });
         (producer_id, tag, (producer_id << 32) | 1, display)
     };
