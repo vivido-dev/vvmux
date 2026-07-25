@@ -6,8 +6,9 @@ use std::time::Duration;
 use vivid_protocol::messages;
 use vivid_protocol::wire::{
     BorrowedRecord, HEADER_SIZE, PREFACE_SIZE, Preface, RECORD_KNOWN_FLAGS, Record, RecordHeader,
+    accept_preface,
 };
-use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY, VIVID_MAJOR, VIVID_MINOR};
+use vivid_protocol::{CONTROL_MAX_RECORD_BODY, HARD_MAX_RECORD_BODY};
 
 use crate::platform::{ConnectionCancel, Transport};
 
@@ -29,10 +30,7 @@ impl Reader {
         let deadline = transport.deadline.clone();
         let mut bytes = [0_u8; PREFACE_SIZE];
         transport.reader.read_exact(&mut bytes)?;
-        let preface = Preface::decode(bytes)?;
-        if (preface.major, preface.minor) != (VIVID_MAJOR, VIVID_MINOR) {
-            return Err(invalid("unsupported Vivid version"));
-        }
+        let preface = accept_preface(bytes, transport.writer.as_mut())?;
         let negotiated_maximum = preface.initiator_tx_body_limit.min(HARD_MAX_RECORD_BODY);
         let maximum = if preface.kind == vivid_protocol::wire::ConnectionKind::Control {
             negotiated_maximum.min(CONTROL_MAX_RECORD_BODY)
@@ -288,4 +286,63 @@ fn write_parts(stream: &mut dyn Write, header: &[u8], parts: &[&[u8]]) -> io::Re
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    use vivid_protocol::wire::{ConnectionKind, encode_preface};
+
+    use crate::platform::ConnectionCancel;
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn transport(preface: [u8; PREFACE_SIZE], writer: SharedWriter) -> Transport {
+        Transport::new(
+            Box::new(Cursor::new(preface)),
+            Box::new(writer),
+            ConnectionCancel::new(|| {}),
+            Arc::new(|_| Ok(())),
+        )
+    }
+
+    #[test]
+    fn version_mismatch_is_typed_but_malformed_preface_is_silent() {
+        let mut mismatch = encode_preface(ConnectionKind::Control, 1024);
+        mismatch[5] = 0;
+        let output = SharedWriter::default();
+        let error = match Reader::new(transport(mismatch, output.clone())) {
+            Ok(_) => panic!("mismatched preface was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        let bytes = output.0.lock().unwrap();
+        let header = RecordHeader::decode(bytes[..HEADER_SIZE].try_into().unwrap());
+        assert_eq!(header.record_type, messages::ERROR);
+        assert_eq!(bytes.len(), HEADER_SIZE + header.body_length as usize);
+        let rejection = messages::parse_error_reply(&bytes[HEADER_SIZE..]).unwrap();
+        assert_eq!(rejection.code, messages::ERROR_UNSUPPORTED_VERSION);
+        assert_eq!(rejection.supported_version, Some((1, 1)));
+        drop(bytes);
+
+        let mut malformed = encode_preface(ConnectionKind::Control, 1024);
+        malformed[0] = b'X';
+        let silent = SharedWriter::default();
+        assert!(Reader::new(transport(malformed, silent.clone())).is_err());
+        assert!(silent.0.lock().unwrap().is_empty());
+    }
 }

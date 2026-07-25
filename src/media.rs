@@ -757,6 +757,18 @@ fn handle_control(
         return Err(invalid("first Vivid control record is not HELLO"));
     }
     let (request_id, hello) = messages::parse_hello(&hello_record.body)?;
+    if hello.validate_authentication_kind(false).is_err() {
+        writer.write_record(
+            messages::ERROR,
+            0,
+            &messages::error(
+                request_id,
+                messages::ERROR_UNSUPPORTED_FEATURE,
+                "HELLO authentication kind is unsupported",
+            ),
+        )?;
+        return Ok(());
+    }
     let token =
         anchor::decode_token(&hello.token).map_err(|_| invalid("invalid pane capability"))?;
     let pane = {
@@ -791,7 +803,7 @@ fn handle_control(
             &messages::error(
                 request_id,
                 messages::ERROR_UNSUPPORTED_VERSION,
-                "Vivid 1.0 is required",
+                "Vivid 1.1 is required",
             ),
         )?;
         return Ok(());
@@ -1810,11 +1822,12 @@ mod tests {
     use vivid_protocol::wire::{Connection, Endpoint};
 
     #[test]
-    fn vivid_version_selection_accepts_only_ranges_containing_1_0() {
+    fn vivid_version_selection_accepts_only_ranges_containing_1_1() {
         assert!(!offers_vivid_version(0, 9, 0, 9));
-        assert!(offers_vivid_version(1, 0, 1, 0));
-        assert!(offers_vivid_version(0, 9, 1, 0));
-        assert!(!offers_vivid_version(1, 1, 2, 0));
+        assert!(!offers_vivid_version(1, 0, 1, 0));
+        assert!(offers_vivid_version(1, 1, 1, 1));
+        assert!(offers_vivid_version(1, 0, 1, 1));
+        assert!(!offers_vivid_version(1, 2, 2, 0));
     }
 
     fn test_virtual_endpoint(
@@ -1969,15 +1982,17 @@ mod tests {
                     1,
                     &messages::HelloConfig {
                         minimum_major: 1,
-                        minimum_minor: 1,
+                        minimum_minor: 0,
                         maximum_major: 1,
-                        maximum_minor: 1,
+                        maximum_minor: 0,
                         token: &token,
                         producer: "unsupported-version-test",
                         producer_version: "test",
                         required_features: &[],
                         optional_features: &[],
                         maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+                        authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
+                        preserved_fields: &[],
                     },
                 ),
             )
