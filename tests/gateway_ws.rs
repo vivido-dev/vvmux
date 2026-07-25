@@ -397,6 +397,7 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
                     grid_rows: 24,
                     cell_width: 8,
                     cell_height: 16,
+                    settled: true,
                 },
                 maximum_control_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
                 accepted_profiles: &[],

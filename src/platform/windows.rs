@@ -1713,6 +1713,7 @@ mod tests {
             grid_rows: 22,
             cell_width: u32::from(cell_width),
             cell_height: u32::from(cell_height),
+            settled: true,
         };
         let welcome = vivid_protocol::messages::welcome(1, 1, &[1; 16], 1, display, &[]);
         vivid_protocol::messages::parse_welcome(&welcome).unwrap();
