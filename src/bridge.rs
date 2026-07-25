@@ -33,6 +33,7 @@ const OPTIONAL_FEATURES: &[u64] = &[
     messages::FEATURE_DECODER_DESCRIPTION_V1,
     messages::FEATURE_OBSERVABILITY_CORE_V1,
     messages::FEATURE_ATOMIC_CONTROL_V1,
+    messages::FEATURE_DELEGATED_CONTEXT_V1,
 ];
 const MAX_PENDING_CONTROL_REPLIES: usize = 4096;
 const MEDIA_WRITER_QUEUE: usize = 32;
@@ -539,6 +540,7 @@ pub struct OuterBridge {
     token: Zeroizing<String>,
     control: ControlDispatcher,
     root_context: u64,
+    next_context: u64,
     next_request: u64,
     next_source: u64,
     next_node: u64,
@@ -562,6 +564,15 @@ pub struct OuterBridge {
     /// Local acknowledgement domain for successfully reconciled outer snapshots.
     outer_applied_revision: u64,
     outer_attachment_generations: HashMap<BridgeSourceKey, u64>,
+    delegated_contexts: bool,
+    pane_contexts: HashMap<u64, PaneContextMapping>,
+}
+
+#[derive(Clone, Copy)]
+struct PaneContextMapping {
+    context_id: u64,
+    _class_mask: u64,
+    _quotas: messages::ContextQuotas,
 }
 
 struct PendingBody {
@@ -653,6 +664,8 @@ impl OuterBridge {
         }
         let decoder_description =
             accepted_features.contains(&messages::FEATURE_DECODER_DESCRIPTION_V1);
+        let delegated_contexts =
+            accepted_features.contains(&messages::FEATURE_DELEGATED_CONTEXT_V1);
         connection.set_send_body_limit(welcome.maximum_control_body)?;
         let control = ControlDispatcher::start(connection, welcome.display_generation)?;
         let (completions_tx, completions_rx) = mpsc::channel();
@@ -661,6 +674,7 @@ impl OuterBridge {
             token,
             control,
             root_context: welcome.root_context_id,
+            next_context: welcome.root_context_id,
             next_request: hello_request,
             next_source: 0,
             next_node: 0,
@@ -680,6 +694,8 @@ impl OuterBridge {
             welcome_extensions: welcome.preserved_fields,
             outer_applied_revision: 0,
             outer_attachment_generations: HashMap::new(),
+            delegated_contexts,
+            pane_contexts: HashMap::new(),
         };
         if accepted_features.contains(&messages::FEATURE_OBSERVABILITY_CORE_V1) {
             let request = bridge.request_id()?;
@@ -761,6 +777,7 @@ impl OuterBridge {
         sources: &[BridgeSource],
         nodes: &[BridgeNode],
     ) -> io::Result<std::collections::HashSet<BridgeSourceKey>> {
+        self.sync_pane_contexts(sources, nodes)?;
         let requested = sources
             .iter()
             .map(|source| (source.key, source))
@@ -846,6 +863,135 @@ impl OuterBridge {
             .map(|source| (source.key, source))
             .collect();
         Ok(recreate)
+    }
+
+    fn sync_pane_contexts(
+        &mut self,
+        sources: &[BridgeSource],
+        nodes: &[BridgeNode],
+    ) -> io::Result<()> {
+        if !self.delegated_contexts {
+            return Ok(());
+        }
+        let producers = sources
+            .iter()
+            .map(|source| source.key.producer)
+            .collect::<HashSet<_>>();
+        let removed = self
+            .pane_contexts
+            .keys()
+            .copied()
+            .filter(|producer| !producers.contains(producer))
+            .collect::<Vec<_>>();
+        for producer in removed {
+            let mapping = self
+                .pane_contexts
+                .remove(&producer)
+                .expect("removed pane context exists");
+            let request = self.request_id()?;
+            self.control.write_record(
+                messages::REVOKE_CONTEXT,
+                0,
+                mapping.context_id,
+                &messages::revoke_context(request, mapping.context_id),
+            )?;
+            self.wait_for(request, messages::OK, mapping.context_id)?;
+        }
+        for producer in producers {
+            if self.pane_contexts.contains_key(&producer) {
+                continue;
+            }
+            self.next_context = self
+                .next_context
+                .checked_add(1)
+                .ok_or_else(|| exhausted("context"))?;
+            let context_id = self.next_context;
+            let producer_sources = sources
+                .iter()
+                .filter(|source| source.key.producer == producer)
+                .collect::<Vec<_>>();
+            let maximum_retained_pixels = producer_sources
+                .iter()
+                .map(|source| bridge_source_pixels(source))
+                .try_fold(0_u64, u64::checked_add)
+                .unwrap_or(u64::MAX)
+                .max(1);
+            let maximum_media_bytes = producer_sources
+                .iter()
+                .map(|source| bridge_source_media_body(source))
+                .max()
+                .unwrap_or(1)
+                .max(4 * 1024 * 1024)
+                .saturating_mul(producer_sources.len().max(1) as u64);
+            let quotas = messages::ContextQuotas {
+                maximum_sources: producer_sources.len().max(1) as u64,
+                maximum_nodes: nodes
+                    .iter()
+                    .filter(|node| node.producer == producer)
+                    .count()
+                    .max(1) as u64,
+                maximum_retained_pixels,
+                maximum_media_bytes,
+                maximum_media_connections: producer_sources.len().max(1) as u64,
+            };
+            let class_mask =
+                messages::CONTEXT_CLASS_CREATE_SOURCE | messages::CONTEXT_CLASS_MUTATE_SCENE;
+            let request = self.request_id()?;
+            let create = messages::create_context(
+                request,
+                &messages::CreateContextRequest {
+                    context_id,
+                    parent_context_id: self.root_context,
+                    class_mask,
+                    label: format!("vvmux-pane-{producer}"),
+                    expiry_us: 0,
+                    quotas,
+                },
+            )?;
+            self.control
+                .write_record(messages::CREATE_CONTEXT, 0, context_id, &create)?;
+            let ready_record =
+                self.control
+                    .wait_reply(request, messages::CONTEXT_READY, context_id)?;
+            let (ready_request, ready) = messages::parse_context_ready(&ready_record.body)?;
+            if ready_request != request || ready.context_id != context_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "outer CONTEXT_READY correlation mismatch",
+                ));
+            }
+            let request = self.request_id()?;
+            self.control.write_record(
+                messages::DELEGATE_CONTEXT,
+                0,
+                context_id,
+                &messages::delegate_context(request, context_id),
+            )?;
+            let capability_record =
+                self.control
+                    .wait_reply(request, messages::CONTEXT_CAPABILITY, context_id)?;
+            let (capability_request, capability_context, capability) =
+                messages::parse_context_capability(&capability_record.body)?;
+            if capability_request != request || capability_context != context_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "outer CONTEXT_CAPABILITY correlation mismatch",
+                ));
+            }
+            // The foreground bridge proves delegation succeeded, then immediately destroys its
+            // one-shot plaintext copy. Neither the hidden server nor pane IPC has a credential
+            // field, and current projection remains on the owner-only outer session.
+            drop(Zeroizing::new(capability));
+            self.pane_contexts.insert(
+                producer,
+                PaneContextMapping {
+                    context_id,
+                    _class_mask: ready.class_mask,
+                    _quotas: ready.quotas,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Apply playback-only changes without replacing upstream sources, decoder state, or queued
@@ -1402,6 +1548,33 @@ impl OuterBridge {
     }
 }
 
+fn bridge_source_pixels(source: &BridgeSource) -> u64 {
+    match &source.kind {
+        BridgeSourceKind::Raster { width, height, .. }
+        | BridgeSourceKind::Image { width, height, .. }
+        | BridgeSourceKind::Video { width, height, .. } => u64::from(*width) * u64::from(*height),
+        BridgeSourceKind::Audio { .. } => 0,
+    }
+}
+
+fn bridge_source_media_body(source: &BridgeSource) -> u64 {
+    let length = match &source.kind {
+        BridgeSourceKind::Raster { width, height, .. } => {
+            vivid_protocol::media::rgba8_raw_frame_body_len(*width, *height)
+        }
+        BridgeSourceKind::Image { encoded_length, .. } => Ok(*encoded_length),
+        BridgeSourceKind::Video {
+            max_access_unit_bytes,
+            ..
+        } => vivid_protocol::media::video_body_len(*max_access_unit_bytes),
+        BridgeSourceKind::Audio {
+            max_access_unit_bytes,
+            ..
+        } => vivid_protocol::media::audio_body_len(*max_access_unit_bytes),
+    };
+    length.map(u64::from).unwrap_or(u64::MAX)
+}
+
 fn validate_snapshot(sources: &[BridgeSource], nodes: &[BridgeNode]) -> io::Result<()> {
     let sources = sources
         .iter()
@@ -1580,6 +1753,21 @@ mod tests {
                 start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
             },
         }
+    }
+
+    #[test]
+    fn pane_projection_ipc_has_no_outer_capability_field_or_bytes() {
+        let source = test_raster_source();
+        let capability = [0xa5_u8; messages::CONTEXT_CAPABILITY_BYTES];
+        let encoded = serde_json::to_vec(&source).unwrap();
+        assert!(
+            !encoded
+                .windows(capability.len())
+                .any(|window| window == capability)
+        );
+        let text = String::from_utf8(encoded).unwrap();
+        assert!(!text.contains("capability"));
+        assert!(!text.contains("token"));
     }
 
     #[test]
@@ -1847,6 +2035,123 @@ mod tests {
         .unwrap();
         assert_eq!(bridge.hello_extensions, hello_extensions);
         assert_eq!(bridge.welcome_extensions, welcome_extensions);
+        server.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_context_mapping_delegates_once_and_revokes_on_teardown() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("outer-pane-context.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping pane context mapping socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("fake outer presenter bind failed: {error}"),
+        };
+        let server = thread::spawn(move || -> io::Result<()> {
+            let (mut control, _) = listener.accept()?;
+            let mut preface = [0; PREFACE_SIZE];
+            control.read_exact(&mut preface)?;
+            let hello = read_client_record(&mut control)?;
+            let request = messages::request_id(&hello.body)?;
+            let accepted = [
+                messages::FEATURE_RASTER_RGBA8,
+                messages::FEATURE_SCENE_TRANSACTIONS,
+                messages::FEATURE_GRID_CELL_NODES,
+                messages::FEATURE_CREDIT_FLOW_CONTROL,
+                messages::FEATURE_NODE_CLIP_RECT_V1,
+                messages::FEATURE_DELEGATED_CONTEXT_V1,
+            ];
+            let mut sequence = 0;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::WELCOME,
+                0,
+                &messages::welcome(
+                    request,
+                    1,
+                    &[1; 16],
+                    100,
+                    messages::DisplayChanged {
+                        display_generation: 1,
+                        viewport_width: 800,
+                        viewport_height: 600,
+                        grid_columns: 80,
+                        grid_rows: 24,
+                        cell_width: 10,
+                        cell_height: 25,
+                        settled: true,
+                    },
+                    &accepted,
+                ),
+            )?;
+            let create = read_client_record(&mut control)?;
+            assert_eq!(create.record_type, messages::CREATE_CONTEXT);
+            let (envelope, requested) = messages::parse_create_context(&create.body)?;
+            assert_eq!(requested.parent_context_id, 100);
+            assert_eq!(requested.class_mask & messages::CONTEXT_CLASS_ADMINISTER, 0);
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::CONTEXT_READY,
+                requested.context_id,
+                &messages::context_ready(
+                    envelope.request_id,
+                    messages::ContextReady {
+                        context_id: requested.context_id,
+                        class_mask: requested.class_mask,
+                        quotas: requested.quotas,
+                        expiry_us: 0,
+                    },
+                )?,
+            )?;
+            let delegate = read_client_record(&mut control)?;
+            assert_eq!(delegate.record_type, messages::DELEGATE_CONTEXT);
+            let (envelope, context_id) = messages::parse_object_id(&delegate.body, "context ID")?;
+            let capability = [0xa5; messages::CONTEXT_CAPABILITY_BYTES];
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::CONTEXT_CAPABILITY,
+                context_id,
+                &messages::context_capability(envelope.request_id, context_id, &capability),
+            )?;
+            let revoke = read_client_record(&mut control)?;
+            assert_eq!(revoke.record_type, messages::REVOKE_CONTEXT);
+            let (envelope, revoked_context) =
+                messages::parse_object_id(&revoke.body, "context ID")?;
+            assert_eq!(revoked_context, context_id);
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                context_id,
+                &messages::ok(envelope.request_id),
+            )
+        });
+        let factory = Arc::new(EndpointConnectionFactory {
+            primary: Endpoint::parse(&format!("unix:{}", socket.display())).unwrap(),
+            bulk: None,
+        });
+        let mut bridge = OuterBridge::connect_with_factory(
+            factory,
+            Zeroizing::new("11".repeat(32)),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+        let source = test_raster_source();
+        bridge
+            .sync_pane_contexts(std::slice::from_ref(&source), &[])
+            .unwrap();
+        assert!(bridge.pane_contexts.contains_key(&source.key.producer));
+        bridge.sync_pane_contexts(&[], &[]).unwrap();
+        assert!(bridge.pane_contexts.is_empty());
         server.join().unwrap().unwrap();
     }
 
