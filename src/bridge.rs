@@ -42,6 +42,7 @@ struct ControlState {
     credits: HashMap<u64, messages::CreditLedger>,
     keyframes: Vec<messages::NeedKeyframe>,
     source_losses: Vec<u64>,
+    playback_states: Vec<messages::PlaybackState>,
     display_generation: u64,
     closed: Option<String>,
     last_inbound: Instant,
@@ -62,6 +63,7 @@ impl Default for ControlState {
             credits: HashMap::new(),
             keyframes: Vec::new(),
             source_losses: Vec::new(),
+            playback_states: Vec::new(),
             display_generation: 0,
             closed: None,
             last_inbound: Instant::now(),
@@ -205,6 +207,8 @@ impl ControlDispatcher {
                             }),
                         messages::SCENE_CHANGED => messages::parse_scene_changed(&record.body)
                             .map(|event| state.outer_scene_revision = event.scene_revision),
+                        messages::PLAYBACK_STATE => messages::parse_playback_state(&record.body)
+                            .map(|event| state.playback_states.push(event)),
                         messages::PONG => {
                             messages::request_id(&record.body).and_then(|request_id| {
                                 if record.object_id != 0 || request_id == 0 {
@@ -454,6 +458,17 @@ impl ControlDispatcher {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .source_losses,
+        )
+    }
+
+    fn take_playback_states(&self) -> Vec<messages::PlaybackState> {
+        std::mem::take(
+            &mut self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .playback_states,
         )
     }
 
@@ -991,6 +1006,19 @@ impl OuterBridge {
             self.source_kinds.remove(key);
         }
         losses
+    }
+
+    pub fn take_playback_states(&self) -> Vec<(BridgeSourceKey, messages::PlaybackSnapshot)> {
+        self.control
+            .take_playback_states()
+            .into_iter()
+            .filter_map(|event| {
+                self.reverse_source_ids
+                    .get(&event.source_id)
+                    .copied()
+                    .map(|source| (source, event.snapshot))
+            })
+            .collect()
     }
 
     fn create_sources(&mut self, sources: &[BridgeSource]) -> io::Result<()> {

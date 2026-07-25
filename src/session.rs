@@ -960,6 +960,19 @@ impl SessionActor {
                     self.check_automation_waiters();
                 }
             }
+            ClientMessage::BridgePlaybackState {
+                source,
+                state,
+                eos_state,
+            } => {
+                if self.client_is(id) {
+                    self.vivid.apply_outer_playback(
+                        (source.producer, source.source),
+                        state,
+                        eos_state,
+                    );
+                }
+            }
             ClientMessage::Detach => {
                 if self.client_is(id) {
                     self.cancel_pointer_drag(true);
