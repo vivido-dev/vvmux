@@ -106,6 +106,7 @@ pub struct SnapshotSource {
     pub last_inner_record_sequence: u64,
     pub causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
     pub capture_policy: u64,
+    pub semantic_descriptor: Option<messages::SourceDescriptor>,
 }
 
 #[derive(Debug)]
@@ -166,6 +167,7 @@ struct Source {
     milestones: u64,
     causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
     capture_policy: u64,
+    semantic_descriptor: Option<messages::SourceDescriptor>,
 }
 
 struct Ticket {
@@ -179,6 +181,7 @@ struct SourceCreation {
     object_id: u64,
     causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
     capture_policy: u64,
+    semantic_descriptor: Option<messages::SourceDescriptor>,
 }
 
 #[derive(Clone, Copy)]
@@ -495,6 +498,7 @@ impl VirtualVivid {
                 last_inner_record_sequence: source.last_inner_record_sequence,
                 causation_id: source.causation_id,
                 capture_policy: source.capture_policy,
+                semantic_descriptor: source.semantic_descriptor.clone(),
             });
             if matches!(source.descriptor, SourceDescriptor::Video(_))
                 && source.playing
@@ -623,6 +627,20 @@ impl VirtualVivid {
                         .copied(),
                     visible: state.projected_sources.contains(&key),
                     capture_policy: source.capture_policy,
+                    descriptor: source.semantic_descriptor.as_ref().map(|descriptor| {
+                        let semantic_denied = source.capture_policy
+                            & messages::CAPTURE_POLICY_DENY_SEMANTIC_EXPORT
+                            != 0;
+                        crate::ipc::PaneMediaSourceDescriptor {
+                            role: descriptor.role,
+                            title: (!semantic_denied).then(|| descriptor.title.clone()),
+                            content_revision: (!semantic_denied)
+                                .then_some(descriptor.content_revision),
+                            semantic_availability: (!semantic_denied)
+                                .then_some(descriptor.semantic_availability),
+                            locator: (!semantic_denied).then(|| descriptor.locator.clone()),
+                        }
+                    }),
                     retained_static: source.descriptor.is_static() && source.retained.is_some(),
                     keyframe_needed: source.bridge_desynchronized,
                     milestones: source.milestones,
@@ -1105,7 +1123,15 @@ fn source_status(state: &State, key: SourceKey) -> Option<messages::SourceStatus
         outstanding_byte_credit: maximum.saturating_sub(pending_bytes),
         outstanding_packet_credit: INITIAL_PACKET_CREDITS.saturating_sub(pending_packets),
         ingress_queue_depth: pending_packets.min(messages::QUEUE_DEPTH_CAPACITY),
-        descriptor: None,
+        descriptor: source.semantic_descriptor.clone().map(|descriptor| {
+            if source.capture_policy & messages::CAPTURE_POLICY_DENY_SEMANTIC_EXPORT != 0 {
+                messages::ReportedSourceDescriptor::RoleOnly {
+                    role: descriptor.role,
+                }
+            } else {
+                messages::ReportedSourceDescriptor::Full(descriptor)
+            }
+        }),
         playback,
         terminal_loss_code: None,
     })
@@ -1931,8 +1957,8 @@ fn dispatch_control(
             )?;
         }
         messages::CREATE_RASTER => {
-            let (envelope, config, capture_policy) =
-                messages::parse_create_raster_with_policy(&record.body)?;
+            let (envelope, config, capture_policy, semantic_descriptor) =
+                messages::parse_create_raster_with_extensions(&record.body)?;
             if envelope.payload.map_value(9).is_some()
                 && !producer_has_feature(
                     shared,
@@ -1947,6 +1973,20 @@ fn dispatch_control(
                         envelope.request_id,
                         messages::ERROR_UNSUPPORTED_FEATURE,
                         "source capture policy was not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
+            if envelope.payload.map_value(10).is_some()
+                && !producer_has_feature(shared, producer, messages::FEATURE_SOURCE_DESCRIPTOR_V1)
+            {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "source descriptors were not negotiated",
                     ),
                 )?;
                 return Ok(true);
@@ -1961,12 +2001,13 @@ fn dispatch_control(
                     object_id: record.object_id,
                     causation_id: envelope.causation_id,
                     capture_policy,
+                    semantic_descriptor,
                 },
             )?;
         }
         messages::CREATE_IMAGE => {
-            let (envelope, config, capture_policy) =
-                messages::parse_create_image_with_policy(&record.body)?;
+            let (envelope, config, capture_policy, semantic_descriptor) =
+                messages::parse_create_image_with_extensions(&record.body)?;
             if envelope.payload.map_value(9).is_some()
                 && !producer_has_feature(
                     shared,
@@ -1985,6 +2026,20 @@ fn dispatch_control(
                 )?;
                 return Ok(true);
             }
+            if envelope.payload.map_value(10).is_some()
+                && !producer_has_feature(shared, producer, messages::FEATURE_SOURCE_DESCRIPTOR_V1)
+            {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "source descriptors were not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
             create_source(
                 shared,
                 producer,
@@ -1995,12 +2050,13 @@ fn dispatch_control(
                     object_id: record.object_id,
                     causation_id: envelope.causation_id,
                     capture_policy,
+                    semantic_descriptor,
                 },
             )?;
         }
         messages::CREATE_VIDEO => {
-            let (envelope, config, capture_policy) =
-                messages::parse_create_video_with_policy(&record.body)?;
+            let (envelope, config, capture_policy, semantic_descriptor) =
+                messages::parse_create_video_with_extensions(&record.body)?;
             if envelope.payload.map_value(23).is_some()
                 && !producer_has_feature(
                     shared,
@@ -2019,6 +2075,20 @@ fn dispatch_control(
                 )?;
                 return Ok(true);
             }
+            if envelope.payload.map_value(24).is_some()
+                && !producer_has_feature(shared, producer, messages::FEATURE_SOURCE_DESCRIPTOR_V1)
+            {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "source descriptors were not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
             if !media::is_portable_packetization(&config.codec, &config.packetization) {
                 return Err(invalid("unsupported video configuration"));
             }
@@ -2032,12 +2102,13 @@ fn dispatch_control(
                     object_id: record.object_id,
                     causation_id: envelope.causation_id,
                     capture_policy,
+                    semantic_descriptor,
                 },
             )?;
         }
         messages::CREATE_AUDIO => {
-            let (envelope, config, capture_policy) =
-                messages::parse_create_audio_with_policy(&record.body)?;
+            let (envelope, config, capture_policy, semantic_descriptor) =
+                messages::parse_create_audio_with_extensions(&record.body)?;
             if envelope.payload.map_value(12).is_some()
                 && !producer_has_feature(
                     shared,
@@ -2056,6 +2127,20 @@ fn dispatch_control(
                 )?;
                 return Ok(true);
             }
+            if envelope.payload.map_value(13).is_some()
+                && !producer_has_feature(shared, producer, messages::FEATURE_SOURCE_DESCRIPTOR_V1)
+            {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "source descriptors were not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
             if !messages::audio_config_supported(&config) {
                 return Err(invalid("unsupported audio configuration"));
             }
@@ -2069,6 +2154,7 @@ fn dispatch_control(
                     object_id: record.object_id,
                     causation_id: envelope.causation_id,
                     capture_policy,
+                    semantic_descriptor,
                 },
             )?;
         }
@@ -2138,6 +2224,66 @@ fn dispatch_control(
                 )?;
                 advance_projection(&mut state);
             }
+            writer.write_ok(messages::OK, source_id, envelope.request_id)?;
+        }
+        messages::UPDATE_SOURCE_DESCRIPTOR => {
+            let (envelope, source_id, descriptor) =
+                messages::parse_update_source_descriptor(&record.body)?;
+            if record.object_id != source_id {
+                return Err(invalid("source descriptor object ID mismatch"));
+            }
+            if !producer_has_feature(shared, producer, messages::FEATURE_SOURCE_DESCRIPTOR_V1) {
+                writer.write_record(
+                    messages::ERROR,
+                    source_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "source descriptors were not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
+            let mut state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(source) = state.sources.get_mut(&(producer, source_id)) else {
+                drop(state);
+                writer.write_record(
+                    messages::ERROR,
+                    source_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_NOT_FOUND,
+                        "source does not exist in this pane context",
+                    ),
+                )?;
+                return Ok(true);
+            };
+            let current = source
+                .semantic_descriptor
+                .as_ref()
+                .map_or(0, |current| current.content_revision);
+            if descriptor.content_revision <= current {
+                drop(state);
+                writer.write_record(
+                    messages::ERROR,
+                    source_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_BAD_STATE,
+                        "descriptor content revision must advance",
+                    ),
+                )?;
+                return Ok(true);
+            }
+            source.semantic_descriptor = Some(descriptor);
+            advance_source(
+                &mut state,
+                (producer, source_id),
+                messages::SOURCE_CHANGED_DESCRIPTOR,
+            )?;
+            advance_projection(&mut state);
             writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
         messages::BEGIN_TXN => {
@@ -2411,6 +2557,9 @@ fn create_source(
     creation: SourceCreation,
 ) -> io::Result<()> {
     messages::validate_capture_policy(creation.capture_policy)?;
+    if let Some(descriptor) = creation.semantic_descriptor.as_ref() {
+        messages::validate_source_descriptor(descriptor)?;
+    }
     let source_id = match &descriptor {
         SourceDescriptor::Raster(config) => config.source_id,
         SourceDescriptor::Image(config) => config.source_id,
@@ -2460,6 +2609,7 @@ fn create_source(
             milestones: 0,
             causation_id: creation.causation_id,
             capture_policy: creation.capture_policy,
+            semantic_descriptor: creation.semantic_descriptor,
         },
     );
     state.tickets.insert(
@@ -3046,6 +3196,7 @@ fn supported_feature(feature: u64) -> bool {
             | messages::FEATURE_DECODER_DESCRIPTION_V1
             | messages::FEATURE_OBSERVABILITY_CORE_V1
             | messages::FEATURE_SOURCE_CAPTURE_POLICY_V1
+            | messages::FEATURE_SOURCE_DESCRIPTOR_V1
     )
 }
 
@@ -3108,6 +3259,31 @@ mod tests {
         assert_eq!(tightened_capture_policy(stricter, stricter).unwrap(), None);
         assert!(tightened_capture_policy(stricter, capture).is_err());
         assert!(tightened_capture_policy(0, messages::CAPTURE_POLICY_MASK + 1).is_err());
+    }
+
+    #[test]
+    fn semantic_descriptor_handling_contains_no_locator_io_or_terminal_output() {
+        let source = include_str!("media.rs");
+        for line in source
+            .lines()
+            .filter(|line| line.contains("semantic_descriptor"))
+        {
+            for forbidden in [
+                "std::fs",
+                "File::",
+                ".open(",
+                "connect(",
+                "Url::parse",
+                "reqwest",
+                "terminal::",
+                "pty::",
+            ] {
+                assert!(
+                    !line.contains(forbidden),
+                    "descriptor handling line unexpectedly contains {forbidden}: {line}"
+                );
+            }
+        }
     }
 
     fn test_virtual_endpoint(

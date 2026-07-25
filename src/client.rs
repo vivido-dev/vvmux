@@ -1216,6 +1216,7 @@ mod tests {
                 compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
             },
             capture_policy: 0,
+            descriptor: None,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1355,6 +1356,7 @@ mod tests {
                 max_access_unit_bytes: 1024,
             },
             capture_policy: 0,
+            descriptor: None,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1382,6 +1384,7 @@ mod tests {
                 max_access_unit_bytes: 1024,
             },
             capture_policy: 0,
+            descriptor: None,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1559,6 +1562,7 @@ mod tests {
                 max_access_unit_bytes: 1024,
             },
             capture_policy: 0,
+            descriptor: None,
             playing: true,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1683,6 +1687,7 @@ mod tests {
                 sha256: None,
             },
             capture_policy: 0,
+            descriptor: None,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1837,6 +1842,7 @@ mod tests {
             key: replay_key,
             kind: video_source.kind,
             capture_policy: 0,
+            descriptor: None,
             playing: true,
             causation_id: None,
             play_request: video_source.play_request,
@@ -1911,6 +1917,7 @@ mod tests {
                 max_access_unit_bytes: 1_048_576,
             },
             capture_policy: 0,
+            descriptor: None,
             playing,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -1938,6 +1945,7 @@ mod tests {
                 max_access_unit_bytes: 4096,
             },
             capture_policy: 0,
+            descriptor: None,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -2031,6 +2039,7 @@ mod tests {
                 sha256: None,
             },
             capture_policy: 0,
+            descriptor: None,
             playing: false,
             causation_id: None,
             play_request: after[0].play_request,

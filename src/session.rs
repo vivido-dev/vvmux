@@ -13,9 +13,9 @@ use vvmux_terminal::{Cell, Terminal, TerminalColor, TerminalEvent, TerminalModes
 use crate::config::Config;
 use crate::ipc::{
     Action, AutomationError, AutomationMethod, AutomationRequest, AutomationResponse, Axis,
-    BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceKey, BridgeSourceKind,
-    ClientMessage, Direction, DisplayMetrics, FloatingEditCommand, FloatingEditKind, MouseEvent,
-    MouseKind, ServerMessage, SharedWriter,
+    BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceDescriptor,
+    BridgeSourceKey, BridgeSourceKind, ClientMessage, Direction, DisplayMetrics,
+    FloatingEditCommand, FloatingEditKind, MouseEvent, MouseKind, ServerMessage, SharedWriter,
 };
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
@@ -3166,6 +3166,15 @@ impl SessionActor {
                 key: bridge_key(source.key),
                 kind: bridge_source_kind(source.key, &source.descriptor),
                 capture_policy: source.capture_policy,
+                descriptor: source.semantic_descriptor.as_ref().map(|descriptor| {
+                    BridgeSourceDescriptor {
+                        role: descriptor.role,
+                        title: descriptor.title.clone(),
+                        content_revision: descriptor.content_revision,
+                        semantic_availability: descriptor.semantic_availability,
+                        locator: descriptor.locator.clone(),
+                    }
+                }),
                 playing: source.playing,
                 play_request: bridge_play_request(source.play_request),
                 causation_id: source.causation_id,
