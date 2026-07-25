@@ -469,6 +469,7 @@ struct MediaWrite {
 struct MediaCompletion {
     delivery_id: u64,
     delivered: bool,
+    record_sequence: u64,
 }
 
 struct SourceMediaWriter {
@@ -886,10 +887,16 @@ impl OuterBridge {
         Ok(false)
     }
 
-    pub fn take_media_completions(&self) -> Vec<(u64, bool)> {
+    pub fn take_media_completions(&self) -> Vec<(u64, bool, u64)> {
         self.completions_rx
             .try_iter()
-            .map(|completion| (completion.delivery_id, completion.delivered))
+            .map(|completion| {
+                (
+                    completion.delivery_id,
+                    completion.delivered,
+                    completion.record_sequence,
+                )
+            })
             .collect()
     }
 
@@ -1339,15 +1346,22 @@ fn run_media_writer(
     completions: mpsc::Sender<MediaCompletion>,
 ) {
     while let Ok(write) = receiver.recv() {
-        let delivered = reserve_outer_credit(&shared, write.object_id, write.body.len() as u64)
+        let written = reserve_outer_credit(&shared, write.object_id, write.body.len() as u64)
             .and_then(|()| {
-                connection.write_record(write.record_type, 0, write.object_id, &write.body)
-            })
-            .is_ok();
+                connection.write_record_parts(
+                    write.record_type,
+                    0,
+                    write.object_id,
+                    &[write.body.as_slice()],
+                )
+            });
+        let delivered = written.is_ok();
+        let record_sequence = written.unwrap_or(0);
         if completions
             .send(MediaCompletion {
                 delivery_id: write.delivery_id,
                 delivered,
+                record_sequence,
             })
             .is_err()
         {
@@ -1958,17 +1972,14 @@ mod tests {
             media_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         }
         let deadline = Instant::now() + Duration::from_secs(1);
-        let mut completed = HashSet::new();
+        let mut completed = HashMap::new();
         while completed.len() < 3 && Instant::now() < deadline {
-            completed.extend(
-                bridge
-                    .take_media_completions()
-                    .into_iter()
-                    .filter_map(|(delivery, delivered)| delivered.then_some(delivery)),
-            );
+            completed.extend(bridge.take_media_completions().into_iter().filter_map(
+                |(delivery, delivered, sequence)| delivered.then_some((delivery, sequence)),
+            ));
             thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(completed, HashSet::from([1, 2, 3]));
+        assert_eq!(completed, HashMap::from([(1, 2), (2, 3), (3, 4)]));
         server.join().unwrap().unwrap();
     }
 

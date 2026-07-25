@@ -12,7 +12,7 @@ use vivid_protocol::messages::{
     self, Credits, DisplayChanged, ImageSourceConfig, ParsedAudioSourceConfig, ParsedSceneNode,
     ParsedVideoSourceConfig, RasterSourceConfig,
 };
-use vivid_protocol::wire::{ConnectionKind, Record};
+use vivid_protocol::wire::{BorrowedRecord, ConnectionKind, Record};
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 
 use crate::config::Media as MediaConfig;
@@ -97,6 +97,8 @@ pub struct SnapshotSource {
     pub retained: Option<Arc<[u8]>>,
     pub playing: bool,
     pub play_request: messages::PlayRequest,
+    #[allow(dead_code)] // Kept distinct from the outer sequence for the Stage 4 EOS barrier.
+    pub last_inner_record_sequence: u64,
 }
 
 #[derive(Debug)]
@@ -136,6 +138,7 @@ struct Source {
     last_pts_us: Option<i64>,
     clock_started: Option<Instant>,
     clock_origin_pts_us: Option<i64>,
+    last_inner_record_sequence: u64,
 }
 
 struct Ticket {
@@ -420,6 +423,7 @@ impl VirtualVivid {
                 retained: source.retained.clone(),
                 playing: source.playing,
                 play_request: source.play_request,
+                last_inner_record_sequence: source.last_inner_record_sequence,
             });
             if matches!(source.descriptor, SourceDescriptor::Video(_))
                 && source.playing
@@ -511,11 +515,7 @@ impl VirtualVivid {
         };
         self.delivery_changed.notify_all();
         if let Some(writer) = writer {
-            let _ = writer.write_record(
-                messages::CREDIT,
-                pending.source.1,
-                &messages::credit(pending.bytes, 1, 0),
-            );
+            let _ = writer.write_credit(pending.source.1, pending.bytes, 1, 0);
         }
         if request_keyframe {
             self.request_keyframes(&[pending.source]);
@@ -589,11 +589,7 @@ fn take_deliveries(state: &mut State, delivery_ids: &[u64]) -> Vec<DeliveryCredi
 fn return_delivery_credits(released: Vec<DeliveryCredit>) {
     for (writer, pending) in released {
         if let Some(writer) = writer {
-            let _ = writer.write_record(
-                messages::CREDIT,
-                pending.source.1,
-                &messages::credit(pending.bytes, 1, 0),
-            );
+            let _ = writer.write_credit(pending.source.1, pending.bytes, 1, 0);
         }
     }
 }
@@ -1016,7 +1012,7 @@ fn dispatch_control(
             {
                 return Err(invalid("transaction already exists"));
             }
-            writer.write_record(messages::OK, 0, &messages::ok(envelope.request_id))?;
+            writer.write_ok(messages::OK, 0, envelope.request_id)?;
         }
         messages::CREATE_NODE | messages::UPDATE_NODE => {
             let (envelope, node) = messages::parse_scene_node(&record.body)?;
@@ -1062,11 +1058,7 @@ fn dispatch_control(
                 .get_mut(&(producer, transaction))
                 .ok_or_else(|| invalid("transaction has not begun"))?
                 .push(mutation);
-            writer.write_record(
-                messages::OK,
-                record.object_id,
-                &messages::ok(envelope.request_id),
-            )?;
+            writer.write_ok(messages::OK, record.object_id, envelope.request_id)?;
         }
         messages::DELETE_NODE => {
             let (envelope, node_id) = messages::parse_object_id(&record.body, "node ID")?;
@@ -1080,11 +1072,7 @@ fn dispatch_control(
                 .get_mut(&(producer, transaction))
                 .ok_or_else(|| invalid("transaction has not begun"))?
                 .push(Mutation::Delete(producer, node_id));
-            writer.write_record(
-                messages::OK,
-                record.object_id,
-                &messages::ok(envelope.request_id),
-            )?;
+            writer.write_ok(messages::OK, record.object_id, envelope.request_id)?;
         }
         messages::COMMIT_TXN => {
             let envelope = messages::decode_control(&record.body)?;
@@ -1099,7 +1087,7 @@ fn dispatch_control(
                 .remove(&(producer, transaction))
                 .ok_or_else(|| invalid("transaction has not begun"))?;
             apply_transaction(&mut state, producer, mutations)?;
-            writer.write_record(messages::PRESENTED, 0, &messages::ok(envelope.request_id))?;
+            writer.write_ok(messages::PRESENTED, 0, envelope.request_id)?;
         }
         messages::ABORT_TXN => {
             let envelope = messages::decode_control(&record.body)?;
@@ -1111,7 +1099,7 @@ fn dispatch_control(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .transactions
                 .remove(&(producer, transaction));
-            writer.write_record(messages::OK, 0, &messages::ok(envelope.request_id))?;
+            writer.write_ok(messages::OK, 0, envelope.request_id)?;
         }
         messages::DESTROY_SOURCE => {
             let (envelope, source_id) = messages::parse_object_id(&record.body, "source ID")?;
@@ -1121,7 +1109,7 @@ fn dispatch_control(
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
                 (producer, source_id),
             )?;
-            writer.write_record(messages::OK, source_id, &messages::ok(envelope.request_id))?;
+            writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
         messages::PLAY | messages::PAUSE | messages::DRAIN => {
             let playing = record.record_type == messages::PLAY;
@@ -1168,7 +1156,7 @@ fn dispatch_control(
             if changed {
                 state.revision = state.revision.wrapping_add(1);
             }
-            writer.write_record(messages::OK, source_id, &messages::ok(envelope.request_id))?;
+            writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
         messages::FLUSH => {
             let (envelope, source_id, epoch) = messages::parse_flush(&record.body)?;
@@ -1184,7 +1172,7 @@ fn dispatch_control(
             source.minimum_epoch = epoch;
             source.ended = false;
             source.bridge_desynchronized = true;
-            writer.write_record(messages::OK, source_id, &messages::ok(envelope.request_id))?;
+            writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
         messages::EOS => {
             let (envelope, source_id, _epoch) = messages::parse_eos(&record.body)?;
@@ -1206,18 +1194,18 @@ fn dispatch_control(
                 source.retained_bytes = 0;
             }
             state.revision = state.revision.wrapping_add(1);
-            writer.write_record(messages::OK, source_id, &messages::ok(envelope.request_id))?;
+            writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
         messages::PING => {
             let envelope = messages::decode_control(&record.body)?;
             if record.object_id != 0 || envelope.request_id == 0 {
                 return Err(invalid("PING is not a correlated session-level request"));
             }
-            writer.write_record(messages::PONG, 0, &messages::ok(envelope.request_id))?;
+            writer.write_pong(envelope.request_id)?;
         }
         messages::GOODBYE => {
             let envelope = messages::decode_control(&record.body)?;
-            writer.write_record(messages::OK, 0, &messages::ok(envelope.request_id))?;
+            writer.write_ok(messages::OK, 0, envelope.request_id)?;
             return Ok(false);
         }
         _ if record.flags & vivid_protocol::wire::RECORD_OPTIONAL != 0 => {}
@@ -1275,6 +1263,7 @@ fn create_source(
             last_pts_us: None,
             clock_started: None,
             clock_origin_pts_us: None,
+            last_inner_record_sequence: 0,
         },
     );
     state.tickets.insert(
@@ -1352,8 +1341,9 @@ fn handle_media(
     mark_connection_pane(shared, connection_id, pane)?;
     reader.clear_read_deadline()?;
     reader.set_maximum(ticket.maximum_body);
+    let mut body = Vec::new();
     loop {
-        let record = match reader.read_record() {
+        let record = match reader.read_record_into(&mut body) {
             Ok(record) => record,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error),
@@ -1399,7 +1389,7 @@ fn ingest_record(
     shared: &Arc<Mutex<State>>,
     delivery_changed: &Condvar,
     key: SourceKey,
-    record: &Record,
+    record: &BorrowedRecord<'_>,
 ) -> io::Result<()> {
     let mut state = shared
         .lock()
@@ -1411,21 +1401,21 @@ fn ingest_record(
         .producers
         .get(&key.0)
         .and_then(|producer| producer.writer.upgrade());
-    let (old_retained, new_retained, pts, candidate_forward) = {
+    let (old_retained, retained_body, new_retained, pts, candidate_forward) = {
         let source = state
             .sources
             .get_mut(&key)
             .ok_or_else(|| invalid("source no longer exists"))?;
         let new_retained = match (&source.descriptor, record.record_type) {
             (SourceDescriptor::Raster(config), messages::RASTER_FRAME) => {
-                let parsed = media::parse_full_raster_frame(&record.body)?;
+                let parsed = media::parse_full_raster_frame(record.body)?;
                 if (parsed.width, parsed.height) != (config.width, config.height) {
                     return Err(invalid("raster dimensions changed"));
                 }
                 source.sequence.accept(parsed.frame_id, parsed.epoch)?;
                 media::decode_raster_pixels(parsed)?;
                 source.last_pts_us = Some(parsed.pts_us);
-                Some(Arc::<[u8]>::from(record.body.clone()))
+                Some(Arc::<[u8]>::from(record.body))
             }
             (SourceDescriptor::Image(config), messages::IMAGE_DATA) => {
                 if source.retained.is_some() || record.body.len() != config.encoded_length as usize
@@ -1433,7 +1423,7 @@ fn ingest_record(
                     return Err(invalid("image body count or length is invalid"));
                 }
                 if let Some(expected) = config.sha256
-                    && Sha256::digest(&record.body).as_slice() != expected
+                    && Sha256::digest(record.body).as_slice() != expected
                 {
                     return Err(invalid("image hash mismatch"));
                 }
@@ -1442,15 +1432,15 @@ fn ingest_record(
                     messages::IMAGE_JPEG => image::ImageFormat::Jpeg,
                     _ => return Err(invalid("unsupported image encoding")),
                 };
-                let decoded = image::load_from_memory_with_format(&record.body, format)
+                let decoded = image::load_from_memory_with_format(record.body, format)
                     .map_err(|_| invalid("image decoder rejected body"))?;
                 if (decoded.width(), decoded.height()) != (config.width, config.height) {
                     return Err(invalid("decoded image dimensions mismatch"));
                 }
-                Some(Arc::<[u8]>::from(record.body.clone()))
+                Some(Arc::<[u8]>::from(record.body))
             }
             (SourceDescriptor::Video(config), messages::VIDEO_PACKET) => {
-                let packet = media::parse_video_packet(&record.body)?;
+                let packet = media::parse_video_packet(record.body)?;
                 if packet.data.len() > config.max_access_unit_bytes as usize {
                     return Err(invalid("video access unit exceeds source maximum"));
                 }
@@ -1467,7 +1457,7 @@ fn ingest_record(
                 None
             }
             (SourceDescriptor::Audio(config), messages::AUDIO_PACKET) => {
-                let packet = media::parse_audio_packet(&record.body)?;
+                let packet = media::parse_audio_packet(record.body)?;
                 if packet.data.len() > config.max_access_unit_bytes as usize {
                     return Err(invalid("audio access unit exceeds source maximum"));
                 }
@@ -1484,7 +1474,7 @@ fn ingest_record(
             SourceDescriptor::Raster(_) | SourceDescriptor::Video(_) | SourceDescriptor::Audio(_)
         ) && projected_source
             && !source.bridge_desynchronized;
-        (old, new, source.last_pts_us, forward)
+        (old, new_retained, new, source.last_pts_us, forward)
     };
     let forward_timed = candidate_forward
         && match &state.sources.get(&key).expect("source exists").descriptor {
@@ -1503,11 +1493,12 @@ fn ingest_record(
     }
     let source = state.sources.get_mut(&key).unwrap();
     let retained_requires_revision = matches!(source.descriptor, SourceDescriptor::Image(_));
-    if new_retained > 0 {
-        source.retained = Some(Arc::from(record.body.clone()));
+    if let Some(retained) = retained_body {
+        source.retained = Some(retained);
         source.retained_bytes = new_retained;
     }
     source.last_pts_us = pts;
+    source.last_inner_record_sequence = record.sequence;
     state.retained_bytes = projected;
     if retained_requires_revision && new_retained > 0 && old_retained == 0 {
         // Immutable images have no live MediaEvent, so their first retained body must trigger
@@ -1555,7 +1546,7 @@ fn ingest_record(
             delivery_id,
             source: key,
             record_type: record.record_type,
-            body: record.body.clone(),
+            body: record.body.to_vec(),
         }) {
             Ok(()) => return Ok(()),
             Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -1577,11 +1568,7 @@ fn ingest_record(
         }
     }
     if let Some(writer) = writer {
-        writer.write_record(
-            messages::CREDIT,
-            key.1,
-            &messages::credit(record.body.len() as u64, 1, 0),
-        )?;
+        writer.write_credit(key.1, record.body.len() as u64, 1, 0)?;
     }
     Ok(())
 }
@@ -2236,6 +2223,7 @@ mod tests {
             snapshot.sources[0].retained.as_deref(),
             Some(second.as_slice())
         );
+        assert_eq!(snapshot.sources[0].last_inner_record_sequence, 3);
     }
 
     #[test]

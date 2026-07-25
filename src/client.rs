@@ -484,7 +484,7 @@ fn run_bridge_worker(
     let mut force_replacement = false;
     let mut deferred = None;
     loop {
-        for (delivery_id, delivered) in bridge.take_media_completions() {
+        for (delivery_id, delivered, _outer_record_sequence) in bridge.take_media_completions() {
             if delivery_id != 0 {
                 acknowledge_bridge_delivery(&client_writer, delivery_id, delivered);
             }
