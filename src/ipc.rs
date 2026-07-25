@@ -105,6 +105,7 @@ pub struct PaneMediaSourceStatus {
     pub outer_attachment_generation: Option<u64>,
     pub visible: bool,
     pub capture_policy: u64,
+    pub descriptor: Option<PaneMediaSourceDescriptor>,
     pub retained_static: bool,
     pub keyframe_needed: bool,
     pub milestones: u64,
@@ -112,6 +113,19 @@ pub struct PaneMediaSourceStatus {
     pub queued_bytes: u64,
     pub available_packet_credit: u64,
     pub available_byte_credit: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneMediaSourceDescriptor {
+    pub role: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_availability: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -332,10 +346,21 @@ pub struct BridgeSource {
     pub kind: BridgeSourceKind,
     #[serde(default)]
     pub capture_policy: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor: Option<BridgeSourceDescriptor>,
     pub playing: bool,
     pub play_request: BridgePlayRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<[u8; 16]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeSourceDescriptor {
+    pub role: u64,
+    pub title: String,
+    pub content_revision: u64,
+    pub semantic_availability: u64,
+    pub locator: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

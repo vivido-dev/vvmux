@@ -14,7 +14,10 @@ use vivid_protocol::wire::{Connection, ConnectionKind, ConnectionWriter, Endpoin
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 use zeroize::Zeroizing;
 
-use crate::ipc::{BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind, DisplayMetrics};
+use crate::ipc::{
+    BridgeNode, BridgeSource, BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind,
+    DisplayMetrics,
+};
 
 const REQUIRED_FEATURES: &[u64] = &[
     messages::FEATURE_RASTER_RGBA8,
@@ -33,6 +36,7 @@ const OPTIONAL_FEATURES: &[u64] = &[
     messages::FEATURE_DECODER_DESCRIPTION_V1,
     messages::FEATURE_OBSERVABILITY_CORE_V1,
     messages::FEATURE_ATOMIC_CONTROL_V1,
+    messages::FEATURE_SOURCE_DESCRIPTOR_V1,
     messages::FEATURE_DELEGATED_CONTEXT_V1,
     messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
 ];
@@ -567,6 +571,7 @@ pub struct OuterBridge {
     outer_attachment_generations: HashMap<BridgeSourceKey, u64>,
     delegated_contexts: bool,
     capture_policy: bool,
+    source_descriptors: bool,
     pane_contexts: HashMap<u64, PaneContextMapping>,
 }
 
@@ -670,6 +675,8 @@ impl OuterBridge {
             accepted_features.contains(&messages::FEATURE_DELEGATED_CONTEXT_V1);
         let capture_policy =
             accepted_features.contains(&messages::FEATURE_SOURCE_CAPTURE_POLICY_V1);
+        let source_descriptors =
+            accepted_features.contains(&messages::FEATURE_SOURCE_DESCRIPTOR_V1);
         connection.set_send_body_limit(welcome.maximum_control_body)?;
         let control = ControlDispatcher::start(connection, welcome.display_generation)?;
         let (completions_tx, completions_rx) = mpsc::channel();
@@ -700,6 +707,7 @@ impl OuterBridge {
             outer_attachment_generations: HashMap::new(),
             delegated_contexts,
             capture_policy,
+            source_descriptors,
             pane_contexts: HashMap::new(),
         };
         if accepted_features.contains(&messages::FEATURE_OBSERVABILITY_CORE_V1) {
@@ -784,6 +792,15 @@ impl OuterBridge {
     ) -> io::Result<std::collections::HashSet<BridgeSourceKey>> {
         for source in sources {
             messages::validate_capture_policy(source.capture_policy)?;
+            if let Some(descriptor) = source.descriptor.as_ref() {
+                messages::validate_source_descriptor(&protocol_descriptor(descriptor))?;
+                if !self.source_descriptors {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "outer presenter lacks source-descriptor-v1",
+                    ));
+                }
+            }
             if source.capture_policy != 0 && !self.capture_policy {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -797,6 +814,26 @@ impl OuterBridge {
                     io::ErrorKind::InvalidData,
                     "capture policy cannot be relaxed across the bridge",
                 ));
+            }
+            if let Some(previous) = self.active_sources.get(&source.key) {
+                match (&previous.descriptor, &source.descriptor) {
+                    (Some(previous), Some(current))
+                        if previous != current
+                            && current.content_revision <= previous.content_revision =>
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "descriptor content revision must advance across the bridge",
+                        ));
+                    }
+                    (Some(_), None) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "source descriptor cannot be removed across the bridge",
+                        ));
+                    }
+                    _ => {}
+                }
             }
         }
         self.sync_pane_contexts(sources, nodes)?;
@@ -874,6 +911,33 @@ impl OuterBridge {
                 0,
                 upstream,
                 &messages::set_source_policy(request, upstream, source.capture_policy),
+            )?;
+            self.wait_for(request, messages::OK, upstream)?;
+        }
+        for source in sources
+            .iter()
+            .filter(|source| !recreate.contains(&source.key))
+        {
+            let Some(previous) = self.active_sources.get(&source.key) else {
+                continue;
+            };
+            if source.descriptor == previous.descriptor {
+                continue;
+            }
+            let Some(descriptor) = source.descriptor.as_ref() else {
+                continue;
+            };
+            let upstream = self.source_ids[&source.key];
+            let request = self.request_id()?;
+            self.control.write_record(
+                messages::UPDATE_SOURCE_DESCRIPTOR,
+                0,
+                upstream,
+                &messages::update_source_descriptor(
+                    request,
+                    upstream,
+                    &protocol_descriptor(descriptor),
+                ),
             )?;
             self.wait_for(request, messages::OK, upstream)?;
         }
@@ -1236,7 +1300,7 @@ impl OuterBridge {
                 } => (
                     messages::CREATE_RASTER,
                     ConnectionKind::Raster,
-                    messages::create_raster_with_policy(
+                    messages::create_raster_with_extensions(
                         request,
                         &RasterSourceConfig {
                             source_id: upstream,
@@ -1246,6 +1310,7 @@ impl OuterBridge {
                             compression_mode: *compression_mode,
                         },
                         source.capture_policy,
+                        source.descriptor.as_ref().map(protocol_descriptor).as_ref(),
                     ),
                 ),
                 BridgeSourceKind::Image {
@@ -1257,7 +1322,7 @@ impl OuterBridge {
                 } => (
                     messages::CREATE_IMAGE,
                     ConnectionKind::Blob,
-                    messages::create_image_with_policy(
+                    messages::create_image_with_extensions(
                         request,
                         &ImageSourceConfig {
                             source_id: upstream,
@@ -1268,6 +1333,7 @@ impl OuterBridge {
                             sha256: *sha256,
                         },
                         source.capture_policy,
+                        source.descriptor.as_ref().map(protocol_descriptor).as_ref(),
                     ),
                 ),
                 BridgeSourceKind::Video {
@@ -1291,7 +1357,7 @@ impl OuterBridge {
                 } => (
                     messages::CREATE_VIDEO,
                     ConnectionKind::Video,
-                    messages::create_video_with_policy(
+                    messages::create_video_with_extensions(
                         request,
                         &VideoSourceConfig {
                             source_id: upstream,
@@ -1320,6 +1386,7 @@ impl OuterBridge {
                                 .flatten(),
                         },
                         source.capture_policy,
+                        source.descriptor.as_ref().map(protocol_descriptor).as_ref(),
                     ),
                 ),
                 BridgeSourceKind::Audio {
@@ -1338,7 +1405,7 @@ impl OuterBridge {
                     (
                         messages::CREATE_AUDIO,
                         ConnectionKind::Audio,
-                        messages::create_audio_with_policy(
+                        messages::create_audio_with_extensions(
                             request,
                             &AudioSourceConfig {
                                 source_id: upstream,
@@ -1357,6 +1424,7 @@ impl OuterBridge {
                                     .flatten(),
                             },
                             source.capture_policy,
+                            source.descriptor.as_ref().map(protocol_descriptor).as_ref(),
                         ),
                     )
                 }
@@ -1621,6 +1689,16 @@ fn bridge_source_media_body(source: &BridgeSource) -> u64 {
     length.map(u64::from).unwrap_or(u64::MAX)
 }
 
+fn protocol_descriptor(descriptor: &BridgeSourceDescriptor) -> messages::SourceDescriptor {
+    messages::SourceDescriptor {
+        role: descriptor.role,
+        title: descriptor.title.clone(),
+        content_revision: descriptor.content_revision,
+        semantic_availability: descriptor.semantic_availability,
+        locator: descriptor.locator.clone(),
+    }
+}
+
 fn validate_snapshot(sources: &[BridgeSource], nodes: &[BridgeNode]) -> io::Result<()> {
     let sources = sources
         .iter()
@@ -1788,6 +1866,7 @@ mod tests {
                 compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
             },
             capture_policy: 0,
+            descriptor: None,
             playing: false,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -2515,6 +2594,7 @@ mod tests {
                 max_access_unit_bytes: 1024,
             },
             capture_policy: 0,
+            descriptor: None,
             playing: true,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
@@ -2601,6 +2681,7 @@ mod tests {
                 max_access_unit_bytes: 1_048_576,
             },
             capture_policy: 0,
+            descriptor: None,
             playing: true,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
