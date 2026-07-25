@@ -2,7 +2,7 @@
 
 VVWS/1 is the public, renderer-neutral protocol for attaching a browser terminal to sessions owned
 by vvmux. It is distinct from the private, same-user VVMX IPC protocol. VVWS/1 carries terminal
-text and session control; its `vivid-bridge-v1` capability also brokers the existing Vivid 1.0 wire
+text and session control; its `vivid-bridge-v1` capability also brokers the existing Vivid 1.1 wire
 protocol over separate binary WebSockets. Vivid records are not translated into VVWS JSON.
 
 ## Transport and authentication

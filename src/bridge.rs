@@ -569,6 +569,8 @@ impl OuterBridge {
                 required_features: REQUIRED_FEATURES,
                 optional_features: OPTIONAL_FEATURES,
                 maximum_record_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
+                authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
+                preserved_fields: &[],
             },
         );
         connection.write_record(messages::HELLO, 0, 0, &body)?;

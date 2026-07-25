@@ -147,7 +147,7 @@ record.
 
 The gateway lists, creates, and exclusively attaches to sessions. It serves no HTML or JavaScript
 and does not expose session kill operations. Plain xterm.js clients can attach text-only;
-Vivido.js's built-in `connectVvmux` coordinator also routes Vivid 1.0 over authenticated binary
+Vivido.js's built-in `connectVvmux` coordinator also routes Vivid 1.1 over authenticated binary
 WebSockets, so images and timed media remain synchronized with the session. See
 [VVWS-1.md](VVWS-1.md) for the normative wire contract and client integration shape.
 

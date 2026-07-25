@@ -401,8 +401,10 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
                 maximum_control_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
                 accepted_profiles: &[],
                 selected_major: 1,
-                selected_minor: 0,
+                selected_minor: 1,
                 accepted_features: &vivid_hello.required_features,
+                initial_scene_revision: 0,
+                preserved_fields: &[],
             },
         );
         let welcome_header = RecordHeader {
