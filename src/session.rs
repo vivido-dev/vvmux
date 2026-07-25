@@ -32,6 +32,7 @@ const MAX_PROJECTED_NODES: usize = 256;
 const INPUT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_AUTOMATION_REQUESTS_PER_CLIENT: usize = 64;
 const MAX_AUTOMATION_WAITERS: usize = 256;
+const MAX_PENDING_ACTOR_WORK: usize = 256;
 const AUTOMATION_RESPONSE_QUEUE: usize = 8;
 const SCREEN_CHANGE_HISTORY: usize = 1024;
 const EXIT_TOMBSTONES: usize = 128;
@@ -483,6 +484,7 @@ struct SessionActor {
     session_sequence: u64,
     response_sender: mpsc::SyncSender<AutomationResponseJob>,
     automation_inflight: HashMap<u64, HashSet<u64>>,
+    pending_actor_work: HashSet<(u64, u64)>,
     automation_waiters: Vec<AutomationWaiter>,
     exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
@@ -567,6 +569,7 @@ pub fn start(
         session_sequence: 1,
         response_sender,
         automation_inflight: HashMap::new(),
+        pending_actor_work: HashSet::new(),
         automation_waiters: Vec::new(),
         exit_tombstones: VecDeque::new(),
         shutdown: shutdown.clone(),
@@ -635,6 +638,8 @@ impl SessionActor {
             }
             ActorEvent::Disconnected(id) => {
                 self.automation_inflight.remove(&id);
+                self.pending_actor_work
+                    .retain(|(client_id, _)| *client_id != id);
                 self.automation_waiters
                     .retain(|waiter| waiter.reply.client_id != id);
                 if self.attached.as_ref().is_some_and(|client| client.id == id) {
@@ -743,9 +748,13 @@ impl SessionActor {
                 self.close_pane(pane_id);
             }
             ActorEvent::AutomationInputComplete { reply, result } => match result {
-                Ok(()) => self.reply_automation(reply, serde_json::Value::Null),
+                Ok(()) => {
+                    self.complete_pending_actor_work(&reply);
+                    self.reply_automation(reply, serde_json::Value::Null);
+                }
                 Err(message) => {
-                    self.reply_automation_error(reply, AutomationError::new("pty_closed", message))
+                    self.complete_pending_actor_work(&reply);
+                    self.reply_automation_error(reply, AutomationError::new("pty_closed", message));
                 }
             },
             ActorEvent::Media(event) => {
@@ -1449,6 +1458,13 @@ impl SessionActor {
             );
             return;
         }
+        if !self.register_pending_actor_work(&target) {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("limit_exceeded", "session pending-work quota is exhausted"),
+            );
+            return;
+        }
         let receiver = match self
             .panes
             .get(&pane_id)
@@ -1457,6 +1473,7 @@ impl SessionActor {
         {
             Ok(receiver) => receiver,
             Err(error) => {
+                self.complete_pending_actor_work(&target);
                 self.reply_automation_error(
                     target,
                     AutomationError::new("pty_closed", error.to_string()),
@@ -1485,11 +1502,30 @@ impl SessionActor {
                 });
             });
         if let Err(error) = spawn {
+            self.complete_pending_actor_work(&target);
             self.reply_automation_error(
                 target,
                 AutomationError::new("unsupported", error.to_string()),
             );
         }
+    }
+
+    /// Admit work that may block outside the single-writer session actor.
+    ///
+    /// The actor performs ordered validation and admission, records a bounded completion key, and
+    /// yields. A worker owns the blocking wait and can only return through a typed `ActorEvent`;
+    /// mutation and reply emission resume on the actor after this key is released.
+    fn register_pending_actor_work(&mut self, target: &AutomationReplyTarget) -> bool {
+        if self.pending_actor_work.len() >= MAX_PENDING_ACTOR_WORK {
+            return false;
+        }
+        self.pending_actor_work
+            .insert((target.client_id, target.request_id))
+    }
+
+    fn complete_pending_actor_work(&mut self, target: &AutomationReplyTarget) {
+        self.pending_actor_work
+            .remove(&(target.client_id, target.request_id));
     }
 
     fn pane_description(&self, pane_id: PaneId) -> Option<serde_json::Value> {
@@ -4706,6 +4742,7 @@ mod tests {
             session_sequence: 1,
             response_sender,
             automation_inflight: HashMap::new(),
+            pending_actor_work: HashSet::new(),
             automation_waiters: Vec::new(),
             exit_tombstones: VecDeque::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
