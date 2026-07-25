@@ -501,6 +501,13 @@ fn run_bridge_worker(
             force_sources = true;
             let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
         }
+        for (source, playback) in bridge.take_playback_states() {
+            let _ = client_writer.send(ClientMessage::BridgePlaybackState {
+                source,
+                state: playback.state,
+                eos_state: playback.eos_state,
+            });
+        }
         let pending = snapshot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

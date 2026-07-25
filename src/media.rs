@@ -753,6 +753,25 @@ impl VirtualVivid {
         }
     }
 
+    pub fn apply_outer_playback(&self, key: SourceKey, playback_state: u64, eos_state: u64) {
+        let mut state = self.lock();
+        let Some(source) = state.sources.get_mut(&key) else {
+            return;
+        };
+        let mut changed = messages::SOURCE_CHANGED_PLAYBACK;
+        if playback_state == messages::PLAYBACK_PLAYING {
+            source.milestones |= messages::MILESTONE_PLAYBACK_STARTED;
+            changed |= messages::SOURCE_CHANGED_MILESTONES;
+        } else if playback_state == messages::PLAYBACK_ENDED && eos_state >= messages::EOS_ACCEPTED
+        {
+            source.playing = false;
+            source.milestones |= messages::MILESTONE_PLAYBACK_ENDED;
+            changed |= messages::SOURCE_CHANGED_LIFECYCLE | messages::SOURCE_CHANGED_MILESTONES;
+            advance_projection(&mut state);
+        }
+        let _ = advance_source(&mut state, key, changed);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -2104,8 +2123,9 @@ fn dispatch_control(
                 source.clock_origin_pts_us = None;
             }
             if changed {
+                let headless = state.events.is_none();
                 let source = state.sources.get_mut(&(producer, source_id)).unwrap();
-                if playing {
+                if playing && headless {
                     source.milestones |= messages::MILESTONE_PLAYBACK_STARTED;
                 }
                 advance_source(

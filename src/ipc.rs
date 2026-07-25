@@ -391,6 +391,11 @@ pub enum ClientMessage {
         outer_revision: u64,
         outer_attachment_generations: Vec<(BridgeSourceKey, u64)>,
     },
+    BridgePlaybackState {
+        source: BridgeSourceKey,
+        state: u64,
+        eos_state: u64,
+    },
     /// Keyboard float-edit input, valid only while the actor-confirmed mode `mode_id` is
     /// current; the actor ignores stale IDs.
     FloatingEdit {
