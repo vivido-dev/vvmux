@@ -9,6 +9,7 @@ use vivid_protocol::messages::{
     self, AudioSourceConfig, ClipRect, HelloConfig, ImageSourceConfig, RasterSourceConfig,
     SceneNodeConfig, VideoSourceConfig,
 };
+use vivid_protocol::revision::{SceneRevision, SourceRevision};
 use vivid_protocol::wire::{Connection, ConnectionKind, ConnectionWriter, Endpoint, Record};
 use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 use zeroize::Zeroizing;
@@ -30,6 +31,7 @@ const OPTIONAL_FEATURES: &[u64] = &[
     messages::FEATURE_VIDEO_CONTROL_V1,
     messages::FEATURE_AUDIO_ACCESS_UNIT_V1,
     messages::FEATURE_DECODER_DESCRIPTION_V1,
+    messages::FEATURE_OBSERVABILITY_CORE_V1,
 ];
 const MAX_PENDING_CONTROL_REPLIES: usize = 4096;
 const MEDIA_WRITER_QUEUE: usize = 32;
@@ -48,6 +50,8 @@ struct ControlState {
     next_ping_id: u64,
     pending_pings: HashMap<u64, Instant>,
     rtt_us: Option<u64>,
+    outer_scene_revision: SceneRevision,
+    outer_source_revisions: HashMap<u64, SourceRevision>,
 }
 
 impl Default for ControlState {
@@ -66,6 +70,8 @@ impl Default for ControlState {
             next_ping_id: u64::MAX,
             pending_pings: HashMap::new(),
             rtt_us: None,
+            outer_scene_revision: SceneRevision::ZERO,
+            outer_source_revisions: HashMap::new(),
         }
     }
 }
@@ -184,6 +190,21 @@ impl ControlDispatcher {
                             }),
                         messages::DISPLAY_CHANGED => messages::parse_display_changed(&record.body)
                             .map(|display| state.display_generation = display.display_generation),
+                        messages::SOURCE_CHANGED => messages::parse_source_changed(&record.body)
+                            .and_then(|event| {
+                                if event.source_id != record.object_id {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "outer SOURCE_CHANGED source/object ID mismatch",
+                                    ));
+                                }
+                                state
+                                    .outer_source_revisions
+                                    .insert(event.source_id, event.source_revision);
+                                Ok(())
+                            }),
+                        messages::SCENE_CHANGED => messages::parse_scene_changed(&record.body)
+                            .map(|event| state.outer_scene_revision = event.scene_revision),
                         messages::PONG => {
                             messages::request_id(&record.body).and_then(|request_id| {
                                 if record.object_id != 0 || request_id == 0 {
@@ -522,6 +543,9 @@ pub struct OuterBridge {
     hello_extensions: Vec<PreservedField>,
     #[allow(dead_code)] // Retained for negotiation-aware gateway consumers and conformance tests.
     welcome_extensions: Vec<PreservedField>,
+    /// Local acknowledgement domain for successfully reconciled outer snapshots.
+    outer_applied_revision: u64,
+    outer_attachment_generations: HashMap<BridgeSourceKey, u64>,
 }
 
 struct PendingBody {
@@ -616,7 +640,7 @@ impl OuterBridge {
         connection.set_send_body_limit(welcome.maximum_control_body)?;
         let control = ControlDispatcher::start(connection, welcome.display_generation)?;
         let (completions_tx, completions_rx) = mpsc::channel();
-        Ok(Self {
+        let mut bridge = Self {
             connection_factory,
             token,
             control,
@@ -638,7 +662,35 @@ impl OuterBridge {
             decoder_description,
             hello_extensions: hello_extensions.to_vec(),
             welcome_extensions: welcome.preserved_fields,
-        })
+            outer_applied_revision: 0,
+            outer_attachment_generations: HashMap::new(),
+        };
+        if accepted_features.contains(&messages::FEATURE_OBSERVABILITY_CORE_V1) {
+            let request = bridge.request_id()?;
+            bridge.control.write_record(
+                messages::SET_OBSERVATION,
+                0,
+                0,
+                &messages::set_observation(request, messages::OBSERVATION_CLASS_MASK)?,
+            )?;
+            bridge.wait_for(request, messages::OK, 0)?;
+        }
+        Ok(bridge)
+    }
+
+    pub fn mark_projection_applied(&mut self) -> u64 {
+        self.outer_applied_revision = self.outer_applied_revision.saturating_add(1);
+        self.outer_applied_revision
+    }
+
+    pub fn attachment_generations(&self) -> Vec<(BridgeSourceKey, u64)> {
+        let mut generations = self
+            .outer_attachment_generations
+            .iter()
+            .map(|(&source, &generation)| (source, generation))
+            .collect::<Vec<_>>();
+        generations.sort_by_key(|(source, _)| (source.producer, source.source));
+        generations
     }
 
     pub fn rebuild(
@@ -1112,6 +1164,11 @@ impl OuterBridge {
                 .name(format!("vvmux-media-{upstream}"))
                 .spawn(move || run_media_writer(media, shared, receiver, completions))?;
             self.media.insert(source.key, SourceMediaWriter { sender });
+            let generation = self
+                .outer_attachment_generations
+                .entry(source.key)
+                .or_default();
+            *generation = generation.saturating_add(1);
             self.source_kinds.insert(source.key, source.kind.clone());
         }
         Ok(())

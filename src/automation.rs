@@ -41,6 +41,8 @@ pub enum MsgCommand {
     ListPanes,
     /// Inspect one pane.
     Inspect(PaneTarget),
+    /// Inspect sanitized Vivid media state owned by one pane.
+    InspectMedia(PaneTarget),
     /// Split a tiled pane without changing the active tab.
     Split {
         #[arg(value_enum)]
@@ -155,6 +157,17 @@ pub enum WaitCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Wait for a newer virtual or outer media projection revision.
+    Media {
+        #[arg(long)]
+        after_virtual: Option<u64>,
+        #[arg(long)]
+        after_outer: Option<u64>,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
 }
 
 pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()> {
@@ -230,6 +243,12 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
         MsgCommand::ListPanes => (AutomationMethod::ListPanes, None, false, Output::Json),
         MsgCommand::Inspect(target) => (
             AutomationMethod::Inspect,
+            target.pane_id,
+            true,
+            Output::Json,
+        ),
+        MsgCommand::InspectMedia(target) => (
+            AutomationMethod::InspectMedia,
             target.pane_id,
             true,
             Output::Json,
@@ -371,6 +390,21 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             ),
             WaitCommand::Exit { timeout, pane_id } => (
                 AutomationMethod::WaitExit {
+                    timeout_ms: millis(timeout),
+                },
+                pane_id,
+                true,
+                Output::Json,
+            ),
+            WaitCommand::Media {
+                after_virtual,
+                after_outer,
+                timeout,
+                pane_id,
+            } => (
+                AutomationMethod::WaitMedia {
+                    after_virtual_revision: after_virtual,
+                    after_outer_revision: after_outer,
                     timeout_ms: millis(timeout),
                 },
                 pane_id,

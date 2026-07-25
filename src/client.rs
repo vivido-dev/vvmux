@@ -145,14 +145,15 @@ pub fn attach(
                         let _ = write_title(&output_thread, &format!("vvmux: {status}"));
                     }
                     ServerMessage::MediaSnapshot {
+                        revision,
                         sources,
                         nodes,
                         videos_needing_keyframes,
-                        ..
                     } => {
                         if let Some(bridge) = &mut bridge {
                             bridge.replace_snapshot(BridgeSnapshot {
                                 generation: 0,
+                                virtual_revision: revision,
                                 sources,
                                 nodes,
                                 videos_needing_keyframes,
@@ -351,6 +352,7 @@ impl Drop for ClientWorkers {
 
 pub(crate) struct BridgeSnapshot {
     pub(crate) generation: u64,
+    pub(crate) virtual_revision: u64,
     pub(crate) sources: Vec<BridgeSource>,
     pub(crate) nodes: Vec<BridgeNode>,
     pub(crate) videos_needing_keyframes: Vec<BridgeSourceKey>,
@@ -541,6 +543,13 @@ fn run_bridge_worker(
                 let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
                 continue;
             }
+            let outer_revision = bridge.mark_projection_applied();
+            let outer_attachment_generations = bridge.attachment_generations();
+            let _ = client_writer.send(ClientMessage::BridgeApplied {
+                virtual_revision: pending.virtual_revision,
+                outer_revision,
+                outer_attachment_generations,
+            });
 
             if change == ProjectionChange::Sources {
                 let current = pending
@@ -1230,6 +1239,7 @@ mod tests {
         };
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 1,
             sources: vec![source],
             nodes: vec![node],
             videos_needing_keyframes: Vec::new(),
@@ -1373,6 +1383,7 @@ mod tests {
         };
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 1,
             sources: vec![video_source.clone(), audio_source.clone()],
             nodes: Vec::new(),
             videos_needing_keyframes: Vec::new(),
@@ -1421,6 +1432,7 @@ mod tests {
         playing_video.playing = true;
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 2,
             sources: vec![playing_video, audio_source],
             nodes: Vec::new(),
             videos_needing_keyframes: Vec::new(),
@@ -1586,6 +1598,7 @@ mod tests {
 
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 1,
             sources: vec![video_source.clone()],
             nodes: vec![node(0)],
             videos_needing_keyframes: Vec::new(),
@@ -1608,6 +1621,7 @@ mod tests {
 
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 2,
             sources: vec![video_source.clone()],
             nodes: vec![node(5)],
             videos_needing_keyframes: Vec::new(),
@@ -1666,6 +1680,7 @@ mod tests {
         };
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 3,
             sources: vec![video_source.clone(), image_source.clone()],
             nodes: vec![node(5)],
             videos_needing_keyframes: Vec::new(),
@@ -1705,6 +1720,7 @@ mod tests {
         };
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 4,
             sources: vec![video_source.clone(), image_source.clone()],
             nodes: vec![node(5), image_node.clone()],
             videos_needing_keyframes: Vec::new(),
@@ -1732,6 +1748,7 @@ mod tests {
 
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 5,
             sources: Vec::new(),
             nodes: Vec::new(),
             videos_needing_keyframes: Vec::new(),
@@ -1743,6 +1760,7 @@ mod tests {
 
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 6,
             sources: vec![image_source.clone()],
             nodes: vec![image_node.clone()],
             videos_needing_keyframes: Vec::new(),
@@ -1776,6 +1794,7 @@ mod tests {
         };
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 7,
             sources: vec![image_source.clone()],
             nodes: vec![remaining_image_node.clone()],
             videos_needing_keyframes: Vec::new(),
@@ -1816,6 +1835,7 @@ mod tests {
         };
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 8,
             sources: vec![image_source, replay_video],
             nodes: vec![replay_node, remaining_image_node],
             videos_needing_keyframes: Vec::new(),

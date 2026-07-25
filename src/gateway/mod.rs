@@ -851,10 +851,10 @@ async fn handle_session_message(
         }
         ServerMessage::Pong => {}
         ServerMessage::MediaSnapshot {
+            revision,
             sources,
             nodes,
             videos_needing_keyframes,
-            ..
         } => {
             let Some(bridge) = bridge.as_mut() else {
                 return Err(io::Error::new(
@@ -864,6 +864,7 @@ async fn handle_session_message(
             };
             bridge.replace_snapshot(BridgeSnapshot {
                 generation: 0,
+                virtual_revision: revision,
                 sources,
                 nodes,
                 videos_needing_keyframes,

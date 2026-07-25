@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 pub const CONTROL_MAX_BODY: u32 = 1024 * 1024;
 pub const BULK_MAX_BODY: u32 = 64 * 1024 * 1024;
 const STRUCTURED_RECORD: u16 = 1;
@@ -29,6 +29,7 @@ pub enum AutomationMethod {
     Capabilities,
     ListPanes,
     Inspect,
+    InspectMedia,
     Split {
         axis: Axis,
     },
@@ -75,6 +76,53 @@ pub enum AutomationMethod {
     WaitExit {
         timeout_ms: u64,
     },
+    WaitMedia {
+        after_virtual_revision: Option<u64>,
+        after_outer_revision: Option<u64>,
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneMediaStatus {
+    pub virtual_projection_revision: u64,
+    pub virtual_scene_revision: u64,
+    pub outer_projection_revision: u64,
+    pub sources: Vec<PaneMediaSourceStatus>,
+    pub nodes: Vec<PaneMediaNodeStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneMediaSourceStatus {
+    pub producer_id: u64,
+    pub source_id: u64,
+    pub kind: String,
+    pub lifecycle: String,
+    pub source_revision: u64,
+    pub epoch: u32,
+    pub attachment_state: u64,
+    pub attachment_generation: u64,
+    pub outer_attachment_generation: Option<u64>,
+    pub visible: bool,
+    pub retained_static: bool,
+    pub keyframe_needed: bool,
+    pub milestones: u64,
+    pub queued_packets: u64,
+    pub queued_bytes: u64,
+    pub available_packet_credit: u64,
+    pub available_byte_credit: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneMediaNodeStatus {
+    pub producer_id: u64,
+    pub node_id: u64,
+    pub source_id: u64,
+    pub visible: bool,
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -338,6 +386,11 @@ pub enum ClientMessage {
         delivered: bool,
     },
     BridgeSnapshotRetry,
+    BridgeApplied {
+        virtual_revision: u64,
+        outer_revision: u64,
+        outer_attachment_generations: Vec<(BridgeSourceKey, u64)>,
+    },
     /// Keyboard float-edit input, valid only while the actor-confirmed mode `mode_id` is
     /// current; the actor ignores stale IDs.
     FloatingEdit {
