@@ -992,6 +992,14 @@ impl OuterBridge {
         {
             self.play_source(source)?;
         }
+        // A recreated outer source starts with an open epoch, so a stream that already ended
+        // inner-side has to be closed again; `update_playback` above sees no transition for it.
+        for source in sources
+            .iter()
+            .filter(|source| recreate.contains(&source.key) && source.eos_epoch.is_some())
+        {
+            self.end_source(source)?;
+        }
 
         for (_, upstream) in obsolete {
             let request = self.request_id()?;
@@ -1153,15 +1161,17 @@ impl OuterBridge {
             let Some(old) = previous.iter().find(|old| old.key == source.key) else {
                 continue;
             };
-            if old.playing == source.playing
-                && (!source.playing || old.play_request == source.play_request)
+            if old.playing != source.playing
+                || (source.playing && old.play_request != source.play_request)
             {
-                continue;
+                if source.playing {
+                    self.play_source(source)?;
+                } else {
+                    self.pause_source(source)?;
+                }
             }
-            if source.playing {
-                self.play_source(source)?;
-            } else {
-                self.pause_source(source)?;
+            if old.eos_epoch != source.eos_epoch {
+                self.end_source(source)?;
             }
         }
         Ok(())
@@ -1652,6 +1662,36 @@ impl OuterBridge {
         self.wait_for(request, messages::OK, upstream)
     }
 
+    /// Close the outer epoch for a source whose inner ingress has ended.
+    ///
+    /// `EOS` closes ingress without pausing: already-buffered media keeps playing, and the outer
+    /// presenter reports `MILESTONE_PLAYBACK_ENDED` once its queue drains. Skipping this leaves an
+    /// inner producer waiting on `WAIT_PLAYBACK_ENDED` for a milestone that can never arrive.
+    fn end_source(&mut self, source: &BridgeSource) -> io::Result<()> {
+        let Some(epoch) = source.eos_epoch else {
+            return Ok(());
+        };
+        if !matches!(
+            source.kind,
+            BridgeSourceKind::Video { .. } | BridgeSourceKind::Audio { .. }
+        ) {
+            return Ok(());
+        }
+        let upstream = *self
+            .source_ids
+            .get(&source.key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ended source missing"))?;
+        let request = self.request_id()?;
+        let body = messages::eos(request, upstream, epoch);
+        self.control.write_record(
+            messages::EOS,
+            0,
+            upstream,
+            &with_causation(&body, source.causation_id)?,
+        )?;
+        self.wait_for(request, messages::OK, upstream)
+    }
+
     fn pause_source(&mut self, source: &BridgeSource) -> io::Result<()> {
         if !matches!(
             source.kind,
@@ -1927,6 +1967,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: false,
+            eos_epoch: None,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
@@ -2655,6 +2696,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: true,
+            eos_epoch: None,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
@@ -2742,6 +2784,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: true,
+            eos_epoch: None,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
@@ -2803,5 +2846,36 @@ mod tests {
             snapshot.sources[0].play_request.start_pts_us, 30_000_000,
             "a playback-only update must re-base the outer PLAY without a rebuild"
         );
+
+        // Inner ingress ends. The outer epoch has to be closed explicitly: a presenter only
+        // reaches its playback-ended milestone after EOS, so without this the inner producer
+        // waits on WAIT_PLAYBACK_ENDED for a milestone that never arrives.
+        let mut ended = rebased.clone();
+        ended.eos_epoch = Some(1);
+        bridge
+            .update_playback(std::slice::from_ref(&rebased), std::slice::from_ref(&ended))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let snapshot = loop {
+            let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+            if snapshot.sources[0].eos_epoch.is_some() || Instant::now() >= deadline {
+                break snapshot;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(
+            snapshot.sources[0].eos_epoch,
+            Some(1),
+            "the outer presenter must receive EOS for the ended epoch"
+        );
+        assert!(
+            snapshot.sources[0].playing,
+            "EOS closes ingress without pausing already-buffered playback"
+        );
+
+        // The transition is edge-triggered, so a repeated snapshot must not re-send EOS.
+        bridge
+            .update_playback(std::slice::from_ref(&ended), std::slice::from_ref(&ended))
+            .unwrap();
     }
 }

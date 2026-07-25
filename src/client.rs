@@ -1223,6 +1223,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: false,
+            eos_epoch: None,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
@@ -1363,6 +1364,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: false,
+            eos_epoch: None,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
@@ -1391,6 +1393,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: false,
+            eos_epoch: None,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
@@ -1569,6 +1572,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: true,
+            eos_epoch: None,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
@@ -1694,6 +1698,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: false,
+            eos_epoch: None,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
@@ -1849,6 +1854,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: true,
+            eos_epoch: None,
             causation_id: None,
             play_request: video_source.play_request,
         };
@@ -1924,6 +1930,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing,
+            eos_epoch: None,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
@@ -1952,6 +1959,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: false,
+            eos_epoch: None,
             causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
@@ -2046,6 +2054,7 @@ mod tests {
             capture_policy: 0,
             descriptor: None,
             playing: false,
+            eos_epoch: None,
             causation_id: None,
             play_request: after[0].play_request,
         });

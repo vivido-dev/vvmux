@@ -8,7 +8,14 @@ use serde_json::Value;
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
+/// Raised when a peer's preface carries a different [`VERSION`].
+///
+/// A session server outlives the binary that spawned it, so rebuilding across a version bump
+/// leaves the old daemon owning the socket. Callers that know which server they reached append its
+/// identity to this text; see `server::describe_peer_version`.
+pub const VERSION_MISMATCH: &str =
+    "unsupported VVMX protocol version; restart the vvmux client and session server";
 pub const CONTROL_MAX_BODY: u32 = 1024 * 1024;
 pub const BULK_MAX_BODY: u32 = 64 * 1024 * 1024;
 const STRUCTURED_RECORD: u16 = 1;
@@ -350,6 +357,12 @@ pub struct BridgeSource {
     pub descriptor: Option<BridgeSourceDescriptor>,
     pub playing: bool,
     pub play_request: BridgePlayRequest,
+    /// Epoch of the inner `EOS`, once ingress has closed.
+    ///
+    /// The outer presenter only reaches `MILESTONE_PLAYBACK_ENDED` after it sees `EOS`, so the
+    /// bridge has to close the matching outer epoch rather than let the source simply run dry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eos_epoch: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<[u8; 16]>,
 }
@@ -656,9 +669,7 @@ fn decode_preface(preface: &[u8; 12]) -> io::Result<(ChannelKind, u32)> {
         return Err(invalid("bad VVMX magic"));
     }
     if u16::from_be_bytes(preface[4..6].try_into().unwrap()) != VERSION {
-        return Err(invalid(
-            "unsupported VVMX protocol version; restart the vvmux client and session server",
-        ));
+        return Err(invalid(VERSION_MISMATCH));
     }
     if preface[7] != 0 {
         return Err(invalid("VVMX preface reserved byte is nonzero"));

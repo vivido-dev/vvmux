@@ -3182,6 +3182,7 @@ impl SessionActor {
                 }),
                 playing: source.playing,
                 play_request: bridge_play_request(source.play_request),
+                eos_epoch: source.eos_epoch,
                 causation_id: source.causation_id,
             })
             .collect::<Vec<_>>();

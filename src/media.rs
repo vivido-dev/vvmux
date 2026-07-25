@@ -103,6 +103,7 @@ pub struct SnapshotSource {
     pub retained: Option<Arc<[u8]>>,
     pub playing: bool,
     pub play_request: messages::PlayRequest,
+    pub eos_epoch: Option<u32>,
     #[allow(dead_code)] // Kept distinct from the outer sequence for the Stage 4 EOS barrier.
     pub last_inner_record_sequence: u64,
     pub causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
@@ -155,6 +156,12 @@ struct Source {
     playing: bool,
     play_request: messages::PlayRequest,
     ended: bool,
+    /// Epoch carried by the inner `EOS`, once ingress has closed for that epoch.
+    ///
+    /// The bridge needs it to close the matching outer epoch: an outer presenter only reaches
+    /// `MILESTONE_PLAYBACK_ENDED` after it has seen `EOS`, so without this the inner producer
+    /// waits on `WAIT_PLAYBACK_ENDED` forever.
+    eos_epoch: Option<u32>,
     bridge_desynchronized: bool,
     minimum_epoch: u32,
     last_pts_us: Option<i64>,
@@ -530,6 +537,7 @@ impl VirtualVivid {
                 retained: source.retained.clone(),
                 playing: source.playing,
                 play_request: source.play_request,
+                eos_epoch: source.eos_epoch,
                 last_inner_record_sequence: source.last_inner_record_sequence,
                 causation_id: source.causation_id,
                 capture_policy: source.capture_policy,
@@ -1070,6 +1078,20 @@ fn emit_source_event(state: &mut State, key: SourceKey, changed_fields: u64) -> 
     Ok(())
 }
 
+/// Whether a pane's display can back a spec-valid `WELCOME`.
+///
+/// Vivid requires a nonzero viewport, grid, and cell size, and `update_metrics` only runs from the
+/// projection pass, so a pane has no metrics until a client attaches. Producers admitted before
+/// then would receive a `WELCOME` they must reject as malformed.
+fn usable_display(display: &DisplayChanged) -> bool {
+    display.viewport_width > 0
+        && display.viewport_height > 0
+        && display.grid_columns > 0
+        && display.grid_rows > 0
+        && display.cell_width > 0
+        && display.cell_height > 0
+}
+
 fn evaluate_wait(source: &Source, visible: bool, wait: PendingSourceWait) -> Option<Option<u64>> {
     let reached = match wait.condition {
         messages::WAIT_SOURCE_REVISION => source.revision.get() >= wait.value.unwrap_or(u64::MAX),
@@ -1479,6 +1501,25 @@ fn handle_control(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Read the metrics under the same lock that admits the producer: WELCOME is built from
+        // this snapshot, so checking it separately could still emit a malformed one if the pane
+        // closed in between.
+        let Some(display) = state.metrics.get(&pane).copied().filter(usable_display) else {
+            let mut detail = messages::ErrorDetail::new();
+            detail.insert_bool(messages::ERROR_DETAIL_RETRYABLE, true);
+            writer.write_record(
+                messages::ERROR,
+                0,
+                &messages::error_with_detail(
+                    request_id,
+                    messages::ERROR_PRECONDITION_FAILED,
+                    false,
+                    &detail,
+                    "vvmux pane has no display metrics yet; attach a vvmux client",
+                )?,
+            )?;
+            return Ok(());
+        };
         if state.producers.len() >= MAX_PRODUCERS {
             let detail = messages::ErrorDetail::limit(
                 messages::LIMIT_CONCURRENT_SESSIONS,
@@ -1540,16 +1581,6 @@ fn handle_control(
                 waits: HashMap::new(),
             },
         );
-        let display = state.metrics.get(&pane).copied().unwrap_or(DisplayChanged {
-            display_generation: 1,
-            viewport_width: 0,
-            viewport_height: 0,
-            grid_columns: 80,
-            grid_rows: 22,
-            cell_width: 0,
-            cell_height: 0,
-            settled: true,
-        });
         (producer_id, tag, (producer_id << 32) | 1, display)
     };
     writer.write_record(
@@ -2541,6 +2572,7 @@ fn dispatch_control(
             source.sequence = MediaSequence::default();
             source.minimum_epoch = epoch;
             source.ended = false;
+            source.eos_epoch = None;
             source.bridge_desynchronized = true;
             source.last_media_id = 0;
             source.last_pts_us = None;
@@ -2554,7 +2586,7 @@ fn dispatch_control(
             writer.write_ok(messages::OK, source_id, envelope.request_id)?;
         }
         messages::EOS => {
-            let (envelope, source_id, _epoch) = messages::parse_eos(&record.body)?;
+            let (envelope, source_id, eos_epoch) = messages::parse_eos(&record.body)?;
             wait_for_source_deliveries(shared, delivery_changed, (producer, source_id));
             let mut state = shared
                 .lock()
@@ -2564,6 +2596,10 @@ fn dispatch_control(
                 .get_mut(&(producer, source_id))
                 .ok_or_else(|| invalid("source missing"))?;
             source.ended = true;
+            // `wait_for_source_deliveries` above already drained this source's outstanding bridge
+            // deliveries, so publishing the epoch now orders the outer EOS strictly after the last
+            // forwarded media record.
+            source.eos_epoch = Some(eos_epoch);
             source.causation_id = envelope.causation_id;
             source.milestones |= messages::MILESTONE_EOS_ACCEPTED;
             // EOS closes ingress but does not pause presentation. Vivi submits ahead, then keeps
@@ -2661,6 +2697,7 @@ fn create_source(
             owner: producer,
             descriptor,
             retained: None,
+            eos_epoch: None,
             sequence: MediaSequence::default(),
             retained_bytes: 0,
             playing: false,
@@ -3775,6 +3812,54 @@ mod tests {
     }
 
     #[test]
+    fn hello_is_rejected_until_the_pane_has_display_metrics() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = test_virtual_endpoint(&directory, "vivid-no-metrics.sock");
+        let service = match VirtualVivid::start(socket, MediaConfig::default()) {
+            Ok(service) => service,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping virtual presenter metrics socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("virtual presenter start failed: {error}"),
+        };
+        let token = service.issue_pane_capability(7).unwrap();
+        let endpoint = service_endpoint(&service);
+
+        // No client has attached, so the projection pass has never called `update_metrics`. The
+        // pane cannot back a spec-valid WELCOME, so the session must be refused outright rather
+        // than answered with a zero viewport the producer would reject as malformed.
+        let mut early = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        early
+            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &token))
+            .unwrap();
+        let rejection = early.read_record().unwrap();
+        assert_eq!(rejection.record_type, messages::ERROR);
+        let rejection = messages::parse_error_reply(&rejection.body).unwrap();
+        assert_eq!(rejection.code, messages::ERROR_PRECONDITION_FAILED);
+        assert!(!rejection.fatal, "attaching a client clears this condition");
+        assert_eq!(
+            rejection.detail.get_bool(messages::ERROR_DETAIL_RETRYABLE),
+            Some(true)
+        );
+
+        // Once the pane reports real metrics the same capability completes the handshake, and the
+        // WELCOME carries them rather than the zeroes that failed mandatory-field validation.
+        service.update_metrics(7, 80, 22, (10, 20));
+        let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        control
+            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &token))
+            .unwrap();
+        let accepted = control.read_record().unwrap();
+        assert_eq!(accepted.record_type, messages::WELCOME);
+        let welcome = messages::parse_welcome(&accepted.body).unwrap();
+        assert_eq!(welcome.cell_width, 10);
+        assert_eq!(welcome.cell_height, 20);
+        assert_eq!(welcome.viewport_width, 800);
+        assert_eq!(welcome.viewport_height, 440);
+    }
+
+    #[test]
     fn projected_raster_frames_are_forwarded_and_bridge_paced() {
         let directory = tempfile::tempdir().unwrap();
         let socket = test_virtual_endpoint(&directory, "vivid-raster-paced.sock");
@@ -4554,6 +4639,9 @@ mod tests {
         };
         let token_one = service.issue_pane_capability(7).unwrap();
         let token_two = service.issue_pane_capability(8).unwrap();
+        // Match the session actor: a pane reports metrics before a producer can be admitted.
+        service.update_metrics(7, 80, 22, (10, 20));
+        service.update_metrics(8, 80, 22, (10, 20));
         let endpoint = service_endpoint(&service);
 
         let mut owner = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
