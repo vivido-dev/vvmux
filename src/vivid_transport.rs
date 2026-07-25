@@ -535,11 +535,65 @@ mod tests {
             },
             &cbor_shaped_media,
         );
+        let capability = [b'K'; messages::CONTEXT_CAPABILITY_BYTES];
+        let capability_reply = messages::context_capability(10, 5, &capability);
+        channel.emit(
+            TraceDirection::Send,
+            RecordHeader {
+                body_length: capability_reply.len() as u32,
+                record_type: messages::CONTEXT_CAPABILITY,
+                flags: 0,
+                object_id: 5,
+                sequence: 4,
+            },
+            &capability_reply,
+        );
+        let ticket = [b'T'; 32];
+        let ready = messages::source_ready(
+            11,
+            95,
+            &ticket,
+            messages::Credits {
+                bytes: 4096,
+                packets: 1,
+                fragments: 0,
+            },
+            4096,
+        );
+        channel.emit(
+            TraceDirection::Send,
+            RecordHeader {
+                body_length: ready.len() as u32,
+                record_type: messages::SOURCE_READY,
+                flags: 0,
+                object_id: 95,
+                sequence: 5,
+            },
+            &ready,
+        );
+        let cookie = "vvbridge_session=COOKIE-SENTINEL";
+        let marker = "\u{1b}_GVIVID1;MARKER-SENTINEL\u{1b}\\";
+        let diagnostic = messages::error(
+            12,
+            messages::ERROR_BAD_MESSAGE,
+            &format!("{cookie} {marker}"),
+        );
+        channel.emit(
+            TraceDirection::Send,
+            RecordHeader {
+                body_length: diagnostic.len() as u32,
+                record_type: messages::ERROR,
+                flags: 0,
+                object_id: 0,
+                sequence: 6,
+            },
+            &diagnostic,
+        );
         drop(channel);
         drop(guard);
 
         let records = records.lock().unwrap();
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 6);
         assert_eq!(records[1].outcome, TraceOutcome::Restricted);
         assert_eq!(records[1].object_id, None);
         assert_eq!(
@@ -555,6 +609,10 @@ mod tests {
             "confidential pane title",
             "private-media-body",
             "\"object_id\":92",
+            "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK",
+            "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+            cookie,
+            "MARKER-SENTINEL",
         ] {
             assert!(!trace.contains(forbidden), "trace leaked {forbidden}");
         }
