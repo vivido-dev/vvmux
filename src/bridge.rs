@@ -2150,6 +2150,27 @@ impl OuterBridge {
     }
 }
 
+impl Drop for OuterBridge {
+    fn drop(&mut self) {
+        // The control dispatcher owns cloned socket halves on its reader and heartbeat threads, so
+        // dropping the foreground writer alone does not close the transport. End the protocol
+        // session explicitly: Vivido can then remove this bridge's scene before a reattached
+        // client creates its replacement session, and the peer observes a clean close rather than
+        // a later connection reset.
+        let Ok(request) = self.request_id() else {
+            return;
+        };
+        let body = messages::goodbye(request);
+        if self
+            .control
+            .write_record(messages::GOODBYE, 0, 0, &body)
+            .is_ok()
+        {
+            let _ = self.wait_for(request, messages::OK, 0);
+        }
+    }
+}
+
 fn bridge_source_pixels(source: &BridgeSource) -> u64 {
     match &source.kind {
         BridgeSourceKind::Raster { width, height, .. }
@@ -2548,11 +2569,10 @@ fn exhausted(kind: &'static str) -> io::Error {
 mod tests {
     #[cfg(unix)]
     use std::collections::HashSet;
-    #[cfg(unix)]
     use std::io::{Read, Write};
+    use std::net::TcpListener;
     #[cfg(unix)]
     use std::sync::mpsc;
-    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -2560,6 +2580,7 @@ mod tests {
     use crate::config::Media as MediaConfig;
     #[cfg(unix)]
     use crate::media::VirtualVivid;
+    use vivid_protocol::wire::{HEADER_SIZE, PREFACE_SIZE, RecordHeader};
 
     #[test]
     fn raster_frames_are_reoriginated_as_full_with_hop_local_identity() {
@@ -2952,11 +2973,7 @@ mod tests {
     }
     #[cfg(unix)]
     use vivid_protocol::media::{self, VideoPacket};
-    #[cfg(unix)]
-    use vivid_protocol::wire::{HEADER_SIZE, PREFACE_SIZE, RecordHeader};
-
-    #[cfg(unix)]
-    fn read_client_record(stream: &mut std::os::unix::net::UnixStream) -> io::Result<Record> {
+    fn read_client_record(stream: &mut impl Read) -> io::Result<Record> {
         let mut header = [0; HEADER_SIZE];
         stream.read_exact(&mut header)?;
         let header = RecordHeader::decode(header);
@@ -2971,9 +2988,8 @@ mod tests {
         })
     }
 
-    #[cfg(unix)]
     fn write_server_record(
-        stream: &mut std::os::unix::net::UnixStream,
+        stream: &mut impl Write,
         sequence: &mut u64,
         record_type: u16,
         object_id: u64,
@@ -2992,6 +3008,65 @@ mod tests {
         )?;
         stream.write_all(body)?;
         stream.flush()
+    }
+
+    #[test]
+    fn dropping_outer_bridge_sends_goodbye_before_reattach() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> io::Result<()> {
+            let (mut control, _) = listener.accept()?;
+            control.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut preface = [0; PREFACE_SIZE];
+            control.read_exact(&mut preface)?;
+            let hello = read_client_record(&mut control)?;
+            let request = messages::request_id(&hello.body)?;
+            let mut sequence = 0;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::WELCOME,
+                0,
+                &messages::welcome(
+                    request,
+                    1,
+                    &[1; 16],
+                    1,
+                    messages::DisplayChanged {
+                        display_generation: 1,
+                        viewport_width: 800,
+                        viewport_height: 600,
+                        grid_columns: 80,
+                        grid_rows: 24,
+                        cell_width: 10,
+                        cell_height: 25,
+                        settled: true,
+                    },
+                    REQUIRED_FEATURES,
+                ),
+            )?;
+
+            let goodbye = read_client_record(&mut control)?;
+            assert_eq!(goodbye.record_type, messages::GOODBYE);
+            assert_eq!(goodbye.object_id, 0);
+            let request = messages::request_id(&goodbye.body)?;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                0,
+                &messages::ok(request),
+            )
+        });
+
+        let bridge = OuterBridge::connect(
+            format!("tcp:{address}"),
+            Zeroizing::new("11".repeat(32)),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+        drop(bridge);
+        server.join().unwrap().unwrap();
     }
 
     #[cfg(unix)]
