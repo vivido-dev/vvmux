@@ -114,6 +114,8 @@ pub struct SnapshotSource {
     pub causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
     pub capture_policy: u64,
     pub semantic_descriptor: Option<messages::SourceDescriptor>,
+    /// Operation limit of a delta-capable inner raster source, if it negotiated one.
+    pub raster_delta_operation_limit: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -266,8 +268,15 @@ struct State {
     next_delivery_id: u64,
     queued_bridge_bytes: usize,
     events: Option<mpsc::SyncSender<MediaEvent>>,
+    /// Wakes the consumer after a media event is queued.
+    ///
+    /// The events channel is drained by the session actor, which spends most of its time parked
+    /// on a different receiver. Without this nudge a frame would wait for that receiver's timeout.
+    media_wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
     next_connection: u64,
     connection_cancellers: HashMap<u64, (Option<PaneId>, ConnectionCancel)>,
+    /// Diagnostic counters only. Nothing in ingest, projection, or credit accounting reads these.
+    delivery_metrics: crate::metrics::DeliveryMetrics,
 }
 
 pub struct VirtualVivid {
@@ -315,8 +324,10 @@ impl VirtualVivid {
             next_delivery_id: 0,
             queued_bridge_bytes: 0,
             events,
+            media_wakeup: None,
             next_connection: 0,
             connection_cancellers: HashMap::new(),
+            delivery_metrics: crate::metrics::DeliveryMetrics::default(),
         }));
         let delivery_changed = Arc::new(Condvar::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -331,6 +342,11 @@ impl VirtualVivid {
             .name("vvmux-vivid-listener".into())
             .spawn(move || accept_loop(listener, state, delivery_changed, shutdown))?;
         Ok(service)
+    }
+
+    /// Install the callback that nudges the media-event consumer after a queue.
+    pub fn set_media_wakeup(&self, wakeup: Arc<dyn Fn() + Send + Sync>) {
+        self.lock().media_wakeup = Some(wakeup);
     }
 
     pub fn endpoint(&self) -> String {
@@ -580,6 +596,10 @@ impl VirtualVivid {
                 causation_id: source.causation_id,
                 capture_policy: source.capture_policy,
                 semantic_descriptor: source.semantic_descriptor.clone(),
+                raster_delta_operation_limit: source
+                    .raster_update
+                    .filter(|update| update.mode == messages::RASTER_FULL_FRAME_AND_DELTA)
+                    .map(|update| update.operation_limit),
             });
             if matches!(source.descriptor, SourceDescriptor::Video(_))
                 && source.playing
@@ -606,6 +626,10 @@ impl VirtualVivid {
             .copied()
             .collect::<Vec<_>>();
         state.projected_sources = projected_sources;
+        state.delivery_metrics.released_hidden = state
+            .delivery_metrics
+            .released_hidden
+            .saturating_add(hidden_deliveries.len() as u64);
         let released = take_deliveries(&mut state, &hidden_deliveries);
         state.active_panes = panes.clone();
         for key in visibility_changes {
@@ -635,6 +659,7 @@ impl VirtualVivid {
         pane: PaneId,
         outer_projection_revision: u64,
         outer_attachment_generations: &HashMap<crate::ipc::BridgeSourceKey, u64>,
+        relay: crate::metrics::RelayMetrics,
     ) -> PaneMediaStatus {
         let state = self.lock();
         let mut owners = state
@@ -754,6 +779,10 @@ impl VirtualVivid {
             outer_projection_revision,
             sources,
             nodes,
+            relay: crate::metrics::RelayMetrics {
+                delivery: state.delivery_metrics,
+                ..relay
+            },
         }
     }
 
@@ -781,6 +810,12 @@ impl VirtualVivid {
             let Some(pending) = state.deliveries.remove(&delivery_id) else {
                 return false;
             };
+            if delivered {
+                state.delivery_metrics.delivered =
+                    state.delivery_metrics.delivered.saturating_add(1);
+            } else {
+                state.delivery_metrics.failed = state.delivery_metrics.failed.saturating_add(1);
+            }
             state.queued_bridge_bytes = state
                 .queued_bridge_bytes
                 .saturating_sub(pending.queued_bytes);
@@ -837,6 +872,19 @@ impl VirtualVivid {
                 if !matches!(source.descriptor, SourceDescriptor::Video(_)) || source.ended {
                     continue;
                 }
+                // Recovery is already outstanding when the source is desynchronized and the
+                // producer has not yet reached the epoch previously demanded. Asking again would
+                // push the bar further out, and a producer of encoded video cannot manufacture a
+                // key packet — it must wait for the next natural one, discarding up to a full GOP
+                // each time. Under load a burst of dropped packets would otherwise convert one
+                // hiccup into seconds of frozen video.
+                if source.bridge_desynchronized && source.minimum_epoch > source.sequence.epoch() {
+                    state.delivery_metrics.keyframe_requests_damped = state
+                        .delivery_metrics
+                        .keyframe_requests_damped
+                        .saturating_add(1);
+                    continue;
+                }
                 source.minimum_epoch = source
                     .minimum_epoch
                     .max(source.sequence.epoch())
@@ -849,6 +897,8 @@ impl VirtualVivid {
                 .get(&key.0)
                 .and_then(|producer| producer.writer.upgrade())
             {
+                state.delivery_metrics.keyframe_requests =
+                    state.delivery_metrics.keyframe_requests.saturating_add(1);
                 let _ = writer.write_record(
                     messages::NEED_KEYFRAME,
                     key.1,
@@ -859,6 +909,39 @@ impl VirtualVivid {
                         None,
                     ),
                 );
+            }
+        }
+    }
+
+    /// Ask inner raster producers for a full frame.
+    ///
+    /// Used when the bridge's own outgoing delta chain cannot continue. Setting
+    /// `raster_requires_full_reason` makes `prepare_raster` reject further inner deltas until a
+    /// full frame arrives, which is the presenter obligation in specification 11.4 applied to this
+    /// hop's boundary.
+    pub fn request_full_frames(&self, sources: &[SourceKey], reason: u64) {
+        let mut state = self.lock();
+        for key in sources {
+            {
+                let Some(source) = state.sources.get_mut(key) else {
+                    continue;
+                };
+                if !matches!(source.descriptor, SourceDescriptor::Raster(_)) || source.ended {
+                    continue;
+                }
+                if source.raster_requires_full_reason == Some(reason) {
+                    // Recovery is already outstanding; a second request would only add traffic.
+                    continue;
+                }
+                source.raster_requires_full_reason = Some(reason);
+            }
+            if let Some(writer) = state
+                .producers
+                .get(&key.0)
+                .and_then(|producer| producer.writer.upgrade())
+                && let Ok(body) = messages::need_full_frame(key.1, reason)
+            {
+                let _ = writer.write_record(messages::NEED_FULL_FRAME, key.1, &body);
             }
         }
     }
@@ -3536,12 +3619,66 @@ fn prepare_raster(
     }))
 }
 
+/// Verify an `IMAGE_DATA` body against its source configuration without holding the global lock.
+///
+/// The lock is taken only to copy the immutable image configuration; hashing and decoding then run
+/// unlocked. A source's descriptor is fixed for its lifetime, so the copy cannot go stale, and the
+/// caller re-checks the mutable conditions — retained state and body length — under the lock.
+/// Non-image records return immediately.
+fn validate_encoded_image(
+    shared: &Arc<Mutex<State>>,
+    key: SourceKey,
+    record: &BorrowedRecord<'_>,
+) -> io::Result<()> {
+    if record.record_type != messages::IMAGE_DATA {
+        return Ok(());
+    }
+    let config = {
+        let state = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source = state
+            .sources
+            .get(&key)
+            .ok_or_else(|| invalid("source no longer exists"))?;
+        match &source.descriptor {
+            SourceDescriptor::Image(config) => config.clone(),
+            _ => return Ok(()),
+        }
+    };
+    if record.body.len() != config.encoded_length as usize {
+        return Err(invalid("image body count or length is invalid"));
+    }
+    if let Some(expected) = config.sha256
+        && Sha256::digest(record.body).as_slice() != expected
+    {
+        return Err(invalid("image hash mismatch"));
+    }
+    let format = match config.encoding {
+        messages::IMAGE_PNG => image::ImageFormat::Png,
+        messages::IMAGE_JPEG => image::ImageFormat::Jpeg,
+        _ => return Err(invalid("unsupported image encoding")),
+    };
+    let decoded = image::load_from_memory_with_format(record.body, format)
+        .map_err(|_| invalid("image decoder rejected body"))?;
+    if (decoded.width(), decoded.height()) != (config.width, config.height) {
+        return Err(invalid("decoded image dimensions mismatch"));
+    }
+    Ok(())
+}
+
 fn ingest_record(
     shared: &Arc<Mutex<State>>,
     delivery_changed: &Condvar,
     key: SourceKey,
     record: &BorrowedRecord<'_>,
 ) -> io::Result<IngestOutcome> {
+    // Hashing and decoding an encoded image are the most expensive work on any ingest path — a
+    // large PNG is easily hundreds of milliseconds under load. Doing it before taking the global
+    // media lock keeps it off every other source and off the session actor, which needs that lock
+    // for delivery completion, projection snapshots, marker observation, and anchor scrolling. An
+    // image arriving in one tab used to stall rendering and video for every other pane.
+    validate_encoded_image(shared, key, record)?;
     let mut state = shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3593,24 +3730,11 @@ fn ingest_record(
                 Some(prepared.body.clone())
             }
             (SourceDescriptor::Image(config), messages::IMAGE_DATA) => {
+                // The hash and decode already ran without the lock. Re-check the two conditions
+                // that depend on state the lock protects, because it was released in between.
                 if source.retained.is_some() || record.body.len() != config.encoded_length as usize
                 {
                     return Err(invalid("image body count or length is invalid"));
-                }
-                if let Some(expected) = config.sha256
-                    && Sha256::digest(record.body).as_slice() != expected
-                {
-                    return Err(invalid("image hash mismatch"));
-                }
-                let format = match config.encoding {
-                    messages::IMAGE_PNG => image::ImageFormat::Png,
-                    messages::IMAGE_JPEG => image::ImageFormat::Jpeg,
-                    _ => return Err(invalid("unsupported image encoding")),
-                };
-                let decoded = image::load_from_memory_with_format(record.body, format)
-                    .map_err(|_| invalid("image decoder rejected body"))?;
-                if (decoded.width(), decoded.height()) != (config.width, config.height) {
-                    return Err(invalid("decoded image dimensions mismatch"));
                 }
                 source.last_media_id = 1;
                 Some(Arc::<[u8]>::from(record.body))
@@ -3652,8 +3776,31 @@ fn ingest_record(
             SourceDescriptor::Raster(_) | SourceDescriptor::Video(_) | SourceDescriptor::Audio(_)
         ) && projected_source
             && !source.bridge_desynchronized;
+        // Raster forwards the composed canonical full frame, except when the inner record was a
+        // delta that the bridge can chain onto its own outgoing frame. Forwarding the delta keeps
+        // an update proportional to its damage instead of expanding it to the whole framebuffer on
+        // both remaining hops; the bridge restamps the identities so no inner base crosses the
+        // boundary.
         let forward_body = matches!(source.descriptor, SourceDescriptor::Raster(_))
-            .then(|| new_retained.clone())
+            .then(|| {
+                let is_delta = record.record_type == messages::RASTER_FRAME
+                    && record.body.len() >= 8
+                    && u32::from_be_bytes(record.body[4..8].try_into().expect("checked length"))
+                        & media::RASTER_FRAME_DELTA
+                        != 0;
+                // Prefer whichever form is smaller, the same rule the specification puts on a
+                // producer. For a small surface the operation descriptors can outweigh the pixels
+                // they describe, and then the full frame is both cheaper and simpler downstream.
+                let delta_wins = is_delta
+                    && new_retained
+                        .as_ref()
+                        .is_none_or(|full| record.body.len() < full.len());
+                if delta_wins {
+                    Some(Arc::<[u8]>::from(record.body))
+                } else {
+                    new_retained.clone()
+                }
+            })
             .flatten();
         let pts = prepared_raster
             .as_ref()
@@ -3720,6 +3867,7 @@ fn ingest_record(
     let headless_delay = (!projected_source)
         .then(|| headless_playback_delay(&mut state, key, pts))
         .flatten();
+    let media_wakeup = state.media_wakeup.clone();
     let delivery = if forward_timed
         && let Some(events) = state.events.clone()
         && (state.queued_bridge_bytes == 0
@@ -3739,8 +3887,15 @@ fn ingest_record(
                 queued_bytes: forwarded.len(),
             },
         );
+        state.delivery_metrics.created = state.delivery_metrics.created.saturating_add(1);
         Some((delivery_id, events))
     } else {
+        if forward_timed {
+            state.delivery_metrics.dropped_queue_budget = state
+                .delivery_metrics
+                .dropped_queue_budget
+                .saturating_add(1);
+        }
         if forward_timed
             && let Some(source) = state.sources.get_mut(&key)
             && matches!(source.descriptor, SourceDescriptor::Video(_))
@@ -3764,12 +3919,21 @@ fn ingest_record(
             record_type: record.record_type,
             body: forwarded.to_vec(),
         }) {
-            Ok(()) => return Ok(IngestOutcome::Accepted),
+            Ok(()) => {
+                if let Some(wakeup) = media_wakeup {
+                    wakeup();
+                }
+                return Ok(IngestOutcome::Accepted);
+            }
             Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
                 let credit = {
                     let mut state = shared
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.delivery_metrics.dropped_actor_queue_full = state
+                        .delivery_metrics
+                        .dropped_actor_queue_full
+                        .saturating_add(1);
                     let credit = if let Some(pending) = state.deliveries.remove(&delivery_id) {
                         state.queued_bridge_bytes = state
                             .queued_bridge_bytes
@@ -4156,8 +4320,10 @@ mod tests {
             next_delivery_id: 0,
             queued_bridge_bytes: 0,
             events: None,
+            media_wakeup: None,
             next_connection: 0,
             connection_cancellers: HashMap::new(),
+            delivery_metrics: crate::metrics::DeliveryMetrics::default(),
         }
     }
 
@@ -4542,6 +4708,154 @@ mod tests {
         );
     }
 
+    /// Decoding an encoded image must not hold the global media lock.
+    ///
+    /// That lock is also needed by the session actor for delivery completion, projection
+    /// snapshots, marker observation, and anchor scrolling, so a large decode used to stall
+    /// rendering and video for every other pane while one pane displayed an image.
+    #[test]
+    fn image_validation_does_not_hold_the_global_media_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = test_virtual_endpoint(&directory, "vivid-image-lock.sock");
+        let service = match VirtualVivid::start(socket, MediaConfig::default()) {
+            Ok(service) => service,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("virtual Vivid failed to start: {error}"),
+        };
+
+        // Large enough that the decode dominates any lock bookkeeping around it.
+        const SIDE: u32 = 1024;
+        let mut encoded = Vec::new();
+        image::DynamicImage::new_rgba8(SIDE, SIDE)
+            .write_to(
+                &mut std::io::Cursor::new(&mut encoded),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let key = (1_u64, 3_u64);
+        {
+            let mut state = service.lock();
+            let mut source = barrier_source(1);
+            source.descriptor = SourceDescriptor::Image(ImageSourceConfig {
+                source_id: key.1,
+                encoding: messages::IMAGE_PNG,
+                width: SIDE,
+                height: SIDE,
+                encoded_length: encoded.len() as u32,
+                sha256: Some(Sha256::digest(&encoded).into()),
+            });
+            state.sources.insert(key, source);
+        }
+
+        // Contend for the lock throughout one validation and count how often it was obtainable.
+        let contender = service.state.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let contender_stop = stop.clone();
+        let contender_thread = thread::spawn(move || {
+            let mut acquisitions = 0_u64;
+            while !contender_stop.load(Ordering::Acquire) {
+                drop(
+                    contender
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+                acquisitions += 1;
+                thread::sleep(Duration::from_millis(1));
+            }
+            acquisitions
+        });
+
+        let record = BorrowedRecord {
+            record_type: messages::IMAGE_DATA,
+            flags: 0,
+            object_id: key.1,
+            sequence: 1,
+            body: &encoded,
+        };
+        let started = Instant::now();
+        validate_encoded_image(&service.state, key, &record).unwrap();
+        let decode = started.elapsed();
+        stop.store(true, Ordering::Release);
+        let acquisitions = contender_thread.join().unwrap();
+
+        assert!(
+            acquisitions > 4,
+            "the lock was obtainable only {acquisitions} times during a {decode:?} decode, \
+             so the decode is still holding it"
+        );
+
+        // The behavioural contract is unchanged: every rejection still happens.
+        let mut corrupt = encoded.clone();
+        *corrupt.last_mut().unwrap() ^= 0xff;
+        let bad_hash = BorrowedRecord {
+            body: &corrupt,
+            ..record
+        };
+        assert!(validate_encoded_image(&service.state, key, &bad_hash).is_err());
+        let truncated = BorrowedRecord {
+            body: &encoded[..encoded.len() - 1],
+            ..record
+        };
+        assert!(validate_encoded_image(&service.state, key, &truncated).is_err());
+        // A record for a non-image source is not this function's concern.
+        let other = BorrowedRecord {
+            record_type: messages::VIDEO_PACKET,
+            ..record
+        };
+        assert!(validate_encoded_image(&service.state, key, &other).is_ok());
+    }
+
+    /// A burst of dropped packets must produce one recovery request, not one per packet.
+    ///
+    /// A producer of encoded video cannot manufacture a key packet; it discards until the next
+    /// natural one, so each extra request costs up to a full GOP of frozen video and pushes
+    /// `minimum_epoch` further beyond what the producer will ever reach.
+    #[test]
+    fn repeated_keyframe_requests_are_damped_until_the_producer_catches_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = test_virtual_endpoint(&directory, "vivid-keyframe-damping.sock");
+        let service = match VirtualVivid::start(socket, MediaConfig::default()) {
+            Ok(service) => service,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("virtual Vivid failed to start: {error}"),
+        };
+
+        let key = (1_u64, 5_u64);
+        {
+            let mut state = service.lock();
+            let mut source = barrier_source(1);
+            source.playing = true;
+            state.sources.insert(key, source);
+            state.projected_sources.insert(key);
+        }
+
+        service.request_keyframes(&[key]);
+        let after_first = {
+            let state = service.lock();
+            (
+                state.sources[&key].minimum_epoch,
+                state.delivery_metrics.keyframe_requests,
+                state.delivery_metrics.keyframe_requests_damped,
+            )
+        };
+        assert_eq!(after_first.2, 0, "the first request is not damped");
+
+        for _ in 0..32 {
+            service.request_keyframes(&[key]);
+        }
+        let state = service.lock();
+        assert_eq!(
+            state.sources[&key].minimum_epoch, after_first.0,
+            "a damped request must not push the demanded epoch further out"
+        );
+        assert_eq!(
+            state.delivery_metrics.keyframe_requests, after_first.1,
+            "no further NEED_KEYFRAME should be emitted while recovery is outstanding"
+        );
+        assert_eq!(state.delivery_metrics.keyframe_requests_damped, 32);
+        assert!(state.sources[&key].bridge_desynchronized);
+    }
+
     #[test]
     fn hidden_media_credit_follows_the_playback_clock() {
         let started = Instant::now();
@@ -4827,6 +5141,119 @@ mod tests {
         assert_eq!(welcome.viewport_height, 440);
     }
 
+    /// A realistic surface: a small damaged region should cross the hop as a delta rather than as
+    /// the whole framebuffer, which is the bandwidth this stage exists to remove.
+    #[test]
+    fn delta_re_origination_is_used_when_it_is_smaller_than_a_full_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = test_virtual_endpoint(&directory, "vivid-raster-delta-size.sock");
+        let (event_sender, event_receiver) = mpsc::sync_channel(8);
+        let service = match VirtualVivid::start_with_events(
+            socket,
+            MediaConfig::default(),
+            Some(event_sender),
+        ) {
+            Ok(service) => service,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("virtual Vivid failed to start: {error}"),
+        };
+        let token = service.issue_pane_capability(7).unwrap();
+        service.update_metrics(7, 80, 24, (10, 20));
+
+        const WIDTH: u32 = 256;
+        const HEIGHT: u32 = 256;
+        let endpoint = service_endpoint(&service);
+        let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        control
+            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &token))
+            .unwrap();
+        assert_eq!(
+            control.read_record().unwrap().record_type,
+            messages::WELCOME
+        );
+        control
+            .write_record(
+                messages::CREATE_RASTER,
+                0,
+                9,
+                &messages::create_raster_delta_config(
+                    2,
+                    &RasterSourceConfig {
+                        source_id: 9,
+                        width: WIDTH,
+                        height: HEIGHT,
+                        alpha_mode: messages::ALPHA_STRAIGHT,
+                        compression_mode: messages::COMPRESSION_NONE,
+                    },
+                    4,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let ready = messages::parse_source_ready(&control.read_record().unwrap().body).unwrap();
+        let mut raster = Connection::open(&endpoint, ConnectionKind::Raster).unwrap();
+        raster
+            .write_record(
+                messages::ATTACH_CHANNEL,
+                0,
+                9,
+                &messages::attach_channel(&ready.media_ticket),
+            )
+            .unwrap();
+
+        let mut scene_writer = service.lock();
+        scene_writer.active_panes.insert(7);
+        drop(scene_writer);
+        service.projection_snapshot(&HashSet::from([7]));
+
+        let pixels = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
+        let full = media::raster_frame_body(1, 1, WIDTH, HEIGHT, &pixels).unwrap();
+        raster
+            .write_record(messages::RASTER_FRAME, 0, 9, &full)
+            .unwrap();
+        let first = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            first.body, full,
+            "the first frame of a source is always full"
+        );
+        service.complete_bridge_delivery(first.delivery_id, true);
+
+        // Repaint a 16x16 corner: 1 KiB of pixels against a 256 KiB framebuffer.
+        let delta = media::raster_delta_frame_body(
+            1,
+            2,
+            1,
+            10_000,
+            16_000,
+            WIDTH,
+            HEIGHT,
+            4,
+            &[media::RasterDeltaOperation::Overwrite {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+                rgba: &vec![255_u8; 16 * 16 * 4],
+            }],
+            false,
+        )
+        .unwrap();
+        raster
+            .write_record(messages::RASTER_FRAME, 0, 9, &delta)
+            .unwrap();
+        let second = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            second.body, delta,
+            "a delta smaller than the framebuffer must cross the hop as a delta"
+        );
+        assert!(
+            second.body.len() * 20 < full.len(),
+            "expected a large saving, got {} against {}",
+            second.body.len(),
+            full.len()
+        );
+    }
+
     #[test]
     fn projected_raster_frames_are_forwarded_and_bridge_paced() {
         let directory = tempfile::tempdir().unwrap();
@@ -4893,6 +5320,9 @@ mod tests {
             .unwrap();
 
         let revision_before_frames = service.revision();
+        let expected_full_frame_len = media::raster_frame_body(1, 1, 2, 2, &[0; 16])
+            .unwrap()
+            .len();
         let first_pixels = [
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
         ];
@@ -4946,6 +5376,10 @@ mod tests {
             .unwrap();
         let second_event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(second_event.record_type, messages::RASTER_FRAME);
+        // On a 2x2 surface two operation descriptors cost more than the whole framebuffer, so the
+        // composed full frame is the smaller form and wins. `delta_re_origination_is_used_when_it_
+        // is_smaller_than_a_full_frame` covers the size where the delta pays.
+        assert!(second.len() >= expected_full_frame_len);
         let expected_pixels = [0, 0, 0, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255];
         let expected =
             canonical_raster_full_body(1, 2, 10_000, 16_000, 2, 2, &expected_pixels).unwrap();
@@ -5810,8 +6244,8 @@ mod tests {
             },
             7,
         )]);
-        let first = service.pane_status(7, 41, &outer_generations);
-        let second = service.pane_status(7, 42, &outer_generations);
+        let first = service.pane_status(7, 41, &outer_generations, Default::default());
+        let second = service.pane_status(7, 42, &outer_generations, Default::default());
         assert_eq!(first.virtual_scene_revision, second.virtual_scene_revision);
         assert_eq!(
             first.sources[0].source_revision, second.sources[0].source_revision,

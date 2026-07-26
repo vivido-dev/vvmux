@@ -1,12 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,11 @@ use crate::ipc::{
 use crate::platform::ClientTerminal;
 
 const BRIDGE_MEDIA_CHUNK: usize = 128 * 1024;
+/// How often the bridge worker reports its counters to the session server.
+///
+/// Coarse on purpose: these are diagnostics and must not add measurable traffic to the client
+/// connection they are measuring.
+const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
 pub fn attach(
     name: &str,
@@ -70,7 +75,7 @@ pub fn attach(
     let (mode_sender, mode_receiver) = mpsc::sync_channel::<(u64, bool)>(8);
     let output = terminal.output()?;
     let output = Arc::new(Mutex::new(output));
-    let output_thread = output.clone();
+    let output_thread = TerminalOutput::spawn(output, writer.clone())?;
     let bridge_display = display;
     let bridge_queue_records =
         (client_config.media.ipc_queue_bytes / BRIDGE_MEDIA_CHUNK).clamp(1, 1024);
@@ -92,7 +97,7 @@ pub fn attach(
                         ) {
                             Ok(worker) => Some(worker),
                             Err(error) => {
-                                let _ = write_title(
+                                write_title(
                                     &output_thread,
                                     &format!("vvmux media disabled: {error}"),
                                 );
@@ -100,49 +105,48 @@ pub fn attach(
                             }
                         },
                         Err(error) => {
-                            let _ = write_title(
-                                &output_thread,
-                                &format!("vvmux media disabled: {error}"),
-                            );
+                            write_title(&output_thread, &format!("vvmux media disabled: {error}"));
                             None
                         }
                     }
                 }
                 _ => None,
             };
-            while let Ok(message) = reader.recv::<ServerMessage>() {
+            while let Ok(message) = reader.recv_server() {
                 match message {
                     ServerMessage::Attached { text_only, .. } => {
                         if text_only {
-                            let _ = write_title(&output_thread, "vvmux (text-only media fallback)");
+                            write_title(&output_thread, "vvmux (text-only media fallback)");
                         }
                     }
                     ServerMessage::Render {
                         frame_id,
+                        full,
                         last,
                         bytes,
                         ..
                     } => {
-                        if write_output(&output_thread, &bytes).is_err() {
-                            break;
-                        }
-                        if last {
-                            let _ = send_client(&read_writer, &ClientMessage::RenderAck(frame_id));
+                        // Queue and return. The acknowledgement is sent by the output thread once
+                        // the bytes reach the terminal, so it stays a true completion signal.
+                        if !output_thread.enqueue_frame(frame_id, full, last, bytes) {
+                            // The backlog was discarded, so the screen no longer matches what the
+                            // server believes it drew. Only a full redraw can restore agreement.
+                            let _ = send_client(&read_writer, &ClientMessage::RenderResync);
                         }
                     }
                     ServerMessage::Title(title) => {
-                        let _ = write_title(&output_thread, &title);
+                        write_title(&output_thread, &title);
                     }
                     ServerMessage::Bell => {
-                        let _ = write_output(&output_thread, b"\x07");
+                        output_thread.enqueue_control(b"\x07".to_vec());
                     }
                     ServerMessage::Clipboard(text) => {
                         let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-                        let operation = format!("\x1b]52;c;{encoded}\x1b\\");
-                        let _ = write_output(&output_thread, operation.as_bytes());
+                        output_thread
+                            .enqueue_control(format!("\x1b]52;c;{encoded}\x1b\\").into_bytes());
                     }
                     ServerMessage::Status(status) => {
-                        let _ = write_title(&output_thread, &format!("vvmux: {status}"));
+                        write_title(&output_thread, &format!("vvmux: {status}"));
                     }
                     ServerMessage::MediaSnapshot {
                         revision,
@@ -194,6 +198,7 @@ pub fn attach(
                     ServerMessage::Automation(_) | ServerMessage::AutomationChunk { .. } => break,
                 }
             }
+            output_thread.stop();
             read_stopped.store(true, Ordering::Release);
         })?;
 
@@ -391,6 +396,9 @@ pub(crate) struct BridgeWorker {
     snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     dropped: Arc<Mutex<HashSet<u64>>>,
     generation: u64,
+    /// Incremented by the reader thread when a media record cannot be queued; folded into the
+    /// worker's periodic report so a drop storm is visible in `inspect-media`.
+    queue_drops: Arc<AtomicU64>,
 }
 
 impl BridgeWorker {
@@ -414,8 +422,10 @@ impl BridgeWorker {
         let (media, receiver) = mpsc::sync_channel(queue_records);
         let snapshot = Arc::new(Mutex::new(None));
         let dropped = Arc::new(Mutex::new(HashSet::new()));
+        let queue_drops = Arc::new(AtomicU64::new(0));
         let worker_snapshot = snapshot.clone();
         let worker_dropped = dropped.clone();
+        let worker_drops = queue_drops.clone();
         thread::Builder::new()
             .name("vvmux-media-bridge".into())
             .spawn(move || {
@@ -425,6 +435,7 @@ impl BridgeWorker {
                     receiver,
                     worker_snapshot,
                     worker_dropped,
+                    worker_drops,
                 )
             })?;
         Ok(Self {
@@ -432,6 +443,7 @@ impl BridgeWorker {
             snapshot,
             dropped,
             generation: 0,
+            queue_drops,
         })
     }
 
@@ -461,6 +473,7 @@ impl BridgeWorker {
     }
 
     fn mark_dropped(&self, delivery_id: u64) {
+        self.queue_drops.fetch_add(1, Ordering::Relaxed);
         self.dropped
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -474,7 +487,12 @@ fn run_bridge_worker(
     receiver: mpsc::Receiver<BridgeMedia>,
     snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     dropped: Arc<Mutex<HashSet<u64>>>,
+    queue_drops: Arc<AtomicU64>,
 ) {
+    let mut metrics = crate::metrics::BridgeMetrics::default();
+    let mut metrics_reported_at = Instant::now();
+    // Diagnostic only: which form the in-flight raster body for each source uses.
+    let mut raster_forms = HashMap::<BridgeSourceKey, bool>::new();
     let mut active_generation = 0;
     let mut minimum_media_generation = HashMap::<BridgeSourceKey, u64>::new();
     let mut retained_rehydration = HashSet::<BridgeSourceKey>::new();
@@ -486,6 +504,17 @@ fn run_bridge_worker(
     let mut force_replacement = false;
     let mut deferred = None;
     loop {
+        // Report on a coarse interval rather than per record: this is diagnostic traffic and must
+        // never compete with media for the client connection.
+        if metrics_reported_at.elapsed() >= METRICS_REPORT_INTERVAL {
+            metrics.client_queue_drops = queue_drops.load(Ordering::Relaxed);
+            let (wait_us, wait_timeouts) = bridge.take_control_wait_stats();
+            metrics.control_wait_us = metrics.control_wait_us.saturating_add(wait_us);
+            metrics.control_wait_timeouts =
+                metrics.control_wait_timeouts.saturating_add(wait_timeouts);
+            let _ = client_writer.send(ClientMessage::BridgeMetrics(metrics));
+            metrics_reported_at = Instant::now();
+        }
         for (delivery_id, delivered, _outer_record_sequence) in bridge.take_media_completions() {
             if delivery_id != 0 {
                 acknowledge_bridge_delivery(&client_writer, delivery_id, delivered);
@@ -494,6 +523,10 @@ fn run_bridge_worker(
         let outer_keyframes = bridge.take_keyframe_requests();
         if !outer_keyframes.is_empty() {
             let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(outer_keyframes));
+        }
+        let outer_full_frames = bridge.take_full_frame_requests();
+        if !outer_full_frames.is_empty() {
+            let _ = client_writer.send(ClientMessage::BridgeNeedFullFrames(outer_full_frames));
         }
         let source_losses = bridge.take_source_losses();
         if !source_losses.is_empty() {
@@ -529,6 +562,9 @@ fn run_bridge_worker(
                 )
             };
             let mut recreated = HashSet::new();
+            if change == ProjectionChange::Sources && force_replacement {
+                metrics.session_replacements = metrics.session_replacements.saturating_add(1);
+            }
             let applied = match change {
                 ProjectionChange::PlaybackOnly => {
                     bridge.update_playback(&active_sources, &pending.sources)
@@ -675,6 +711,18 @@ fn run_bridge_worker(
             acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
             continue;
         }
+        let is_raster = media.record_type == vivid_protocol::messages::RASTER_FRAME;
+        // Only the chunk carrying the frame header reveals the form, and the counters are applied
+        // on the last chunk, so remember it across a fragmented body.
+        if is_raster && media.offset == 0 && media.bytes.len() >= 8 {
+            let flags = u32::from_be_bytes(media.bytes[4..8].try_into().expect("checked length"));
+            raster_forms.insert(
+                media.source,
+                flags & vivid_protocol::media::RASTER_FRAME_DELTA != 0,
+            );
+        }
+        let is_raster_delta =
+            is_raster && raster_forms.get(&media.source).copied().unwrap_or_default();
         match bridge.media_chunk(
             media.delivery_id,
             media.source,
@@ -685,6 +733,21 @@ fn run_bridge_worker(
             media.bytes,
         ) {
             Ok(true) => {
+                metrics.outer_media_records = metrics.outer_media_records.saturating_add(1);
+                metrics.outer_media_bytes =
+                    metrics.outer_media_bytes.saturating_add(media.total.into());
+                if is_raster {
+                    metrics.inner_raster_bytes = metrics
+                        .inner_raster_bytes
+                        .saturating_add(media.total.into());
+                    if is_raster_delta {
+                        metrics.outer_raster_delta_frames =
+                            metrics.outer_raster_delta_frames.saturating_add(1);
+                    } else {
+                        metrics.outer_raster_full_frames =
+                            metrics.outer_raster_full_frames.saturating_add(1);
+                    }
+                }
                 if hydrates_retained_source(media.record_type) {
                     // A live raster delivery can be the first body for a newly projected outer
                     // source. It hydrates that source just as retained delivery 0 does, so later
@@ -951,9 +1014,154 @@ fn write_output(output: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8]) -> io:
     output.flush()
 }
 
-fn write_title(output: &Arc<Mutex<Box<dyn Write + Send>>>, title: &str) -> io::Result<()> {
+fn write_title(output: &TerminalOutput, title: &str) {
     let sanitized = title.replace(['\x07', '\x1b'], "");
-    write_output(output, format!("\x1b]2;{sanitized}\x1b\\").as_bytes())
+    output.enqueue_control(format!("\x1b]2;{sanitized}\x1b\\").into_bytes());
+}
+
+/// One unit of work for the terminal writer thread.
+enum OutputJob {
+    /// A chunk of one server frame. `last` carries the frame's acknowledgement.
+    Frame {
+        frame_id: u64,
+        last: bool,
+        bytes: Vec<u8>,
+    },
+    /// Title, bell, or clipboard bytes, which are not part of the frame diff stream.
+    Control(Vec<u8>),
+}
+
+#[derive(Default)]
+struct OutputQueue {
+    jobs: VecDeque<OutputJob>,
+    bytes: usize,
+    stopped: bool,
+}
+
+/// Terminal writes, moved off the thread that dispatches Vivid media.
+///
+/// Writing to the terminal blocks whenever the outer terminal is behind on reading its PTY. While
+/// that write was inline on the reader thread, it also stalled `MediaSnapshot` and `MediaRecord`
+/// dispatch, so a busy outer terminal froze the projected scene and video rather than just the
+/// text. Frames now queue here and the reader thread returns immediately.
+struct TerminalOutput {
+    queue: Arc<(Mutex<OutputQueue>, Condvar)>,
+}
+
+/// Bound on queued terminal bytes.
+///
+/// Frame diffs are incremental, so a queued frame can never be dropped in isolation without
+/// corrupting the screen. When the bound is reached the queue is cleared and the server is asked
+/// for a full redraw, which is the one supersede that is safe.
+const OUTPUT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+
+impl TerminalOutput {
+    fn spawn(output: Arc<Mutex<Box<dyn Write + Send>>>, writer: SharedWriter) -> io::Result<Self> {
+        let queue = Arc::new((Mutex::new(OutputQueue::default()), Condvar::new()));
+        let worker = queue.clone();
+        thread::Builder::new()
+            .name("vvmux-terminal-output".into())
+            .spawn(move || run_terminal_output(&output, &writer, &worker))?;
+        Ok(Self { queue })
+    }
+
+    fn enqueue_control(&self, bytes: Vec<u8>) {
+        self.push(OutputJob::Control(bytes));
+    }
+
+    /// Queue one frame chunk. Returns false when the queue overflowed and the caller must ask the
+    /// server to resynchronize with a full redraw.
+    fn enqueue_frame(&self, frame_id: u64, full: bool, last: bool, bytes: Vec<u8>) -> bool {
+        let (lock, signal) = &*self.queue;
+        let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A full redraw makes every earlier diff irrelevant, so it is the one point where the
+        // backlog can be discarded without losing screen state.
+        if full {
+            queue
+                .jobs
+                .retain(|job| matches!(job, OutputJob::Control(_)));
+            queue.bytes = 0;
+        }
+        if queue.bytes.saturating_add(bytes.len()) > OUTPUT_QUEUE_BYTES {
+            queue.jobs.clear();
+            queue.bytes = 0;
+            return false;
+        }
+        queue.bytes = queue.bytes.saturating_add(bytes.len());
+        queue.jobs.push_back(OutputJob::Frame {
+            frame_id,
+            last,
+            bytes,
+        });
+        signal.notify_one();
+        true
+    }
+
+    fn push(&self, job: OutputJob) {
+        let (lock, signal) = &*self.queue;
+        let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let OutputJob::Control(bytes) = &job {
+            queue.bytes = queue.bytes.saturating_add(bytes.len());
+        }
+        queue.jobs.push_back(job);
+        signal.notify_one();
+    }
+
+    fn stop(&self) {
+        let (lock, signal) = &*self.queue;
+        lock.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stopped = true;
+        signal.notify_all();
+    }
+}
+
+fn run_terminal_output(
+    output: &Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: &SharedWriter,
+    queue: &Arc<(Mutex<OutputQueue>, Condvar)>,
+) {
+    let (lock, signal) = &**queue;
+    loop {
+        let job = {
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if let Some(job) = state.jobs.pop_front() {
+                    let (OutputJob::Frame { bytes, .. } | OutputJob::Control(bytes)) = &job;
+                    state.bytes = state.bytes.saturating_sub(bytes.len());
+                    break job;
+                }
+                if state.stopped {
+                    return;
+                }
+                state = signal
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+        match job {
+            OutputJob::Frame {
+                frame_id,
+                last,
+                bytes,
+            } => {
+                if write_output(output, &bytes).is_err() {
+                    return;
+                }
+                // Acknowledge only after the bytes reached the terminal. The server uses this as
+                // flow control, so acknowledging on receipt would let it keep producing frames
+                // this client has not managed to display.
+                if last && send_client(writer, &ClientMessage::RenderAck(frame_id)).is_err() {
+                    return;
+                }
+            }
+            OutputJob::Control(bytes) => {
+                if write_output(output, &bytes).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1129,15 +1337,70 @@ mod tests {
         assert_eq!(scanner.reset(), b"\x1b[");
     }
 
+    /// A terminal that has stopped draining must not stall the thread that dispatches Vivid
+    /// media. This is the failure that made a hidden tab's image stick and video freeze while the
+    /// outer terminal was behind: both travel through the same reader thread.
+    #[test]
+    fn a_stalled_terminal_does_not_block_frame_enqueue() {
+        /// A terminal whose writes never complete until released.
+        struct StalledTerminal(Arc<(Mutex<bool>, Condvar)>);
+
+        impl Write for StalledTerminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let (lock, signal) = &*self.0;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = signal.wait(released).unwrap();
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let output: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(StalledTerminal(gate.clone()))));
+        let writer = crate::ipc::test_shared_writer(Box::new(io::sink()));
+        let terminal = TerminalOutput::spawn(output, writer).unwrap();
+
+        // The writer thread is parked inside the first frame's write.
+        assert!(terminal.enqueue_frame(1, true, true, vec![b'a'; 16]));
+        let start = Instant::now();
+        for frame in 2..64_u64 {
+            assert!(
+                terminal.enqueue_frame(frame, false, true, vec![b'b'; 16]),
+                "queueing must not depend on the terminal draining"
+            );
+        }
+        terminal.enqueue_control(b"\x07".to_vec());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "enqueue blocked on the stalled terminal"
+        );
+
+        // Past the byte bound the backlog is discarded and the caller is told to resynchronize,
+        // because an incremental diff can never be dropped on its own.
+        assert!(!terminal.enqueue_frame(64, false, true, vec![0; OUTPUT_QUEUE_BYTES + 1]));
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        terminal.stop();
+    }
+
     #[test]
     fn full_bridge_media_queue_drops_instead_of_blocking_input() {
         let (media, receiver) = mpsc::sync_channel(1);
         let dropped = Arc::new(Mutex::new(HashSet::new()));
+        let queue_drops = Arc::new(AtomicU64::new(0));
         let mut worker = BridgeWorker {
             media,
             snapshot: Arc::new(Mutex::new(None)),
             dropped: dropped.clone(),
             generation: 1,
+            queue_drops: queue_drops.clone(),
         };
         let key = BridgeSourceKey {
             producer: 3,
@@ -1163,6 +1426,8 @@ mod tests {
                 .contains(&11)
         );
         assert_eq!(receiver.try_recv().unwrap().generation, 1);
+        // The drop is counted for `inspect-media` without changing the drop behavior itself.
+        assert_eq!(queue_drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1219,6 +1484,7 @@ mod tests {
                 height: 1,
                 alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                 compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
+                delta_operation_limit: None,
             },
             capture_policy: 0,
             descriptor: None,

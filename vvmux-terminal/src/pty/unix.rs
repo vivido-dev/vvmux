@@ -115,7 +115,7 @@ pub(super) fn spawn(
     }
     let mut master = -1;
     let mut slave = -1;
-    let mut size = libc::winsize {
+    let size = libc::winsize {
         ws_row: rows,
         ws_col: columns,
         ws_xpixel: 0,
@@ -127,7 +127,7 @@ pub(super) fn spawn(
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            &size,
         )
     } == -1
     {

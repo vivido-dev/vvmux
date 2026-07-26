@@ -423,7 +423,7 @@ fn receive_response(
     let mut chunks = Vec::new();
     let mut next_index = 0;
     loop {
-        match reader.recv::<ServerMessage>()? {
+        match reader.recv_server()? {
             ServerMessage::Automation(response) if response.id == id => return Ok(response),
             ServerMessage::AutomationChunk {
                 request_id,

@@ -63,12 +63,17 @@ remote deployments use an SSH tunnel or a trusted TLS reverse proxy.
 
 ### Private IPC compatibility
 
-VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 5,
-which is a hard cutover from VVMX 4. VVMX 5 adds pane-scoped sanitized media inspection/waits and
-the bridge-applied acknowledgement carrying separate virtual and outer projection revisions.
-These fields never enter VVWS JSON control messages and never contain Vivid tokens, media tickets,
-payloads, hashes, or derived capability material. Gateway/session processes from different VVMX
-versions must reject one another and the older session must be restarted.
+VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 7,
+which is a hard cutover from VVMX 6. VVMX 7 moves render and media byte payloads out of the JSON
+message body into two binary record types with fixed headers, and chunks them against the
+negotiated record ceiling rather than a fixed size. Earlier versions added pane-scoped sanitized
+media inspection/waits and the bridge-applied acknowledgement carrying separate virtual and outer
+projection revisions.
+
+The binary forms carry terminal frame bytes and Vivid media bodies only. They never enter VVWS
+JSON control messages and never contain Vivid tokens, media tickets, hashes, or derived capability
+material. Gateway/session processes from different VVMX versions must reject one another and the
+older session must be restarted.
 
 ## Connection states and terminal data
 

@@ -40,17 +40,45 @@ const OPTIONAL_FEATURES: &[u64] = &[
     messages::FEATURE_SOURCE_DESCRIPTOR_V1,
     messages::FEATURE_DELEGATED_CONTEXT_V1,
     messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
+    // HELLO requires strictly increasing feature IDs; keep this list sorted by ID.
+    messages::FEATURE_RASTER_DELTA_V1,
     messages::FEATURE_IMAGE_CACHE_V1,
     messages::FEATURE_MEDIA_ORDER_BARRIER_V1,
 ];
 const MAX_PENDING_CONTROL_REPLIES: usize = 4096;
 const MEDIA_WRITER_QUEUE: usize = 32;
+/// How long one outer control reply may be awaited.
+///
+/// Generous relative to any legitimate reply — a presenter answers `COMMIT_TXN` at a compositor
+/// boundary — but finite, because this wait happens on the single bridge worker thread that also
+/// forwards media and applies projections.
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a media writer may wait for outer credit before failing its delivery.
+///
+/// Longer than the control deadline: withholding credit is legitimate backpressure, not a fault.
+/// The bound exists so a presenter that stops granting entirely cannot strand the delivery and
+/// pin the writer thread forever.
+const OUTER_CREDIT_TIMEOUT: Duration = Duration::from_secs(15);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 struct ControlState {
     replies: HashMap<u64, Record>,
     pending_requests: HashSet<u64>,
+    /// Requests whose wait hit its deadline.
+    ///
+    /// The request stays known so a late reply is discarded quietly instead of being treated as a
+    /// reply to something never sent, which would close an otherwise healthy connection.
+    abandoned_requests: HashSet<u64>,
+    /// When the oldest currently outstanding request was issued.
+    ///
+    /// `last_inbound` cannot answer "is this request progressing": unsolicited `CREDIT` and event
+    /// records keep refreshing it while a reply never arrives.
+    oldest_pending_request: Option<Instant>,
+    wait_us: u64,
+    wait_timeouts: u64,
     credits: HashMap<u64, messages::CreditLedger>,
     keyframes: Vec<messages::NeedKeyframe>,
+    full_frames: Vec<messages::NeedFullFrame>,
     source_losses: Vec<u64>,
     playback_states: Vec<messages::PlaybackState>,
     display_generation: u64,
@@ -72,8 +100,13 @@ impl Default for ControlState {
         Self {
             replies: HashMap::new(),
             pending_requests: HashSet::new(),
+            abandoned_requests: HashSet::new(),
+            oldest_pending_request: None,
+            wait_us: 0,
+            wait_timeouts: 0,
             credits: HashMap::new(),
             keyframes: Vec::new(),
+            full_frames: Vec::new(),
             source_losses: Vec::new(),
             playback_states: Vec::new(),
             display_generation: 0,
@@ -210,6 +243,19 @@ impl ControlDispatcher {
                         }
                         messages::NEED_KEYFRAME => messages::parse_need_keyframe(&record.body)
                             .map(|request| state.keyframes.push(request)),
+                        // Raster recovery on this hop's own delta chain. Ignoring it would leave
+                        // the outer source rejecting every later delta with BAD_STATE.
+                        messages::NEED_FULL_FRAME => messages::parse_need_full_frame(&record.body)
+                            .and_then(|request| {
+                                if request.source_id != record.object_id {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "outer NEED_FULL_FRAME source/object ID mismatch",
+                                    ));
+                                }
+                                state.full_frames.push(request);
+                                Ok(())
+                            }),
                         messages::SOURCE_LOST => messages::parse_source_lost(&record.body)
                             .and_then(|lost| {
                                 if lost.source_id != record.object_id {
@@ -267,11 +313,19 @@ impl ControlDispatcher {
                             if request_id == 0 {
                                 return Ok(());
                             }
+                            // A reply that arrives after its wait gave up is expected, not a
+                            // protocol violation. Discard it rather than closing the connection.
+                            if state.abandoned_requests.remove(&request_id) {
+                                return Ok(());
+                            }
                             if !state.pending_requests.remove(&request_id) {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     "outer presenter replied to an unknown request",
                                 ));
+                            }
+                            if state.pending_requests.is_empty() {
+                                state.oldest_pending_request = None;
                             }
                             if state.replies.len() >= MAX_PENDING_CONTROL_REPLIES
                                 || state.replies.insert(request_id, record).is_some()
@@ -309,10 +363,18 @@ impl ControlDispatcher {
                             break;
                         }
                         let now = Instant::now();
-                        if now.duration_since(state.last_inbound) < Duration::from_secs(15)
-                            || state.last_probe_sent.is_some_and(|sent| {
-                                now.duration_since(sent) < Duration::from_secs(15)
-                            })
+                        // Liveness is per request, not per connection: unsolicited `CREDIT` and
+                        // event records keep `last_inbound` fresh while a reply this bridge is
+                        // waiting on never arrives, so a presenter that has stopped answering can
+                        // look perfectly healthy.
+                        let request_stalled = state
+                            .oldest_pending_request
+                            .is_some_and(|issued| now.duration_since(issued) >= HEARTBEAT_INTERVAL);
+                        if (now.duration_since(state.last_inbound) < HEARTBEAT_INTERVAL
+                            && !request_stalled)
+                            || state
+                                .last_probe_sent
+                                .is_some_and(|sent| now.duration_since(sent) < HEARTBEAT_INTERVAL)
                         {
                             continue;
                         }
@@ -375,6 +437,9 @@ impl ControlDispatcher {
                     "outer pending request bound exceeded or request ID was reused",
                 ));
             }
+            state
+                .oldest_pending_request
+                .get_or_insert_with(Instant::now);
         }
         if let Err(error) = self
             .writer
@@ -397,47 +462,32 @@ impl ControlDispatcher {
         expected: u16,
         expected_object_id: u64,
     ) -> io::Result<Record> {
+        wait_reply_on(&self.shared, request_id, expected, expected_object_id)
+    }
+
+    /// Retire a destroyed source's credit ledger so any waiter fails instead of parking forever.
+    fn retire_source(&self, source_id: u64) {
         let mut state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        loop {
-            if let Some(record) = state.replies.remove(&request_id) {
-                if record.object_id != expected_object_id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "outer reply {request_id} has object {}, expected {expected_object_id}",
-                            record.object_id
-                        ),
-                    ));
-                }
-                if record.record_type == messages::ERROR {
-                    return Err(protocol_error(&record.body));
-                }
-                if record.record_type != expected {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "outer reply {} was {}, expected {}",
-                            request_id,
-                            messages::name(record.record_type),
-                            messages::name(expected)
-                        ),
-                    ));
-                }
-                return Ok(record);
-            }
-            if let Some(error) = &state.closed {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
-            }
-            state = self
-                .shared
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
+        // Outer source IDs are allocated monotonically and never reused, so dropping the ledger
+        // cannot affect a later source.
+        state.credits.remove(&source_id);
+        self.shared.changed.notify_all();
+    }
+
+    fn take_wait_stats(&self) -> (u64, u64) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            std::mem::take(&mut state.wait_us),
+            std::mem::take(&mut state.wait_timeouts),
+        )
     }
 
     fn register_source(&self, ready: &messages::SourceReady) -> io::Result<()> {
@@ -483,6 +533,17 @@ impl ControlDispatcher {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .keyframes,
+        )
+    }
+
+    fn take_full_frames(&self) -> Vec<messages::NeedFullFrame> {
+        std::mem::take(
+            &mut self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .full_frames,
         )
     }
 
@@ -602,9 +663,12 @@ pub struct OuterBridge {
     completions_tx: mpsc::Sender<MediaCompletion>,
     completions_rx: mpsc::Receiver<MediaCompletion>,
     source_kinds: HashMap<BridgeSourceKey, BridgeSourceKind>,
-    /// Hop-local raster identities. The bridge currently chooses full frames for every outer
-    /// raster update, but still re-originates IDs so an inner delta base can never leak outward.
+    /// Hop-local raster identities, re-originated so an inner delta base can never leak outward.
     raster_frame_ids: HashMap<BridgeSourceKey, u64>,
+    /// Per-source state of vvmux's own outgoing raster delta chain.
+    raster_chains: HashMap<BridgeSourceKey, RasterChain>,
+    /// Sources whose outgoing chain is broken and need a full frame from the inner producer.
+    raster_needs_full: HashSet<BridgeSourceKey>,
     active_sources: HashMap<BridgeSourceKey, BridgeSource>,
     node_ids: HashMap<(u64, u64, u8), u64>,
     display: DisplayMetrics,
@@ -622,6 +686,11 @@ pub struct OuterBridge {
     source_descriptors: bool,
     media_order_barrier: bool,
     image_cache: bool,
+    /// Outer presenter accepted `raster-delta-v1`, so this hop may re-originate deltas rather than
+    /// expanding every inner update to a full frame.
+    raster_delta: bool,
+    /// Outer presenter accepted `raster-zstd-v1`.
+    raster_zstd: bool,
     cached_images: HashSet<BridgeSourceKey>,
     pane_contexts: HashMap<u64, PaneContextMapping>,
 }
@@ -733,6 +802,8 @@ impl OuterBridge {
         let media_order_barrier =
             accepted_features.contains(&messages::FEATURE_MEDIA_ORDER_BARRIER_V1);
         let image_cache = accepted_features.contains(&messages::FEATURE_IMAGE_CACHE_V1);
+        let raster_delta = accepted_features.contains(&messages::FEATURE_RASTER_DELTA_V1);
+        let raster_zstd = accepted_features.contains(&messages::FEATURE_RASTER_ZSTD_V1);
         connection.set_send_body_limit(welcome.maximum_control_body)?;
         let control = ControlDispatcher::start(
             connection,
@@ -758,6 +829,8 @@ impl OuterBridge {
             completions_rx,
             source_kinds: HashMap::new(),
             raster_frame_ids: HashMap::new(),
+            raster_chains: HashMap::new(),
+            raster_needs_full: HashSet::new(),
             active_sources: HashMap::new(),
             node_ids: HashMap::new(),
             display,
@@ -771,6 +844,8 @@ impl OuterBridge {
             source_descriptors,
             media_order_barrier,
             image_cache,
+            raster_delta,
+            raster_zstd,
             cached_images: HashSet::new(),
             pane_contexts: HashMap::new(),
         };
@@ -946,6 +1021,10 @@ impl OuterBridge {
             }
             self.pending.remove(key);
             self.raster_frame_ids.remove(key);
+            // A recreated outer source has no retained framebuffer, so its chain restarts from a
+            // full frame. Dropping the chain here is what forces that.
+            self.raster_chains.remove(key);
+            self.raster_needs_full.remove(key);
             self.cached_images.remove(key);
             self.reverse_source_ids.remove(upstream);
             if !requested.contains_key(key) {
@@ -1035,6 +1114,10 @@ impl OuterBridge {
                 &messages::destroy_source(request, upstream),
             )?;
             self.wait_for(request, messages::OK, upstream)?;
+            // A destroyed source will never be granted credit again. Retiring the ledger wakes a
+            // media writer parked in `reserve_outer_credit` now instead of at its deadline, and
+            // lets that thread exit rather than outliving the source it served.
+            self.control.retire_source(upstream);
         }
         drop(obsolete_media);
         self.active_sources = sources
@@ -1323,8 +1406,32 @@ impl OuterBridge {
             } else {
                 None
             };
+            let mut pending_chain = None;
             if let Some(frame_id) = next_raster_id {
-                pending.bytes = reoriginated_full_raster(&pending.bytes, frame_id)?;
+                match self.reoriginate_raster(key, frame_id, &pending.bytes)? {
+                    Some(reoriginated) => {
+                        pending_chain = reoriginated.chain;
+                        pending.bytes = reoriginated.body;
+                    }
+                    // The inner delta cannot extend this hop's chain. Ask the inner producer for a
+                    // full frame and drop this update rather than sending an unusable delta.
+                    None => {
+                        self.raster_needs_full.insert(key);
+                        self.completions_tx
+                            .send(MediaCompletion {
+                                delivery_id,
+                                delivered: false,
+                                record_sequence: 0,
+                            })
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "outer media completion receiver stopped",
+                                )
+                            })?;
+                        return Ok(false);
+                    }
+                }
             }
             self.media
                 .get(&key)
@@ -1348,12 +1455,138 @@ impl OuterBridge {
                         "outer source media writer stopped",
                     ),
                 })?;
+            // Commit the chain only after the writer accepted the body: a rejected write leaves the
+            // outer presenter on the previous frame, so advancing the base here would make every
+            // later delta reference a frame that was never applied.
             if let Some(frame_id) = next_raster_id {
                 self.raster_frame_ids.insert(key, frame_id);
+                if let Some(mut chain) = pending_chain {
+                    chain.base_frame_id = frame_id;
+                    self.raster_chains.insert(key, chain);
+                }
             }
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Sources whose outgoing raster chain broke and need a full frame from the inner producer.
+    ///
+    /// Merges this hop's own chain breaks with `NEED_FULL_FRAME` from the outer presenter. Both
+    /// mean the same thing here: the next outgoing raster body for that source must be full, so
+    /// the chain is dropped and a full frame requested from the producer that can still make one.
+    pub fn take_full_frame_requests(&mut self) -> Vec<BridgeSourceKey> {
+        let outer = self
+            .control
+            .take_full_frames()
+            .into_iter()
+            .filter_map(|request| self.reverse_source_ids.get(&request.source_id).copied())
+            .collect::<Vec<_>>();
+        self.raster_needs_full.extend(outer);
+        let mut requests = self.raster_needs_full.drain().collect::<Vec<_>>();
+        for key in &requests {
+            self.raster_chains.remove(key);
+        }
+        requests.sort_by_key(|key| (key.producer, key.source));
+        requests
+    }
+
+    /// Choose this hop's encoding for one inner raster body.
+    ///
+    /// `Ok(None)` means the body was a delta that cannot extend this hop's chain; the caller
+    /// recovers by asking the inner producer for a full frame.
+    fn reoriginate_raster(
+        &mut self,
+        key: BridgeSourceKey,
+        frame_id: u64,
+        body: &[u8],
+    ) -> io::Result<Option<ReoriginatedRaster>> {
+        let (width, height, compression_mode, delta_operation_limit) =
+            match self.source_kinds.get(&key) {
+                Some(BridgeSourceKind::Raster {
+                    width,
+                    height,
+                    compression_mode,
+                    delta_operation_limit,
+                    ..
+                }) => (*width, *height, *compression_mode, *delta_operation_limit),
+                _ => {
+                    return Ok(Some(ReoriginatedRaster {
+                        body: reoriginated_full_raster(body, frame_id)?,
+                        chain: None,
+                    }));
+                }
+            };
+        let flags = body
+            .get(4..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_be_bytes)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raster frame header is truncated",
+                )
+            })?;
+        let now = Instant::now();
+        if flags & media::RASTER_FRAME_DELTA == 0 {
+            // A full frame restarts the chain and clears this hop's damage window.
+            let parsed = media::parse_full_raster_frame(body)?;
+            let chain = RasterChain {
+                epoch: parsed.epoch,
+                base_frame_id: 0,
+                damage_pixels: 0,
+                damage_window_started: now,
+            };
+            return Ok(Some(ReoriginatedRaster {
+                body: reoriginated_full_raster(body, frame_id)?,
+                chain: Some(chain),
+            }));
+        }
+        let (Some(operation_limit), Some(mut chain)) = (
+            delta_operation_limit.filter(|_| self.raster_delta),
+            self.raster_chains.get(&key).copied(),
+        ) else {
+            return Ok(None);
+        };
+        let damage = media::parse_delta_raster_frame(body, width, height, operation_limit)
+            .and_then(|frame| raster_damage_pixels(&frame.operations))?;
+        if now.duration_since(chain.damage_window_started) >= RASTER_DAMAGE_INTERVAL {
+            chain.damage_window_started = now;
+            chain.damage_pixels = 0;
+        }
+        let budget = u64::from(width)
+            .saturating_mul(u64::from(height))
+            .saturating_mul(RASTER_DAMAGE_FRAME_EQUIVALENTS);
+        if chain.damage_pixels.saturating_add(damage) > budget {
+            // Past the budget a full frame is the cheaper and simpler encoding.
+            return Ok(None);
+        }
+        let compress = compression_mode == messages::COMPRESSION_RAW_OR_ZSTD && self.raster_zstd;
+        let Some(reoriginated) = reoriginated_delta_raster(
+            body,
+            width,
+            height,
+            operation_limit,
+            &chain,
+            frame_id,
+            compress,
+        )?
+        else {
+            return Ok(None);
+        };
+        // The specification requires a producer to prefer a full frame whenever the delta is not
+        // smaller, so a pathological damage pattern can never cost more than the full form.
+        let full_frame_len = media::rgba8_raw_frame_body_len(width, height).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "raster dimensions overflow")
+        })?;
+        if reoriginated.len() >= full_frame_len as usize {
+            return Ok(None);
+        }
+        chain.damage_pixels = chain.damage_pixels.saturating_add(damage);
+        Ok(Some(ReoriginatedRaster {
+            body: reoriginated,
+            chain: Some(chain),
+        }))
     }
 
     pub fn take_media_completions(&self) -> Vec<(u64, bool, u64)> {
@@ -1409,6 +1642,11 @@ impl OuterBridge {
         self.control.take_capability_changes()
     }
 
+    /// Accumulated outer-control wait time and deadline expiries, for `inspect-media`.
+    pub fn take_control_wait_stats(&self) -> (u64, u64) {
+        self.control.take_wait_stats()
+    }
+
     fn create_sources(&mut self, sources: &[BridgeSource]) -> io::Result<()> {
         let mut ordered = sources.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|source| match source.kind {
@@ -1432,22 +1670,39 @@ impl OuterBridge {
                     height,
                     alpha_mode,
                     compression_mode,
-                } => (
-                    messages::CREATE_RASTER,
-                    ConnectionKind::Raster,
-                    messages::create_raster_with_extensions(
-                        request,
-                        &RasterSourceConfig {
-                            source_id: upstream,
-                            width: *width,
-                            height: *height,
-                            alpha_mode: *alpha_mode,
-                            compression_mode: *compression_mode,
-                        },
-                        source.capture_policy,
-                        source.descriptor.as_ref().map(protocol_descriptor).as_ref(),
-                    ),
-                ),
+                    delta_operation_limit,
+                } => {
+                    let config = RasterSourceConfig {
+                        source_id: upstream,
+                        width: *width,
+                        height: *height,
+                        alpha_mode: *alpha_mode,
+                        compression_mode: *compression_mode,
+                    };
+                    let descriptor = source.descriptor.as_ref().map(protocol_descriptor);
+                    // Ask for delta updates only when the inner source can produce them and the
+                    // outer presenter accepted the feature. Otherwise this stays a full-frame
+                    // source and behaves exactly as before.
+                    let body = match delta_operation_limit.filter(|_| self.raster_delta) {
+                        Some(operation_limit) => messages::create_raster_with_update_extensions(
+                            request,
+                            &config,
+                            messages::RasterUpdateConfig {
+                                mode: messages::RASTER_FULL_FRAME_AND_DELTA,
+                                operation_limit,
+                            },
+                            source.capture_policy,
+                            descriptor.as_ref(),
+                        )?,
+                        None => messages::create_raster_with_extensions(
+                            request,
+                            &config,
+                            source.capture_policy,
+                            descriptor.as_ref(),
+                        ),
+                    };
+                    (messages::CREATE_RASTER, ConnectionKind::Raster, body)
+                }
                 BridgeSourceKind::Image {
                     encoding,
                     width,
@@ -1895,6 +2150,116 @@ fn bridge_source_pixels(source: &BridgeSource) -> u64 {
     }
 }
 
+/// One inner raster body re-encoded for this hop.
+struct ReoriginatedRaster {
+    body: Vec<u8>,
+    /// Chain state to commit once the body is accepted by the media writer, or `None` when this
+    /// source does not maintain a chain.
+    chain: Option<RasterChain>,
+}
+
+/// Damaged pixels described by a delta's operations, used for this hop's own damage budget.
+fn raster_damage_pixels(operations: &[media::ParsedRasterDeltaOperation<'_>]) -> io::Result<u64> {
+    operations.iter().try_fold(0_u64, |total, operation| {
+        let (width, height) = match operation {
+            media::ParsedRasterDeltaOperation::Overwrite { width, height, .. }
+            | media::ParsedRasterDeltaOperation::Copy { width, height, .. } => (*width, *height),
+        };
+        u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|area| total.checked_add(area))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "raster damage area overflows")
+            })
+    })
+}
+
+/// State of one outgoing raster delta chain.
+///
+/// The chain is entirely vvmux's own: `base_frame_id` is the identity this hop last wrote and had
+/// accepted into its media writer, never an identity from the inner hop. `damage_pixels` enforces
+/// this hop's own accumulated-damage budget, because the inner hop's budget bounds a different
+/// stream of frames (specification 11.4).
+#[derive(Debug, Clone, Copy)]
+struct RasterChain {
+    epoch: u32,
+    base_frame_id: u64,
+    damage_pixels: u64,
+    damage_window_started: Instant,
+}
+
+/// Frame-equivalents of damage tolerated per window before a full frame is preferred, and the
+/// window length. Matching the inner presenter's policy keeps the two hops from oscillating.
+const RASTER_DAMAGE_FRAME_EQUIVALENTS: u64 = 4;
+const RASTER_DAMAGE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Re-encode an inner delta onto this hop's chain, or `None` when it cannot be chained.
+///
+/// Returning `None` is not an error: the caller falls back to requesting a full frame, which is
+/// the recovery the specification defines for a delta whose base is unavailable.
+fn reoriginated_delta_raster(
+    body: &[u8],
+    width: u32,
+    height: u32,
+    operation_limit: u32,
+    chain: &RasterChain,
+    frame_id: u64,
+    compress: bool,
+) -> io::Result<Option<Vec<u8>>> {
+    let frame = media::parse_delta_raster_frame(body, width, height, operation_limit)?;
+    // A chain carries within one epoch only. An epoch change restarts from a full frame.
+    if chain.base_frame_id == 0 || frame.epoch != chain.epoch {
+        return Ok(None);
+    }
+    let operations = frame
+        .operations
+        .iter()
+        .map(|operation| match operation {
+            media::ParsedRasterDeltaOperation::Overwrite {
+                x,
+                y,
+                width,
+                height,
+                rgba,
+            } => media::RasterDeltaOperation::Overwrite {
+                x: *x,
+                y: *y,
+                width: *width,
+                height: *height,
+                rgba: rgba.as_ref(),
+            },
+            media::ParsedRasterDeltaOperation::Copy {
+                destination_x,
+                destination_y,
+                width,
+                height,
+                source_x,
+                source_y,
+            } => media::RasterDeltaOperation::Copy {
+                destination_x: *destination_x,
+                destination_y: *destination_y,
+                width: *width,
+                height: *height,
+                source_x: *source_x,
+                source_y: *source_y,
+            },
+        })
+        .collect::<Vec<_>>();
+    media::raster_delta_frame_body(
+        frame.epoch,
+        frame_id,
+        chain.base_frame_id,
+        frame.pts_us,
+        frame.duration_us,
+        width,
+        height,
+        operation_limit,
+        &operations,
+        compress,
+    )
+    .map(Some)
+}
+
 fn reoriginated_full_raster(body: &[u8], frame_id: u64) -> io::Result<Vec<u8>> {
     if frame_id == 0 {
         return Err(io::Error::new(
@@ -2026,7 +2391,86 @@ fn run_media_writer(
     }
 }
 
+/// Await one correlated outer reply, or fail at [`CONTROL_REPLY_TIMEOUT`].
+///
+/// Free-standing so the deadline can be exercised against control state alone, without standing up
+/// a transport.
+fn wait_reply_on(
+    shared: &Arc<SharedControl>,
+    request_id: u64,
+    expected: u16,
+    expected_object_id: u64,
+) -> io::Result<Record> {
+    let started = Instant::now();
+    let deadline = started + CONTROL_REPLY_TIMEOUT;
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        if let Some(record) = state.replies.remove(&request_id) {
+            state.wait_us = state
+                .wait_us
+                .saturating_add(started.elapsed().as_micros() as u64);
+            if record.object_id != expected_object_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "outer reply {request_id} has object {}, expected {expected_object_id}",
+                        record.object_id
+                    ),
+                ));
+            }
+            if record.record_type == messages::ERROR {
+                return Err(protocol_error(&record.body));
+            }
+            if record.record_type != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "outer reply {} was {}, expected {}",
+                        request_id,
+                        messages::name(record.record_type),
+                        messages::name(expected)
+                    ),
+                ));
+            }
+            return Ok(record);
+        }
+        if let Some(error) = &state.closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
+        }
+        // An unbounded wait here is what turned one missing reply into a permanently frozen
+        // bridge: the worker is single-threaded, so it also stops forwarding media and applying
+        // projections. Failing instead lets the existing snapshot-retry and replacement-session
+        // recovery run.
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            state.pending_requests.remove(&request_id);
+            if state.abandoned_requests.len() < MAX_PENDING_CONTROL_REPLIES {
+                state.abandoned_requests.insert(request_id);
+            }
+            if state.pending_requests.is_empty() {
+                state.oldest_pending_request = None;
+            }
+            state.wait_us = state
+                .wait_us
+                .saturating_add(started.elapsed().as_micros() as u64);
+            state.wait_timeouts = state.wait_timeouts.saturating_add(1);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("outer reply {request_id} did not arrive within the deadline"),
+            ));
+        };
+        let (next, _) = shared
+            .changed
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = next;
+    }
+}
+
 fn reserve_outer_credit(shared: &SharedControl, source_id: u64, bytes: u64) -> io::Result<()> {
+    let deadline = Instant::now() + OUTER_CREDIT_TIMEOUT;
     let mut state = shared
         .state
         .lock()
@@ -2051,10 +2495,17 @@ fn reserve_outer_credit(shared: &SharedControl, source_id: u64, bytes: u64) -> i
         if let Some(error) = &state.closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, error.clone()));
         }
-        state = shared
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "outer source did not grant credit within the deadline",
+            ));
+        };
+        let (next, _) = shared
             .changed
-            .wait(state)
+            .wait_timeout(state, remaining)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = next;
     }
 }
 
@@ -2139,6 +2590,142 @@ mod tests {
         );
     }
 
+    /// Specification 11.4 "Nesting" and 16.3 rule 5: a nested presenter terminates the inner delta
+    /// chain and re-encodes on its own. The operations survive; the identities must not.
+    #[test]
+    fn re_originated_deltas_carry_hop_local_identities_and_never_the_inner_base() {
+        let inner_base = 4_242;
+        let inner_frame = 4_243;
+        let inner = media::raster_delta_frame_body(
+            7,
+            inner_frame,
+            inner_base,
+            10_000,
+            16_000,
+            4,
+            2,
+            4,
+            &[
+                media::RasterDeltaOperation::Overwrite {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                    rgba: &[9, 8, 7, 255],
+                },
+                media::RasterDeltaOperation::Copy {
+                    destination_x: 2,
+                    destination_y: 1,
+                    width: 2,
+                    height: 1,
+                    source_x: 0,
+                    source_y: 0,
+                },
+            ],
+            false,
+        )
+        .unwrap();
+
+        let chain = RasterChain {
+            epoch: 7,
+            base_frame_id: 11,
+            damage_pixels: 0,
+            damage_window_started: Instant::now(),
+        };
+        let outer = reoriginated_delta_raster(&inner, 4, 2, 4, &chain, 12, false)
+            .unwrap()
+            .expect("a chained delta re-originates");
+        let parsed = media::parse_delta_raster_frame(&outer, 4, 2, 4).unwrap();
+        assert_eq!(parsed.frame_id, 12);
+        assert_eq!(parsed.base_frame_id, 11);
+        assert_ne!(parsed.frame_id, inner_frame);
+        assert_ne!(parsed.base_frame_id, inner_base);
+        assert_eq!(parsed.epoch, 7);
+        assert_eq!(parsed.pts_us, 10_000);
+        assert_eq!(parsed.operations.len(), 2);
+
+        // No base of its own yet: the chain cannot be extended and the caller must fall back.
+        let unstarted = RasterChain {
+            base_frame_id: 0,
+            ..chain
+        };
+        assert!(
+            reoriginated_delta_raster(&inner, 4, 2, 4, &unstarted, 12, false)
+                .unwrap()
+                .is_none()
+        );
+
+        // An epoch change restarts from a full frame rather than chaining across it.
+        let other_epoch = RasterChain { epoch: 8, ..chain };
+        assert!(
+            reoriginated_delta_raster(&inner, 4, 2, 4, &other_epoch, 12, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A presenter that keeps sending unsolicited records while never answering a request used to
+    /// hang the bridge worker forever: `wait_reply` had no deadline and the heartbeat treated any
+    /// inbound record as proof of life. The worker is single-threaded, so that also froze media
+    /// forwarding and projection — the persistent form of the reported stall.
+    #[test]
+    fn a_reply_that_never_arrives_fails_instead_of_hanging_the_worker() {
+        let shared = Arc::new(SharedControl {
+            state: Mutex::new(ControlState::default()),
+            changed: Condvar::new(),
+        });
+
+        // A live connection: unsolicited traffic keeps arriving for the whole wait, so
+        // `last_inbound` never goes stale and the heartbeat sees a healthy peer.
+        let chatter = shared.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let chatter_stop = stop.clone();
+        let chatter_thread = thread::spawn(move || {
+            while !chatter_stop.load(std::sync::atomic::Ordering::Acquire) {
+                chatter
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .last_inbound = Instant::now();
+                chatter.changed.notify_all();
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending_requests
+            .insert(77);
+        let started = Instant::now();
+        let outcome = wait_reply_on(&shared, 77, messages::OK, 0);
+        let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        chatter_thread.join().unwrap();
+
+        let error = match outcome {
+            Ok(_) => panic!("an unanswered request must not wait forever"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= CONTROL_REPLY_TIMEOUT && elapsed < CONTROL_REPLY_TIMEOUT * 3,
+            "waited {elapsed:?}, expected about {CONTROL_REPLY_TIMEOUT:?}"
+        );
+
+        let state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!state.pending_requests.contains(&77));
+        // A late reply for an abandoned request is discarded, not treated as a reply to something
+        // that was never sent, which would close an otherwise healthy connection.
+        assert!(state.abandoned_requests.contains(&77));
+        assert_eq!(state.wait_timeouts, 1);
+        assert!(state.wait_us > 0);
+    }
+
     #[test]
     fn outer_capability_changes_must_strictly_advance() {
         let mut state = ControlState::default();
@@ -2164,6 +2751,7 @@ mod tests {
                 height: 16,
                 alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                 compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
+                delta_operation_limit: None,
             },
             capture_policy: 0,
             descriptor: None,
