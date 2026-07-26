@@ -9,12 +9,11 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Bumped to 8 when keyframe recovery began carrying its minimum epoch and reason end to end.
+/// Bumped to 9 when bridge-instance correlation and bounded media tracing were added.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
-/// have very different cost, and silently keeping the expensive one on an upgraded client would
-/// hide exactly the regression this version exists to remove.
-pub const VERSION: u16 = 8;
+/// differ in client-message framing, so accepting an older peer would misdecode bridge state.
+pub const VERSION: u16 = 9;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -72,6 +71,12 @@ pub enum AutomationMethod {
     ListPanes,
     Inspect,
     InspectMedia,
+    TraceMedia {
+        after_sequence: Option<u64>,
+        limit: u16,
+        timeout_ms: u64,
+        filter: crate::media_trace::MediaTraceFilter,
+    },
     Split {
         axis: Axis,
     },
@@ -129,7 +134,16 @@ pub enum AutomationMethod {
 pub struct PaneMediaStatus {
     pub virtual_projection_revision: u64,
     pub virtual_scene_revision: u64,
+    /// Compatibility sequence for callers of the original `wait media --after-outer` API.
+    ///
+    /// This never moves backwards across foreground bridge replacement.
     pub outer_projection_revision: u64,
+    /// Number of accepted outer projection applications in this session actor.
+    pub outer_apply_sequence: u64,
+    /// Current foreground bridge identity, or `None` before its first applied projection.
+    pub bridge_instance_id: Option<u64>,
+    /// Projection revision local to the current foreground bridge.
+    pub bridge_local_revision: u64,
     pub sources: Vec<PaneMediaSourceStatus>,
     pub nodes: Vec<PaneMediaNodeStatus>,
     /// Session-scoped relay counters. Every pane shares one client connection and one foreground
@@ -148,6 +162,7 @@ pub struct PaneMediaSourceStatus {
     pub attachment_state: u64,
     pub attachment_generation: u64,
     pub outer_attachment_generation: Option<u64>,
+    pub outer_mapping_fresh: bool,
     pub visible: bool,
     pub capture_policy: u64,
     pub descriptor: Option<PaneMediaSourceDescriptor>,
@@ -495,9 +510,14 @@ pub enum ClientMessage {
     },
     BridgeSnapshotRetry,
     BridgeApplied {
+        bridge_instance_id: u64,
         virtual_revision: u64,
         outer_revision: u64,
         outer_attachment_generations: Vec<(BridgeSourceKey, u64)>,
+    },
+    BridgeTrace {
+        bridge_instance_id: u64,
+        event: crate::media_trace::BridgeMediaTraceEvent,
     },
     BridgePlaybackState {
         source: BridgeSourceKey,

@@ -24,6 +24,9 @@ use crate::ipc::{
     BridgeKeyframeRequest, BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind,
     ClientMessage, FloatingEditCommand, ServerMessage, SharedWriter,
 };
+use crate::media_trace::{
+    BridgeMediaTraceEvent, MediaKeyframeStage, MediaPlaybackControl, MediaTraceKind,
+};
 use crate::platform::ClientTerminal;
 
 const BRIDGE_MEDIA_CHUNK: usize = 128 * 1024;
@@ -487,6 +490,7 @@ impl BridgeWorker {
         client_writer: BridgeClientSender,
         queue_records: usize,
     ) -> io::Result<Self> {
+        let bridge_instance_id = new_bridge_instance_id()?;
         let (media, receiver) = mpsc::sync_channel(queue_records);
         let snapshot = Arc::new(Mutex::new(None));
         let dropped = Arc::new(Mutex::new(HashSet::new()));
@@ -507,6 +511,7 @@ impl BridgeWorker {
                     worker_dropped,
                     worker_drops,
                     worker_stopped,
+                    bridge_instance_id,
                 )
             })?;
         Ok(Self {
@@ -572,6 +577,31 @@ impl Drop for BridgeWorker {
     }
 }
 
+fn new_bridge_instance_id() -> io::Result<u64> {
+    let mut bytes = [0_u8; 8];
+    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(u64::from_le_bytes(bytes) | 1)
+}
+
+fn send_bridge_trace(
+    client_writer: &BridgeClientSender,
+    bridge_instance_id: u64,
+    trace_started: Instant,
+    source: Option<BridgeSourceKey>,
+    kind: MediaTraceKind,
+) {
+    let _ = client_writer.send(ClientMessage::BridgeTrace {
+        bridge_instance_id,
+        event: BridgeMediaTraceEvent {
+            origin_monotonic_us: u64::try_from(trace_started.elapsed().as_micros())
+                .unwrap_or(u64::MAX),
+            source,
+            kind,
+        },
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_bridge_worker(
     mut bridge: crate::bridge::OuterBridge,
     client_writer: BridgeClientSender,
@@ -580,9 +610,20 @@ fn run_bridge_worker(
     dropped: Arc<Mutex<HashSet<u64>>>,
     queue_drops: Arc<AtomicU64>,
     stopped: Arc<AtomicBool>,
+    mut bridge_instance_id: u64,
 ) {
+    let trace_started = Instant::now();
+    let mut diagnostic_generation = bridge.diagnostic_instance_generation();
+    send_bridge_trace(
+        &client_writer,
+        bridge_instance_id,
+        trace_started,
+        None,
+        MediaTraceKind::BridgeClientAttached { vivid: true },
+    );
     let mut metrics = crate::metrics::BridgeMetrics::default();
     let mut metrics_reported_at = Instant::now();
+    let mut traced_queue_drops = 0_u64;
     // Diagnostic only: which form the in-flight raster body for each source uses.
     let mut raster_forms = HashMap::<BridgeSourceKey, bool>::new();
     let mut active_generation = 0;
@@ -603,6 +644,19 @@ fn run_bridge_worker(
         // never compete with media for the client connection.
         if metrics_reported_at.elapsed() >= METRICS_REPORT_INTERVAL {
             metrics.client_queue_drops = queue_drops.load(Ordering::Relaxed);
+            if metrics.client_queue_drops > traced_queue_drops {
+                send_bridge_trace(
+                    &client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    None,
+                    MediaTraceKind::QueueDrops {
+                        dropped: metrics.client_queue_drops - traced_queue_drops,
+                        total: metrics.client_queue_drops,
+                    },
+                );
+                traced_queue_drops = metrics.client_queue_drops;
+            }
             let (wait_us, wait_timeouts) = bridge.take_control_wait_stats();
             metrics.control_wait_us = metrics.control_wait_us.saturating_add(wait_us);
             metrics.control_wait_timeouts =
@@ -617,6 +671,19 @@ fn run_bridge_worker(
         }
         let outer_keyframes = bridge.take_keyframe_requests();
         if !outer_keyframes.is_empty() {
+            for request in &outer_keyframes {
+                send_bridge_trace(
+                    &client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    Some(request.source),
+                    MediaTraceKind::KeyframeRequest {
+                        stage: MediaKeyframeStage::OuterRequested,
+                        minimum_epoch: request.minimum_epoch,
+                        reason: request.reason,
+                    },
+                );
+            }
             let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(outer_keyframes));
         }
         let outer_full_frames = bridge.take_full_frame_requests();
@@ -625,6 +692,15 @@ fn run_bridge_worker(
         }
         let source_losses = bridge.take_source_losses();
         if !source_losses.is_empty() {
+            for source in &source_losses {
+                send_bridge_trace(
+                    &client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    Some(*source),
+                    MediaTraceKind::SourceLost,
+                );
+            }
             desynchronized_sources.extend(source_losses);
             force_sources = true;
             let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
@@ -686,9 +762,32 @@ fn run_bridge_worker(
                 let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
                 continue;
             }
+            let next_generation = bridge.diagnostic_instance_generation();
+            if next_generation != diagnostic_generation {
+                diagnostic_generation = next_generation;
+                bridge_instance_id = bridge_instance_id.wrapping_add(2);
+                send_bridge_trace(
+                    &client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    None,
+                    MediaTraceKind::BridgeClientAttached { vivid: true },
+                );
+            }
+            trace_projection_change(
+                &client_writer,
+                bridge_instance_id,
+                trace_started,
+                change,
+                &active_sources,
+                &pending.sources,
+                &recreated,
+                &bridge.attachment_generations(),
+            );
             let outer_revision = bridge.mark_projection_applied();
             let outer_attachment_generations = bridge.attachment_generations();
             let _ = client_writer.send(ClientMessage::BridgeApplied {
+                bridge_instance_id,
                 virtual_revision: pending.virtual_revision,
                 outer_revision,
                 outer_attachment_generations,
@@ -888,6 +987,13 @@ fn run_bridge_worker(
             }
         }
     }
+    send_bridge_trace(
+        &client_writer,
+        bridge_instance_id,
+        trace_started,
+        None,
+        MediaTraceKind::BridgeClientDetached,
+    );
 }
 
 fn hydrates_retained_source(record_type: u16) -> bool {
@@ -967,6 +1073,115 @@ fn compare_projection(
         ProjectionChange::PlaybackOnly
     } else {
         ProjectionChange::SceneOnly
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_projection_change(
+    client_writer: &BridgeClientSender,
+    bridge_instance_id: u64,
+    trace_started: Instant,
+    change: ProjectionChange,
+    previous: &[BridgeSource],
+    current: &[BridgeSource],
+    recreated: &HashSet<BridgeSourceKey>,
+    attachment_generations: &[(BridgeSourceKey, u64)],
+) {
+    if change == ProjectionChange::Sources {
+        let mut removed = previous
+            .iter()
+            .filter(|source| !current.iter().any(|next| next.key == source.key))
+            .map(|source| source.key)
+            .collect::<Vec<_>>();
+        removed.sort_by_key(|source| (source.producer, source.source));
+        for source in removed {
+            send_bridge_trace(
+                client_writer,
+                bridge_instance_id,
+                trace_started,
+                Some(source),
+                MediaTraceKind::OuterSourceRemoved,
+            );
+        }
+    }
+
+    let mut ordered = current.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|source| (source.key.producer, source.key.source));
+    for source in ordered {
+        if recreated.contains(&source.key) {
+            let attachment_generation = attachment_generations
+                .iter()
+                .find_map(|(key, generation)| (*key == source.key).then_some(*generation))
+                .unwrap_or(0);
+            send_bridge_trace(
+                client_writer,
+                bridge_instance_id,
+                trace_started,
+                Some(source.key),
+                MediaTraceKind::OuterSourceRecreated {
+                    attachment_generation,
+                    playing: source.playing,
+                },
+            );
+            if source.playing {
+                send_bridge_trace(
+                    client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    Some(source.key),
+                    MediaTraceKind::PlaybackControl {
+                        control: MediaPlaybackControl::Play,
+                        request: Some(source.play_request),
+                    },
+                );
+            }
+            if source.eos_epoch.is_some() {
+                send_bridge_trace(
+                    client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    Some(source.key),
+                    MediaTraceKind::PlaybackControl {
+                        control: MediaPlaybackControl::Eos,
+                        request: None,
+                    },
+                );
+            }
+            continue;
+        }
+        let Some(old) = previous.iter().find(|old| old.key == source.key) else {
+            continue;
+        };
+        if old.playing != source.playing
+            || (source.playing && old.play_request != source.play_request)
+        {
+            send_bridge_trace(
+                client_writer,
+                bridge_instance_id,
+                trace_started,
+                Some(source.key),
+                MediaTraceKind::PlaybackControl {
+                    control: if source.playing {
+                        MediaPlaybackControl::Play
+                    } else {
+                        MediaPlaybackControl::Pause
+                    },
+                    request: source.playing.then_some(source.play_request),
+                },
+            );
+        }
+        if old.eos_epoch != source.eos_epoch && source.eos_epoch.is_some() {
+            send_bridge_trace(
+                client_writer,
+                bridge_instance_id,
+                trace_started,
+                Some(source.key),
+                MediaTraceKind::PlaybackControl {
+                    control: MediaPlaybackControl::Eos,
+                    request: None,
+                },
+            );
+        }
     }
 }
 
@@ -1340,6 +1555,97 @@ mod tests {
         ));
         assert!(!hydrates_retained_source(
             vivid_protocol::messages::VIDEO_PACKET
+        ));
+    }
+
+    #[test]
+    fn recreated_playing_video_trace_orders_decoder_recreation_before_play() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let captured = messages.clone();
+        let sender = BridgeClientSender::new(move |message| {
+            captured.lock().unwrap().push(message);
+            Ok(())
+        });
+        let key = BridgeSourceKey {
+            producer: 3,
+            source: 7,
+        };
+        let source = BridgeSource {
+            key,
+            kind: BridgeSourceKind::Video {
+                codec_string: None,
+                decoder_config: None,
+                codec: "h264".into(),
+                packetization: "h264-annexb-au-v1".into(),
+                extradata: Vec::new(),
+                width: 16,
+                height: 16,
+                profile: 0,
+                level: 0,
+                bitrate: 0,
+                color_primaries: 1,
+                transfer: 1,
+                matrix: 1,
+                range: 1,
+                sar_num: 1,
+                sar_den: 1,
+                max_access_unit_bytes: 1024,
+            },
+            capture_policy: 0,
+            descriptor: None,
+            playing: true,
+            eos_epoch: None,
+            causation_id: None,
+            play_request: crate::ipc::BridgePlayRequest {
+                start_pts_us: 8_033_333,
+                minimum_buffer_us: 33_000,
+                maximum_latency_us: 500_000,
+                rate_32_32: 1_i64 << 32,
+                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                loop_count: 0,
+                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+            },
+        };
+
+        trace_projection_change(
+            &sender,
+            19,
+            Instant::now(),
+            ProjectionChange::Sources,
+            &[],
+            std::slice::from_ref(&source),
+            &HashSet::from([key]),
+            &[(key, 2)],
+        );
+
+        let messages = messages.lock().unwrap();
+        assert!(matches!(
+            &messages[0],
+            ClientMessage::BridgeTrace {
+                bridge_instance_id: 19,
+                event: BridgeMediaTraceEvent {
+                    source: Some(source),
+                    kind: MediaTraceKind::OuterSourceRecreated {
+                        attachment_generation: 2,
+                        playing: true,
+                    },
+                    ..
+                },
+            } if *source == key
+        ));
+        assert!(matches!(
+            &messages[1],
+            ClientMessage::BridgeTrace {
+                event: BridgeMediaTraceEvent {
+                    source: Some(source),
+                    kind: MediaTraceKind::PlaybackControl {
+                        control: MediaPlaybackControl::Play,
+                        request: Some(request),
+                    },
+                    ..
+                },
+                ..
+            } if *source == key && request.start_pts_us == 8_033_333
         ));
     }
 
