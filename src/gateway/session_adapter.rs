@@ -10,6 +10,7 @@ use crate::ipc::{ClientMessage, DisplayMetrics, ServerMessage};
 const WRITER_QUEUE_MESSAGES: usize = 256;
 
 pub(crate) struct SessionAdapter {
+    name: String,
     writer: mpsc::SyncSender<ClientMessage>,
     events: tokio_mpsc::Receiver<QueuedServerMessage>,
     cancel: crate::platform::ConnectionCancel,
@@ -135,6 +136,7 @@ impl SessionAdapter {
 
         Ok((
             Self {
+                name: session.clone(),
                 writer: writer_sender,
                 events: event_receiver,
                 cancel,
@@ -171,6 +173,11 @@ impl SessionAdapter {
 
     pub(crate) async fn recv(&mut self) -> Option<QueuedServerMessage> {
         self.events.recv().await
+    }
+
+    /// The session this connection holds, as the server resolved it.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     pub(crate) fn overloaded(&self) -> bool {
