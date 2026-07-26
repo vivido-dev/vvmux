@@ -680,6 +680,8 @@ pub struct OuterBridge {
     welcome_extensions: Vec<PreservedField>,
     /// Local acknowledgement domain for successfully reconciled outer snapshots.
     outer_applied_revision: u64,
+    /// Changes whenever this worker replaces its outer presenter session.
+    diagnostic_instance_generation: u64,
     outer_attachment_generations: HashMap<BridgeSourceKey, u64>,
     delegated_contexts: bool,
     capture_policy: bool,
@@ -838,6 +840,7 @@ impl OuterBridge {
             hello_extensions: hello_extensions.to_vec(),
             welcome_extensions: welcome.preserved_fields,
             outer_applied_revision: 0,
+            diagnostic_instance_generation: 1,
             outer_attachment_generations: HashMap::new(),
             delegated_contexts,
             capture_policy,
@@ -865,6 +868,10 @@ impl OuterBridge {
     pub fn mark_projection_applied(&mut self) -> u64 {
         self.outer_applied_revision = self.outer_applied_revision.saturating_add(1);
         self.outer_applied_revision
+    }
+
+    pub fn diagnostic_instance_generation(&self) -> u64 {
+        self.diagnostic_instance_generation
     }
 
     pub fn attachment_generations(&self) -> Vec<(BridgeSourceKey, u64)> {
@@ -899,6 +906,8 @@ impl OuterBridge {
             &self.hello_extensions,
         )?;
         let recreated = replacement.reconcile(sources, nodes)?;
+        replacement.diagnostic_instance_generation =
+            self.diagnostic_instance_generation.saturating_add(1);
         *self = replacement;
         Ok(recreated)
     }
@@ -920,6 +929,8 @@ impl OuterBridge {
             &self.hello_extensions,
         )?;
         let recreated = replacement.reconcile(sources, nodes)?;
+        replacement.diagnostic_instance_generation =
+            self.diagnostic_instance_generation.saturating_add(1);
         *self = replacement;
         Ok(recreated)
     }

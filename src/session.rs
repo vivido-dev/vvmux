@@ -21,6 +21,7 @@ use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
 };
 use crate::media::VirtualVivid;
+use crate::media_trace::{MediaKeyframeStage, MediaTraceFilter, MediaTraceJournal, MediaTraceKind};
 use crate::platform::VirtualPresenterEndpoint;
 use crate::region::{FixedRect, from_cells, intersect, subtract_all};
 use crate::screen::{ScreenBuffer, ansi_diff};
@@ -156,6 +157,11 @@ enum AutomationWaitKind {
     Media {
         after_virtual_revision: Option<u64>,
         after_outer_revision: Option<u64>,
+    },
+    MediaTrace {
+        after_sequence: Option<u64>,
+        limit: u16,
+        filter: MediaTraceFilter,
     },
 }
 
@@ -475,6 +481,23 @@ fn should_sync_media(
     force || last != Some(current)
 }
 
+fn bridge_apply_is_current(
+    current_instance: Option<u64>,
+    current_virtual_revision: u64,
+    current_bridge_revision: u64,
+    incoming_instance: u64,
+    incoming_virtual_revision: u64,
+    incoming_bridge_revision: u64,
+) -> bool {
+    incoming_virtual_revision >= current_virtual_revision
+        && (current_instance != Some(incoming_instance)
+            || incoming_bridge_revision >= current_bridge_revision)
+}
+
+fn next_outer_compatibility_revision(current: u64, incoming_bridge_revision: u64) -> u64 {
+    current.saturating_add(1).max(incoming_bridge_revision)
+}
+
 struct SessionActor {
     name: String,
     config: Config,
@@ -497,8 +520,14 @@ struct SessionActor {
     last_media_projection: Option<MediaProjectionKey>,
     media_projection_revision: u64,
     outer_virtual_revision: u64,
+    bridge_instance_id: Option<u64>,
+    bridge_local_revision: u64,
     outer_projection_revision: u64,
+    outer_apply_sequence: u64,
     outer_attachment_generations: HashMap<BridgeSourceKey, u64>,
+    traced_projected_sources: HashSet<BridgeSourceKey>,
+    traced_recovery_deliveries: HashMap<u64, (BridgeSourceKey, Option<u64>, u32, i64)>,
+    media_trace: MediaTraceJournal,
     fragment_assignments: HashMap<(u64, u64), FragmentMap>,
     last_projection_warning: Option<MediaProjectionKey>,
     pointer_drag: Option<PointerDrag>,
@@ -594,8 +623,14 @@ pub fn start(
         last_media_projection: None,
         media_projection_revision: 0,
         outer_virtual_revision: 0,
+        bridge_instance_id: None,
+        bridge_local_revision: 0,
         outer_projection_revision: 0,
+        outer_apply_sequence: 0,
         outer_attachment_generations: HashMap::new(),
+        traced_projected_sources: HashSet::new(),
+        traced_recovery_deliveries: HashMap::new(),
+        media_trace: MediaTraceJournal::default(),
         fragment_assignments: HashMap::new(),
         last_projection_warning: None,
         pointer_drag: None,
@@ -684,6 +719,23 @@ impl SessionActor {
     }
 
     fn forward_media(&mut self, event: crate::media::MediaEvent) {
+        if let Some((epoch, pts_us)) = event.recovered_keyframe {
+            self.traced_recovery_deliveries.insert(
+                event.delivery_id,
+                (
+                    bridge_key(event.source),
+                    self.bridge_instance_id,
+                    epoch,
+                    pts_us,
+                ),
+            );
+            self.record_media_trace(
+                Some(bridge_key(event.source)),
+                self.bridge_instance_id,
+                None,
+                MediaTraceKind::KeyframeRecovered { epoch, pts_us },
+            );
+        }
         // PLAY/PAUSE/EOS arrive on the producer's control connection while media arrives on
         // independent source connections. Publish any resulting authoritative projection revision
         // before forwarding the next media record. Otherwise a busy stream can starve the actor's
@@ -704,6 +756,7 @@ impl SessionActor {
                 )
             });
         if !sent {
+            self.record_delivery_result(event.delivery_id, false);
             self.vivid
                 .complete_bridge_delivery(event.delivery_id, false);
         }
@@ -726,8 +779,18 @@ impl SessionActor {
                 self.automation_waiters
                     .retain(|waiter| waiter.reply.client_id != id);
                 if self.attached.as_ref().is_some_and(|client| client.id == id) {
+                    self.record_media_trace(
+                        None,
+                        self.bridge_instance_id,
+                        None,
+                        MediaTraceKind::BridgeClientDetached,
+                    );
                     self.cancel_pointer_drag(true);
                     self.attached = None;
+                    self.bridge_instance_id = None;
+                    self.bridge_local_revision = 0;
+                    self.traced_recovery_deliveries.clear();
+                    self.record_projection_sources(&HashSet::new(), self.vivid.revision());
                     self.last_screen = None;
                     #[cfg(windows)]
                     {
@@ -885,6 +948,9 @@ impl SessionActor {
                         .counters(),
                 );
                 self.bridge_metrics = crate::metrics::BridgeMetrics::default();
+                self.bridge_instance_id = None;
+                self.bridge_local_revision = 0;
+                self.traced_recovery_deliveries.clear();
                 self.attached = Some(AttachedClient {
                     id,
                     writer: writer.clone(),
@@ -918,6 +984,12 @@ impl SessionActor {
                     self.outer_bracketed_paste = None;
                 }
                 self.force_full = true;
+                self.record_media_trace(
+                    None,
+                    None,
+                    None,
+                    MediaTraceKind::BridgeClientAttached { vivid },
+                );
                 self.resize_all();
                 self.sync_media(true);
                 self.schedule_render();
@@ -990,10 +1062,30 @@ impl SessionActor {
             ClientMessage::BridgeNeedKeyframes(requests) => {
                 if self.client_is(id) {
                     for request in requests {
-                        self.vivid.request_keyframe(
+                        let outcome = self.vivid.request_keyframe(
                             (request.source.producer, request.source.source),
                             request.minimum_epoch,
                             request.reason,
+                        );
+                        self.record_media_trace(
+                            Some(request.source),
+                            self.bridge_instance_id,
+                            None,
+                            MediaTraceKind::KeyframeRequest {
+                                stage: match outcome {
+                                    crate::media::KeyframeRequestOutcome::Forwarded => {
+                                        MediaKeyframeStage::ProducerForwarded
+                                    }
+                                    crate::media::KeyframeRequestOutcome::Damped => {
+                                        MediaKeyframeStage::ProducerDamped
+                                    }
+                                    crate::media::KeyframeRequestOutcome::Ignored => {
+                                        MediaKeyframeStage::ProducerIgnored
+                                    }
+                                },
+                                minimum_epoch: request.minimum_epoch,
+                                reason: request.reason,
+                            },
                         );
                     }
                 }
@@ -1019,6 +1111,7 @@ impl SessionActor {
                 delivered,
             } => {
                 if self.client_is(id) {
+                    self.record_delivery_result(delivery_id, delivered);
                     let resync = self.vivid.complete_bridge_delivery(delivery_id, delivered);
                     if resync {
                         self.last_media_projection = None;
@@ -1028,6 +1121,12 @@ impl SessionActor {
             }
             ClientMessage::BridgeSnapshotRetry => {
                 if self.client_is(id) {
+                    self.record_media_trace(
+                        None,
+                        self.bridge_instance_id,
+                        None,
+                        MediaTraceKind::SnapshotRetry,
+                    );
                     // The worker requests this only when it will rebuild a replacement outer
                     // session. Fragment identities are scoped to that outer session.
                     self.fragment_assignments.clear();
@@ -1036,19 +1135,73 @@ impl SessionActor {
                 }
             }
             ClientMessage::BridgeApplied {
+                bridge_instance_id,
                 virtual_revision,
                 outer_revision,
                 outer_attachment_generations,
             } => {
+                let instance_changed = self.bridge_instance_id != Some(bridge_instance_id);
                 if self.client_is(id)
-                    && virtual_revision >= self.outer_virtual_revision
-                    && outer_revision >= self.outer_projection_revision
+                    && bridge_apply_is_current(
+                        self.bridge_instance_id,
+                        self.outer_virtual_revision,
+                        self.bridge_local_revision,
+                        bridge_instance_id,
+                        virtual_revision,
+                        outer_revision,
+                    )
                 {
+                    if instance_changed {
+                        self.bridge_local_revision = 0;
+                        self.outer_attachment_generations.clear();
+                    }
+                    self.bridge_instance_id = Some(bridge_instance_id);
                     self.outer_virtual_revision = virtual_revision;
-                    self.outer_projection_revision = outer_revision;
+                    self.bridge_local_revision = outer_revision;
+                    self.outer_apply_sequence = self.outer_apply_sequence.saturating_add(1);
+                    self.outer_projection_revision = next_outer_compatibility_revision(
+                        self.outer_projection_revision,
+                        outer_revision,
+                    );
+                    let attachment_count =
+                        u16::try_from(outer_attachment_generations.len()).unwrap_or(u16::MAX);
                     self.outer_attachment_generations =
                         outer_attachment_generations.into_iter().collect();
+                    self.record_media_trace(
+                        None,
+                        Some(bridge_instance_id),
+                        None,
+                        MediaTraceKind::ProjectionApplied {
+                            virtual_revision,
+                            bridge_local_revision: outer_revision,
+                            attachment_count,
+                        },
+                    );
                     self.check_automation_waiters();
+                }
+            }
+            ClientMessage::BridgeTrace {
+                bridge_instance_id,
+                event,
+            } => {
+                if self.client_is(id) {
+                    if matches!(event.kind, MediaTraceKind::BridgeClientAttached { .. })
+                        || self.bridge_instance_id.is_none()
+                    {
+                        if self.bridge_instance_id != Some(bridge_instance_id) {
+                            self.bridge_local_revision = 0;
+                            self.outer_attachment_generations.clear();
+                        }
+                        self.bridge_instance_id = Some(bridge_instance_id);
+                    }
+                    if self.bridge_instance_id == Some(bridge_instance_id) {
+                        self.record_media_trace(
+                            event.source,
+                            Some(bridge_instance_id),
+                            Some(event.origin_monotonic_us),
+                            event.kind,
+                        );
+                    }
                 }
             }
             ClientMessage::BridgePlaybackState {
@@ -1057,6 +1210,12 @@ impl SessionActor {
                 eos_state,
             } => {
                 if self.client_is(id) {
+                    self.record_media_trace(
+                        Some(source),
+                        self.bridge_instance_id,
+                        None,
+                        MediaTraceKind::PlaybackState { state, eos_state },
+                    );
                     self.vivid.apply_outer_playback(
                         (source.producer, source.source),
                         state,
@@ -1071,6 +1230,12 @@ impl SessionActor {
             }
             ClientMessage::Detach => {
                 if self.client_is(id) {
+                    self.record_media_trace(
+                        None,
+                        self.bridge_instance_id,
+                        None,
+                        MediaTraceKind::BridgeClientDetached,
+                    );
                     self.cancel_pointer_drag(true);
                     crate::ipc::send(
                         &writer,
@@ -1079,6 +1244,10 @@ impl SessionActor {
                         },
                     )?;
                     self.attached = None;
+                    self.bridge_instance_id = None;
+                    self.bridge_local_revision = 0;
+                    self.traced_recovery_deliveries.clear();
+                    self.record_projection_sources(&HashSet::new(), self.vivid.revision());
                     self.last_screen = None;
                     #[cfg(windows)]
                     {
@@ -1218,11 +1387,35 @@ impl SessionActor {
                 let pane_id = pane_id.unwrap();
                 let status = self.vivid.pane_status(
                     pane_id,
-                    self.outer_projection_revision,
-                    &self.outer_attachment_generations,
+                    self.outer_media_projection(),
                     self.relay_metrics(),
                 );
                 self.reply_automation(target, serde_json::to_value(status).unwrap());
+            }
+            AutomationMethod::TraceMedia {
+                after_sequence,
+                limit,
+                timeout_ms,
+                filter,
+            } => {
+                let pane_id = pane_id.unwrap();
+                let result = self
+                    .media_trace
+                    .query(after_sequence, limit, Some(pane_id), filter);
+                if timeout_ms == 0 || result.gap.is_some() || !result.events.is_empty() {
+                    self.reply_automation(target, serde_json::to_value(result).unwrap());
+                } else {
+                    self.add_automation_waiter(AutomationWaiter {
+                        reply: target,
+                        pane_id: Some(pane_id),
+                        deadline: deadline(timeout_ms),
+                        kind: AutomationWaitKind::MediaTrace {
+                            after_sequence,
+                            limit,
+                            filter,
+                        },
+                    });
+                }
             }
             AutomationMethod::Split { axis } => {
                 let pane_id = pane_id.unwrap();
@@ -1989,10 +2182,22 @@ impl SessionActor {
         let waiters = std::mem::take(&mut self.automation_waiters);
         for waiter in waiters {
             if waiter.deadline <= now {
-                self.reply_automation_error(
-                    waiter.reply,
-                    AutomationError::new("timeout", "automation wait timed out"),
-                );
+                if let AutomationWaitKind::MediaTrace {
+                    after_sequence,
+                    limit,
+                    filter,
+                } = waiter.kind
+                {
+                    let result =
+                        self.media_trace
+                            .query(after_sequence, limit, waiter.pane_id, filter);
+                    self.reply_automation(waiter.reply, serde_json::to_value(result).unwrap());
+                } else {
+                    self.reply_automation_error(
+                        waiter.reply,
+                        AutomationError::new("timeout", "automation wait timed out"),
+                    );
+                }
                 continue;
             }
             match self.automation_waiter_result(&waiter, now) {
@@ -2016,8 +2221,7 @@ impl SessionActor {
                 let pane_id = waiter.pane_id?;
                 let status = self.vivid.pane_status(
                     pane_id,
-                    self.outer_projection_revision,
-                    &self.outer_attachment_generations,
+                    self.outer_media_projection(),
                     self.relay_metrics(),
                 );
                 let virtual_ready = after_virtual_revision
@@ -2026,6 +2230,20 @@ impl SessionActor {
                     .is_none_or(|revision| status.outer_projection_revision > revision);
                 (virtual_ready && outer_ready).then(|| {
                     serde_json::to_value(status).map_err(|error| {
+                        AutomationError::new("serialization_failed", error.to_string())
+                    })
+                })
+            }
+            AutomationWaitKind::MediaTrace {
+                after_sequence,
+                limit,
+                filter,
+            } => {
+                let result =
+                    self.media_trace
+                        .query(*after_sequence, *limit, waiter.pane_id, *filter);
+                (result.gap.is_some() || !result.events.is_empty()).then(|| {
+                    serde_json::to_value(result).map_err(|error| {
                         AutomationError::new("serialization_failed", error.to_string())
                     })
                 })
@@ -3241,10 +3459,14 @@ impl SessionActor {
         live_delivery_source: Option<crate::media::SourceKey>,
     ) {
         let Some(client) = &self.attached else {
+            self.record_projection_sources(&HashSet::new(), self.vivid.revision());
+            self.traced_recovery_deliveries.clear();
             self.vivid.deactivate_bridge();
             return;
         };
         if !client.vivid {
+            self.record_projection_sources(&HashSet::new(), self.vivid.revision());
+            self.traced_recovery_deliveries.clear();
             self.vivid.deactivate_bridge();
             return;
         }
@@ -3419,6 +3641,12 @@ impl SessionActor {
             .copied()
             .map(bridge_key)
             .collect();
+        let projected_source_keys = sources
+            .iter()
+            .map(|source| source.key)
+            .collect::<HashSet<_>>();
+        let source_count = u16::try_from(sources.len()).unwrap_or(u16::MAX);
+        let node_count = u16::try_from(nodes.len()).unwrap_or(u16::MAX);
         let projection_revision = self.media_projection_revision.wrapping_add(1);
         if crate::ipc::send(
             &writer,
@@ -3433,6 +3661,17 @@ impl SessionActor {
         {
             return;
         }
+        self.record_projection_sources(&projected_source_keys, projection_key.virtual_revision);
+        self.record_media_trace(
+            None,
+            self.bridge_instance_id,
+            None,
+            MediaTraceKind::ProjectionSubmitted {
+                virtual_revision: projection_key.virtual_revision,
+                source_count,
+                node_count,
+            },
+        );
         for source in snapshot.sources {
             if !should_replay_retained(source.key, live_delivery_source) {
                 // The MediaEvent that triggered this projection sync follows immediately. Do not
@@ -3476,6 +3715,93 @@ impl SessionActor {
             delivery: crate::metrics::DeliveryMetrics::default(),
             bridge: self.bridge_metrics,
         }
+    }
+
+    fn outer_media_projection(&self) -> crate::media::OuterMediaProjection<'_> {
+        crate::media::OuterMediaProjection {
+            compatibility_revision: self.outer_projection_revision,
+            apply_sequence: self.outer_apply_sequence,
+            bridge_instance_id: self.bridge_instance_id,
+            bridge_local_revision: self.bridge_local_revision,
+            attachment_generations: &self.outer_attachment_generations,
+        }
+    }
+
+    fn record_media_trace(
+        &mut self,
+        source: Option<BridgeSourceKey>,
+        bridge_instance_id: Option<u64>,
+        origin_monotonic_us: Option<u64>,
+        kind: MediaTraceKind,
+    ) {
+        let pane =
+            source.and_then(|source| self.vivid.pane_for_source((source.producer, source.source)));
+        self.media_trace
+            .push(pane, source, bridge_instance_id, origin_monotonic_us, kind);
+    }
+
+    fn record_delivery_result(&mut self, delivery_id: u64, delivered: bool) {
+        if let Some((source, bridge_instance_id, epoch, pts_us)) =
+            self.traced_recovery_deliveries.remove(&delivery_id)
+        {
+            self.record_media_trace(
+                Some(source),
+                bridge_instance_id,
+                None,
+                MediaTraceKind::KeyframeDelivery {
+                    delivery_id,
+                    delivered,
+                    epoch,
+                    pts_us,
+                },
+            );
+        } else if !delivered {
+            self.record_media_trace(
+                None,
+                self.bridge_instance_id,
+                None,
+                MediaTraceKind::DeliveryFailed { delivery_id },
+            );
+        }
+    }
+
+    fn record_projection_sources(
+        &mut self,
+        current: &HashSet<BridgeSourceKey>,
+        virtual_revision: u64,
+    ) {
+        let hidden = self
+            .traced_projected_sources
+            .difference(current)
+            .copied()
+            .collect::<Vec<_>>();
+        let visible = current
+            .difference(&self.traced_projected_sources)
+            .copied()
+            .collect::<Vec<_>>();
+        for source in hidden {
+            self.record_media_trace(
+                Some(source),
+                self.bridge_instance_id,
+                None,
+                MediaTraceKind::SourceVisibility {
+                    visible: false,
+                    virtual_revision,
+                },
+            );
+        }
+        for source in visible {
+            self.record_media_trace(
+                Some(source),
+                self.bridge_instance_id,
+                None,
+                MediaTraceKind::SourceVisibility {
+                    visible: true,
+                    virtual_revision,
+                },
+            );
+        }
+        self.traced_projected_sources = current.clone();
     }
 
     fn content_area(&self) -> Rect {
@@ -3725,6 +4051,22 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
         AutomationMethod::WaitText { text, regex, .. } if *regex && text.len() > 8 * 1024 => Err(
             AutomationError::new("limit_exceeded", "regular expression exceeds 8 KiB"),
         ),
+        AutomationMethod::TraceMedia { limit, .. }
+            if !(1..=crate::media_trace::MAX_MEDIA_TRACE_QUERY_EVENTS).contains(limit) =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "media trace limit must be from 1 through 512",
+            ))
+        }
+        AutomationMethod::TraceMedia { filter, .. }
+            if filter.source_id.is_some() && filter.producer_id.is_none() =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "media trace source-id requires producer-id",
+            ))
+        }
         AutomationMethod::WaitScreenStable { quiet_ms, .. }
             if !(1..=24 * 60 * 60 * 1000).contains(quiet_ms) =>
         {
@@ -3741,6 +4083,9 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 | AutomationMethod::WaitRendered { timeout_ms, .. }
                 | AutomationMethod::WaitExit { timeout_ms }
                 | AutomationMethod::WaitMedia { timeout_ms, .. } => Some(*timeout_ms),
+                AutomationMethod::TraceMedia { timeout_ms, .. } if *timeout_ms != 0 => {
+                    Some(*timeout_ms)
+                }
                 _ => None,
             };
             if timeout.is_some_and(|timeout| !(1..=24 * 60 * 60 * 1000).contains(&timeout)) {
@@ -3762,7 +4107,8 @@ fn automation_capabilities() -> serde_json::Value {
         "methods": [
             "capabilities", "list_panes", "inspect", "inspect_media", "split", "focus", "close_pane",
             "typing", "key", "paste", "get_text", "get_grid", "wait_text",
-            "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media"
+            "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
+            "trace_media"
         ],
         "limits": automation_limits(),
         "render_acknowledgment": "attached_client_write",
@@ -3776,6 +4122,9 @@ fn automation_limits() -> serde_json::Value {
         "rows": 1000,
         "key_repeats": 1000,
         "regex_bytes": 8 * 1024,
+        "media_trace_events": crate::media_trace::MAX_MEDIA_TRACE_EVENTS,
+        "media_trace_bytes": crate::media_trace::MAX_MEDIA_TRACE_BYTES,
+        "media_trace_query_events": crate::media_trace::MAX_MEDIA_TRACE_QUERY_EVENTS,
         "timeout_ms": { "minimum": 1, "maximum": 24 * 60 * 60 * 1000_u64 },
         "pty_write_timeout_ms": 5000,
     })
@@ -4504,6 +4853,17 @@ mod tests {
         assert_eq!(sanitize_bracketed_paste(b"a\x1b[201~b"), b"a\x1b[201;~b");
     }
 
+    #[test]
+    fn a_new_bridge_instance_accepts_a_lower_local_revision_without_regressing_wait_sequence() {
+        assert!(bridge_apply_is_current(Some(11), 40, 73, 12, 40, 1));
+        assert!(
+            !bridge_apply_is_current(Some(11), 40, 73, 11, 40, 72),
+            "the current bridge must still reject its own stale local acknowledgement"
+        );
+        assert_eq!(next_outer_compatibility_revision(73, 1), 74);
+        assert_eq!(next_outer_compatibility_revision(4, 9), 9);
+    }
+
     #[cfg(windows)]
     #[test]
     fn outer_bracketed_paste_transitions_are_authoritative_and_deduplicated() {
@@ -4970,8 +5330,14 @@ mod tests {
             last_media_projection: None,
             media_projection_revision: 0,
             outer_virtual_revision: 0,
+            bridge_instance_id: None,
+            bridge_local_revision: 0,
             outer_projection_revision: 0,
+            outer_apply_sequence: 0,
             outer_attachment_generations: HashMap::new(),
+            traced_projected_sources: HashSet::new(),
+            traced_recovery_deliveries: HashMap::new(),
+            media_trace: MediaTraceJournal::default(),
             fragment_assignments: HashMap::new(),
             last_projection_warning: None,
             pointer_drag: None,
@@ -5244,6 +5610,36 @@ mod tests {
                 timeout_ms: 0,
             })
             .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::TraceMedia {
+                after_sequence: None,
+                limit: 0,
+                timeout_ms: 0,
+                filter: MediaTraceFilter::default(),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::TraceMedia {
+                after_sequence: None,
+                limit: 32,
+                timeout_ms: 0,
+                filter: MediaTraceFilter {
+                    source_id: Some(4),
+                    ..MediaTraceFilter::default()
+                },
+            })
+            .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::TraceMedia {
+                after_sequence: None,
+                limit: 32,
+                timeout_ms: 0,
+                filter: MediaTraceFilter::default(),
+            })
+            .is_ok()
         );
     }
 }
