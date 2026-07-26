@@ -8,6 +8,7 @@ mod gateway;
 mod ipc;
 mod layout;
 mod media;
+mod metrics;
 mod platform;
 mod region;
 mod runtime;

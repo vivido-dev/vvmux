@@ -54,7 +54,7 @@ impl SessionAdapter {
                     display,
                     vivid,
                 })?;
-            match reader.recv::<ServerMessage>()? {
+            match reader.recv_server()? {
                 ServerMessage::Attached { session, text_only } => {
                     Ok((reader, writer, session, text_only))
                 }
@@ -101,7 +101,7 @@ impl SessionAdapter {
         thread::Builder::new()
             .name("vvmux-gateway-ipc-reader".into())
             .spawn(move || {
-                while let Ok(message) = reader.recv::<ServerMessage>() {
+                while let Ok(message) = reader.recv_server() {
                     if !vivid && let ServerMessage::MediaRecord { delivery_id, .. } = &message {
                         let _ = media_writer.try_send(ClientMessage::BridgeMediaAck {
                             delivery_id: *delivery_id,

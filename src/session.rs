@@ -26,6 +26,12 @@ use crate::region::{FixedRect, from_cells, intersect, subtract_all};
 use crate::screen::{ScreenBuffer, ansi_diff};
 
 const EVENT_QUEUE: usize = 1024;
+/// Slots on the dedicated media-event receiver.
+///
+/// Total queued media bytes are separately bounded by `media.ipc_queue_bytes`, so this only needs
+/// enough slots that small records — audio access units especially — cannot exhaust it while that
+/// byte budget is far from spent.
+const MEDIA_EVENT_QUEUE: usize = 256;
 const COPY_BUFFER_LIMIT: usize = 1024 * 1024;
 const MAX_NODE_FRAGMENTS: usize = 8;
 const MAX_PROJECTED_NODES: usize = 256;
@@ -33,6 +39,12 @@ const INPUT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_AUTOMATION_REQUESTS_PER_CLIENT: usize = 64;
 const MAX_AUTOMATION_WAITERS: usize = 256;
 const MAX_PENDING_ACTOR_WORK: usize = 256;
+/// Frames allowed outstanding before rendering pauses for the client to catch up.
+///
+/// The acknowledgement arrives after the client writes the frame to its terminal, so this bounds
+/// how far the server may run ahead of what the user can actually see. Media snapshots and media
+/// records are never gated by it: a slow terminal must not stall the projected scene.
+const MAX_UNACKNOWLEDGED_FRAMES: u64 = 8;
 const AUTOMATION_RESPONSE_QUEUE: usize = 8;
 const SCREEN_CHANGE_HISTORY: usize = 1024;
 const EXIT_TOMBSTONES: usize = 128;
@@ -57,7 +69,11 @@ pub enum ActorEvent {
         reply: AutomationReplyTarget,
         result: Result<(), String>,
     },
-    Media(crate::media::MediaEvent),
+    /// A media event is waiting on the dedicated media receiver.
+    ///
+    /// Carries no payload: it exists only to wake the actor promptly. Losing one to a full queue
+    /// is harmless because the actor drains media at the top of every iteration anyway.
+    MediaReady,
 }
 
 #[derive(Clone)]
@@ -496,6 +512,12 @@ struct SessionActor {
     exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
     vivid: VirtualVivid,
+    /// Latest foreground-bridge counter report. Diagnostic only; retained across a detach so
+    /// `inspect-media` still describes the last live bridge.
+    bridge_metrics: crate::metrics::BridgeMetrics,
+    /// Counters for the attached client's VVMX connection, retained across a detach for the same
+    /// reason. Replaced when a new client attaches.
+    client_ipc: Option<Arc<crate::metrics::IpcCounters>>,
 }
 
 pub fn start(
@@ -504,10 +526,18 @@ pub fn start(
     vivid_endpoint: VirtualPresenterEndpoint,
 ) -> io::Result<ActorHandle> {
     let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE);
-    let (media_sender, media_receiver) = mpsc::sync_channel(64);
+    let (media_sender, media_receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE);
     let shutdown = Arc::new(AtomicBool::new(false));
     let vivid =
         VirtualVivid::start_with_events(vivid_endpoint, config.media.clone(), Some(media_sender))?;
+    {
+        // Losing a wakeup to a full queue is harmless: the actor drains media around every event
+        // and on every idle tick regardless, so `try_send` here must never block ingest.
+        let wakeup = sender.clone();
+        vivid.set_media_wakeup(Arc::new(move || {
+            let _ = wakeup.try_send(ActorEvent::MediaReady);
+        }));
+    }
     let (response_sender, response_receiver) =
         mpsc::sync_channel::<AutomationResponseJob>(AUTOMATION_RESPONSE_QUEUE);
     let response_receiver = Arc::new(std::sync::Mutex::new(response_receiver));
@@ -528,16 +558,11 @@ pub fn start(
                 }
             })?;
     }
-    let media_events = sender.clone();
-    std::thread::Builder::new()
-        .name("vvmux-media-events".into())
-        .spawn(move || {
-            while let Ok(event) = media_receiver.recv() {
-                if media_events.send(ActorEvent::Media(event)).is_err() {
-                    break;
-                }
-            }
-        })?;
+    // Media no longer travels through the actor's general event queue. That queue is shared with
+    // `PtyOutput`, so a pane producing a lot of terminal output could fill it, block the forwarder,
+    // back up the media channel, and make ingest drop frames — starving media in one pane because
+    // a different pane was busy. Media now has its own receiver that the actor drains first, and
+    // only a coalescible wakeup crosses the shared queue.
     let last_display = normalized_display(
         DisplayMetrics {
             columns: 80,
@@ -584,16 +609,22 @@ pub fn start(
         exit_tombstones: VecDeque::new(),
         shutdown: shutdown.clone(),
         vivid,
+        bridge_metrics: crate::metrics::BridgeMetrics::default(),
+        client_ipc: None,
     };
     actor.new_tab()?;
     std::thread::Builder::new()
         .name("vvmux-session".into())
-        .spawn(move || actor.run(receiver))?;
+        .spawn(move || actor.run(receiver, media_receiver))?;
     Ok(ActorHandle { sender, shutdown })
 }
 
 impl SessionActor {
-    fn run(&mut self, receiver: mpsc::Receiver<ActorEvent>) {
+    fn run(
+        &mut self,
+        receiver: mpsc::Receiver<ActorEvent>,
+        media_receiver: mpsc::Receiver<crate::media::MediaEvent>,
+    ) {
         let interval = Duration::from_millis(self.config.general.render_interval_ms);
         let mut render_at = Instant::now();
         loop {
@@ -603,11 +634,16 @@ impl SessionActor {
                 Duration::from_secs(1)
             };
             timeout = timeout.min(self.next_automation_deadline());
+            // Media first, and to exhaustion: a projected source's frames must not queue behind an
+            // unrelated pane's terminal output. This is cheap when idle because the media receiver
+            // is empty and `try_recv` does not block.
+            self.drain_media(&media_receiver);
             match receiver.recv_timeout(timeout) {
                 Ok(event) => {
                     if self.handle_event(event).is_err() {
                         self.force_full = true;
                     }
+                    self.drain_media(&media_receiver);
                     if self.pending_render && render_at <= Instant::now() {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -619,6 +655,7 @@ impl SessionActor {
                     self.check_automation_waiters();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.drain_media(&media_receiver);
                     if self.pending_render {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -634,6 +671,42 @@ impl SessionActor {
         }
         self.terminate_children();
         self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Forward every media event currently queued.
+    ///
+    /// Bounded by the media channel's own capacity, so this cannot become an unbounded stall on
+    /// the actor even when a producer is saturating its source.
+    fn drain_media(&mut self, media_receiver: &mpsc::Receiver<crate::media::MediaEvent>) {
+        while let Ok(event) = media_receiver.try_recv() {
+            self.forward_media(event);
+        }
+    }
+
+    fn forward_media(&mut self, event: crate::media::MediaEvent) {
+        // PLAY/PAUSE/EOS arrive on the producer's control connection while media arrives on
+        // independent source connections. Publish any resulting authoritative projection revision
+        // before forwarding the next media record. Otherwise a busy stream can starve the actor's
+        // idle sync, fill outer pre-roll with later audio, and leave video waiting for a PLAY
+        // snapshot that is queued behind that media.
+        self.sync_media_before_delivery(event.source);
+        let sent = self
+            .attached
+            .as_ref()
+            .filter(|client| client.vivid)
+            .is_some_and(|client| {
+                send_media_body(
+                    &client.writer,
+                    event.delivery_id,
+                    bridge_key(event.source),
+                    event.record_type,
+                    &event.body,
+                )
+            });
+        if !sent {
+            self.vivid
+                .complete_bridge_delivery(event.delivery_id, false);
+        }
     }
 
     fn handle_event(&mut self, event: ActorEvent) -> io::Result<()> {
@@ -767,31 +840,9 @@ impl SessionActor {
                     self.reply_automation_error(reply, AutomationError::new("pty_closed", message));
                 }
             },
-            ActorEvent::Media(event) => {
-                // PLAY/PAUSE/EOS arrive on the producer's control connection while media arrives
-                // on independent source connections. Publish any resulting authoritative
-                // projection revision before forwarding the next media record. Otherwise a busy
-                // stream can starve the actor's idle sync, fill outer pre-roll with later audio,
-                // and leave video waiting for a PLAY snapshot that is queued behind that media.
-                self.sync_media_before_delivery(event.source);
-                let sent = self
-                    .attached
-                    .as_ref()
-                    .filter(|client| client.vivid)
-                    .is_some_and(|client| {
-                        send_media_body(
-                            &client.writer,
-                            event.delivery_id,
-                            bridge_key(event.source),
-                            event.record_type,
-                            &event.body,
-                        )
-                    });
-                if !sent {
-                    self.vivid
-                        .complete_bridge_delivery(event.delivery_id, false);
-                }
-            }
+            // The payload arrives on the dedicated media receiver, which the run loop drains
+            // around every event; this wakeup only ensures it happens promptly.
+            ActorEvent::MediaReady => {}
         }
         Ok(())
     }
@@ -827,6 +878,13 @@ impl SessionActor {
                 }
                 let display = normalized_display(display, self.config.general.status_visible);
                 self.last_display = display;
+                self.client_ipc = Some(
+                    writer
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .counters(),
+                );
+                self.bridge_metrics = crate::metrics::BridgeMetrics::default();
                 self.attached = Some(AttachedClient {
                     id,
                     writer: writer.clone(),
@@ -913,6 +971,19 @@ impl SessionActor {
                     }
                 }
             }
+            ClientMessage::RenderResync => {
+                if self.client_is(id) {
+                    // Treat the discarded backlog as acknowledged: those frames will never be
+                    // displayed, and leaving them outstanding would stall the render gate.
+                    if let Some(client) = &mut self.attached {
+                        client.acknowledged_frame = self.frame_id;
+                        client.frame_sequences.clear();
+                    }
+                    self.force_full = true;
+                    self.last_screen = None;
+                    self.schedule_render();
+                }
+            }
             ClientMessage::BridgeNeedKeyframes(sources) => {
                 if self.client_is(id) {
                     self.vivid.request_keyframes(
@@ -920,6 +991,17 @@ impl SessionActor {
                             .into_iter()
                             .map(|source| (source.producer, source.source))
                             .collect::<Vec<_>>(),
+                    );
+                }
+            }
+            ClientMessage::BridgeNeedFullFrames(sources) => {
+                if self.client_is(id) {
+                    self.vivid.request_full_frames(
+                        &sources
+                            .into_iter()
+                            .map(|source| (source.producer, source.source))
+                            .collect::<Vec<_>>(),
+                        vivid_protocol::messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
                     );
                 }
             }
@@ -976,6 +1058,11 @@ impl SessionActor {
                         state,
                         eos_state,
                     );
+                }
+            }
+            ClientMessage::BridgeMetrics(metrics) => {
+                if self.client_is(id) {
+                    self.bridge_metrics = metrics;
                 }
             }
             ClientMessage::Detach => {
@@ -1129,6 +1216,7 @@ impl SessionActor {
                     pane_id,
                     self.outer_projection_revision,
                     &self.outer_attachment_generations,
+                    self.relay_metrics(),
                 );
                 self.reply_automation(target, serde_json::to_value(status).unwrap());
             }
@@ -1926,6 +2014,7 @@ impl SessionActor {
                     pane_id,
                     self.outer_projection_revision,
                     &self.outer_attachment_generations,
+                    self.relay_metrics(),
                 );
                 let virtual_ready = after_virtual_revision
                     .is_none_or(|revision| status.virtual_projection_revision > revision);
@@ -2961,6 +3050,15 @@ impl SessionActor {
     }
 
     fn render(&mut self) {
+        // Frames the client has queued but not yet displayed. Producing more of them cannot make
+        // the terminal any more current, and the extra bytes compete with media on the same
+        // connection, so hold off and keep the render pending.
+        if let Some(client) = &self.attached
+            && self.frame_id.saturating_sub(client.acknowledged_frame) >= MAX_UNACKNOWLEDGED_FRAMES
+        {
+            self.pending_render = true;
+            return;
+        }
         self.pending_render = false;
         let Some(client) = &self.attached else {
             return;
@@ -3072,22 +3170,24 @@ impl SessionActor {
         if let Some(transition) = bracketed_paste_transition {
             prepend_bracketed_paste_transition(&mut bytes, transition);
         }
-        let chunks = bytes.chunks(256 * 1024).collect::<Vec<_>>();
-        let mut sent = true;
-        for (index, chunk) in chunks.iter().enumerate() {
-            let message = ServerMessage::Render {
-                frame_id: self.frame_id,
-                session_sequence: self.session_sequence,
-                full: self.force_full && index == 0,
-                last: index + 1 == chunks.len(),
-                bytes: chunk.to_vec(),
-            };
-            if crate::ipc::send(&client.writer, &message).is_err() {
-                sent = false;
-                break;
-            }
-        }
+        let sent = crate::ipc::send_render_record(
+            &client.writer,
+            self.frame_id,
+            self.session_sequence,
+            self.force_full,
+            &bytes,
+        )
+        .is_ok();
         if !sent {
+            // Dropping the client here is the only signal it gets, so say why. Previously a
+            // failed frame silently detached the session while the client kept running against a
+            // frozen outer scene, which is indistinguishable from a hang.
+            let _ = crate::ipc::send(
+                &client.writer,
+                &ServerMessage::Detached {
+                    reason: "frame delivery failed".into(),
+                },
+            );
             self.attached = None;
             self.last_screen = None;
             #[cfg(windows)]
@@ -3169,7 +3269,11 @@ impl SessionActor {
             .iter()
             .map(|source| BridgeSource {
                 key: bridge_key(source.key),
-                kind: bridge_source_kind(source.key, &source.descriptor),
+                kind: bridge_source_kind(
+                    source.key,
+                    &source.descriptor,
+                    source.raster_delta_operation_limit,
+                ),
                 capture_policy: source.capture_policy,
                 descriptor: source.semantic_descriptor.as_ref().map(|descriptor| {
                     BridgeSourceDescriptor {
@@ -3330,6 +3434,21 @@ impl SessionActor {
 
     fn schedule_render(&mut self) {
         self.pending_render = true;
+    }
+
+    /// Session-scoped relay counters for the media diagnostic surfaces.
+    ///
+    /// `delivery` is filled in by the virtual presenter, which owns those counters.
+    fn relay_metrics(&self) -> crate::metrics::RelayMetrics {
+        crate::metrics::RelayMetrics {
+            ipc: self
+                .client_ipc
+                .as_ref()
+                .map(|counters| counters.snapshot())
+                .unwrap_or_default(),
+            delivery: crate::metrics::DeliveryMetrics::default(),
+            bridge: self.bridge_metrics,
+        }
     }
 
     fn content_area(&self) -> Rect {
@@ -4032,6 +4151,7 @@ fn bridge_key(key: crate::media::SourceKey) -> BridgeSourceKey {
 fn bridge_source_kind(
     key: crate::media::SourceKey,
     descriptor: &crate::media::SourceDescriptor,
+    raster_delta_operation_limit: Option<u32>,
 ) -> BridgeSourceKind {
     match descriptor {
         crate::media::SourceDescriptor::Raster(config) => BridgeSourceKind::Raster {
@@ -4039,6 +4159,7 @@ fn bridge_source_kind(
             height: config.height,
             alpha_mode: config.alpha_mode,
             compression_mode: config.compression_mode,
+            delta_operation_limit: raster_delta_operation_limit,
         },
         crate::media::SourceDescriptor::Image(config) => BridgeSourceKind::Image {
             encoding: config.encoding,
@@ -4210,27 +4331,7 @@ fn send_media_body(
     record_type: u16,
     body: &[u8],
 ) -> bool {
-    const CHUNK: usize = 128 * 1024;
-    for (index, bytes) in body.chunks(CHUNK).enumerate() {
-        let offset = index * CHUNK;
-        if crate::ipc::send(
-            writer,
-            &ServerMessage::MediaRecord {
-                delivery_id,
-                source,
-                record_type,
-                offset: offset as u32,
-                total: body.len() as u32,
-                last: offset + bytes.len() == body.len(),
-                bytes: bytes.to_vec(),
-            },
-        )
-        .is_err()
-        {
-            return false;
-        }
-    }
-    true
+    crate::ipc::send_media_record(writer, delivery_id, source, record_type, body).is_ok()
 }
 
 fn normalized_display(display: DisplayMetrics, status_visible: bool) -> DisplayMetrics {
@@ -4851,6 +4952,8 @@ mod tests {
             exit_tombstones: VecDeque::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             vivid,
+            bridge_metrics: crate::metrics::BridgeMetrics::default(),
+            client_ipc: None,
             attached: Some(AttachedClient {
                 id: 1,
                 writer: client_writer,
@@ -4938,7 +5041,7 @@ mod tests {
 
         actor.sync_media(true);
         assert!(matches!(
-            client_reader.recv::<ServerMessage>().unwrap(),
+            client_reader.recv_server().unwrap(),
             ServerMessage::MediaSnapshot { .. }
         ));
 
@@ -4965,12 +5068,8 @@ mod tests {
         audio_media
             .write_record(messages::AUDIO_PACKET, 0, 10, &audio_packet)
             .unwrap();
-        actor
-            .handle_event(ActorEvent::Media(
-                media_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ))
-            .unwrap();
-        let delivery_id = match client_reader.recv::<ServerMessage>().unwrap() {
+        actor.forward_media(media_receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+        let delivery_id = match client_reader.recv_server().unwrap() {
             ServerMessage::MediaRecord {
                 delivery_id,
                 record_type: messages::AUDIO_PACKET,
@@ -5009,13 +5108,9 @@ mod tests {
         video_media
             .write_record(messages::VIDEO_PACKET, 0, 9, &video_packet)
             .unwrap();
-        actor
-            .handle_event(ActorEvent::Media(
-                media_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ))
-            .unwrap();
+        actor.forward_media(media_receiver.recv_timeout(Duration::from_secs(1)).unwrap());
 
-        match client_reader.recv::<ServerMessage>().unwrap() {
+        match client_reader.recv_server().unwrap() {
             ServerMessage::MediaSnapshot { sources, .. } => {
                 assert!(
                     sources
@@ -5025,7 +5120,7 @@ mod tests {
             }
             other => panic!("PLAY snapshot must precede post-PLAY media, got {other:?}"),
         }
-        let video_delivery_id = match client_reader.recv::<ServerMessage>().unwrap() {
+        let video_delivery_id = match client_reader.recv_server().unwrap() {
             ServerMessage::MediaRecord {
                 delivery_id,
                 record_type: messages::VIDEO_PACKET,
@@ -5045,7 +5140,7 @@ mod tests {
         assert_eq!(returned_video_credit.object_id, 9);
         assert_eq!(control.read_record().unwrap().record_type, messages::OK);
         actor.sync_media(false);
-        match client_reader.recv::<ServerMessage>().unwrap() {
+        match client_reader.recv_server().unwrap() {
             ServerMessage::MediaSnapshot { sources, .. } => {
                 assert!(
                     sources
