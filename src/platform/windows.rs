@@ -43,11 +43,11 @@ use windows_sys::Win32::System::Console::{
     AllocConsole, CONSOLE_CURSOR_INFO, CONSOLE_FONT_INFOEX, CONSOLE_SCREEN_BUFFER_INFO, COORD,
     DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
     ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, FreeConsole, GetConsoleCP, GetConsoleCursorInfo,
-    GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, GetConsoleTitleW,
-    GetCurrentConsoleFontEx, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    SetConsoleCP, SetConsoleCtrlHandler, SetConsoleCursorInfo, SetConsoleCursorPosition,
-    SetConsoleMode, SetConsoleOutputCP, SetConsoleTitleW, SetStdHandle,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, FreeConsole, GetConsoleCP,
+    GetConsoleCursorInfo, GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo,
+    GetConsoleTitleW, GetCurrentConsoleFontEx, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleCtrlHandler, SetConsoleCursorInfo,
+    SetConsoleCursorPosition, SetConsoleMode, SetConsoleOutputCP, SetConsoleTitleW, SetStdHandle,
 };
 use windows_sys::Win32::System::IO::{
     CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
@@ -138,11 +138,7 @@ impl ClientTerminal {
         let title_length = unsafe { GetConsoleTitleW(title.as_mut_ptr(), title.len() as u32) };
         title.truncate(title_length as usize);
 
-        let raw_input = (input_mode | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS)
-            & !(ENABLE_LINE_INPUT
-                | ENABLE_ECHO_INPUT
-                | ENABLE_PROCESSED_INPUT
-                | ENABLE_QUICK_EDIT_MODE);
+        let raw_input = client_input_mode(input_mode);
         let vt_output =
             output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
 
@@ -229,33 +225,7 @@ impl ClientTerminal {
     }
 
     pub fn display_metrics(&self) -> io::Result<DisplayMetrics> {
-        let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
-        if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let columns = u16::try_from(info.srWindow.Right - info.srWindow.Left + 1)
-            .map_err(|_| io::Error::other("console width is invalid"))?;
-        let rows = u16::try_from(info.srWindow.Bottom - info.srWindow.Top + 1)
-            .map_err(|_| io::Error::other("console height is invalid"))?;
-        if columns == 0 || rows == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "console has zero dimensions",
-            ));
-        }
-        let mut font = CONSOLE_FONT_INFOEX {
-            cbSize: std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32,
-            ..CONSOLE_FONT_INFOEX::default()
-        };
-        let has_font = unsafe { GetCurrentConsoleFontEx(output, 0, &mut font) } != 0;
-        let (cell_width, cell_height) = console_cell_size(has_font.then_some(font.dwFontSize));
-        Ok(DisplayMetrics {
-            columns,
-            rows,
-            cell_width,
-            cell_height,
-        })
+        current_display_metrics()
     }
 
     pub fn output(&self) -> io::Result<Box<dyn Write + Send>> {
@@ -272,6 +242,52 @@ impl ClientTerminal {
             _ => Err(io::Error::last_os_error()),
         }
     }
+}
+
+/// Query the attached console without borrowing `ClientTerminal`, allowing the Windows client to
+/// observe viewport changes on a thread that cannot be stalled by console input semantics.
+pub fn current_display_metrics() -> io::Result<DisplayMetrics> {
+    let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+    if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let columns = u16::try_from(info.srWindow.Right - info.srWindow.Left + 1)
+        .map_err(|_| io::Error::other("console width is invalid"))?;
+    let rows = u16::try_from(info.srWindow.Bottom - info.srWindow.Top + 1)
+        .map_err(|_| io::Error::other("console height is invalid"))?;
+    if columns == 0 || rows == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "console has zero dimensions",
+        ));
+    }
+    let mut font = CONSOLE_FONT_INFOEX {
+        cbSize: std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32,
+        ..CONSOLE_FONT_INFOEX::default()
+    };
+    let has_font = unsafe { GetCurrentConsoleFontEx(output, 0, &mut font) } != 0;
+    let (cell_width, cell_height) = console_cell_size(has_font.then_some(font.dwFontSize));
+    Ok(DisplayMetrics {
+        columns,
+        rows,
+        cell_width,
+        cell_height,
+    })
+}
+
+fn client_input_mode(original: u32) -> u32 {
+    // ReadFile only returns character/VT input, while a console input handle is signaled for
+    // every queued record. Leaving window input enabled lets a resize record wake read_input()
+    // and then strand it inside the blocking byte read until a key or mouse event arrives.
+    // Viewport changes are polled independently by the client loop, so do not queue records that
+    // this input path cannot consume.
+    (original | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS)
+        & !(ENABLE_LINE_INPUT
+            | ENABLE_ECHO_INPUT
+            | ENABLE_PROCESSED_INPUT
+            | ENABLE_QUICK_EDIT_MODE
+            | ENABLE_WINDOW_INPUT)
 }
 
 fn console_cell_size(size: Option<COORD>) -> (u16, u16) {
@@ -1717,6 +1733,27 @@ mod tests {
         };
         let welcome = vivid_protocol::messages::welcome(1, 1, &[1; 16], 1, display, &[]);
         vivid_protocol::messages::parse_welcome(&welcome).unwrap();
+    }
+
+    #[test]
+    fn client_input_mode_does_not_queue_unreadable_resize_records() {
+        let original = ENABLE_LINE_INPUT
+            | ENABLE_ECHO_INPUT
+            | ENABLE_PROCESSED_INPUT
+            | ENABLE_QUICK_EDIT_MODE
+            | ENABLE_WINDOW_INPUT;
+        let mode = client_input_mode(original);
+
+        assert_eq!(
+            mode & (ENABLE_LINE_INPUT
+                | ENABLE_ECHO_INPUT
+                | ENABLE_PROCESSED_INPUT
+                | ENABLE_QUICK_EDIT_MODE
+                | ENABLE_WINDOW_INPUT),
+            0
+        );
+        assert_ne!(mode & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+        assert_ne!(mode & ENABLE_EXTENDED_FLAGS, 0);
     }
 
     #[test]
