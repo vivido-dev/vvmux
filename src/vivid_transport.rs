@@ -332,7 +332,7 @@ fn body_restricts_trace(record_type: u16, body: &[u8]) -> bool {
             .map(|(_, _, policy, _)| policy),
         messages::CREATE_IMAGE => messages::parse_create_image_with_extensions(body)
             .ok()
-            .map(|(_, _, policy, _)| policy),
+            .map(|(_, _, _, policy, _)| policy),
         messages::CREATE_VIDEO => messages::parse_create_video_with_extensions(body)
             .ok()
             .map(|(_, _, policy, _)| policy),

@@ -2321,9 +2321,23 @@ fn dispatch_control(
             )?;
         }
         messages::CREATE_IMAGE => {
-            let (envelope, config, capture_policy, semantic_descriptor) =
+            let (envelope, config, cache_lookup, capture_policy, semantic_descriptor) =
                 messages::parse_create_image_with_extensions(&record.body)?;
             writer.mark_source_policy(config.source_id, capture_policy);
+            if cache_lookup
+                && !producer_has_feature(shared, producer, messages::FEATURE_IMAGE_CACHE_V1)
+            {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "image cache lookup was not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
             if envelope.payload.map_value(9).is_some()
                 && !producer_has_feature(
                     shared,
