@@ -121,13 +121,17 @@ pub(super) fn spawn(
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    // A raw pointer rather than `&mut size`: this argument is `*mut winsize` on macOS and
+    // `*const winsize` on Linux, and only the raw form compiles on both without tripping
+    // `clippy::unnecessary_mut_passed` on the platform that takes a const pointer.
+    let size = &raw mut size;
     if unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            size,
         )
     } == -1
     {

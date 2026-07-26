@@ -1,12 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-#[cfg(unix)]
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+#[cfg(windows)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,12 +19,23 @@ use crate::ipc::DisplayMetrics;
 #[cfg(test)]
 use crate::ipc::{Action, Axis, Direction, MouseEvent, MouseKind};
 use crate::ipc::{
-    BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind, ClientMessage,
-    FloatingEditCommand, ServerMessage, SharedWriter,
+    BridgeKeyframeRequest, BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind,
+    ClientMessage, FloatingEditCommand, ServerMessage, SharedWriter,
+};
+use crate::media_trace::{
+    BridgeMediaTraceEvent, MediaKeyframeStage, MediaPlaybackControl, MediaTraceKind,
 };
 use crate::platform::ClientTerminal;
 
 const BRIDGE_MEDIA_CHUNK: usize = 128 * 1024;
+/// How often the bridge worker reports its counters to the session server.
+///
+/// Coarse on purpose: these are diagnostics and must not add measurable traffic to the client
+/// connection they are measuring.
+const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const DISPLAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DETACH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn attach(
     name: &str,
@@ -52,6 +61,8 @@ pub fn attach(
     let vivid = outer_endpoint.is_some() && outer_token.is_some();
     let terminal = ClientTerminal::enter()?;
     let display = terminal.display_metrics()?;
+    #[cfg(windows)]
+    let presenter_cell_size = Arc::new(AtomicU32::new(pack_cell_size(display)));
     send_client(
         &writer,
         &ClientMessage::Attach {
@@ -70,8 +81,10 @@ pub fn attach(
     let (mode_sender, mode_receiver) = mpsc::sync_channel::<(u64, bool)>(8);
     let output = terminal.output()?;
     let output = Arc::new(Mutex::new(output));
-    let output_thread = output.clone();
+    let output_thread = TerminalOutput::spawn(output, writer.clone())?;
     let bridge_display = display;
+    #[cfg(windows)]
+    let bridge_cell_size = presenter_cell_size.clone();
     let bridge_queue_records =
         (client_config.media.ipc_queue_bytes / BRIDGE_MEDIA_CHUNK).clamp(1, 1024);
     let reader_thread = thread::Builder::new()
@@ -85,74 +98,86 @@ pub fn attach(
                         token,
                         bridge_display,
                     ) {
-                        Ok(bridge) => match BridgeWorker::spawn(
-                            bridge,
-                            read_writer.clone(),
-                            bridge_queue_records,
-                        ) {
-                            Ok(worker) => Some(worker),
-                            Err(error) => {
-                                let _ = write_title(
-                                    &output_thread,
-                                    &format!("vvmux media disabled: {error}"),
+                        Ok(bridge) => {
+                            let presenter_display = bridge.display_metrics();
+                            #[cfg(windows)]
+                            bridge_cell_size
+                                .store(pack_cell_size(presenter_display), Ordering::Release);
+                            if presenter_display != bridge_display {
+                                let _ = send_client(
+                                    &read_writer,
+                                    &ClientMessage::Resize(presenter_display),
                                 );
-                                None
                             }
-                        },
+                            match BridgeWorker::spawn(
+                                bridge,
+                                read_writer.clone(),
+                                bridge_queue_records,
+                            ) {
+                                Ok(worker) => Some(worker),
+                                Err(error) => {
+                                    write_title(
+                                        &output_thread,
+                                        &format!("vvmux media disabled: {error}"),
+                                    );
+                                    None
+                                }
+                            }
+                        }
                         Err(error) => {
-                            let _ = write_title(
-                                &output_thread,
-                                &format!("vvmux media disabled: {error}"),
-                            );
+                            write_title(&output_thread, &format!("vvmux media disabled: {error}"));
                             None
                         }
                     }
                 }
                 _ => None,
             };
-            while let Ok(message) = reader.recv::<ServerMessage>() {
+            while let Ok(message) = reader.recv_server() {
                 match message {
                     ServerMessage::Attached { text_only, .. } => {
                         if text_only {
-                            let _ = write_title(&output_thread, "vvmux (text-only media fallback)");
+                            write_title(&output_thread, "vvmux (text-only media fallback)");
                         }
                     }
                     ServerMessage::Render {
                         frame_id,
+                        full,
                         last,
                         bytes,
                         ..
                     } => {
-                        if write_output(&output_thread, &bytes).is_err() {
-                            break;
-                        }
-                        if last {
-                            let _ = send_client(&read_writer, &ClientMessage::RenderAck(frame_id));
+                        // Queue and return. The acknowledgement is sent by the output thread once
+                        // the bytes reach the terminal, so it stays a true completion signal.
+                        if !output_thread.enqueue_frame(frame_id, full, last, bytes) {
+                            // The backlog was discarded, so the screen no longer matches what the
+                            // server believes it drew. Only a full redraw can restore agreement.
+                            let _ = send_client(&read_writer, &ClientMessage::RenderResync);
                         }
                     }
                     ServerMessage::Title(title) => {
-                        let _ = write_title(&output_thread, &title);
+                        write_title(&output_thread, &title);
                     }
                     ServerMessage::Bell => {
-                        let _ = write_output(&output_thread, b"\x07");
+                        output_thread.enqueue_control(b"\x07".to_vec());
                     }
                     ServerMessage::Clipboard(text) => {
                         let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-                        let operation = format!("\x1b]52;c;{encoded}\x1b\\");
-                        let _ = write_output(&output_thread, operation.as_bytes());
+                        output_thread
+                            .enqueue_control(format!("\x1b]52;c;{encoded}\x1b\\").into_bytes());
                     }
                     ServerMessage::Status(status) => {
-                        let _ = write_title(&output_thread, &format!("vvmux: {status}"));
+                        write_title(&output_thread, &format!("vvmux: {status}"));
                     }
                     ServerMessage::MediaSnapshot {
+                        revision,
                         sources,
                         nodes,
                         videos_needing_keyframes,
-                        ..
                     } => {
                         if let Some(bridge) = &mut bridge {
                             bridge.replace_snapshot(BridgeSnapshot {
                                 generation: 0,
+                                virtual_revision: revision,
                                 sources,
                                 nodes,
                                 videos_needing_keyframes,
@@ -193,8 +218,46 @@ pub fn attach(
                     ServerMessage::Automation(_) | ServerMessage::AutomationChunk { .. } => break,
                 }
             }
+            output_thread.stop();
             read_stopped.store(true, Ordering::Release);
         })?;
+
+    #[cfg(windows)]
+    let resize_stopped = stopped.clone();
+    #[cfg(windows)]
+    let resize_writer = writer.clone();
+    #[cfg(windows)]
+    let resize_cell_size = presenter_cell_size;
+    #[cfg(windows)]
+    let resize_thread = match thread::Builder::new()
+        .name("vvmux-display".into())
+        .spawn(move || {
+            let mut last_display = display;
+            while !resize_stopped.load(Ordering::Acquire) {
+                thread::sleep(DISPLAY_POLL_INTERVAL);
+                if resize_stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let Ok(mut current) = crate::platform::current_display_metrics() else {
+                    continue;
+                };
+                apply_cell_size(&mut current, resize_cell_size.load(Ordering::Acquire));
+                if current != last_display {
+                    if send_client(&resize_writer, &ClientMessage::Resize(current)).is_err() {
+                        resize_stopped.store(true, Ordering::Release);
+                        break;
+                    }
+                    last_display = current;
+                }
+            }
+        }) {
+        Ok(thread) => thread,
+        Err(error) => {
+            ipc_cancel.cancel();
+            let _ = reader_thread.join();
+            return Err(error);
+        }
+    };
 
     #[cfg(unix)]
     let signal_stopped = stopped.clone();
@@ -228,8 +291,11 @@ pub fn attach(
     };
 
     let mut workers = ClientWorkers {
+        stopped: stopped.clone(),
         ipc_cancel,
         reader_thread: Some(reader_thread),
+        #[cfg(windows)]
+        resize_thread: Some(resize_thread),
         #[cfg(unix)]
         signal_handle,
         #[cfg(unix)]
@@ -240,11 +306,20 @@ pub fn attach(
         crate::config::parse_control_chord(&client_config.general.prefix).unwrap_or(0x02),
         &client_config.keys.prefix,
     );
+    #[cfg(not(windows))]
     let mut last_display = display;
     let mut float_mode: Option<u64> = None;
     let mut float_scanner = FloatEditScanner::default();
+    let mut detach_requested_at: Option<Instant> = None;
     let result = (|| -> io::Result<()> {
         while !stopped.load(Ordering::Acquire) {
+            if let Some(requested_at) = detach_requested_at {
+                if requested_at.elapsed() >= DETACH_ACK_TIMEOUT {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             while let Ok((mode_id, active)) = mode_receiver.try_recv() {
                 if active {
                     float_mode = Some(mode_id);
@@ -261,7 +336,8 @@ pub fn attach(
             if let Some(read) = terminal.read_input(&mut bytes, Duration::from_millis(100))? {
                 if read == 0 {
                     let _ = send_client(&writer, &ClientMessage::Detach);
-                    break;
+                    detach_requested_at = Some(Instant::now());
+                    continue;
                 }
                 let parsed = if let Some(mode_id) = float_mode {
                     // Scan edit keys before the ordinary prefix/mouse parser. In particular, that
@@ -294,7 +370,12 @@ pub fn attach(
                         }
                         ParsedInput::Detach => {
                             send_client(&writer, &ClientMessage::Detach)?;
-                            stopped.store(true, Ordering::Release);
+                            // Keep the reader alive until the session actor acknowledges Detach.
+                            // Closing IPC immediately can let a new attach overtake the old detach,
+                            // producing an empty alternate screen and then tearing down its newly
+                            // opened Vivid connection with a Windows socket reset.
+                            detach_requested_at = Some(Instant::now());
+                            break;
                         }
                     }
                 }
@@ -304,11 +385,14 @@ pub fn attach(
                 send_client(&writer, &ClientMessage::FloatingEdit { mode_id, command })?;
                 float_mode = None;
             }
-            if let Ok(display) = terminal.display_metrics()
-                && display != last_display
+            #[cfg(not(windows))]
             {
-                send_client(&writer, &ClientMessage::Resize(display))?;
-                last_display = display;
+                if let Ok(display) = terminal.display_metrics()
+                    && display != last_display
+                {
+                    send_client(&writer, &ClientMessage::Resize(display))?;
+                    last_display = display;
+                }
             }
         }
         Ok(())
@@ -319,8 +403,11 @@ pub fn attach(
 }
 
 struct ClientWorkers {
+    stopped: Arc<AtomicBool>,
     ipc_cancel: crate::platform::ConnectionCancel,
     reader_thread: Option<thread::JoinHandle<()>>,
+    #[cfg(windows)]
+    resize_thread: Option<thread::JoinHandle<()>>,
     #[cfg(unix)]
     signal_handle: signal_hook::iterator::Handle,
     #[cfg(unix)]
@@ -329,8 +416,13 @@ struct ClientWorkers {
 
 impl ClientWorkers {
     fn stop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
         self.ipc_cancel.cancel();
         if let Some(thread) = self.reader_thread.take() {
+            let _ = thread.join();
+        }
+        #[cfg(windows)]
+        if let Some(thread) = self.resize_thread.take() {
             let _ = thread.join();
         }
         #[cfg(unix)]
@@ -351,6 +443,7 @@ impl Drop for ClientWorkers {
 
 pub(crate) struct BridgeSnapshot {
     pub(crate) generation: u64,
+    pub(crate) virtual_revision: u64,
     pub(crate) sources: Vec<BridgeSource>,
     pub(crate) nodes: Vec<BridgeNode>,
     pub(crate) videos_needing_keyframes: Vec<BridgeSourceKey>,
@@ -385,10 +478,15 @@ impl BridgeClientSender {
 }
 
 pub(crate) struct BridgeWorker {
-    media: mpsc::SyncSender<BridgeMedia>,
+    media: Option<mpsc::SyncSender<BridgeMedia>>,
     snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     dropped: Arc<Mutex<HashSet<u64>>>,
     generation: u64,
+    /// Incremented by the reader thread when a media record cannot be queued; folded into the
+    /// worker's periodic report so a drop storm is visible in `inspect-media`.
+    queue_drops: Arc<AtomicU64>,
+    stopped: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl BridgeWorker {
@@ -409,12 +507,17 @@ impl BridgeWorker {
         client_writer: BridgeClientSender,
         queue_records: usize,
     ) -> io::Result<Self> {
+        let bridge_instance_id = new_bridge_instance_id()?;
         let (media, receiver) = mpsc::sync_channel(queue_records);
         let snapshot = Arc::new(Mutex::new(None));
         let dropped = Arc::new(Mutex::new(HashSet::new()));
+        let queue_drops = Arc::new(AtomicU64::new(0));
         let worker_snapshot = snapshot.clone();
         let worker_dropped = dropped.clone();
-        thread::Builder::new()
+        let worker_drops = queue_drops.clone();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = stopped.clone();
+        let thread = thread::Builder::new()
             .name("vvmux-media-bridge".into())
             .spawn(move || {
                 run_bridge_worker(
@@ -423,13 +526,19 @@ impl BridgeWorker {
                     receiver,
                     worker_snapshot,
                     worker_dropped,
+                    worker_drops,
+                    worker_stopped,
+                    bridge_instance_id,
                 )
             })?;
         Ok(Self {
-            media,
+            media: Some(media),
             snapshot,
             dropped,
             generation: 0,
+            queue_drops,
+            stopped,
+            thread: Some(thread),
         })
     }
 
@@ -445,7 +554,11 @@ impl BridgeWorker {
     pub(crate) fn queue_media(&mut self, mut media: BridgeMedia) -> bool {
         media.generation = self.generation;
         let delivery_id = media.delivery_id;
-        match self.media.try_send(media) {
+        let Some(sender) = &self.media else {
+            self.mark_dropped(delivery_id);
+            return false;
+        };
+        match sender.try_send(media) {
             Ok(()) => true,
             Err(mpsc::TrySendError::Full(_)) => {
                 self.mark_dropped(delivery_id);
@@ -459,6 +572,7 @@ impl BridgeWorker {
     }
 
     fn mark_dropped(&self, delivery_id: u64) {
+        self.queue_drops.fetch_add(1, Ordering::Relaxed);
         self.dropped
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -466,13 +580,80 @@ impl BridgeWorker {
     }
 }
 
+impl Drop for BridgeWorker {
+    fn drop(&mut self) {
+        // The bridge owns the outer Vivid connection on its worker thread. Merely dropping the
+        // queue sender lets the foreground process return while that thread is still unwinding;
+        // process teardown can then reset the Windows socket before OuterBridge sends GOODBYE.
+        // Stop and join so detach does not complete until the protocol session is closed cleanly.
+        self.stopped.store(true, Ordering::Release);
+        self.media.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn new_bridge_instance_id() -> io::Result<u64> {
+    let mut bytes = [0_u8; 8];
+    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(u64::from_le_bytes(bytes) | 1)
+}
+
+fn send_bridge_trace(
+    client_writer: &BridgeClientSender,
+    bridge_instance_id: u64,
+    trace_started: Instant,
+    source: Option<BridgeSourceKey>,
+    kind: MediaTraceKind,
+) {
+    let _ = client_writer.send(ClientMessage::BridgeTrace {
+        bridge_instance_id,
+        event: BridgeMediaTraceEvent {
+            origin_monotonic_us: u64::try_from(trace_started.elapsed().as_micros())
+                .unwrap_or(u64::MAX),
+            source,
+            kind,
+        },
+    });
+}
+
+#[cfg(windows)]
+fn pack_cell_size(display: crate::ipc::DisplayMetrics) -> u32 {
+    u32::from(display.cell_width) | (u32::from(display.cell_height) << 16)
+}
+
+#[cfg(windows)]
+fn apply_cell_size(display: &mut crate::ipc::DisplayMetrics, packed: u32) {
+    display.cell_width = packed as u16;
+    display.cell_height = (packed >> 16) as u16;
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_bridge_worker(
     mut bridge: crate::bridge::OuterBridge,
     client_writer: BridgeClientSender,
     receiver: mpsc::Receiver<BridgeMedia>,
     snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     dropped: Arc<Mutex<HashSet<u64>>>,
+    queue_drops: Arc<AtomicU64>,
+    stopped: Arc<AtomicBool>,
+    mut bridge_instance_id: u64,
 ) {
+    let trace_started = Instant::now();
+    let mut diagnostic_generation = bridge.diagnostic_instance_generation();
+    send_bridge_trace(
+        &client_writer,
+        bridge_instance_id,
+        trace_started,
+        None,
+        MediaTraceKind::BridgeClientAttached { vivid: true },
+    );
+    let mut metrics = crate::metrics::BridgeMetrics::default();
+    let mut metrics_reported_at = Instant::now();
+    let mut traced_queue_drops = 0_u64;
+    // Diagnostic only: which form the in-flight raster body for each source uses.
+    let mut raster_forms = HashMap::<BridgeSourceKey, bool>::new();
     let mut active_generation = 0;
     let mut minimum_media_generation = HashMap::<BridgeSourceKey, u64>::new();
     let mut retained_rehydration = HashSet::<BridgeSourceKey>::new();
@@ -484,20 +665,85 @@ fn run_bridge_worker(
     let mut force_replacement = false;
     let mut deferred = None;
     loop {
-        for (delivery_id, delivered) in bridge.take_media_completions() {
+        if stopped.load(Ordering::Acquire) {
+            break;
+        }
+        // Report on a coarse interval rather than per record: this is diagnostic traffic and must
+        // never compete with media for the client connection.
+        if metrics_reported_at.elapsed() >= METRICS_REPORT_INTERVAL {
+            metrics.client_queue_drops = queue_drops.load(Ordering::Relaxed);
+            if metrics.client_queue_drops > traced_queue_drops {
+                send_bridge_trace(
+                    &client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    None,
+                    MediaTraceKind::QueueDrops {
+                        dropped: metrics.client_queue_drops - traced_queue_drops,
+                        total: metrics.client_queue_drops,
+                    },
+                );
+                traced_queue_drops = metrics.client_queue_drops;
+            }
+            let (wait_us, wait_timeouts) = bridge.take_control_wait_stats();
+            metrics.control_wait_us = metrics.control_wait_us.saturating_add(wait_us);
+            metrics.control_wait_timeouts =
+                metrics.control_wait_timeouts.saturating_add(wait_timeouts);
+            let _ = client_writer.send(ClientMessage::BridgeMetrics(metrics));
+            metrics_reported_at = Instant::now();
+        }
+        for (delivery_id, delivered, _outer_record_sequence) in bridge.take_media_completions() {
             if delivery_id != 0 {
                 acknowledge_bridge_delivery(&client_writer, delivery_id, delivered);
             }
         }
         let outer_keyframes = bridge.take_keyframe_requests();
         if !outer_keyframes.is_empty() {
+            for request in &outer_keyframes {
+                send_bridge_trace(
+                    &client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    Some(request.source),
+                    MediaTraceKind::KeyframeRequest {
+                        stage: MediaKeyframeStage::OuterRequested,
+                        minimum_epoch: request.minimum_epoch,
+                        reason: request.reason,
+                    },
+                );
+            }
             let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(outer_keyframes));
+        }
+        let outer_full_frames = bridge.take_full_frame_requests();
+        if !outer_full_frames.is_empty() {
+            let _ = client_writer.send(ClientMessage::BridgeNeedFullFrames(outer_full_frames));
         }
         let source_losses = bridge.take_source_losses();
         if !source_losses.is_empty() {
+            for source in &source_losses {
+                send_bridge_trace(
+                    &client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    Some(*source),
+                    MediaTraceKind::SourceLost,
+                );
+            }
             desynchronized_sources.extend(source_losses);
             force_sources = true;
             let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
+        }
+        for changed in bridge.take_capability_changes() {
+            let _ = client_writer.send(ClientMessage::BridgeCapabilitiesChanged {
+                reason_mask: changed.reason_mask,
+            });
+        }
+        for (source, playback) in bridge.take_playback_states() {
+            let _ = client_writer.send(ClientMessage::BridgePlaybackState {
+                source,
+                state: playback.state,
+                eos_state: playback.eos_state,
+            });
         }
         let pending = snapshot
             .lock()
@@ -515,6 +761,9 @@ fn run_bridge_worker(
                 )
             };
             let mut recreated = HashSet::new();
+            if change == ProjectionChange::Sources && force_replacement {
+                metrics.session_replacements = metrics.session_replacements.saturating_add(1);
+            }
             let applied = match change {
                 ProjectionChange::PlaybackOnly => {
                     bridge.update_playback(&active_sources, &pending.sources)
@@ -541,6 +790,36 @@ fn run_bridge_worker(
                 let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
                 continue;
             }
+            let next_generation = bridge.diagnostic_instance_generation();
+            if next_generation != diagnostic_generation {
+                diagnostic_generation = next_generation;
+                bridge_instance_id = bridge_instance_id.wrapping_add(2);
+                send_bridge_trace(
+                    &client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    None,
+                    MediaTraceKind::BridgeClientAttached { vivid: true },
+                );
+            }
+            trace_projection_change(
+                &client_writer,
+                bridge_instance_id,
+                trace_started,
+                change,
+                &active_sources,
+                &pending.sources,
+                &recreated,
+                &bridge.attachment_generations(),
+            );
+            let outer_revision = bridge.mark_projection_applied();
+            let outer_attachment_generations = bridge.attachment_generations();
+            let _ = client_writer.send(ClientMessage::BridgeApplied {
+                bridge_instance_id,
+                virtual_revision: pending.virtual_revision,
+                outer_revision,
+                outer_attachment_generations,
+            });
 
             if change == ProjectionChange::Sources {
                 let current = pending
@@ -571,17 +850,44 @@ fn run_bridge_worker(
             force_sources = false;
             force_replacement = false;
             active_generation = pending.generation;
-            let mut keyframes = pending.videos_needing_keyframes;
-            keyframes.extend(desynchronized_sources.drain());
+            let mut keyframes = pending
+                .videos_needing_keyframes
+                .into_iter()
+                .map(|source| {
+                    (
+                        source,
+                        BridgeKeyframeRequest {
+                            source,
+                            minimum_epoch: None,
+                            reason: vivid_protocol::messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            keyframes.extend(desynchronized_sources.drain().map(|source| {
+                (
+                    source,
+                    BridgeKeyframeRequest {
+                        source,
+                        minimum_epoch: None,
+                        reason: vivid_protocol::messages::KEYFRAME_REASON_DECODER_ERROR,
+                    },
+                )
+            }));
             if change == ProjectionChange::Sources {
                 keyframes.extend(pending.sources.iter().filter_map(|source| {
                     (recreated.contains(&source.key)
                         && source.playing
                         && matches!(source.kind, BridgeSourceKind::Video { .. }))
-                    .then_some(source.key)
+                    .then_some((
+                        source.key,
+                        BridgeKeyframeRequest {
+                            source: source.key,
+                            minimum_epoch: None,
+                            reason: vivid_protocol::messages::KEYFRAME_REASON_INITIAL,
+                        },
+                    ))
                 }));
-                keyframes.sort_by_key(|source| (source.producer, source.source));
-                keyframes.dedup();
             }
             active_sources = pending.sources;
             active_nodes = pending.nodes;
@@ -592,6 +898,8 @@ fn run_bridge_worker(
                     .map(|source| source.key),
             );
             if !keyframes.is_empty() {
+                let mut keyframes = keyframes.into_values().collect::<Vec<_>>();
+                keyframes.sort_by_key(|request| (request.source.producer, request.source.source));
                 let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(keyframes));
             }
             continue;
@@ -654,6 +962,18 @@ fn run_bridge_worker(
             acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
             continue;
         }
+        let is_raster = media.record_type == vivid_protocol::messages::RASTER_FRAME;
+        // Only the chunk carrying the frame header reveals the form, and the counters are applied
+        // on the last chunk, so remember it across a fragmented body.
+        if is_raster && media.offset == 0 && media.bytes.len() >= 8 {
+            let flags = u32::from_be_bytes(media.bytes[4..8].try_into().expect("checked length"));
+            raster_forms.insert(
+                media.source,
+                flags & vivid_protocol::media::RASTER_FRAME_DELTA != 0,
+            );
+        }
+        let is_raster_delta =
+            is_raster && raster_forms.get(&media.source).copied().unwrap_or_default();
         match bridge.media_chunk(
             media.delivery_id,
             media.source,
@@ -664,6 +984,21 @@ fn run_bridge_worker(
             media.bytes,
         ) {
             Ok(true) => {
+                metrics.outer_media_records = metrics.outer_media_records.saturating_add(1);
+                metrics.outer_media_bytes =
+                    metrics.outer_media_bytes.saturating_add(media.total.into());
+                if is_raster {
+                    metrics.inner_raster_bytes = metrics
+                        .inner_raster_bytes
+                        .saturating_add(media.total.into());
+                    if is_raster_delta {
+                        metrics.outer_raster_delta_frames =
+                            metrics.outer_raster_delta_frames.saturating_add(1);
+                    } else {
+                        metrics.outer_raster_full_frames =
+                            metrics.outer_raster_full_frames.saturating_add(1);
+                    }
+                }
                 if hydrates_retained_source(media.record_type) {
                     // A live raster delivery can be the first body for a newly projected outer
                     // source. It hydrates that source just as retained delivery 0 does, so later
@@ -680,6 +1015,13 @@ fn run_bridge_worker(
             }
         }
     }
+    send_bridge_trace(
+        &client_writer,
+        bridge_instance_id,
+        trace_started,
+        None,
+        MediaTraceKind::BridgeClientDetached,
+    );
 }
 
 fn hydrates_retained_source(record_type: u16) -> bool {
@@ -759,6 +1101,115 @@ fn compare_projection(
         ProjectionChange::PlaybackOnly
     } else {
         ProjectionChange::SceneOnly
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_projection_change(
+    client_writer: &BridgeClientSender,
+    bridge_instance_id: u64,
+    trace_started: Instant,
+    change: ProjectionChange,
+    previous: &[BridgeSource],
+    current: &[BridgeSource],
+    recreated: &HashSet<BridgeSourceKey>,
+    attachment_generations: &[(BridgeSourceKey, u64)],
+) {
+    if change == ProjectionChange::Sources {
+        let mut removed = previous
+            .iter()
+            .filter(|source| !current.iter().any(|next| next.key == source.key))
+            .map(|source| source.key)
+            .collect::<Vec<_>>();
+        removed.sort_by_key(|source| (source.producer, source.source));
+        for source in removed {
+            send_bridge_trace(
+                client_writer,
+                bridge_instance_id,
+                trace_started,
+                Some(source),
+                MediaTraceKind::OuterSourceRemoved,
+            );
+        }
+    }
+
+    let mut ordered = current.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|source| (source.key.producer, source.key.source));
+    for source in ordered {
+        if recreated.contains(&source.key) {
+            let attachment_generation = attachment_generations
+                .iter()
+                .find_map(|(key, generation)| (*key == source.key).then_some(*generation))
+                .unwrap_or(0);
+            send_bridge_trace(
+                client_writer,
+                bridge_instance_id,
+                trace_started,
+                Some(source.key),
+                MediaTraceKind::OuterSourceRecreated {
+                    attachment_generation,
+                    playing: source.playing,
+                },
+            );
+            if source.playing {
+                send_bridge_trace(
+                    client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    Some(source.key),
+                    MediaTraceKind::PlaybackControl {
+                        control: MediaPlaybackControl::Play,
+                        request: Some(source.play_request),
+                    },
+                );
+            }
+            if source.eos_epoch.is_some() {
+                send_bridge_trace(
+                    client_writer,
+                    bridge_instance_id,
+                    trace_started,
+                    Some(source.key),
+                    MediaTraceKind::PlaybackControl {
+                        control: MediaPlaybackControl::Eos,
+                        request: None,
+                    },
+                );
+            }
+            continue;
+        }
+        let Some(old) = previous.iter().find(|old| old.key == source.key) else {
+            continue;
+        };
+        if old.playing != source.playing
+            || (source.playing && old.play_request != source.play_request)
+        {
+            send_bridge_trace(
+                client_writer,
+                bridge_instance_id,
+                trace_started,
+                Some(source.key),
+                MediaTraceKind::PlaybackControl {
+                    control: if source.playing {
+                        MediaPlaybackControl::Play
+                    } else {
+                        MediaPlaybackControl::Pause
+                    },
+                    request: source.playing.then_some(source.play_request),
+                },
+            );
+        }
+        if old.eos_epoch != source.eos_epoch && source.eos_epoch.is_some() {
+            send_bridge_trace(
+                client_writer,
+                bridge_instance_id,
+                trace_started,
+                Some(source.key),
+                MediaTraceKind::PlaybackControl {
+                    control: MediaPlaybackControl::Eos,
+                    request: None,
+                },
+            );
+        }
     }
 }
 
@@ -859,37 +1310,6 @@ pub fn create_detached(name: &str, config_path: Option<&Path>) -> io::Result<()>
     }
 }
 
-#[cfg(unix)]
-fn spawn_server(name: &str, config_path: Option<&Path>) -> io::Result<()> {
-    let executable = std::env::current_exe()?;
-    let mut command = Command::new(executable);
-    command.arg("__server").arg("--session").arg(name);
-    if let Some(path) = config_path {
-        command.arg("--config").arg(path);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("VIVID_ENDPOINT")
-        .env_remove("VIVID_ENDPOINT_BULK")
-        .env_remove("VIVID_TOKEN")
-        .env_remove("VIVID_SSH_ENDPOINT")
-        .env_remove("VIVID_SSH_TOKEN");
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    command.spawn()?;
-    Ok(())
-}
-
-#[cfg(windows)]
 fn spawn_server(name: &str, config_path: Option<&Path>) -> io::Result<()> {
     crate::platform::DaemonLauncher::launch(name, config_path)
 }
@@ -930,9 +1350,154 @@ fn write_output(output: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8]) -> io:
     output.flush()
 }
 
-fn write_title(output: &Arc<Mutex<Box<dyn Write + Send>>>, title: &str) -> io::Result<()> {
+fn write_title(output: &TerminalOutput, title: &str) {
     let sanitized = title.replace(['\x07', '\x1b'], "");
-    write_output(output, format!("\x1b]2;{sanitized}\x1b\\").as_bytes())
+    output.enqueue_control(format!("\x1b]2;{sanitized}\x1b\\").into_bytes());
+}
+
+/// One unit of work for the terminal writer thread.
+enum OutputJob {
+    /// A chunk of one server frame. `last` carries the frame's acknowledgement.
+    Frame {
+        frame_id: u64,
+        last: bool,
+        bytes: Vec<u8>,
+    },
+    /// Title, bell, or clipboard bytes, which are not part of the frame diff stream.
+    Control(Vec<u8>),
+}
+
+#[derive(Default)]
+struct OutputQueue {
+    jobs: VecDeque<OutputJob>,
+    bytes: usize,
+    stopped: bool,
+}
+
+/// Terminal writes, moved off the thread that dispatches Vivid media.
+///
+/// Writing to the terminal blocks whenever the outer terminal is behind on reading its PTY. While
+/// that write was inline on the reader thread, it also stalled `MediaSnapshot` and `MediaRecord`
+/// dispatch, so a busy outer terminal froze the projected scene and video rather than just the
+/// text. Frames now queue here and the reader thread returns immediately.
+struct TerminalOutput {
+    queue: Arc<(Mutex<OutputQueue>, Condvar)>,
+}
+
+/// Bound on queued terminal bytes.
+///
+/// Frame diffs are incremental, so a queued frame can never be dropped in isolation without
+/// corrupting the screen. When the bound is reached the queue is cleared and the server is asked
+/// for a full redraw, which is the one supersede that is safe.
+const OUTPUT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+
+impl TerminalOutput {
+    fn spawn(output: Arc<Mutex<Box<dyn Write + Send>>>, writer: SharedWriter) -> io::Result<Self> {
+        let queue = Arc::new((Mutex::new(OutputQueue::default()), Condvar::new()));
+        let worker = queue.clone();
+        thread::Builder::new()
+            .name("vvmux-terminal-output".into())
+            .spawn(move || run_terminal_output(&output, &writer, &worker))?;
+        Ok(Self { queue })
+    }
+
+    fn enqueue_control(&self, bytes: Vec<u8>) {
+        self.push(OutputJob::Control(bytes));
+    }
+
+    /// Queue one frame chunk. Returns false when the queue overflowed and the caller must ask the
+    /// server to resynchronize with a full redraw.
+    fn enqueue_frame(&self, frame_id: u64, full: bool, last: bool, bytes: Vec<u8>) -> bool {
+        let (lock, signal) = &*self.queue;
+        let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A full redraw makes every earlier diff irrelevant, so it is the one point where the
+        // backlog can be discarded without losing screen state.
+        if full {
+            queue
+                .jobs
+                .retain(|job| matches!(job, OutputJob::Control(_)));
+            queue.bytes = 0;
+        }
+        if queue.bytes.saturating_add(bytes.len()) > OUTPUT_QUEUE_BYTES {
+            queue.jobs.clear();
+            queue.bytes = 0;
+            return false;
+        }
+        queue.bytes = queue.bytes.saturating_add(bytes.len());
+        queue.jobs.push_back(OutputJob::Frame {
+            frame_id,
+            last,
+            bytes,
+        });
+        signal.notify_one();
+        true
+    }
+
+    fn push(&self, job: OutputJob) {
+        let (lock, signal) = &*self.queue;
+        let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let OutputJob::Control(bytes) = &job {
+            queue.bytes = queue.bytes.saturating_add(bytes.len());
+        }
+        queue.jobs.push_back(job);
+        signal.notify_one();
+    }
+
+    fn stop(&self) {
+        let (lock, signal) = &*self.queue;
+        lock.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stopped = true;
+        signal.notify_all();
+    }
+}
+
+fn run_terminal_output(
+    output: &Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: &SharedWriter,
+    queue: &Arc<(Mutex<OutputQueue>, Condvar)>,
+) {
+    let (lock, signal) = &**queue;
+    loop {
+        let job = {
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if let Some(job) = state.jobs.pop_front() {
+                    let (OutputJob::Frame { bytes, .. } | OutputJob::Control(bytes)) = &job;
+                    state.bytes = state.bytes.saturating_sub(bytes.len());
+                    break job;
+                }
+                if state.stopped {
+                    return;
+                }
+                state = signal
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+        match job {
+            OutputJob::Frame {
+                frame_id,
+                last,
+                bytes,
+            } => {
+                if write_output(output, &bytes).is_err() {
+                    return;
+                }
+                // Acknowledge only after the bytes reached the terminal. The server uses this as
+                // flow control, so acknowledging on receipt would let it keep producing frames
+                // this client has not managed to display.
+                if last && send_client(writer, &ClientMessage::RenderAck(frame_id)).is_err() {
+                    return;
+                }
+            }
+            OutputJob::Control(bytes) => {
+                if write_output(output, &bytes).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -964,6 +1529,27 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn receive_bridge_message_until(
+        receiver: &mpsc::Receiver<ClientMessage>,
+        seen: &mut Vec<ClientMessage>,
+        description: &str,
+        predicate: impl Fn(&ClientMessage) -> bool,
+    ) -> usize {
+        loop {
+            let message = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|error| {
+                    panic!("timed out waiting for {description}: {error}; messages={seen:#?}")
+                });
+            seen.push(message);
+            let index = seen.len() - 1;
+            if predicate(&seen[index]) {
+                return index;
+            }
+        }
+    }
+
     #[test]
     fn prefix_parser_sends_literal_and_actions() {
         let mut parser = PrefixParser::default();
@@ -987,6 +1573,97 @@ mod tests {
         ));
         assert!(!hydrates_retained_source(
             vivid_protocol::messages::VIDEO_PACKET
+        ));
+    }
+
+    #[test]
+    fn recreated_playing_video_trace_orders_decoder_recreation_before_play() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let captured = messages.clone();
+        let sender = BridgeClientSender::new(move |message| {
+            captured.lock().unwrap().push(message);
+            Ok(())
+        });
+        let key = BridgeSourceKey {
+            producer: 3,
+            source: 7,
+        };
+        let source = BridgeSource {
+            key,
+            kind: BridgeSourceKind::Video {
+                codec_string: None,
+                decoder_config: None,
+                codec: "h264".into(),
+                packetization: "h264-annexb-au-v1".into(),
+                extradata: Vec::new(),
+                width: 16,
+                height: 16,
+                profile: 0,
+                level: 0,
+                bitrate: 0,
+                color_primaries: 1,
+                transfer: 1,
+                matrix: 1,
+                range: 1,
+                sar_num: 1,
+                sar_den: 1,
+                max_access_unit_bytes: 1024,
+            },
+            capture_policy: 0,
+            descriptor: None,
+            playing: true,
+            eos_epoch: None,
+            causation_id: None,
+            play_request: crate::ipc::BridgePlayRequest {
+                start_pts_us: 8_033_333,
+                minimum_buffer_us: 33_000,
+                maximum_latency_us: 500_000,
+                rate_32_32: 1_i64 << 32,
+                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                loop_count: 0,
+                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+            },
+        };
+
+        trace_projection_change(
+            &sender,
+            19,
+            Instant::now(),
+            ProjectionChange::Sources,
+            &[],
+            std::slice::from_ref(&source),
+            &HashSet::from([key]),
+            &[(key, 2)],
+        );
+
+        let messages = messages.lock().unwrap();
+        assert!(matches!(
+            &messages[0],
+            ClientMessage::BridgeTrace {
+                bridge_instance_id: 19,
+                event: BridgeMediaTraceEvent {
+                    source: Some(source),
+                    kind: MediaTraceKind::OuterSourceRecreated {
+                        attachment_generation: 2,
+                        playing: true,
+                    },
+                    ..
+                },
+            } if *source == key
+        ));
+        assert!(matches!(
+            &messages[1],
+            ClientMessage::BridgeTrace {
+                event: BridgeMediaTraceEvent {
+                    source: Some(source),
+                    kind: MediaTraceKind::PlaybackControl {
+                        control: MediaPlaybackControl::Play,
+                        request: Some(request),
+                    },
+                    ..
+                },
+                ..
+            } if *source == key && request.start_pts_us == 8_033_333
         ));
     }
 
@@ -1108,15 +1785,72 @@ mod tests {
         assert_eq!(scanner.reset(), b"\x1b[");
     }
 
+    /// A terminal that has stopped draining must not stall the thread that dispatches Vivid
+    /// media. This is the failure that made a hidden tab's image stick and video freeze while the
+    /// outer terminal was behind: both travel through the same reader thread.
+    #[test]
+    fn a_stalled_terminal_does_not_block_frame_enqueue() {
+        /// A terminal whose writes never complete until released.
+        struct StalledTerminal(Arc<(Mutex<bool>, Condvar)>);
+
+        impl Write for StalledTerminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let (lock, signal) = &*self.0;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = signal.wait(released).unwrap();
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let output: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(StalledTerminal(gate.clone()))));
+        let writer = crate::ipc::test_shared_writer(Box::new(io::sink()));
+        let terminal = TerminalOutput::spawn(output, writer).unwrap();
+
+        // The writer thread is parked inside the first frame's write.
+        assert!(terminal.enqueue_frame(1, true, true, vec![b'a'; 16]));
+        let start = Instant::now();
+        for frame in 2..64_u64 {
+            assert!(
+                terminal.enqueue_frame(frame, false, true, vec![b'b'; 16]),
+                "queueing must not depend on the terminal draining"
+            );
+        }
+        terminal.enqueue_control(b"\x07".to_vec());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "enqueue blocked on the stalled terminal"
+        );
+
+        // Past the byte bound the backlog is discarded and the caller is told to resynchronize,
+        // because an incremental diff can never be dropped on its own.
+        assert!(!terminal.enqueue_frame(64, false, true, vec![0; OUTPUT_QUEUE_BYTES + 1]));
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        terminal.stop();
+    }
+
     #[test]
     fn full_bridge_media_queue_drops_instead_of_blocking_input() {
         let (media, receiver) = mpsc::sync_channel(1);
         let dropped = Arc::new(Mutex::new(HashSet::new()));
+        let queue_drops = Arc::new(AtomicU64::new(0));
         let mut worker = BridgeWorker {
-            media,
+            media: Some(media),
             snapshot: Arc::new(Mutex::new(None)),
             dropped: dropped.clone(),
             generation: 1,
+            queue_drops: queue_drops.clone(),
+            stopped: Arc::new(AtomicBool::new(false)),
+            thread: None,
         };
         let key = BridgeSourceKey {
             producer: 3,
@@ -1142,6 +1876,8 @@ mod tests {
                 .contains(&11)
         );
         assert_eq!(receiver.try_recv().unwrap().generation, 1);
+        // The drop is counted for `inspect-media` without changing the drop behavior itself.
+        assert_eq!(queue_drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1198,8 +1934,13 @@ mod tests {
                 height: 1,
                 alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
                 compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
+                delta_operation_limit: None,
             },
+            capture_policy: 0,
+            descriptor: None,
             playing: false,
+            eos_epoch: None,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
@@ -1230,6 +1971,7 @@ mod tests {
         };
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 1,
             sources: vec![source],
             nodes: vec![node],
             videos_needing_keyframes: Vec::new(),
@@ -1335,7 +2077,11 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1024,
             },
+            capture_policy: 0,
+            descriptor: None,
             playing: false,
+            eos_epoch: None,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 100_000,
@@ -1360,7 +2106,11 @@ mod tests {
                 bitrate: 0,
                 max_access_unit_bytes: 1024,
             },
+            capture_policy: 0,
+            descriptor: None,
             playing: false,
+            eos_epoch: None,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
@@ -1373,6 +2123,7 @@ mod tests {
         };
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 1,
             sources: vec![video_source.clone(), audio_source.clone()],
             nodes: Vec::new(),
             videos_needing_keyframes: Vec::new(),
@@ -1421,6 +2172,7 @@ mod tests {
         playing_video.playing = true;
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
+            virtual_revision: 2,
             sources: vec![playing_video, audio_source],
             nodes: Vec::new(),
             videos_needing_keyframes: Vec::new(),
@@ -1470,71 +2222,78 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn delayed_retained_image_and_source_changes_preserve_mixed_media() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("outer-scene.sock");
-        let presenter = match VirtualVivid::start(socket.clone(), MediaConfig::default()) {
-            Ok(presenter) => presenter,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                eprintln!("skipping scene-only bridge socket test: {error}");
-                return;
-            }
-            Err(error) => panic!("virtual outer presenter start failed: {error}"),
-        };
-        let token = presenter.issue_pane_capability(7).unwrap();
-        presenter.update_metrics(7, 80, 22, (10, 20));
-        let bridge = crate::bridge::OuterBridge::connect(
-            format!("unix:{}", socket.display()),
-            Zeroizing::new(token),
-            DisplayMetrics::default(),
-        )
-        .unwrap();
-
-        let (client, server) = UnixStream::pair().unwrap();
-        let client_establish = thread::spawn(move || {
-            crate::ipc::establish(test_transport(client), ChannelKind::Control)
-        });
-        let (mut server_reader, _server_writer) =
-            establish(test_transport(server), ChannelKind::Control).unwrap();
-        let (_client_reader, client_writer) = client_establish.join().unwrap().unwrap();
-        let mut worker = BridgeWorker::spawn(bridge, client_writer, 8).unwrap();
-
-        let (keyframe_sender, keyframe_receiver) = mpsc::channel();
-        thread::spawn(move || {
-            while let Ok(message) = server_reader.recv::<ClientMessage>() {
-                if let ClientMessage::BridgeNeedKeyframes(sources) = message {
-                    let _ = keyframe_sender.send(sources);
+    fn two_three_pane_tabs_restore_video_and_audio_after_showing_an_image() {
+        for iteration in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory
+                .path()
+                .join(format!("outer-tab-recovery-{iteration}.sock"));
+            let presenter = match VirtualVivid::start(socket.clone(), MediaConfig::default()) {
+                Ok(presenter) => presenter,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    eprintln!("skipping tab recovery bridge socket test: {error}");
+                    return;
                 }
-            }
-        });
+                Err(error) => panic!("virtual outer presenter start failed: {error}"),
+            };
+            let token = presenter.issue_pane_capability(7).unwrap();
+            presenter.update_metrics(7, 80, 22, (10, 20));
+            let bridge = crate::bridge::OuterBridge::connect(
+                format!("unix:{}", socket.display()),
+                Zeroizing::new(token),
+                DisplayMetrics::default(),
+            )
+            .unwrap();
 
-        let video_key = BridgeSourceKey {
-            producer: 3,
-            source: 7,
-        };
-        let video_source = BridgeSource {
-            key: video_key,
-            kind: BridgeSourceKind::Video {
-                codec_string: None,
-                decoder_config: None,
-                codec: "h264".into(),
-                packetization: "h264-annexb-au-v1".into(),
-                extradata: Vec::new(),
-                width: 16,
-                height: 16,
-                profile: 0,
-                level: 0,
-                bitrate: 0,
-                color_primaries: 1,
-                transfer: 1,
-                matrix: 1,
-                range: 1,
-                sar_num: 1,
-                sar_den: 1,
-                max_access_unit_bytes: 1024,
-            },
-            playing: true,
-            play_request: crate::ipc::BridgePlayRequest {
+            let (client, server) = UnixStream::pair().unwrap();
+            let client_establish = thread::spawn(move || {
+                crate::ipc::establish(test_transport(client), ChannelKind::Control)
+            });
+            let (mut server_reader, _server_writer) =
+                establish(test_transport(server), ChannelKind::Control).unwrap();
+            let (_client_reader, client_writer) = client_establish.join().unwrap().unwrap();
+            let mut worker = BridgeWorker::spawn(bridge, client_writer, 8).unwrap();
+
+            let (message_sender, message_receiver) = mpsc::channel();
+            thread::spawn(move || {
+                while let Ok(message) = server_reader.recv::<ClientMessage>() {
+                    let _ = message_sender.send(message);
+                }
+            });
+            let mut seen = Vec::new();
+
+            let tabs = [[1_u64, 2, 3], [4_u64, 5, 6]];
+            let tab_area = crate::layout::Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 22,
+            };
+            let three_pane_tab = |panes: [u64; 3]| {
+                let mut tree = crate::layout::TiledNode::leaf(panes[0]);
+                tree.split(panes[0], panes[1], crate::ipc::Axis::Vertical, tab_area)
+                    .unwrap();
+                tree.split(panes[1], panes[2], crate::ipc::Axis::Horizontal, tab_area)
+                    .unwrap();
+                tree
+            };
+            let video_tab = three_pane_tab(tabs[0]);
+            let image_tab = three_pane_tab(tabs[1]);
+            assert_eq!(video_tab.pane_ids(), tabs[0]);
+            assert_eq!(image_tab.pane_ids(), tabs[1]);
+            let video_pane = tabs[0][1];
+            let image_pane = tabs[1][1];
+            let video_rect = video_tab.geometry(tab_area)[&video_pane].content();
+            let image_rect = image_tab.geometry(tab_area)[&image_pane].content();
+            let video_key = BridgeSourceKey {
+                producer: video_pane,
+                source: 7,
+            };
+            let audio_key = BridgeSourceKey {
+                producer: video_pane,
+                source: 8,
+            };
+            let play_request = crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 33_000,
                 maximum_latency_us: 500_000,
@@ -1542,266 +2301,614 @@ mod tests {
                 late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
                 loop_count: 0,
                 start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
-            },
-        };
-        let node = |x: i64| BridgeNode {
-            producer: 3,
-            node: 1,
-            fragment: 0,
-            source: video_key,
-            x: x << 32,
-            y: 0,
-            width: 8_i64 << 32,
-            height: 4_i64 << 32,
-            z_index: 0,
-            visible: true,
-            clip: crate::ipc::BridgeClipRect {
-                x: x << 32,
-                y: 0,
-                width: 8_i64 << 32,
-                height: 4_i64 << 32,
-            },
-        };
-        let outer_video = |snapshot: &crate::media::ProjectionSnapshot| {
-            snapshot
-                .sources
-                .iter()
-                .find(|source| {
-                    matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
-                })
-                .map(|source| (source.key, source.playing))
-        };
-        let wait_for = |condition: &dyn Fn(&crate::media::ProjectionSnapshot) -> bool,
-                        what: &str| {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
-                if condition(&snapshot) {
-                    break snapshot;
-                }
-                assert!(Instant::now() < deadline, "timed out waiting for {what}");
-                thread::sleep(Duration::from_millis(2));
-            }
-        };
-
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            sources: vec![video_source.clone()],
-            nodes: vec![node(0)],
-            videos_needing_keyframes: Vec::new(),
-        });
-        let snapshot = wait_for(
-            &|snapshot| {
-                outer_video(snapshot).is_some_and(|(_, playing)| playing)
-                    && !snapshot.nodes.is_empty()
-            },
-            "initial playing video projection",
-        );
-        let (outer_key, _) = outer_video(&snapshot).unwrap();
-        assert_eq!(
-            keyframe_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap(),
-            vec![video_key],
-            "a newly created playing video requests one keyframe"
-        );
-
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            sources: vec![video_source.clone()],
-            nodes: vec![node(5)],
-            videos_needing_keyframes: Vec::new(),
-        });
-        let snapshot = wait_for(
-            &|snapshot| {
-                snapshot
-                    .nodes
-                    .first()
-                    .is_some_and(|node| node.config.node.x == 5_i64 << 32)
-            },
-            "moved scene node",
-        );
-        assert_eq!(
-            outer_video(&snapshot).unwrap(),
-            (outer_key, true),
-            "a scene-only change must not pause or recreate the playing video"
-        );
-        assert!(
-            keyframe_receiver.try_recv().is_err(),
-            "a scene-only change must not request a keyframe"
-        );
-
-        let mut encoded = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut encoded)
-            .write_image(
-                &[0xff, 0x40, 0x20, 0xff],
-                1,
-                1,
-                image::ExtendedColorType::Rgba8,
-            )
-            .unwrap();
-        let image_key = BridgeSourceKey {
-            producer: 4,
-            source: 9,
-        };
-        let image_source = BridgeSource {
-            key: image_key,
-            kind: BridgeSourceKind::Image {
-                encoding: vivid_protocol::messages::IMAGE_PNG,
-                width: 1,
-                height: 1,
-                encoded_length: u32::try_from(encoded.len()).unwrap(),
-                sha256: None,
-            },
-            playing: false,
-            play_request: crate::ipc::BridgePlayRequest {
-                start_pts_us: 0,
-                minimum_buffer_us: 0,
-                maximum_latency_us: 500_000,
-                rate_32_32: 1_i64 << 32,
-                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
-                loop_count: 0,
-                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
-            },
-        };
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            sources: vec![video_source.clone(), image_source.clone()],
-            nodes: vec![node(5)],
-            videos_needing_keyframes: Vec::new(),
-        });
-        let snapshot = wait_for(
-            &|snapshot| {
-                snapshot.sources.iter().any(|source| {
-                    matches!(source.descriptor, crate::media::SourceDescriptor::Image(_))
-                })
-            },
-            "added image source",
-        );
-        assert_eq!(
-            outer_video(&snapshot).unwrap(),
-            (outer_key, true),
-            "adding a source must reconcile in the current session without pausing playback"
-        );
-        assert!(keyframe_receiver.try_recv().is_err());
-
-        let image_node = BridgeNode {
-            producer: image_key.producer,
-            node: 2,
-            fragment: 0,
-            source: image_key,
-            x: 20_i64 << 32,
-            y: 0,
-            width: 1_i64 << 32,
-            height: 1_i64 << 32,
-            z_index: 0,
-            visible: true,
-            clip: crate::ipc::BridgeClipRect {
-                x: 20_i64 << 32,
-                y: 0,
-                width: 1_i64 << 32,
-                height: 1_i64 << 32,
-            },
-        };
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            sources: vec![video_source.clone(), image_source.clone()],
-            nodes: vec![node(5), image_node.clone()],
-            videos_needing_keyframes: Vec::new(),
-        });
-        assert!(worker.queue_media(BridgeMedia {
-            generation: 0,
-            delivery_id: 0,
-            source: image_key,
-            record_type: vivid_protocol::messages::IMAGE_DATA,
-            offset: 0,
-            total: u32::try_from(encoded.len()).unwrap(),
-            last: true,
-            bytes: encoded,
-        }));
-        let snapshot = wait_for(
-            &|snapshot| {
+            };
+            let video_source = |playing, play_request| BridgeSource {
+                key: video_key,
+                kind: BridgeSourceKind::Video {
+                    codec_string: None,
+                    decoder_config: None,
+                    codec: "h264".into(),
+                    packetization: "h264-annexb-au-v1".into(),
+                    extradata: Vec::new(),
+                    width: 16,
+                    height: 16,
+                    profile: 0,
+                    level: 0,
+                    bitrate: 0,
+                    color_primaries: 1,
+                    transfer: 1,
+                    matrix: 1,
+                    range: 1,
+                    sar_num: 1,
+                    sar_den: 1,
+                    max_access_unit_bytes: 1024,
+                },
+                capture_policy: 0,
+                descriptor: None,
+                playing,
+                eos_epoch: None,
+                causation_id: None,
+                play_request,
+            };
+            let audio_source = BridgeSource {
+                key: audio_key,
+                kind: BridgeSourceKind::Audio {
+                    codec_string: None,
+                    linked_video: Some(video_key),
+                    codec: "pcm_s16le".into(),
+                    packetization: "pcm-packet-v1".into(),
+                    extradata: Vec::new(),
+                    sample_rate: 48_000,
+                    channels: 2,
+                    channel_mask: 3,
+                    bitrate: 0,
+                    max_access_unit_bytes: 1024,
+                },
+                capture_policy: 0,
+                descriptor: None,
+                playing: false,
+                eos_epoch: None,
+                causation_id: None,
+                play_request: crate::ipc::BridgePlayRequest {
+                    minimum_buffer_us: 0,
+                    ..play_request
+                },
+            };
+            let video_node = BridgeNode {
+                producer: video_key.producer,
+                node: 1,
+                fragment: 0,
+                source: video_key,
+                x: i64::from(video_rect.x) << 32,
+                y: i64::from(video_rect.y) << 32,
+                width: i64::from(video_rect.width) << 32,
+                height: i64::from(video_rect.height) << 32,
+                z_index: 0,
+                visible: true,
+                clip: crate::ipc::BridgeClipRect {
+                    x: i64::from(video_rect.x) << 32,
+                    y: i64::from(video_rect.y) << 32,
+                    width: i64::from(video_rect.width) << 32,
+                    height: i64::from(video_rect.height) << 32,
+                },
+            };
+            let outer_video = |snapshot: &crate::media::ProjectionSnapshot| {
                 snapshot
                     .sources
                     .iter()
-                    .any(|source| source.key.1 != 0 && source.retained.is_some())
-            },
-            "image body arriving after its source-creation generation",
-        );
-        assert_eq!(outer_video(&snapshot).unwrap(), (outer_key, true));
-
-        let remaining_image_node = BridgeNode {
-            x: 0,
-            clip: crate::ipc::BridgeClipRect {
-                x: 0,
-                ..image_node.clip
-            },
-            ..image_node.clone()
-        };
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            sources: vec![image_source.clone()],
-            nodes: vec![remaining_image_node.clone()],
-            videos_needing_keyframes: Vec::new(),
-        });
-        let snapshot = wait_for(
-            &|snapshot| {
-                snapshot.sources.len() == 1
-                    && snapshot.sources[0].retained.is_some()
-                    && snapshot
-                        .nodes
-                        .first()
-                        .is_some_and(|node| node.config.node.x == 0)
-            },
-            "remaining image after the video pane exits",
-        );
-        assert!(snapshot.sources[0].retained.is_some());
-
-        let replay_key = BridgeSourceKey {
-            producer: 5,
-            source: 10,
-        };
-        let replay_video = BridgeSource {
-            key: replay_key,
-            kind: video_source.kind,
-            playing: true,
-            play_request: video_source.play_request,
-        };
-        let replay_node = BridgeNode {
-            producer: replay_key.producer,
-            node: 3,
-            source: replay_key,
-            x: 20_i64 << 32,
-            clip: crate::ipc::BridgeClipRect {
-                x: 20_i64 << 32,
-                ..image_node.clip
-            },
-            ..image_node.clone()
-        };
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            sources: vec![image_source, replay_video],
-            nodes: vec![replay_node, remaining_image_node],
-            videos_needing_keyframes: Vec::new(),
-        });
-        let snapshot = wait_for(
-            &|snapshot| {
-                snapshot.nodes.len() == 2
-                    && outer_video(snapshot).is_some_and(|(_, playing)| playing)
-                    && snapshot.sources.iter().any(|source| {
-                        matches!(source.descriptor, crate::media::SourceDescriptor::Image(_))
-                            && source.retained.is_some()
+                    .find(|source| {
+                        matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
                     })
-            },
-            "replayed video node alongside the retained image",
-        );
-        assert_eq!(snapshot.nodes.len(), 2);
-        assert_eq!(
-            keyframe_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap(),
-            vec![replay_key]
-        );
+                    .map(|source| (source.key, source.playing))
+            };
+            let video_packet = |packet_id, pts_us, key| {
+                let key_access_unit = [0, 0, 0, 1, 0x65, 0x88];
+                let delta_access_unit = [0, 0, 0, 1, 0x41, 0x9a];
+                media::video_packet_body(VideoPacket {
+                    epoch: 1,
+                    packet_id,
+                    pts_us,
+                    dts_us: pts_us,
+                    duration_us: 33_000,
+                    key,
+                    data: if key {
+                        &key_access_unit
+                    } else {
+                        &delta_access_unit
+                    },
+                })
+                .unwrap()
+            };
+            let audio_packet = |packet_id, pts_us| {
+                media::audio_packet_body(AudioPacket {
+                    epoch: 1,
+                    packet_id,
+                    pts_us,
+                    dts_us: pts_us,
+                    duration_us: 20_000,
+                    trim_start_samples: 0,
+                    trim_end_samples: 0,
+                    data: &[0, 0, 0, 0],
+                })
+                .unwrap()
+            };
+
+            // Tab 1 becomes visible with all three panes, but only pane 2 contributes media. Deliver
+            // linked-audio pre-roll before the authoritative PLAY transition.
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision: 1,
+                sources: vec![video_source(false, play_request), audio_source.clone()],
+                nodes: vec![video_node.clone()],
+                videos_needing_keyframes: Vec::new(),
+            });
+            let initial_applied = receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "initial tab 1 projection",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeApplied {
+                            virtual_revision: 1,
+                            ..
+                        }
+                    )
+                },
+            );
+            let (bridge_instance_id, initial_attachment_generation) = match &seen[initial_applied] {
+                ClientMessage::BridgeApplied {
+                    bridge_instance_id,
+                    outer_attachment_generations,
+                    ..
+                } => (
+                    *bridge_instance_id,
+                    outer_attachment_generations
+                        .iter()
+                        .find_map(|(source, generation)| {
+                            (*source == video_key).then_some(*generation)
+                        })
+                        .unwrap(),
+                ),
+                _ => unreachable!(),
+            };
+            let initial_audio = audio_packet(1, 0);
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 10,
+                source: audio_key,
+                record_type: vivid_protocol::messages::AUDIO_PACKET,
+                offset: 0,
+                total: u32::try_from(initial_audio.len()).unwrap(),
+                last: true,
+                bytes: initial_audio,
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "linked audio pre-roll acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 10,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+
+            let initial_play_start = seen.len();
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision: 2,
+                sources: vec![video_source(true, play_request), audio_source.clone()],
+                nodes: vec![video_node.clone()],
+                videos_needing_keyframes: Vec::new(),
+            });
+            let initial_play_applied = receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "initial authoritative PLAY",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeApplied {
+                            virtual_revision: 2,
+                            ..
+                        }
+                    )
+                },
+            );
+            let initial_play_trace = seen[initial_play_start..=initial_play_applied]
+                .iter()
+                .position(|message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeTrace {
+                            event: BridgeMediaTraceEvent {
+                                source: Some(source),
+                                kind: MediaTraceKind::PlaybackControl {
+                                    control: MediaPlaybackControl::Play,
+                                    request: Some(request),
+                                },
+                                ..
+                            },
+                            ..
+                        } if *source == video_key && *request == play_request
+                    )
+                });
+            assert!(
+                initial_play_trace.is_some(),
+                "PLAY must be observable before its applied projection acknowledgement"
+            );
+            let opening_keyframe = video_packet(1, 0, true);
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 11,
+                source: video_key,
+                record_type: vivid_protocol::messages::VIDEO_PACKET,
+                offset: 0,
+                total: u32::try_from(opening_keyframe.len()).unwrap(),
+                last: true,
+                bytes: opening_keyframe,
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "opening video keyframe acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 11,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+
+            let mut encoded = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut encoded)
+                .write_image(
+                    &[0xff, 0x40, 0x20, 0xff],
+                    1,
+                    1,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .unwrap();
+            let image_key = BridgeSourceKey {
+                producer: image_pane,
+                source: 9,
+            };
+            let image_source = BridgeSource {
+                key: image_key,
+                kind: BridgeSourceKind::Image {
+                    encoding: vivid_protocol::messages::IMAGE_PNG,
+                    width: 1,
+                    height: 1,
+                    encoded_length: u32::try_from(encoded.len()).unwrap(),
+                    sha256: None,
+                },
+                capture_policy: 0,
+                descriptor: None,
+                playing: false,
+                eos_epoch: None,
+                causation_id: None,
+                play_request: crate::ipc::BridgePlayRequest {
+                    start_pts_us: 0,
+                    minimum_buffer_us: 0,
+                    maximum_latency_us: 500_000,
+                    rate_32_32: 1_i64 << 32,
+                    late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                    loop_count: 0,
+                    start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+                },
+            };
+            let image_node = BridgeNode {
+                producer: image_key.producer,
+                node: 2,
+                fragment: 0,
+                source: image_key,
+                x: i64::from(image_rect.x) << 32,
+                y: i64::from(image_rect.y) << 32,
+                width: i64::from(image_rect.width) << 32,
+                height: i64::from(image_rect.height) << 32,
+                z_index: 0,
+                visible: true,
+                clip: crate::ipc::BridgeClipRect {
+                    x: i64::from(image_rect.x) << 32,
+                    y: i64::from(image_rect.y) << 32,
+                    width: i64::from(image_rect.width) << 32,
+                    height: i64::from(image_rect.height) << 32,
+                },
+            };
+
+            // Switching tabs atomically removes tab 1's video/audio projection and replaces it with
+            // the image owned by pane 2 of tab 2.
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision: 3,
+                sources: vec![image_source.clone()],
+                nodes: vec![image_node.clone()],
+                videos_needing_keyframes: Vec::new(),
+            });
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "tab 2 image projection",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeApplied {
+                            virtual_revision: 3,
+                            ..
+                        }
+                    )
+                },
+            );
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 12,
+                source: image_key,
+                record_type: vivid_protocol::messages::IMAGE_DATA,
+                offset: 0,
+                total: u32::try_from(encoded.len()).unwrap(),
+                last: true,
+                bytes: encoded.clone(),
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "tab 2 image delivery acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 12,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+            assert!(
+                presenter.wait_for_retained_media(7, Duration::from_secs(2)),
+                "tab 2 image never reached the outer presenter's retained state"
+            );
+            let image_snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+            assert_eq!(image_snapshot.sources.len(), 1);
+            assert!(image_snapshot.sources[0].retained.is_some());
+            assert!(outer_video(&image_snapshot).is_none());
+
+            // Return to tab 1. Decoder recreation and the original authoritative PLAY must precede
+            // the applied acknowledgement, and the recreated attachment must request a keyframe.
+            let return_start = seen.len();
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision: 4,
+                sources: vec![video_source(true, play_request), audio_source.clone()],
+                nodes: vec![video_node.clone()],
+                videos_needing_keyframes: Vec::new(),
+            });
+            let return_applied = receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "tab 1 restored projection",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeApplied {
+                            virtual_revision: 4,
+                            ..
+                        }
+                    )
+                },
+            );
+            let (return_bridge_instance, return_attachment_generation) = match &seen[return_applied]
+            {
+                ClientMessage::BridgeApplied {
+                    bridge_instance_id,
+                    outer_attachment_generations,
+                    ..
+                } => (
+                    *bridge_instance_id,
+                    outer_attachment_generations
+                        .iter()
+                        .find_map(|(source, generation)| {
+                            (*source == video_key).then_some(*generation)
+                        })
+                        .unwrap(),
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                return_bridge_instance, bridge_instance_id,
+                "a tab switch reconciles sources without replacing the outer bridge session"
+            );
+            assert!(
+                return_attachment_generation > initial_attachment_generation,
+                "the video decoder attachment must be a new generation"
+            );
+            let return_messages = &seen[return_start..=return_applied];
+            let recreated = return_messages
+                .iter()
+                .position(|message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeTrace {
+                            event: BridgeMediaTraceEvent {
+                                source: Some(source),
+                                kind: MediaTraceKind::OuterSourceRecreated {
+                                    playing: true,
+                                    ..
+                                },
+                                ..
+                            },
+                            ..
+                        } if *source == video_key
+                    )
+                })
+                .expect("video decoder recreation was not traced");
+            let replayed_play = return_messages
+                .iter()
+                .position(|message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeTrace {
+                            event: BridgeMediaTraceEvent {
+                                source: Some(source),
+                                kind: MediaTraceKind::PlaybackControl {
+                                    control: MediaPlaybackControl::Play,
+                                    request: Some(request),
+                                },
+                                ..
+                            },
+                            ..
+                        } if *source == video_key && *request == play_request
+                    )
+                })
+                .expect("replayed PLAY was not traced");
+            assert!(
+                recreated < replayed_play,
+                "decoder recreation must precede its authoritative PLAY"
+            );
+            let expected_initial = BridgeKeyframeRequest {
+                source: video_key,
+                minimum_epoch: None,
+                reason: vivid_protocol::messages::KEYFRAME_REASON_INITIAL,
+            };
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "recreated video keyframe request",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeNeedKeyframes(requests)
+                            if requests == std::slice::from_ref(&expected_initial)
+                    )
+                },
+            );
+
+            // Vivi's fixed recovery behavior re-bases PLAY to the same-epoch recovery keyframe before
+            // submitting that packet. The worker must apply that playback-only update before media.
+            let recovery_pts_us = 8_033_333;
+            let recovery_play = crate::ipc::BridgePlayRequest {
+                start_pts_us: recovery_pts_us,
+                ..play_request
+            };
+            let recovery_play_start = seen.len();
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision: 5,
+                sources: vec![video_source(true, recovery_play), audio_source.clone()],
+                nodes: vec![video_node],
+                videos_needing_keyframes: Vec::new(),
+            });
+            let recovery_play_applied = receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "recovery PLAY rebase",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeApplied {
+                            virtual_revision: 5,
+                            ..
+                        }
+                    )
+                },
+            );
+            assert!(
+                seen[recovery_play_start..=recovery_play_applied]
+                    .iter()
+                    .any(|message| {
+                        matches!(
+                            message,
+                            ClientMessage::BridgeTrace {
+                                event: BridgeMediaTraceEvent {
+                                    source: Some(source),
+                                    kind: MediaTraceKind::PlaybackControl {
+                                        control: MediaPlaybackControl::Play,
+                                        request: Some(request),
+                                    },
+                                    ..
+                                },
+                                ..
+                            } if *source == video_key && *request == recovery_play
+                        )
+                    }),
+                "same-epoch recovery must publish its exact PLAY rebase before media"
+            );
+
+            let recovery_keyframe = video_packet(2, recovery_pts_us, true);
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 13,
+                source: video_key,
+                record_type: vivid_protocol::messages::VIDEO_PACKET,
+                offset: 0,
+                total: u32::try_from(recovery_keyframe.len()).unwrap(),
+                last: true,
+                bytes: recovery_keyframe,
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "same-epoch recovery keyframe acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 13,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+
+            let resumed_audio = audio_packet(2, recovery_pts_us + 7_000);
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 14,
+                source: audio_key,
+                record_type: vivid_protocol::messages::AUDIO_PACKET,
+                offset: 0,
+                total: u32::try_from(resumed_audio.len()).unwrap(),
+                last: true,
+                bytes: resumed_audio,
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "resumed linked audio acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 14,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+
+            let resumed_delta = video_packet(3, recovery_pts_us + 33_000, false);
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 15,
+                source: video_key,
+                record_type: vivid_protocol::messages::VIDEO_PACKET,
+                offset: 0,
+                total: u32::try_from(resumed_delta.len()).unwrap(),
+                last: true,
+                bytes: resumed_delta,
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "post-recovery video delta acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 15,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+
+            let restored = presenter.projection_snapshot(&HashSet::from([7]));
+            assert_eq!(restored.nodes.len(), 1);
+            assert!(outer_video(&restored).is_some_and(|(_, playing)| playing));
+            assert!(
+                restored.sources.iter().all(|source| {
+                    !matches!(source.descriptor, crate::media::SourceDescriptor::Image(_))
+                }),
+                "the hidden image tab must not remain in the outer projection"
+            );
+        }
     }
 
     #[test]
@@ -1835,7 +2942,11 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1_048_576,
             },
+            capture_policy: 0,
+            descriptor: None,
             playing,
+            eos_epoch: None,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 100_000,
@@ -1860,7 +2971,11 @@ mod tests {
                 bitrate: 128_000,
                 max_access_unit_bytes: 4096,
             },
+            capture_policy: 0,
+            descriptor: None,
             playing: false,
+            eos_epoch: None,
+            causation_id: None,
             play_request: crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
@@ -1951,7 +3066,11 @@ mod tests {
                 encoded_length: 32,
                 sha256: None,
             },
+            capture_policy: 0,
+            descriptor: None,
             playing: false,
+            eos_epoch: None,
+            causation_id: None,
             play_request: after[0].play_request,
         });
         assert_eq!(

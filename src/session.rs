@@ -13,25 +13,39 @@ use vvmux_terminal::{Cell, Terminal, TerminalColor, TerminalEvent, TerminalModes
 use crate::config::Config;
 use crate::ipc::{
     Action, AutomationError, AutomationMethod, AutomationRequest, AutomationResponse, Axis,
-    BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceKey, BridgeSourceKind,
-    ClientMessage, Direction, DisplayMetrics, FloatingEditCommand, FloatingEditKind, MouseEvent,
-    MouseKind, ServerMessage, SharedWriter,
+    BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceDescriptor,
+    BridgeSourceKey, BridgeSourceKind, ClientMessage, Direction, DisplayMetrics,
+    FloatingEditCommand, FloatingEditKind, MouseEvent, MouseKind, ServerMessage, SharedWriter,
 };
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
 };
 use crate::media::VirtualVivid;
+use crate::media_trace::{MediaKeyframeStage, MediaTraceFilter, MediaTraceJournal, MediaTraceKind};
 use crate::platform::VirtualPresenterEndpoint;
 use crate::region::{FixedRect, from_cells, intersect, subtract_all};
 use crate::screen::{ScreenBuffer, ansi_diff};
 
 const EVENT_QUEUE: usize = 1024;
+/// Slots on the dedicated media-event receiver.
+///
+/// Total queued media bytes are separately bounded by `media.ipc_queue_bytes`, so this only needs
+/// enough slots that small records — audio access units especially — cannot exhaust it while that
+/// byte budget is far from spent.
+const MEDIA_EVENT_QUEUE: usize = 256;
 const COPY_BUFFER_LIMIT: usize = 1024 * 1024;
 const MAX_NODE_FRAGMENTS: usize = 8;
 const MAX_PROJECTED_NODES: usize = 256;
 const INPUT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_AUTOMATION_REQUESTS_PER_CLIENT: usize = 64;
 const MAX_AUTOMATION_WAITERS: usize = 256;
+const MAX_PENDING_ACTOR_WORK: usize = 256;
+/// Frames allowed outstanding before rendering pauses for the client to catch up.
+///
+/// The acknowledgement arrives after the client writes the frame to its terminal, so this bounds
+/// how far the server may run ahead of what the user can actually see. Media snapshots and media
+/// records are never gated by it: a slow terminal must not stall the projected scene.
+const MAX_UNACKNOWLEDGED_FRAMES: u64 = 8;
 const AUTOMATION_RESPONSE_QUEUE: usize = 8;
 const SCREEN_CHANGE_HISTORY: usize = 1024;
 const EXIT_TOMBSTONES: usize = 128;
@@ -56,7 +70,11 @@ pub enum ActorEvent {
         reply: AutomationReplyTarget,
         result: Result<(), String>,
     },
-    Media(crate::media::MediaEvent),
+    /// A media event is waiting on the dedicated media receiver.
+    ///
+    /// Carries no payload: it exists only to wake the actor promptly. Losing one to a full queue
+    /// is harmless because the actor drains media at the top of every iteration anyway.
+    MediaReady,
 }
 
 #[derive(Clone)]
@@ -136,6 +154,15 @@ enum AutomationWaitKind {
         after_session: u64,
     },
     Exit,
+    Media {
+        after_virtual_revision: Option<u64>,
+        after_outer_revision: Option<u64>,
+    },
+    MediaTrace {
+        after_sequence: Option<u64>,
+        limit: u16,
+        filter: MediaTraceFilter,
+    },
 }
 
 enum AutomationTextPattern {
@@ -454,6 +481,23 @@ fn should_sync_media(
     force || last != Some(current)
 }
 
+fn bridge_apply_is_current(
+    current_instance: Option<u64>,
+    current_virtual_revision: u64,
+    current_bridge_revision: u64,
+    incoming_instance: u64,
+    incoming_virtual_revision: u64,
+    incoming_bridge_revision: u64,
+) -> bool {
+    incoming_virtual_revision >= current_virtual_revision
+        && (current_instance != Some(incoming_instance)
+            || incoming_bridge_revision >= current_bridge_revision)
+}
+
+fn next_outer_compatibility_revision(current: u64, incoming_bridge_revision: u64) -> u64 {
+    current.saturating_add(1).max(incoming_bridge_revision)
+}
+
 struct SessionActor {
     name: String,
     config: Config,
@@ -475,6 +519,15 @@ struct SessionActor {
     layout_revision: u64,
     last_media_projection: Option<MediaProjectionKey>,
     media_projection_revision: u64,
+    outer_virtual_revision: u64,
+    bridge_instance_id: Option<u64>,
+    bridge_local_revision: u64,
+    outer_projection_revision: u64,
+    outer_apply_sequence: u64,
+    outer_attachment_generations: HashMap<BridgeSourceKey, u64>,
+    traced_projected_sources: HashSet<BridgeSourceKey>,
+    traced_recovery_deliveries: HashMap<u64, (BridgeSourceKey, Option<u64>, u32, i64)>,
+    media_trace: MediaTraceJournal,
     fragment_assignments: HashMap<(u64, u64), FragmentMap>,
     last_projection_warning: Option<MediaProjectionKey>,
     pointer_drag: Option<PointerDrag>,
@@ -483,10 +536,17 @@ struct SessionActor {
     session_sequence: u64,
     response_sender: mpsc::SyncSender<AutomationResponseJob>,
     automation_inflight: HashMap<u64, HashSet<u64>>,
+    pending_actor_work: HashSet<(u64, u64)>,
     automation_waiters: Vec<AutomationWaiter>,
     exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
     vivid: VirtualVivid,
+    /// Latest foreground-bridge counter report. Diagnostic only; retained across a detach so
+    /// `inspect-media` still describes the last live bridge.
+    bridge_metrics: crate::metrics::BridgeMetrics,
+    /// Counters for the attached client's VVMX connection, retained across a detach for the same
+    /// reason. Replaced when a new client attaches.
+    client_ipc: Option<Arc<crate::metrics::IpcCounters>>,
 }
 
 pub fn start(
@@ -495,10 +555,18 @@ pub fn start(
     vivid_endpoint: VirtualPresenterEndpoint,
 ) -> io::Result<ActorHandle> {
     let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE);
-    let (media_sender, media_receiver) = mpsc::sync_channel(64);
+    let (media_sender, media_receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE);
     let shutdown = Arc::new(AtomicBool::new(false));
     let vivid =
         VirtualVivid::start_with_events(vivid_endpoint, config.media.clone(), Some(media_sender))?;
+    {
+        // Losing a wakeup to a full queue is harmless: the actor drains media around every event
+        // and on every idle tick regardless, so `try_send` here must never block ingest.
+        let wakeup = sender.clone();
+        vivid.set_media_wakeup(Arc::new(move || {
+            let _ = wakeup.try_send(ActorEvent::MediaReady);
+        }));
+    }
     let (response_sender, response_receiver) =
         mpsc::sync_channel::<AutomationResponseJob>(AUTOMATION_RESPONSE_QUEUE);
     let response_receiver = Arc::new(std::sync::Mutex::new(response_receiver));
@@ -519,16 +587,11 @@ pub fn start(
                 }
             })?;
     }
-    let media_events = sender.clone();
-    std::thread::Builder::new()
-        .name("vvmux-media-events".into())
-        .spawn(move || {
-            while let Ok(event) = media_receiver.recv() {
-                if media_events.send(ActorEvent::Media(event)).is_err() {
-                    break;
-                }
-            }
-        })?;
+    // Media no longer travels through the actor's general event queue. That queue is shared with
+    // `PtyOutput`, so a pane producing a lot of terminal output could fill it, block the forwarder,
+    // back up the media channel, and make ingest drop frames — starving media in one pane because
+    // a different pane was busy. Media now has its own receiver that the actor drains first, and
+    // only a coalescible wakeup crosses the shared queue.
     let last_display = normalized_display(
         DisplayMetrics {
             columns: 80,
@@ -559,6 +622,15 @@ pub fn start(
         layout_revision: 0,
         last_media_projection: None,
         media_projection_revision: 0,
+        outer_virtual_revision: 0,
+        bridge_instance_id: None,
+        bridge_local_revision: 0,
+        outer_projection_revision: 0,
+        outer_apply_sequence: 0,
+        outer_attachment_generations: HashMap::new(),
+        traced_projected_sources: HashSet::new(),
+        traced_recovery_deliveries: HashMap::new(),
+        media_trace: MediaTraceJournal::default(),
         fragment_assignments: HashMap::new(),
         last_projection_warning: None,
         pointer_drag: None,
@@ -567,20 +639,27 @@ pub fn start(
         session_sequence: 1,
         response_sender,
         automation_inflight: HashMap::new(),
+        pending_actor_work: HashSet::new(),
         automation_waiters: Vec::new(),
         exit_tombstones: VecDeque::new(),
         shutdown: shutdown.clone(),
         vivid,
+        bridge_metrics: crate::metrics::BridgeMetrics::default(),
+        client_ipc: None,
     };
     actor.new_tab()?;
     std::thread::Builder::new()
         .name("vvmux-session".into())
-        .spawn(move || actor.run(receiver))?;
+        .spawn(move || actor.run(receiver, media_receiver))?;
     Ok(ActorHandle { sender, shutdown })
 }
 
 impl SessionActor {
-    fn run(&mut self, receiver: mpsc::Receiver<ActorEvent>) {
+    fn run(
+        &mut self,
+        receiver: mpsc::Receiver<ActorEvent>,
+        media_receiver: mpsc::Receiver<crate::media::MediaEvent>,
+    ) {
         let interval = Duration::from_millis(self.config.general.render_interval_ms);
         let mut render_at = Instant::now();
         loop {
@@ -590,11 +669,16 @@ impl SessionActor {
                 Duration::from_secs(1)
             };
             timeout = timeout.min(self.next_automation_deadline());
+            // Media first, and to exhaustion: a projected source's frames must not queue behind an
+            // unrelated pane's terminal output. This is cheap when idle because the media receiver
+            // is empty and `try_recv` does not block.
+            self.drain_media(&media_receiver);
             match receiver.recv_timeout(timeout) {
                 Ok(event) => {
                     if self.handle_event(event).is_err() {
                         self.force_full = true;
                     }
+                    self.drain_media(&media_receiver);
                     if self.pending_render && render_at <= Instant::now() {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -606,6 +690,7 @@ impl SessionActor {
                     self.check_automation_waiters();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.drain_media(&media_receiver);
                     if self.pending_render {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -623,6 +708,60 @@ impl SessionActor {
         self.shutdown.store(true, Ordering::Release);
     }
 
+    /// Forward every media event currently queued.
+    ///
+    /// Bounded by the media channel's own capacity, so this cannot become an unbounded stall on
+    /// the actor even when a producer is saturating its source.
+    fn drain_media(&mut self, media_receiver: &mpsc::Receiver<crate::media::MediaEvent>) {
+        while let Ok(event) = media_receiver.try_recv() {
+            self.forward_media(event);
+        }
+    }
+
+    fn forward_media(&mut self, event: crate::media::MediaEvent) {
+        if let Some((epoch, pts_us)) = event.recovered_keyframe {
+            self.traced_recovery_deliveries.insert(
+                event.delivery_id,
+                (
+                    bridge_key(event.source),
+                    self.bridge_instance_id,
+                    epoch,
+                    pts_us,
+                ),
+            );
+            self.record_media_trace(
+                Some(bridge_key(event.source)),
+                self.bridge_instance_id,
+                None,
+                MediaTraceKind::KeyframeRecovered { epoch, pts_us },
+            );
+        }
+        // PLAY/PAUSE/EOS arrive on the producer's control connection while media arrives on
+        // independent source connections. Publish any resulting authoritative projection revision
+        // before forwarding the next media record. Otherwise a busy stream can starve the actor's
+        // idle sync, fill outer pre-roll with later audio, and leave video waiting for a PLAY
+        // snapshot that is queued behind that media.
+        self.sync_media_before_delivery(event.source);
+        let sent = self
+            .attached
+            .as_ref()
+            .filter(|client| client.vivid)
+            .is_some_and(|client| {
+                send_media_body(
+                    &client.writer,
+                    event.delivery_id,
+                    bridge_key(event.source),
+                    event.record_type,
+                    &event.body,
+                )
+            });
+        if !sent {
+            self.record_delivery_result(event.delivery_id, false);
+            self.vivid
+                .complete_bridge_delivery(event.delivery_id, false);
+        }
+    }
+
     fn handle_event(&mut self, event: ActorEvent) -> io::Result<()> {
         match event {
             ActorEvent::Client {
@@ -635,11 +774,23 @@ impl SessionActor {
             }
             ActorEvent::Disconnected(id) => {
                 self.automation_inflight.remove(&id);
+                self.pending_actor_work
+                    .retain(|(client_id, _)| *client_id != id);
                 self.automation_waiters
                     .retain(|waiter| waiter.reply.client_id != id);
                 if self.attached.as_ref().is_some_and(|client| client.id == id) {
+                    self.record_media_trace(
+                        None,
+                        self.bridge_instance_id,
+                        None,
+                        MediaTraceKind::BridgeClientDetached,
+                    );
                     self.cancel_pointer_drag(true);
                     self.attached = None;
+                    self.bridge_instance_id = None;
+                    self.bridge_local_revision = 0;
+                    self.traced_recovery_deliveries.clear();
+                    self.record_projection_sources(&HashSet::new(), self.vivid.revision());
                     self.last_screen = None;
                     #[cfg(windows)]
                     {
@@ -743,36 +894,18 @@ impl SessionActor {
                 self.close_pane(pane_id);
             }
             ActorEvent::AutomationInputComplete { reply, result } => match result {
-                Ok(()) => self.reply_automation(reply, serde_json::Value::Null),
+                Ok(()) => {
+                    self.complete_pending_actor_work(&reply);
+                    self.reply_automation(reply, serde_json::Value::Null);
+                }
                 Err(message) => {
-                    self.reply_automation_error(reply, AutomationError::new("pty_closed", message))
+                    self.complete_pending_actor_work(&reply);
+                    self.reply_automation_error(reply, AutomationError::new("pty_closed", message));
                 }
             },
-            ActorEvent::Media(event) => {
-                // PLAY/PAUSE/EOS arrive on the producer's control connection while media arrives
-                // on independent source connections. Publish any resulting authoritative
-                // projection revision before forwarding the next media record. Otherwise a busy
-                // stream can starve the actor's idle sync, fill outer pre-roll with later audio,
-                // and leave video waiting for a PLAY snapshot that is queued behind that media.
-                self.sync_media_before_delivery(event.source);
-                let sent = self
-                    .attached
-                    .as_ref()
-                    .filter(|client| client.vivid)
-                    .is_some_and(|client| {
-                        send_media_body(
-                            &client.writer,
-                            event.delivery_id,
-                            bridge_key(event.source),
-                            event.record_type,
-                            &event.body,
-                        )
-                    });
-                if !sent {
-                    self.vivid
-                        .complete_bridge_delivery(event.delivery_id, false);
-                }
-            }
+            // The payload arrives on the dedicated media receiver, which the run loop drains
+            // around every event; this wakeup only ensures it happens promptly.
+            ActorEvent::MediaReady => {}
         }
         Ok(())
     }
@@ -808,11 +941,24 @@ impl SessionActor {
                 }
                 let display = normalized_display(display, self.config.general.status_visible);
                 self.last_display = display;
+                self.client_ipc = Some(
+                    writer
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .counters(),
+                );
+                self.bridge_metrics = crate::metrics::BridgeMetrics::default();
+                self.bridge_instance_id = None;
+                self.bridge_local_revision = 0;
+                self.traced_recovery_deliveries.clear();
                 self.attached = Some(AttachedClient {
                     id,
                     writer: writer.clone(),
                     display,
-                    acknowledged_frame: 0,
+                    // This client never received the session's historical frames. Start its
+                    // flow-control window at the current frame so the forced full repaint below
+                    // becomes its first outstanding frame instead of being suppressed as stale.
+                    acknowledged_frame: self.frame_id,
                     vivid,
                     rendered_session_sequence: 0,
                     frame_sequences: VecDeque::new(),
@@ -838,6 +984,12 @@ impl SessionActor {
                     self.outer_bracketed_paste = None;
                 }
                 self.force_full = true;
+                self.record_media_trace(
+                    None,
+                    None,
+                    None,
+                    MediaTraceKind::BridgeClientAttached { vivid },
+                );
                 self.resize_all();
                 self.sync_media(true);
                 self.schedule_render();
@@ -894,14 +1046,64 @@ impl SessionActor {
                     }
                 }
             }
-            ClientMessage::BridgeNeedKeyframes(sources) => {
+            ClientMessage::RenderResync => {
                 if self.client_is(id) {
-                    self.vivid.request_keyframes(
+                    // Treat the discarded backlog as acknowledged: those frames will never be
+                    // displayed, and leaving them outstanding would stall the render gate.
+                    if let Some(client) = &mut self.attached {
+                        client.acknowledged_frame = self.frame_id;
+                        client.frame_sequences.clear();
+                    }
+                    self.force_full = true;
+                    self.last_screen = None;
+                    self.schedule_render();
+                }
+            }
+            ClientMessage::BridgeNeedKeyframes(requests) => {
+                if self.client_is(id) {
+                    for request in requests {
+                        let outcome = self.vivid.request_keyframe(
+                            (request.source.producer, request.source.source),
+                            request.minimum_epoch,
+                            request.reason,
+                        );
+                        self.record_media_trace(
+                            Some(request.source),
+                            self.bridge_instance_id,
+                            None,
+                            MediaTraceKind::KeyframeRequest {
+                                stage: match outcome {
+                                    crate::media::KeyframeRequestOutcome::Forwarded => {
+                                        MediaKeyframeStage::ProducerForwarded
+                                    }
+                                    crate::media::KeyframeRequestOutcome::Damped => {
+                                        MediaKeyframeStage::ProducerDamped
+                                    }
+                                    crate::media::KeyframeRequestOutcome::Ignored => {
+                                        MediaKeyframeStage::ProducerIgnored
+                                    }
+                                },
+                                minimum_epoch: request.minimum_epoch,
+                                reason: request.reason,
+                            },
+                        );
+                    }
+                }
+            }
+            ClientMessage::BridgeNeedFullFrames(sources) => {
+                if self.client_is(id) {
+                    self.vivid.request_full_frames(
                         &sources
                             .into_iter()
                             .map(|source| (source.producer, source.source))
                             .collect::<Vec<_>>(),
+                        vivid_protocol::messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
                     );
+                }
+            }
+            ClientMessage::BridgeCapabilitiesChanged { reason_mask } => {
+                if self.client_is(id) {
+                    let _ = self.vivid.notify_capabilities_changed(reason_mask);
                 }
             }
             ClientMessage::BridgeMediaAck {
@@ -909,6 +1111,7 @@ impl SessionActor {
                 delivered,
             } => {
                 if self.client_is(id) {
+                    self.record_delivery_result(delivery_id, delivered);
                     let resync = self.vivid.complete_bridge_delivery(delivery_id, delivered);
                     if resync {
                         self.last_media_projection = None;
@@ -918,6 +1121,12 @@ impl SessionActor {
             }
             ClientMessage::BridgeSnapshotRetry => {
                 if self.client_is(id) {
+                    self.record_media_trace(
+                        None,
+                        self.bridge_instance_id,
+                        None,
+                        MediaTraceKind::SnapshotRetry,
+                    );
                     // The worker requests this only when it will rebuild a replacement outer
                     // session. Fragment identities are scoped to that outer session.
                     self.fragment_assignments.clear();
@@ -925,8 +1134,108 @@ impl SessionActor {
                     self.sync_media(true);
                 }
             }
+            ClientMessage::BridgeApplied {
+                bridge_instance_id,
+                virtual_revision,
+                outer_revision,
+                outer_attachment_generations,
+            } => {
+                let instance_changed = self.bridge_instance_id != Some(bridge_instance_id);
+                if self.client_is(id)
+                    && bridge_apply_is_current(
+                        self.bridge_instance_id,
+                        self.outer_virtual_revision,
+                        self.bridge_local_revision,
+                        bridge_instance_id,
+                        virtual_revision,
+                        outer_revision,
+                    )
+                {
+                    if instance_changed {
+                        self.bridge_local_revision = 0;
+                        self.outer_attachment_generations.clear();
+                    }
+                    self.bridge_instance_id = Some(bridge_instance_id);
+                    self.outer_virtual_revision = virtual_revision;
+                    self.bridge_local_revision = outer_revision;
+                    self.outer_apply_sequence = self.outer_apply_sequence.saturating_add(1);
+                    self.outer_projection_revision = next_outer_compatibility_revision(
+                        self.outer_projection_revision,
+                        outer_revision,
+                    );
+                    let attachment_count =
+                        u16::try_from(outer_attachment_generations.len()).unwrap_or(u16::MAX);
+                    self.outer_attachment_generations =
+                        outer_attachment_generations.into_iter().collect();
+                    self.record_media_trace(
+                        None,
+                        Some(bridge_instance_id),
+                        None,
+                        MediaTraceKind::ProjectionApplied {
+                            virtual_revision,
+                            bridge_local_revision: outer_revision,
+                            attachment_count,
+                        },
+                    );
+                    self.check_automation_waiters();
+                }
+            }
+            ClientMessage::BridgeTrace {
+                bridge_instance_id,
+                event,
+            } => {
+                if self.client_is(id) {
+                    if matches!(event.kind, MediaTraceKind::BridgeClientAttached { .. })
+                        || self.bridge_instance_id.is_none()
+                    {
+                        if self.bridge_instance_id != Some(bridge_instance_id) {
+                            self.bridge_local_revision = 0;
+                            self.outer_attachment_generations.clear();
+                        }
+                        self.bridge_instance_id = Some(bridge_instance_id);
+                    }
+                    if self.bridge_instance_id == Some(bridge_instance_id) {
+                        self.record_media_trace(
+                            event.source,
+                            Some(bridge_instance_id),
+                            Some(event.origin_monotonic_us),
+                            event.kind,
+                        );
+                    }
+                }
+            }
+            ClientMessage::BridgePlaybackState {
+                source,
+                state,
+                eos_state,
+            } => {
+                if self.client_is(id) {
+                    self.record_media_trace(
+                        Some(source),
+                        self.bridge_instance_id,
+                        None,
+                        MediaTraceKind::PlaybackState { state, eos_state },
+                    );
+                    self.vivid.apply_outer_playback(
+                        (source.producer, source.source),
+                        state,
+                        eos_state,
+                    );
+                }
+            }
+            ClientMessage::BridgeMetrics(metrics) => {
+                if self.client_is(id) {
+                    self.bridge_metrics = metrics;
+                }
+            }
             ClientMessage::Detach => {
                 if self.client_is(id) {
+                    self.record_media_trace(
+                        None,
+                        self.bridge_instance_id,
+                        None,
+                        MediaTraceKind::BridgeClientDetached,
+                    );
                     self.cancel_pointer_drag(true);
                     crate::ipc::send(
                         &writer,
@@ -935,6 +1244,10 @@ impl SessionActor {
                         },
                     )?;
                     self.attached = None;
+                    self.bridge_instance_id = None;
+                    self.bridge_local_revision = 0;
+                    self.traced_recovery_deliveries.clear();
+                    self.record_projection_sources(&HashSet::new(), self.vivid.revision());
                     self.last_screen = None;
                     #[cfg(windows)]
                     {
@@ -1069,6 +1382,40 @@ impl SessionActor {
                         "limits": automation_limits(),
                     }),
                 );
+            }
+            AutomationMethod::InspectMedia => {
+                let pane_id = pane_id.unwrap();
+                let status = self.vivid.pane_status(
+                    pane_id,
+                    self.outer_media_projection(),
+                    self.relay_metrics(),
+                );
+                self.reply_automation(target, serde_json::to_value(status).unwrap());
+            }
+            AutomationMethod::TraceMedia {
+                after_sequence,
+                limit,
+                timeout_ms,
+                filter,
+            } => {
+                let pane_id = pane_id.unwrap();
+                let result = self
+                    .media_trace
+                    .query(after_sequence, limit, Some(pane_id), filter);
+                if timeout_ms == 0 || result.gap.is_some() || !result.events.is_empty() {
+                    self.reply_automation(target, serde_json::to_value(result).unwrap());
+                } else {
+                    self.add_automation_waiter(AutomationWaiter {
+                        reply: target,
+                        pane_id: Some(pane_id),
+                        deadline: deadline(timeout_ms),
+                        kind: AutomationWaitKind::MediaTrace {
+                            after_sequence,
+                            limit,
+                            filter,
+                        },
+                    });
+                }
             }
             AutomationMethod::Split { axis } => {
                 let pane_id = pane_id.unwrap();
@@ -1297,6 +1644,21 @@ impl SessionActor {
                     kind: AutomationWaitKind::Exit,
                 })
             }
+            AutomationMethod::WaitMedia {
+                after_virtual_revision,
+                after_outer_revision,
+                timeout_ms,
+            } => {
+                self.add_automation_waiter(AutomationWaiter {
+                    reply: target,
+                    pane_id,
+                    deadline: deadline(timeout_ms),
+                    kind: AutomationWaitKind::Media {
+                        after_virtual_revision,
+                        after_outer_revision,
+                    },
+                });
+            }
         }
     }
 
@@ -1449,6 +1811,13 @@ impl SessionActor {
             );
             return;
         }
+        if !self.register_pending_actor_work(&target) {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("limit_exceeded", "session pending-work quota is exhausted"),
+            );
+            return;
+        }
         let receiver = match self
             .panes
             .get(&pane_id)
@@ -1457,6 +1826,7 @@ impl SessionActor {
         {
             Ok(receiver) => receiver,
             Err(error) => {
+                self.complete_pending_actor_work(&target);
                 self.reply_automation_error(
                     target,
                     AutomationError::new("pty_closed", error.to_string()),
@@ -1485,11 +1855,30 @@ impl SessionActor {
                 });
             });
         if let Err(error) = spawn {
+            self.complete_pending_actor_work(&target);
             self.reply_automation_error(
                 target,
                 AutomationError::new("unsupported", error.to_string()),
             );
         }
+    }
+
+    /// Admit work that may block outside the single-writer session actor.
+    ///
+    /// The actor performs ordered validation and admission, records a bounded completion key, and
+    /// yields. A worker owns the blocking wait and can only return through a typed `ActorEvent`;
+    /// mutation and reply emission resume on the actor after this key is released.
+    fn register_pending_actor_work(&mut self, target: &AutomationReplyTarget) -> bool {
+        if self.pending_actor_work.len() >= MAX_PENDING_ACTOR_WORK {
+            return false;
+        }
+        self.pending_actor_work
+            .insert((target.client_id, target.request_id))
+    }
+
+    fn complete_pending_actor_work(&mut self, target: &AutomationReplyTarget) {
+        self.pending_actor_work
+            .remove(&(target.client_id, target.request_id));
     }
 
     fn pane_description(&self, pane_id: PaneId) -> Option<serde_json::Value> {
@@ -1793,10 +2182,22 @@ impl SessionActor {
         let waiters = std::mem::take(&mut self.automation_waiters);
         for waiter in waiters {
             if waiter.deadline <= now {
-                self.reply_automation_error(
-                    waiter.reply,
-                    AutomationError::new("timeout", "automation wait timed out"),
-                );
+                if let AutomationWaitKind::MediaTrace {
+                    after_sequence,
+                    limit,
+                    filter,
+                } = waiter.kind
+                {
+                    let result =
+                        self.media_trace
+                            .query(after_sequence, limit, waiter.pane_id, filter);
+                    self.reply_automation(waiter.reply, serde_json::to_value(result).unwrap());
+                } else {
+                    self.reply_automation_error(
+                        waiter.reply,
+                        AutomationError::new("timeout", "automation wait timed out"),
+                    );
+                }
                 continue;
             }
             match self.automation_waiter_result(&waiter, now) {
@@ -1813,6 +2214,40 @@ impl SessionActor {
         now: Instant,
     ) -> Option<Result<serde_json::Value, AutomationError>> {
         match &waiter.kind {
+            AutomationWaitKind::Media {
+                after_virtual_revision,
+                after_outer_revision,
+            } => {
+                let pane_id = waiter.pane_id?;
+                let status = self.vivid.pane_status(
+                    pane_id,
+                    self.outer_media_projection(),
+                    self.relay_metrics(),
+                );
+                let virtual_ready = after_virtual_revision
+                    .is_none_or(|revision| status.virtual_projection_revision > revision);
+                let outer_ready = after_outer_revision
+                    .is_none_or(|revision| status.outer_projection_revision > revision);
+                (virtual_ready && outer_ready).then(|| {
+                    serde_json::to_value(status).map_err(|error| {
+                        AutomationError::new("serialization_failed", error.to_string())
+                    })
+                })
+            }
+            AutomationWaitKind::MediaTrace {
+                after_sequence,
+                limit,
+                filter,
+            } => {
+                let result =
+                    self.media_trace
+                        .query(*after_sequence, *limit, waiter.pane_id, *filter);
+                (result.gap.is_some() || !result.events.is_empty()).then(|| {
+                    serde_json::to_value(result).map_err(|error| {
+                        AutomationError::new("serialization_failed", error.to_string())
+                    })
+                })
+            }
             AutomationWaitKind::Rendered { after_session } => {
                 let Some(client) = self.attached.as_ref() else {
                     return Some(Err(AutomationError::new(
@@ -2069,6 +2504,8 @@ impl SessionActor {
             return;
         }
         let mut translated = None;
+        let mut copy_view_render = false;
+        let mut media_view_changed = false;
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             let modes = pane.terminal.modes();
             let application_mouse = !mouse.shift
@@ -2092,6 +2529,8 @@ impl SessionActor {
                     mouse.y - content.y + 1
                 ));
             } else if mouse.kind == MouseKind::Wheel || mouse.shift {
+                copy_view_render = true;
+                let previous_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
                 let copy = pane.copy.get_or_insert(CopyState {
                     offset: 0,
                     row: 0,
@@ -2106,8 +2545,14 @@ impl SessionActor {
                         pane.copy = None;
                     }
                 }
-                self.schedule_render();
+                media_view_changed =
+                    previous_offset != pane.copy.as_ref().map_or(0, |copy| copy.offset);
             }
+        }
+        if media_view_changed {
+            self.projection_changed();
+        } else if copy_view_render {
+            self.schedule_render();
         }
         if let Some(translated) = translated {
             self.send_pane_input(pane_id, translated.as_bytes());
@@ -2776,11 +3221,7 @@ impl SessionActor {
 
     fn resize_all(&mut self) {
         let area = self.content_area();
-        let display = self
-            .attached
-            .as_ref()
-            .map(|client| client.display)
-            .unwrap_or_default();
+        let display = self.layout_display();
         let mut resize_failures = Vec::new();
         let mut resized_panes = 0_u64;
         for tab in &self.tabs {
@@ -2837,6 +3278,15 @@ impl SessionActor {
     }
 
     fn render(&mut self) {
+        // Frames the client has queued but not yet displayed. Producing more of them cannot make
+        // the terminal any more current, and the extra bytes compete with media on the same
+        // connection, so hold off and keep the render pending.
+        if let Some(client) = &self.attached
+            && self.frame_id.saturating_sub(client.acknowledged_frame) >= MAX_UNACKNOWLEDGED_FRAMES
+        {
+            self.pending_render = true;
+            return;
+        }
         self.pending_render = false;
         let Some(client) = &self.attached else {
             return;
@@ -2948,22 +3398,24 @@ impl SessionActor {
         if let Some(transition) = bracketed_paste_transition {
             prepend_bracketed_paste_transition(&mut bytes, transition);
         }
-        let chunks = bytes.chunks(256 * 1024).collect::<Vec<_>>();
-        let mut sent = true;
-        for (index, chunk) in chunks.iter().enumerate() {
-            let message = ServerMessage::Render {
-                frame_id: self.frame_id,
-                session_sequence: self.session_sequence,
-                full: self.force_full && index == 0,
-                last: index + 1 == chunks.len(),
-                bytes: chunk.to_vec(),
-            };
-            if crate::ipc::send(&client.writer, &message).is_err() {
-                sent = false;
-                break;
-            }
-        }
+        let sent = crate::ipc::send_render_record(
+            &client.writer,
+            self.frame_id,
+            self.session_sequence,
+            self.force_full,
+            &bytes,
+        )
+        .is_ok();
         if !sent {
+            // Dropping the client here is the only signal it gets, so say why. Previously a
+            // failed frame silently detached the session while the client kept running against a
+            // frozen outer scene, which is indistinguishable from a hang.
+            let _ = crate::ipc::send(
+                &client.writer,
+                &ServerMessage::Detached {
+                    reason: "frame delivery failed".into(),
+                },
+            );
             self.attached = None;
             self.last_screen = None;
             #[cfg(windows)]
@@ -3003,10 +3455,14 @@ impl SessionActor {
         live_delivery_source: Option<crate::media::SourceKey>,
     ) {
         let Some(client) = &self.attached else {
+            self.record_projection_sources(&HashSet::new(), self.vivid.revision());
+            self.traced_recovery_deliveries.clear();
             self.vivid.deactivate_bridge();
             return;
         };
         if !client.vivid {
+            self.record_projection_sources(&HashSet::new(), self.vivid.revision());
+            self.traced_recovery_deliveries.clear();
             self.vivid.deactivate_bridge();
             return;
         }
@@ -3022,7 +3478,18 @@ impl SessionActor {
         let panes = projections
             .iter()
             .map(|projection| projection.pane_id)
-            .collect();
+            .collect::<HashSet<_>>();
+        let viewport_offsets = panes
+            .iter()
+            .filter_map(|pane_id| {
+                let offset = self
+                    .panes
+                    .get(pane_id)
+                    .and_then(|pane| pane.copy.as_ref())
+                    .map_or(0, |copy| copy.offset);
+                (offset != 0).then_some((*pane_id, offset))
+            })
+            .collect::<HashMap<_, _>>();
         let projection_key = MediaProjectionKey {
             virtual_revision: self.vivid.revision(),
             layout_revision: self.layout_revision,
@@ -3032,7 +3499,9 @@ impl SessionActor {
         }
         // projection_snapshot marks active video sources as requiring a fresh keyframe. Only call
         // it after deciding that the client will actually rebuild its outer Vivid session.
-        let mut snapshot = self.vivid.projection_snapshot(&panes);
+        let mut snapshot = self
+            .vivid
+            .projection_snapshot_with_viewports(&panes, &viewport_offsets);
         let projection_key = MediaProjectionKey {
             virtual_revision: snapshot.revision,
             layout_revision: self.layout_revision,
@@ -3045,9 +3514,25 @@ impl SessionActor {
             .iter()
             .map(|source| BridgeSource {
                 key: bridge_key(source.key),
-                kind: bridge_source_kind(source.key, &source.descriptor),
+                kind: bridge_source_kind(
+                    source.key,
+                    &source.descriptor,
+                    source.raster_delta_operation_limit,
+                ),
+                capture_policy: source.capture_policy,
+                descriptor: source.semantic_descriptor.as_ref().map(|descriptor| {
+                    BridgeSourceDescriptor {
+                        role: descriptor.role,
+                        title: descriptor.title.clone(),
+                        content_revision: descriptor.content_revision,
+                        semantic_availability: descriptor.semantic_availability,
+                        locator: descriptor.locator.clone(),
+                    }
+                }),
                 playing: source.playing,
                 play_request: bridge_play_request(source.play_request),
+                eos_epoch: source.eos_epoch,
+                causation_id: source.causation_id,
             })
             .collect::<Vec<_>>();
         let pane_rank = pane_priority
@@ -3152,6 +3637,12 @@ impl SessionActor {
             .copied()
             .map(bridge_key)
             .collect();
+        let projected_source_keys = sources
+            .iter()
+            .map(|source| source.key)
+            .collect::<HashSet<_>>();
+        let source_count = u16::try_from(sources.len()).unwrap_or(u16::MAX);
+        let node_count = u16::try_from(nodes.len()).unwrap_or(u16::MAX);
         let projection_revision = self.media_projection_revision.wrapping_add(1);
         if crate::ipc::send(
             &writer,
@@ -3166,6 +3657,17 @@ impl SessionActor {
         {
             return;
         }
+        self.record_projection_sources(&projected_source_keys, projection_key.virtual_revision);
+        self.record_media_trace(
+            None,
+            self.bridge_instance_id,
+            None,
+            MediaTraceKind::ProjectionSubmitted {
+                virtual_revision: projection_key.virtual_revision,
+                source_count,
+                node_count,
+            },
+        );
         for source in snapshot.sources {
             if !should_replay_retained(source.key, live_delivery_source) {
                 // The MediaEvent that triggered this projection sync follows immediately. Do not
@@ -3196,11 +3698,123 @@ impl SessionActor {
         self.pending_render = true;
     }
 
-    fn content_area(&self) -> Rect {
-        let display = self
-            .attached
+    /// Session-scoped relay counters for the media diagnostic surfaces.
+    ///
+    /// `delivery` is filled in by the virtual presenter, which owns those counters.
+    fn relay_metrics(&self) -> crate::metrics::RelayMetrics {
+        crate::metrics::RelayMetrics {
+            ipc: self
+                .client_ipc
+                .as_ref()
+                .map(|counters| counters.snapshot())
+                .unwrap_or_default(),
+            delivery: crate::metrics::DeliveryMetrics::default(),
+            bridge: self.bridge_metrics,
+        }
+    }
+
+    fn outer_media_projection(&self) -> crate::media::OuterMediaProjection<'_> {
+        crate::media::OuterMediaProjection {
+            compatibility_revision: self.outer_projection_revision,
+            apply_sequence: self.outer_apply_sequence,
+            bridge_instance_id: self.bridge_instance_id,
+            bridge_local_revision: self.bridge_local_revision,
+            attachment_generations: &self.outer_attachment_generations,
+        }
+    }
+
+    fn record_media_trace(
+        &mut self,
+        source: Option<BridgeSourceKey>,
+        bridge_instance_id: Option<u64>,
+        origin_monotonic_us: Option<u64>,
+        kind: MediaTraceKind,
+    ) {
+        let pane =
+            source.and_then(|source| self.vivid.pane_for_source((source.producer, source.source)));
+        self.media_trace
+            .push(pane, source, bridge_instance_id, origin_monotonic_us, kind);
+    }
+
+    fn record_delivery_result(&mut self, delivery_id: u64, delivered: bool) {
+        if let Some((source, bridge_instance_id, epoch, pts_us)) =
+            self.traced_recovery_deliveries.remove(&delivery_id)
+        {
+            self.record_media_trace(
+                Some(source),
+                bridge_instance_id,
+                None,
+                MediaTraceKind::KeyframeDelivery {
+                    delivery_id,
+                    delivered,
+                    epoch,
+                    pts_us,
+                },
+            );
+        } else if !delivered {
+            self.record_media_trace(
+                None,
+                self.bridge_instance_id,
+                None,
+                MediaTraceKind::DeliveryFailed { delivery_id },
+            );
+        }
+    }
+
+    fn record_projection_sources(
+        &mut self,
+        current: &HashSet<BridgeSourceKey>,
+        virtual_revision: u64,
+    ) {
+        let hidden = self
+            .traced_projected_sources
+            .difference(current)
+            .copied()
+            .collect::<Vec<_>>();
+        let visible = current
+            .difference(&self.traced_projected_sources)
+            .copied()
+            .collect::<Vec<_>>();
+        for source in hidden {
+            self.record_media_trace(
+                Some(source),
+                self.bridge_instance_id,
+                None,
+                MediaTraceKind::SourceVisibility {
+                    visible: false,
+                    virtual_revision,
+                },
+            );
+        }
+        for source in visible {
+            self.record_media_trace(
+                Some(source),
+                self.bridge_instance_id,
+                None,
+                MediaTraceKind::SourceVisibility {
+                    visible: true,
+                    virtual_revision,
+                },
+            );
+        }
+        self.traced_projected_sources = current.clone();
+    }
+
+    /// Host metrics that back layout and the pane geometry published to producers.
+    ///
+    /// A detached session keeps the last attached host's metrics. `DisplayMetrics::default()` has a
+    /// zero cell size, and a relayout while detached (a pane exiting, an automation split) would
+    /// otherwise publish a zero-viewport `DISPLAY_CHANGED` — geometry no producer can honor — and
+    /// then publish real metrics again on reattach, resizing every live source twice for a host
+    /// that never changed.
+    fn layout_display(&self) -> DisplayMetrics {
+        self.attached
             .as_ref()
-            .map_or(self.last_display, |client| client.display);
+            .map_or(self.last_display, |client| client.display)
+    }
+
+    fn content_area(&self) -> Rect {
+        let display = self.layout_display();
         Rect {
             x: 0,
             y: 0,
@@ -3300,10 +3914,16 @@ impl SessionActor {
             _ => {}
         }
         let changed = previous != pane.copy;
+        let media_view_changed = previous.as_ref().map_or(0, |copy| copy.offset)
+            != pane.copy.as_ref().map_or(0, |copy| copy.offset);
         if changed {
             self.mark_pane_screen_change(pane_id, None);
         }
-        self.schedule_render();
+        if media_view_changed {
+            self.projection_changed();
+        } else {
+            self.schedule_render();
+        }
     }
 
     fn paste(&mut self) {
@@ -3437,6 +4057,22 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
         AutomationMethod::WaitText { text, regex, .. } if *regex && text.len() > 8 * 1024 => Err(
             AutomationError::new("limit_exceeded", "regular expression exceeds 8 KiB"),
         ),
+        AutomationMethod::TraceMedia { limit, .. }
+            if !(1..=crate::media_trace::MAX_MEDIA_TRACE_QUERY_EVENTS).contains(limit) =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "media trace limit must be from 1 through 512",
+            ))
+        }
+        AutomationMethod::TraceMedia { filter, .. }
+            if filter.source_id.is_some() && filter.producer_id.is_none() =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "media trace source-id requires producer-id",
+            ))
+        }
         AutomationMethod::WaitScreenStable { quiet_ms, .. }
             if !(1..=24 * 60 * 60 * 1000).contains(quiet_ms) =>
         {
@@ -3451,7 +4087,11 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 | AutomationMethod::WaitScreenChange { timeout_ms, .. }
                 | AutomationMethod::WaitScreenStable { timeout_ms, .. }
                 | AutomationMethod::WaitRendered { timeout_ms, .. }
-                | AutomationMethod::WaitExit { timeout_ms } => Some(*timeout_ms),
+                | AutomationMethod::WaitExit { timeout_ms }
+                | AutomationMethod::WaitMedia { timeout_ms, .. } => Some(*timeout_ms),
+                AutomationMethod::TraceMedia { timeout_ms, .. } if *timeout_ms != 0 => {
+                    Some(*timeout_ms)
+                }
                 _ => None,
             };
             if timeout.is_some_and(|timeout| !(1..=24 * 60 * 60 * 1000).contains(&timeout)) {
@@ -3471,9 +4111,10 @@ fn automation_capabilities() -> serde_json::Value {
         "protocol": "VVMX",
         "protocol_version": crate::ipc::VERSION,
         "methods": [
-            "capabilities", "list_panes", "inspect", "split", "focus", "close_pane",
+            "capabilities", "list_panes", "inspect", "inspect_media", "split", "focus", "close_pane",
             "typing", "key", "paste", "get_text", "get_grid", "wait_text",
-            "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit"
+            "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
+            "trace_media"
         ],
         "limits": automation_limits(),
         "render_acknowledgment": "attached_client_write",
@@ -3487,6 +4128,9 @@ fn automation_limits() -> serde_json::Value {
         "rows": 1000,
         "key_repeats": 1000,
         "regex_bytes": 8 * 1024,
+        "media_trace_events": crate::media_trace::MAX_MEDIA_TRACE_EVENTS,
+        "media_trace_bytes": crate::media_trace::MAX_MEDIA_TRACE_BYTES,
+        "media_trace_query_events": crate::media_trace::MAX_MEDIA_TRACE_QUERY_EVENTS,
         "timeout_ms": { "minimum": 1, "maximum": 24 * 60 * 60 * 1000_u64 },
         "pty_write_timeout_ms": 5000,
     })
@@ -3895,6 +4539,7 @@ fn bridge_key(key: crate::media::SourceKey) -> BridgeSourceKey {
 fn bridge_source_kind(
     key: crate::media::SourceKey,
     descriptor: &crate::media::SourceDescriptor,
+    raster_delta_operation_limit: Option<u32>,
 ) -> BridgeSourceKind {
     match descriptor {
         crate::media::SourceDescriptor::Raster(config) => BridgeSourceKind::Raster {
@@ -3902,6 +4547,7 @@ fn bridge_source_kind(
             height: config.height,
             alpha_mode: config.alpha_mode,
             compression_mode: config.compression_mode,
+            delta_operation_limit: raster_delta_operation_limit,
         },
         crate::media::SourceDescriptor::Image(config) => BridgeSourceKind::Image {
             encoding: config.encoding,
@@ -4073,27 +4719,7 @@ fn send_media_body(
     record_type: u16,
     body: &[u8],
 ) -> bool {
-    const CHUNK: usize = 128 * 1024;
-    for (index, bytes) in body.chunks(CHUNK).enumerate() {
-        let offset = index * CHUNK;
-        if crate::ipc::send(
-            writer,
-            &ServerMessage::MediaRecord {
-                delivery_id,
-                source,
-                record_type,
-                offset: offset as u32,
-                total: body.len() as u32,
-                last: offset + bytes.len() == body.len(),
-                bytes: bytes.to_vec(),
-            },
-        )
-        .is_err()
-        {
-            return false;
-        }
-    }
-    true
+    crate::ipc::send_media_record(writer, delivery_id, source, record_type, body).is_ok()
 }
 
 fn normalized_display(display: DisplayMetrics, status_visible: bool) -> DisplayMetrics {
@@ -4231,6 +4857,17 @@ mod tests {
     #[test]
     fn bracketed_paste_cannot_inject_terminator() {
         assert_eq!(sanitize_bracketed_paste(b"a\x1b[201~b"), b"a\x1b[201;~b");
+    }
+
+    #[test]
+    fn a_new_bridge_instance_accepts_a_lower_local_revision_without_regressing_wait_sequence() {
+        assert!(bridge_apply_is_current(Some(11), 40, 73, 12, 40, 1));
+        assert!(
+            !bridge_apply_is_current(Some(11), 40, 73, 11, 40, 72),
+            "the current bridge must still reject its own stale local acknowledgement"
+        );
+        assert_eq!(next_outer_compatibility_revision(73, 1), 74);
+        assert_eq!(next_outer_compatibility_revision(4, 9), 9);
     }
 
     #[cfg(windows)]
@@ -4698,6 +5335,15 @@ mod tests {
             layout_revision: 1,
             last_media_projection: None,
             media_projection_revision: 0,
+            outer_virtual_revision: 0,
+            bridge_instance_id: None,
+            bridge_local_revision: 0,
+            outer_projection_revision: 0,
+            outer_apply_sequence: 0,
+            outer_attachment_generations: HashMap::new(),
+            traced_projected_sources: HashSet::new(),
+            traced_recovery_deliveries: HashMap::new(),
+            media_trace: MediaTraceJournal::default(),
             fragment_assignments: HashMap::new(),
             last_projection_warning: None,
             pointer_drag: None,
@@ -4706,10 +5352,13 @@ mod tests {
             session_sequence: 1,
             response_sender,
             automation_inflight: HashMap::new(),
+            pending_actor_work: HashSet::new(),
             automation_waiters: Vec::new(),
             exit_tombstones: VecDeque::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             vivid,
+            bridge_metrics: crate::metrics::BridgeMetrics::default(),
+            client_ipc: None,
             attached: Some(AttachedClient {
                 id: 1,
                 writer: client_writer,
@@ -4797,7 +5446,7 @@ mod tests {
 
         actor.sync_media(true);
         assert!(matches!(
-            client_reader.recv::<ServerMessage>().unwrap(),
+            client_reader.recv_server().unwrap(),
             ServerMessage::MediaSnapshot { .. }
         ));
 
@@ -4824,12 +5473,8 @@ mod tests {
         audio_media
             .write_record(messages::AUDIO_PACKET, 0, 10, &audio_packet)
             .unwrap();
-        actor
-            .handle_event(ActorEvent::Media(
-                media_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ))
-            .unwrap();
-        let delivery_id = match client_reader.recv::<ServerMessage>().unwrap() {
+        actor.forward_media(media_receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+        let delivery_id = match client_reader.recv_server().unwrap() {
             ServerMessage::MediaRecord {
                 delivery_id,
                 record_type: messages::AUDIO_PACKET,
@@ -4868,13 +5513,9 @@ mod tests {
         video_media
             .write_record(messages::VIDEO_PACKET, 0, 9, &video_packet)
             .unwrap();
-        actor
-            .handle_event(ActorEvent::Media(
-                media_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ))
-            .unwrap();
+        actor.forward_media(media_receiver.recv_timeout(Duration::from_secs(1)).unwrap());
 
-        match client_reader.recv::<ServerMessage>().unwrap() {
+        match client_reader.recv_server().unwrap() {
             ServerMessage::MediaSnapshot { sources, .. } => {
                 assert!(
                     sources
@@ -4884,7 +5525,7 @@ mod tests {
             }
             other => panic!("PLAY snapshot must precede post-PLAY media, got {other:?}"),
         }
-        let video_delivery_id = match client_reader.recv::<ServerMessage>().unwrap() {
+        let video_delivery_id = match client_reader.recv_server().unwrap() {
             ServerMessage::MediaRecord {
                 delivery_id,
                 record_type: messages::VIDEO_PACKET,
@@ -4904,7 +5545,7 @@ mod tests {
         assert_eq!(returned_video_credit.object_id, 9);
         assert_eq!(control.read_record().unwrap().record_type, messages::OK);
         actor.sync_media(false);
-        match client_reader.recv::<ServerMessage>().unwrap() {
+        match client_reader.recv_server().unwrap() {
             ServerMessage::MediaSnapshot { sources, .. } => {
                 assert!(
                     sources
@@ -4975,6 +5616,36 @@ mod tests {
                 timeout_ms: 0,
             })
             .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::TraceMedia {
+                after_sequence: None,
+                limit: 0,
+                timeout_ms: 0,
+                filter: MediaTraceFilter::default(),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::TraceMedia {
+                after_sequence: None,
+                limit: 32,
+                timeout_ms: 0,
+                filter: MediaTraceFilter {
+                    source_id: Some(4),
+                    ..MediaTraceFilter::default()
+                },
+            })
+            .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::TraceMedia {
+                after_sequence: None,
+                limit: 32,
+                timeout_ms: 0,
+                filter: MediaTraceFilter::default(),
+            })
+            .is_ok()
         );
     }
 }

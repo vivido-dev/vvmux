@@ -2,7 +2,7 @@
 
 VVWS/1 is the public, renderer-neutral protocol for attaching a browser terminal to sessions owned
 by vvmux. It is distinct from the private, same-user VVMX IPC protocol. VVWS/1 carries terminal
-text and session control; its `vivid-bridge-v1` capability also brokers the existing Vivid 1.0 wire
+text and session control; its `vivid-bridge-v1` capability also brokers the existing Vivid 1.1 wire
 protocol over separate binary WebSockets. Vivid records are not translated into VVWS JSON.
 
 ## Transport and authentication
@@ -60,6 +60,28 @@ ordinary binary Vivid connection; the producer-side preface is the first bytes s
 
 VVWS/1 has no direct-network TLS mode. `vvmux serve` binds only an IPv4 or IPv6 loopback address;
 remote deployments use an SSH tunnel or a trusted TLS reverse proxy.
+
+### Private IPC compatibility
+
+VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 9,
+which is a hard cutover from every earlier VVMX version. VVMX 7 moved render and media byte
+payloads out of JSON into bounded binary records. VVMX 8 added transport-loss recovery without
+inventing a new producer epoch. VVMX 9 adds bridge-instance correlation and bounded,
+metadata-only media recovery traces.
+
+Pane media inspection reports separate `virtual_projection_revision`,
+`virtual_scene_revision`, `outer_projection_revision` (the monotonic compatibility sequence),
+`outer_apply_sequence`, `bridge_instance_id`, and `bridge_local_revision`. Per-source fields include
+kind/lifecycle, source revision, epoch, inner and outer attachment generations, outer-mapping
+freshness, visibility, capture policy, sanitized descriptor, retained-static/keyframe state,
+milestones, queued packets/bytes, and available packet/byte credit. Relay/bridge counters are
+diagnostic only. No inner revision, generation, sequence, raster base, or ticket is an outer
+identity.
+
+The binary forms carry terminal frame bytes and Vivid media bodies only. They never enter VVWS
+JSON control messages and never contain Vivid tokens, media tickets, hashes, or derived capability
+material. Gateway/session processes from different VVMX versions must reject one another and the
+older session must be restarted.
 
 ## Connection states and terminal data
 

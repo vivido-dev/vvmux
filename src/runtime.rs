@@ -151,6 +151,50 @@ impl RuntimePaths {
         }
     }
 
+    /// The identity a session server recorded, without validating schema or VVMX version.
+    ///
+    /// [`Self::read_registry`] rejects a registry whose `vvmx_version` or schema is foreign, which
+    /// is exactly the file a rebuilt binary finds after the previous server died. Diagnostics and
+    /// stale-instance recovery still need the identity it records. Never decide whether a session
+    /// is *usable* from this, because the fields have not been checked.
+    pub fn read_unvalidated_registry(&self) -> Option<SessionRegistry> {
+        let bytes = read_registry_bytes(&self.registry, false);
+        #[cfg(unix)]
+        let bytes = bytes.or_else(|_| read_registry_bytes(&self.legacy_registry, false));
+        serde_json::from_slice(&bytes.ok()?).ok()
+    }
+
+    /// The PID and VVMX version a session server recorded, without validating either.
+    pub fn foreign_registry_identity(&self) -> Option<(u32, Option<u16>)> {
+        let registry = self.read_unvalidated_registry()?;
+        Some((registry.pid, registry.vvmx_version))
+    }
+
+    /// Discard registry files this build cannot validate.
+    ///
+    /// Reserved for a session whose endpoint has already been proven unreachable: such a file
+    /// describes an instance nobody can attach to, and leaving it in place makes the session name
+    /// permanently unusable. Files this build *can* validate are left to
+    /// [`Self::remove_instance`], which only removes an exact instance match.
+    pub fn remove_unusable_registry(&self) {
+        #[cfg(windows)]
+        {
+            let _ = remove_windows_registry_if_unusable(&self.registry);
+        }
+        #[cfg(unix)]
+        {
+            for path in [&self.registry, &self.legacy_registry] {
+                match read_registry_file(path) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn remove_instance(&self, expected: &SessionRegistry) {
         #[cfg(windows)]
         {
@@ -331,6 +375,21 @@ fn remove_windows_registry_if_same(path: &Path, expected: &SessionRegistry) -> i
     let bytes = read_bounded_registry(&mut file, length)?;
     let actual = decode_registry(&bytes)?;
     if !same_instance(&actual, expected) {
+        return Ok(());
+    }
+    crate::platform::delete_open_windows_registry_file(&file)
+}
+
+/// Delete a registry file only when this build cannot make sense of its contents.
+///
+/// The same handle decides and deletes, so a registry that becomes readable between the two steps
+/// cannot be removed by mistake.
+#[cfg(windows)]
+fn remove_windows_registry_if_unusable(path: &Path) -> io::Result<()> {
+    let mut file = crate::platform::open_windows_registry_file(path, true)?;
+    let length = file.metadata()?.len();
+    let usable = read_bounded_registry(&mut file, length).and_then(|bytes| decode_registry(&bytes));
+    if usable.is_ok() {
         return Ok(());
     }
     crate::platform::delete_open_windows_registry_file(&file)

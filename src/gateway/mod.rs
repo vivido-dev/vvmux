@@ -8,7 +8,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::State;
@@ -17,7 +17,7 @@ use axum::http::header::{ORIGIN, SEC_WEBSOCKET_PROTOCOL};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
@@ -41,6 +41,20 @@ const TERMINAL_LEAVE: &[u8] =
     b"\x1b[0m\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l";
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an attached client may stay silent, once another client is waiting for its session.
+const CLIENT_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long to keep flushing an outbound queue after the connection loop has finished with it.
+const CLIENT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often an attached client is pinged while it owes us nothing else.
+///
+/// A browser answers at the protocol level, so silence for a full [`CLIENT_STALL_TIMEOUT`] means
+/// the peer has stopped reading its socket rather than merely having nothing to say.
+const CLIENT_PING_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a refused attachment keeps a session marked as wanted by someone else.
+const CONTENTION_WINDOW: Duration = Duration::from_secs(30);
+/// Cap on remembered contended sessions, so refused attachments cannot grow the map without bound.
+const MAX_CONTENDED_SESSIONS: usize = 64;
+const STALLED_CLIENT: &str = "terminal client is too slow";
 const CAPABILITIES: &[&str] = &[
     "terminal-v1",
     "session-list-v1",
@@ -63,6 +77,7 @@ struct GatewayState {
     allowed_origins: Arc<HashSet<String>>,
     connections: Arc<Semaphore>,
     vivid_sessions: Arc<Mutex<HashMap<String, Arc<vivid::VividBroker>>>>,
+    contended_sessions: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 struct VividRegistration {
@@ -129,6 +144,7 @@ pub(crate) fn run(
         auth_file,
         allowed_origins: Arc::new(allowed_origins),
         vivid_sessions: Arc::new(Mutex::new(HashMap::new())),
+        contended_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -249,13 +265,13 @@ async fn handle_connection(
     _permit: OwnedSemaphorePermit,
 ) {
     if authenticate_connection(&mut socket, &state).await.is_err() {
-        let _ = close(&mut socket, 1008, "authentication failed").await;
+        let _ = close_socket(&mut socket, 1008, "authentication failed").await;
         return;
     }
     let broker = match vivid::VividBroker::new() {
         Ok(broker) => broker,
         Err(_) => {
-            let _ = close(&mut socket, 1011, "could not initialize Vivid routing").await;
+            let _ = close_socket(&mut socket, 1011, "could not initialize Vivid routing").await;
             return;
         }
     };
@@ -270,7 +286,7 @@ async fn handle_connection(
         }
     });
     if !registered {
-        let _ = close(&mut socket, 1013, "Vivid route capacity reached").await;
+        let _ = close_socket(&mut socket, 1013, "Vivid route capacity reached").await;
         return;
     }
     let _vivid_registration = VividRegistration {
@@ -278,7 +294,7 @@ async fn handle_connection(
         broker: broker.clone(),
     };
     let vivid_token = broker.encoded_token();
-    if send_control(
+    if send_control_socket(
         &mut socket,
         &ServerControl::Hello {
             protocol: VERSION,
@@ -298,6 +314,21 @@ async fn handle_connection(
         return;
     }
 
+    // The queue is sized from the same budget as the session-side queue, so a client that stops
+    // reading is bounded by one configured amount rather than two independent ones.
+    let outbound_messages = (state.config.server.outbound_queue_bytes / 1024).clamp(8, 4096);
+    let (outbound, mut outbound_receiver) =
+        tokio::sync::mpsc::channel::<Message>(outbound_messages);
+    let writer = ClientWriter { outbound };
+    let (mut sink, mut stream) = socket.split();
+    let mut writer_task = tokio::spawn(async move {
+        while let Some(message) = outbound_receiver.recv().await {
+            if sink.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let prefix = crate::config::parse_control_chord(&state.config.general.prefix).unwrap_or(0x02);
     let mut input = PrefixParser::new(prefix, &state.config.keys.prefix);
     let mut float_scanner = FloatEditScanner::default();
@@ -306,23 +337,26 @@ async fn handle_connection(
     let mut bridge: Option<BridgeWorker> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_seen = Instant::now();
+    let mut last_ping = Instant::now();
 
     loop {
         let incoming = if let Some(adapter) = session.as_mut() {
             tokio::select! {
-                message = socket.next() => Incoming::Socket(message),
+                message = stream.next() => Incoming::Socket(message),
                 event = adapter.recv() => Incoming::Session(event),
                 _ = tick.tick() => Incoming::Tick,
             }
         } else {
-            let message = socket.next().await;
+            let message = stream.next().await;
             Incoming::Socket(message)
         };
 
         let result = match incoming {
             Incoming::Socket(Some(Ok(message))) => {
+                last_seen = Instant::now();
                 handle_socket_message(
-                    &mut socket,
+                    &writer,
                     message,
                     &state,
                     &broker,
@@ -338,7 +372,7 @@ async fn handle_connection(
             Incoming::Socket(None) => break,
             Incoming::Session(Some(event)) => {
                 handle_session_message(
-                    &mut socket,
+                    &writer,
                     event,
                     &mut session,
                     &mut bridge,
@@ -350,33 +384,63 @@ async fn handle_connection(
             }
             Incoming::Session(None) => {
                 let overloaded = session.as_ref().is_some_and(SessionAdapter::overloaded);
-                let _ = socket.send(Message::Binary(TERMINAL_LEAVE.into())).await;
+                let _ = writer.send(Message::Binary(TERMINAL_LEAVE.into()));
                 if overloaded {
-                    let _ = close(&mut socket, 1013, "terminal client is too slow").await;
+                    let _ = close(&writer, 1013, STALLED_CLIENT);
                     break;
                 }
                 session = None;
-                bridge = None;
+                release_bridge(&mut bridge);
                 send_control(
-                    &mut socket,
+                    &writer,
                     &ServerControl::Detached {
                         reason: "session connection closed".into(),
                     },
                 )
-                .await
             }
-            Incoming::Tick => expire_float_mode(&session, &mut float_scanner, &mut float_mode),
+            Incoming::Tick => {
+                match expire_float_mode(&session, &mut float_scanner, &mut float_mode) {
+                    Ok(()) => check_client_liveness(
+                        &writer,
+                        &state,
+                        session.as_ref().map(SessionAdapter::name),
+                        &mut last_seen,
+                        &mut last_ping,
+                    ),
+                    error => error,
+                }
+            }
         };
-        if result.is_err() {
+        if let Err(error) = result {
+            if is_stalled_client(&error) {
+                // Release the session before the close handshake. The socket we would negotiate
+                // the close on is the one that stalled, and a client waiting to take this session
+                // over must not be held behind another write to it.
+                if let Some(adapter) = session.take() {
+                    let _ = adapter.send(ClientMessage::Detach);
+                    adapter.cancel();
+                }
+                let _ = close(&writer, 1013, STALLED_CLIENT);
+            }
             break;
         }
     }
     if session.is_some() {
-        let _ = socket.send(Message::Binary(TERMINAL_LEAVE.into())).await;
+        let _ = writer.send(Message::Binary(TERMINAL_LEAVE.into()));
     }
     if let Some(adapter) = session.take() {
         let _ = adapter.send(ClientMessage::Detach);
         adapter.cancel();
+    }
+    release_bridge(&mut bridge);
+    // Let the queued frames, including any close, reach a peer that is still reading, but never
+    // wait on one that is not.
+    drop(writer);
+    if tokio::time::timeout(CLIENT_FLUSH_TIMEOUT, &mut writer_task)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
     }
 }
 
@@ -422,7 +486,7 @@ async fn authenticate_connection(socket: &mut WebSocket, state: &GatewayState) -
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket_message(
-    socket: &mut WebSocket,
+    writer: &ClientWriter,
     message: Message,
     state: &GatewayState,
     broker: &Arc<vivid::VividBroker>,
@@ -437,49 +501,45 @@ async fn handle_socket_message(
             let control = match decode_control(&text) {
                 Ok(control) => control,
                 Err(error) => {
-                    send_error(socket, None, "invalid_request", error.to_string()).await?;
+                    send_error(writer, None, "invalid_request", error.to_string())?;
                     return Ok(());
                 }
             };
             match control {
                 ClientControl::Hello { .. } => {
                     send_error(
-                        socket,
+                        writer,
                         None,
                         "invalid_state",
                         "hello is valid only as the first message".into(),
-                    )
-                    .await?;
+                    )?;
                 }
                 ClientControl::ListSessions { request_id } => {
                     if session.is_some() {
                         send_error(
-                            socket,
+                            writer,
                             Some(request_id),
                             "invalid_state",
                             "detach before listing sessions".into(),
-                        )
-                        .await?;
+                        )?;
                     } else {
                         match tokio::task::spawn_blocking(list_live_sessions).await {
                             Ok(Ok(sessions)) => {
                                 send_control(
-                                    socket,
+                                    writer,
                                     &ServerControl::Sessions {
                                         request_id,
                                         sessions,
                                     },
-                                )
-                                .await?;
+                                )?;
                             }
                             Ok(Err(error)) => {
                                 send_error(
-                                    socket,
+                                    writer,
                                     Some(request_id),
                                     "session_unavailable",
                                     error.to_string(),
-                                )
-                                .await?;
+                                )?;
                             }
                             Err(error) => return Err(io::Error::other(error)),
                         }
@@ -488,20 +548,18 @@ async fn handle_socket_message(
                 ClientControl::CreateSession { request_id, name } => {
                     if session.is_some() {
                         send_error(
-                            socket,
+                            writer,
                             Some(request_id),
                             "invalid_state",
                             "detach before creating a session".into(),
-                        )
-                        .await?;
+                        )?;
                     } else if let Err(error) = crate::runtime::validate_session_name(&name) {
                         send_error(
-                            socket,
+                            writer,
                             Some(request_id),
                             "invalid_session",
                             error.to_string(),
-                        )
-                        .await?;
+                        )?;
                     } else {
                         let created_name = name.clone();
                         let config_path = state.config_path.clone();
@@ -511,8 +569,7 @@ async fn handle_socket_message(
                         .await
                         {
                             Ok(Ok(())) => {
-                                send_control(socket, &ServerControl::Created { request_id, name })
-                                    .await?;
+                                send_control(writer, &ServerControl::Created { request_id, name })?;
                             }
                             Ok(Err(error)) => {
                                 let code = if error.kind() == io::ErrorKind::AlreadyExists {
@@ -520,8 +577,7 @@ async fn handle_socket_message(
                                 } else {
                                     "session_unavailable"
                                 };
-                                send_error(socket, Some(request_id), code, error.to_string())
-                                    .await?;
+                                send_error(writer, Some(request_id), code, error.to_string())?;
                             }
                             Err(error) => return Err(io::Error::other(error)),
                         }
@@ -536,34 +592,32 @@ async fn handle_socket_message(
                 } => {
                     if session.is_some() {
                         send_error(
-                            socket,
+                            writer,
                             Some(request_id),
                             "invalid_state",
                             "a session is already attached".into(),
-                        )
-                        .await?;
+                        )?;
                     } else if let Err(error) = crate::runtime::validate_session_name(&name) {
                         send_error(
-                            socket,
+                            writer,
                             Some(request_id),
                             "invalid_session",
                             error.to_string(),
-                        )
-                        .await?;
+                        )?;
                     } else {
                         let display = match display.validate() {
                             Ok(display) => display,
                             Err(error) => {
                                 send_error(
-                                    socket,
+                                    writer,
                                     Some(request_id),
                                     "invalid_display",
                                     error.to_string(),
-                                )
-                                .await?;
+                                )?;
                                 return Ok(());
                             }
                         };
+                        let requested = name.clone();
                         match SessionAdapter::connect(
                             name,
                             takeover,
@@ -591,12 +645,11 @@ async fn handle_socket_message(
                                         Ok(Err(error)) => {
                                             adapter.cancel();
                                             send_error(
-                                                socket,
+                                                writer,
                                                 Some(request_id),
                                                 "vivid_unavailable",
                                                 error.to_string(),
-                                            )
-                                            .await?;
+                                            )?;
                                             return Ok(());
                                         }
                                         Err(error) => {
@@ -620,29 +673,27 @@ async fn handle_socket_message(
                                         Err(error) => {
                                             adapter.cancel();
                                             send_error(
-                                                socket,
+                                                writer,
                                                 Some(request_id),
                                                 "vivid_unavailable",
                                                 error.to_string(),
-                                            )
-                                            .await?;
+                                            )?;
                                             return Ok(());
                                         }
                                     }
                                 }
+                                // This client now holds the session, so any earlier refusal has
+                                // been resolved and must not count against it.
+                                clear_contention(&state.contended_sessions, adapter.name());
                                 send_control(
-                                    socket,
+                                    writer,
                                     &ServerControl::Attached {
                                         request_id,
                                         name: attached_name,
                                         text_only,
                                     },
-                                )
-                                .await?;
-                                socket
-                                    .send(Message::Binary(TERMINAL_ENTER.into()))
-                                    .await
-                                    .map_err(io::Error::other)?;
+                                )?;
+                                writer.send(Message::Binary(TERMINAL_ENTER.into()))?;
                                 *input = PrefixParser::new(
                                     crate::config::parse_control_chord(
                                         &state.config.general.prefix,
@@ -656,6 +707,10 @@ async fn handle_socket_message(
                             }
                             Err(error) => {
                                 let code = if error.to_string().contains("attached client") {
+                                    // Let the holder know it is wanted: if it has also stopped
+                                    // answering, it gives the session up rather than keeping it
+                                    // out of reach.
+                                    record_contention(&state.contended_sessions, &requested);
                                     "session_occupied"
                                 } else if matches!(
                                     error.kind(),
@@ -665,8 +720,7 @@ async fn handle_socket_message(
                                 } else {
                                     "session_unavailable"
                                 };
-                                send_error(socket, Some(request_id), code, error.to_string())
-                                    .await?;
+                                send_error(writer, Some(request_id), code, error.to_string())?;
                             }
                         }
                     }
@@ -675,46 +729,43 @@ async fn handle_socket_message(
                     Some(adapter) => match display.validate() {
                         Ok(display) => adapter.send(ClientMessage::Resize(display))?,
                         Err(error) => {
-                            send_error(socket, None, "invalid_display", error.to_string()).await?;
+                            send_error(writer, None, "invalid_display", error.to_string())?;
                         }
                     },
                     None => {
                         send_error(
-                            socket,
+                            writer,
                             None,
                             "invalid_state",
                             "no session is attached".into(),
-                        )
-                        .await?;
+                        )?;
                     }
                 },
                 ClientControl::Action { action } => match session.as_ref() {
                     Some(adapter) => match action.into_ipc() {
                         Ok(action) => adapter.send(ClientMessage::Action(action))?,
                         Err(error) => {
-                            send_error(socket, None, "invalid_action", error.to_string()).await?;
+                            send_error(writer, None, "invalid_action", error.to_string())?;
                         }
                     },
                     None => {
                         send_error(
-                            socket,
+                            writer,
                             None,
                             "invalid_state",
                             "no session is attached".into(),
-                        )
-                        .await?;
+                        )?;
                     }
                 },
                 ClientControl::Detach => match session.as_ref() {
                     Some(adapter) => adapter.send(ClientMessage::Detach)?,
                     None => {
                         send_error(
-                            socket,
+                            writer,
                             None,
                             "invalid_state",
                             "no session is attached".into(),
-                        )
-                        .await?;
+                        )?;
                     }
                 },
             }
@@ -722,29 +773,24 @@ async fn handle_socket_message(
         Message::Binary(bytes) => {
             if bytes.len() > MAX_INPUT_BYTES {
                 send_error(
-                    socket,
+                    writer,
                     None,
                     "input_too_large",
                     "terminal input exceeds 64 KiB".into(),
-                )
-                .await?;
+                )?;
             } else if let Some(adapter) = session.as_ref() {
                 dispatch_input(adapter, input, float_scanner, float_mode, &bytes)?;
             } else {
                 send_error(
-                    socket,
+                    writer,
                     None,
                     "invalid_state",
                     "no session is attached".into(),
-                )
-                .await?;
+                )?;
             }
         }
         Message::Ping(bytes) => {
-            socket
-                .send(Message::Pong(bytes))
-                .await
-                .map_err(io::Error::other)?;
+            writer.send(Message::Pong(bytes))?;
         }
         Message::Pong(_) => {}
         Message::Close(_) => return Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
@@ -753,7 +799,7 @@ async fn handle_socket_message(
 }
 
 async fn handle_session_message(
-    socket: &mut WebSocket,
+    writer: &ClientWriter,
     mut event: QueuedServerMessage,
     session: &mut Option<SessionAdapter>,
     bridge: &mut Option<BridgeWorker>,
@@ -769,16 +815,10 @@ async fn handle_session_message(
             ..
         } => {
             if bytes.is_empty() {
-                socket
-                    .send(Message::Binary(bytes.into()))
-                    .await
-                    .map_err(io::Error::other)?;
+                writer.send(Message::Binary(bytes.into()))?;
             } else {
                 for chunk in bytes.chunks(MAX_FRAME_BYTES) {
-                    socket
-                        .send(Message::Binary(chunk.to_vec().into()))
-                        .await
-                        .map_err(io::Error::other)?;
+                    writer.send(Message::Binary(chunk.to_vec().into()))?;
                 }
             }
             if last && let Some(adapter) = session.as_ref() {
@@ -786,14 +826,14 @@ async fn handle_session_message(
             }
         }
         ServerMessage::Title(title) => {
-            send_control(socket, &ServerControl::Title { title }).await?;
+            send_control(writer, &ServerControl::Title { title })?;
         }
-        ServerMessage::Bell => send_control(socket, &ServerControl::Bell).await?,
+        ServerMessage::Bell => send_control(writer, &ServerControl::Bell)?,
         ServerMessage::Clipboard(text) => {
-            send_control(socket, &ServerControl::Clipboard { text }).await?;
+            send_control(writer, &ServerControl::Clipboard { text })?;
         }
         ServerMessage::Status(message) => {
-            send_control(socket, &ServerControl::Status { message }).await?;
+            send_control(writer, &ServerControl::Status { message })?;
         }
         ServerMessage::FloatingEditMode {
             mode_id,
@@ -819,42 +859,35 @@ async fn handle_session_message(
                 None => None,
             };
             send_control(
-                socket,
+                writer,
                 &ServerControl::FloatingEditState {
                     mode_id,
                     active,
                     pane,
                     kind,
                 },
-            )
-            .await?;
+            )?;
         }
         ServerMessage::Detached { reason } => {
-            socket
-                .send(Message::Binary(TERMINAL_LEAVE.into()))
-                .await
-                .map_err(io::Error::other)?;
-            send_control(socket, &ServerControl::Detached { reason }).await?;
+            writer.send(Message::Binary(TERMINAL_LEAVE.into()))?;
+            send_control(writer, &ServerControl::Detached { reason })?;
             *session = None;
-            *bridge = None;
+            release_bridge(bridge);
             *float_mode = None;
             *float_scanner = FloatEditScanner::default();
         }
         ServerMessage::Error(message) => {
-            socket
-                .send(Message::Binary(TERMINAL_LEAVE.into()))
-                .await
-                .map_err(io::Error::other)?;
-            send_error(socket, None, "session_error", message).await?;
+            writer.send(Message::Binary(TERMINAL_LEAVE.into()))?;
+            send_error(writer, None, "session_error", message)?;
             *session = None;
-            *bridge = None;
+            release_bridge(bridge);
         }
         ServerMessage::Pong => {}
         ServerMessage::MediaSnapshot {
+            revision,
             sources,
             nodes,
             videos_needing_keyframes,
-            ..
         } => {
             let Some(bridge) = bridge.as_mut() else {
                 return Err(io::Error::new(
@@ -864,6 +897,7 @@ async fn handle_session_message(
             };
             bridge.replace_snapshot(BridgeSnapshot {
                 generation: 0,
+                virtual_revision: revision,
                 sources,
                 nodes,
                 videos_needing_keyframes,
@@ -979,39 +1013,166 @@ fn list_live_sessions() -> io::Result<Vec<SessionInfo>> {
         .collect())
 }
 
-async fn send_control(socket: &mut WebSocket, message: &ServerControl<'_>) -> io::Result<()> {
-    let encoded = encode_control(message)?;
-    socket
-        .send(Message::Text(encoded.into()))
-        .await
-        .map_err(io::Error::other)
+/// The write half of a client connection, owned by a task of its own.
+///
+/// Writes must not be able to park the connection loop. A client that stops reading its writer
+/// backs the write up, and a loop parked in `send` also stops reading, so the client's own input
+/// is what gets held: the interrupt that would end the flood cannot reach the pane producing it.
+/// Queueing here keeps the loop free to read no matter how far behind the peer falls, and a queue
+/// that fills anyway is the delivery failure that ends the connection.
+struct ClientWriter {
+    outbound: tokio::sync::mpsc::Sender<Message>,
 }
 
-async fn send_error(
+impl ClientWriter {
+    fn send(&self, message: Message) -> io::Result<()> {
+        self.outbound
+            .try_send(message)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    io::Error::new(io::ErrorKind::TimedOut, STALLED_CLIENT)
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "client connection closed")
+                }
+            })
+    }
+}
+
+async fn send_socket(socket: &mut WebSocket, message: Message) -> io::Result<()> {
+    socket.send(message).await.map_err(io::Error::other)
+}
+
+/// Send a control frame before the write half has been handed to its own task.
+async fn send_control_socket(
     socket: &mut WebSocket,
+    message: &ServerControl<'_>,
+) -> io::Result<()> {
+    let encoded = encode_control(message)?;
+    send_socket(socket, Message::Text(encoded.into())).await
+}
+
+async fn close_socket(socket: &mut WebSocket, code: u16, reason: &'static str) -> io::Result<()> {
+    send_socket(
+        socket,
+        Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })),
+    )
+    .await
+}
+
+/// Give up a bridge worker without blocking the runtime.
+///
+/// `BridgeWorker`'s teardown joins its worker thread so the outer Vivid session closes cleanly,
+/// and that join can take seconds. On a runtime thread it stalls this connection's timers and
+/// queued writes, which is exactly when the client is waiting to be told it was detached, so the
+/// join belongs on a blocking thread instead.
+fn release_bridge(bridge: &mut Option<BridgeWorker>) {
+    if let Some(worker) = bridge.take() {
+        tokio::task::spawn_blocking(move || drop(worker));
+    }
+}
+
+/// Remember that a client was refused because someone else holds this session.
+///
+/// Repeated refusals keep the original instant. The holder is judged on how long it has been
+/// unreachable *since someone started waiting*, so a client that retries in a tight loop must not
+/// be able to keep pushing that deadline out of reach.
+fn record_contention(sessions: &Mutex<HashMap<String, Instant>>, name: &str) {
+    let Ok(mut contended) = sessions.lock() else {
+        return;
+    };
+    contended.retain(|_, since: &mut Instant| since.elapsed() < CONTENTION_WINDOW);
+    if contended.len() >= MAX_CONTENDED_SESSIONS && !contended.contains_key(name) {
+        return;
+    }
+    contended
+        .entry(name.to_owned())
+        .or_insert_with(Instant::now);
+}
+
+/// Forget a session's contention once a client has successfully taken it.
+fn clear_contention(sessions: &Mutex<HashMap<String, Instant>>, name: &str) {
+    if let Ok(mut contended) = sessions.lock() {
+        contended.remove(name);
+    }
+}
+
+/// When another client first went away empty-handed, if it is still plausibly waiting.
+fn contended_since(sessions: &Mutex<HashMap<String, Instant>>, name: &str) -> Option<Instant> {
+    sessions
+        .lock()
+        .ok()
+        .and_then(|contended| contended.get(name).copied())
+        .filter(|since| since.elapsed() < CONTENTION_WINDOW)
+}
+
+/// Ping an attached client that has gone quiet, and give its session up once it stops answering
+/// while another client is waiting for that session.
+///
+/// Silence is the only evidence available. A client that stops reading its socket is otherwise
+/// invisible here: terminal frames are small and rendering is gated on acknowledgement, so neither
+/// the outbound queue nor the socket buffer comes near the limits that would surface the peer as
+/// slow. Silence alone is not enough to disconnect on, though — a healthy client that simply has
+/// nothing to say looks identical — so the attachment is only taken away when a refused client is
+/// actually waiting for it. An idle client nobody is waiting for keeps its session.
+///
+/// The wait is timed from when contention began, not from the holder's last word, so a client that
+/// has merely been quiet for a while still gets a full interval of pings to answer before it loses
+/// the session.
+fn check_client_liveness(
+    writer: &ClientWriter,
+    state: &GatewayState,
+    session: Option<&str>,
+    last_seen: &mut Instant,
+    last_ping: &mut Instant,
+) -> io::Result<()> {
+    if last_seen.elapsed() >= CLIENT_STALL_TIMEOUT
+        && session
+            .and_then(|name| contended_since(&state.contended_sessions, name))
+            .is_some_and(|since| since.elapsed() >= CLIENT_STALL_TIMEOUT)
+    {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, STALLED_CLIENT));
+    }
+    if last_ping.elapsed() < CLIENT_PING_INTERVAL {
+        return Ok(());
+    }
+    *last_ping = Instant::now();
+    writer.send(Message::Ping(Vec::new().into()))
+}
+
+fn is_stalled_client(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::TimedOut && error.to_string() == STALLED_CLIENT
+}
+
+fn send_control(writer: &ClientWriter, message: &ServerControl<'_>) -> io::Result<()> {
+    let encoded = encode_control(message)?;
+    writer.send(Message::Text(encoded.into()))
+}
+
+fn send_error(
+    writer: &ClientWriter,
     request_id: Option<u64>,
     code: &'static str,
     message: String,
 ) -> io::Result<()> {
     send_control(
-        socket,
+        writer,
         &ServerControl::Error {
             request_id,
             code,
             message,
         },
     )
-    .await
 }
 
-async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) -> io::Result<()> {
-    socket
-        .send(Message::Close(Some(CloseFrame {
-            code,
-            reason: reason.into(),
-        })))
-        .await
-        .map_err(io::Error::other)
+fn close(writer: &ClientWriter, code: u16, reason: &'static str) -> io::Result<()> {
+    writer.send(Message::Close(Some(CloseFrame {
+        code,
+        reason: reason.into(),
+    })))
 }
 
 fn offered_subprotocol(headers: &HeaderMap) -> bool {
@@ -1069,6 +1230,95 @@ fn validate_origins(origins: Vec<String>) -> io::Result<HashSet<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contention_is_timed_from_the_first_refusal_and_ends_when_the_session_is_taken() {
+        let sessions = Mutex::new(HashMap::new());
+        assert_eq!(contended_since(&sessions, "work"), None);
+
+        record_contention(&sessions, "work");
+        let first = contended_since(&sessions, "work").expect("a refused client is waiting");
+
+        // A client that retries in a tight loop must not push the holder's deadline out of reach:
+        // every later refusal keeps the instant the waiting started.
+        record_contention(&sessions, "work");
+        record_contention(&sessions, "work");
+        assert_eq!(contended_since(&sessions, "work"), Some(first));
+
+        // Taking the session over resolves the contention, so the new holder is not judged against
+        // the refusal it just won.
+        clear_contention(&sessions, "work");
+        assert_eq!(contended_since(&sessions, "work"), None);
+    }
+
+    #[test]
+    fn contention_expires_and_stays_bounded() {
+        let sessions = Mutex::new(HashMap::new());
+        {
+            let mut guard = sessions.lock().expect("fresh lock");
+            guard.insert(
+                "stale".into(),
+                Instant::now() - CONTENTION_WINDOW - Duration::from_secs(1),
+            );
+        }
+        assert_eq!(
+            contended_since(&sessions, "stale"),
+            None,
+            "a refusal older than the window no longer counts as someone waiting"
+        );
+
+        for index in 0..(MAX_CONTENDED_SESSIONS * 2) {
+            record_contention(&sessions, &format!("session-{index}"));
+        }
+        let recorded = sessions.lock().expect("lock").len();
+        assert!(
+            recorded <= MAX_CONTENDED_SESSIONS,
+            "refused attachments grew the map without bound: {recorded}"
+        );
+        assert!(
+            !sessions.lock().expect("lock").contains_key("stale"),
+            "recording prunes entries that have aged out"
+        );
+    }
+
+    #[test]
+    fn a_silent_holder_only_loses_its_session_once_someone_is_waiting() {
+        let sessions: Mutex<HashMap<String, Instant>> = Mutex::new(HashMap::new());
+        let silent = Instant::now() - CLIENT_STALL_TIMEOUT - Duration::from_secs(1);
+
+        let stalled = |sessions: &Mutex<HashMap<String, Instant>>, last_seen: Instant| {
+            last_seen.elapsed() >= CLIENT_STALL_TIMEOUT
+                && contended_since(sessions, "work")
+                    .is_some_and(|since| since.elapsed() >= CLIENT_STALL_TIMEOUT)
+        };
+
+        assert!(
+            !stalled(&sessions, silent),
+            "an idle client nobody is waiting for keeps its session"
+        );
+
+        record_contention(&sessions, "work");
+        assert!(
+            !stalled(&sessions, silent),
+            "a holder gets a full interval to answer after the waiting starts"
+        );
+
+        {
+            let mut guard = sessions.lock().expect("lock");
+            guard.insert(
+                "work".into(),
+                Instant::now() - CLIENT_STALL_TIMEOUT - Duration::from_secs(1),
+            );
+        }
+        assert!(
+            stalled(&sessions, silent),
+            "a holder that stayed silent while another client waited gives the session up"
+        );
+        assert!(
+            !stalled(&sessions, Instant::now()),
+            "a holder that answered keeps its session even while contended"
+        );
+    }
 
     #[test]
     fn origins_are_exact_and_web_only() {

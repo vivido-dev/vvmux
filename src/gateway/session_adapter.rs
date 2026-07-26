@@ -10,6 +10,7 @@ use crate::ipc::{ClientMessage, DisplayMetrics, ServerMessage};
 const WRITER_QUEUE_MESSAGES: usize = 256;
 
 pub(crate) struct SessionAdapter {
+    name: String,
     writer: mpsc::SyncSender<ClientMessage>,
     events: tokio_mpsc::Receiver<QueuedServerMessage>,
     cancel: crate::platform::ConnectionCancel,
@@ -54,7 +55,7 @@ impl SessionAdapter {
                     display,
                     vivid,
                 })?;
-            match reader.recv::<ServerMessage>()? {
+            match reader.recv_server()? {
                 ServerMessage::Attached { session, text_only } => {
                     Ok((reader, writer, session, text_only))
                 }
@@ -101,7 +102,7 @@ impl SessionAdapter {
         thread::Builder::new()
             .name("vvmux-gateway-ipc-reader".into())
             .spawn(move || {
-                while let Ok(message) = reader.recv::<ServerMessage>() {
+                while let Ok(message) = reader.recv_server() {
                     if !vivid && let ServerMessage::MediaRecord { delivery_id, .. } = &message {
                         let _ = media_writer.try_send(ClientMessage::BridgeMediaAck {
                             delivery_id: *delivery_id,
@@ -135,6 +136,7 @@ impl SessionAdapter {
 
         Ok((
             Self {
+                name: session.clone(),
                 writer: writer_sender,
                 events: event_receiver,
                 cancel,
@@ -171,6 +173,11 @@ impl SessionAdapter {
 
     pub(crate) async fn recv(&mut self) -> Option<QueuedServerMessage> {
         self.events.recv().await
+    }
+
+    /// The session this connection holds, as the server resolved it.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     pub(crate) fn overloaded(&self) -> bool {

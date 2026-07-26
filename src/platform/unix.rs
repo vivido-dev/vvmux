@@ -1,12 +1,15 @@
+use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, PipeReader, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{ConnectionCancel, Transport};
 use crate::ipc::DisplayMetrics;
@@ -14,21 +17,276 @@ use crate::ipc::DisplayMetrics;
 pub type SessionEndpoint = PathBuf;
 pub type VirtualPresenterEndpoint = PathBuf;
 
+/// How long a launcher waits for a spawned session server's startup result.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on a startup diagnostic, so a failing server cannot flood its launcher.
+const READINESS_LIMIT: usize = 4096;
+
 /// Windows restores inherited console-interrupt state here; Unix needs nothing.
 pub fn prepare_server_process() {}
 
-pub struct ReadinessWriter;
+/// The server side of the one-shot startup channel.
+///
+/// Both platforms use the same result format: `OK\n`, or `ERR\n` followed by a bounded diagnostic.
+/// Windows inherits a pipe handle, Unix an inherited descriptor number. The channel is closed by
+/// the first write, so a launcher blocked on it always observes either a result or EOF.
+pub struct ReadinessWriter {
+    file: Option<File>,
+}
 
 impl ReadinessWriter {
-    pub fn from_metadata(_handle: Option<usize>) -> io::Result<Self> {
-        Ok(Self)
+    pub fn from_metadata(handle: Option<usize>) -> io::Result<Self> {
+        let Some(handle) = handle else {
+            return Ok(Self { file: None });
+        };
+        let descriptor = RawFd::try_from(handle)
+            .ok()
+            .filter(|descriptor| *descriptor > libc::STDERR_FILENO)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "readiness descriptor is not a private inherited descriptor",
+                )
+            })?;
+        // The flag is a hidden argument, so treat its value as untrusted: report a result only
+        // over an inherited pipe, never into whatever else happens to occupy that number.
+        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(descriptor, &mut status) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if status.st_mode & libc::S_IFMT != libc::S_IFIFO {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "readiness descriptor is not a pipe",
+            ));
+        }
+        // The launcher had to clear close-on-exec to get the descriptor here; restore it now.
+        // A pane shell that inherited the startup channel would hold it open for the life of the
+        // session, and the launcher waits for the channel to close before it reads a diagnostic.
+        set_close_on_exec(descriptor)?;
+        Ok(Self {
+            file: Some(unsafe { File::from_raw_fd(descriptor) }),
+        })
     }
 
     pub fn success(&mut self) -> io::Result<()> {
-        Ok(())
+        self.write_result(b"OK\n")
     }
 
-    pub fn failure(&mut self, _error: &io::Error) {}
+    pub fn failure(&mut self, error: &io::Error) {
+        let mut message = format!("ERR\n{error}").into_bytes();
+        message.truncate(READINESS_LIMIT);
+        let _ = self.write_result(&message);
+    }
+
+    fn write_result(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let Some(mut file) = self.file.take() else {
+            return Ok(());
+        };
+        file.write_all(bytes)?;
+        file.flush()
+    }
+}
+
+/// The launcher side of the startup channel.
+struct ReadinessReader {
+    reader: PipeReader,
+}
+
+impl ReadinessReader {
+    /// Turn the server's startup result into this launcher's result.
+    fn wait(mut self, mut child: Child, timeout: Duration) -> io::Result<()> {
+        let bytes = self.read_result(timeout)?;
+        if bytes.as_slice() == b"OK\n" {
+            // The server is bound and serving; it must keep running, so it is not waited on.
+            return Ok(());
+        }
+        // Anything else means the server is on its way out. Reap it so a failed startup does not
+        // leave a zombie behind, then report what it said instead of the endpoint error the caller
+        // would otherwise discover on its own.
+        let _ = child.wait();
+        if let Some(diagnostic) = bytes.strip_prefix(b"ERR\n") {
+            Err(io::Error::other(format!(
+                "vvmux server startup failed: {}",
+                String::from_utf8_lossy(diagnostic)
+            )))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "vvmux server exited without a readiness result",
+            ))
+        }
+    }
+
+    fn read_result(&mut self, timeout: Duration) -> io::Result<Vec<u8>> {
+        let deadline = Instant::now() + timeout;
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 256];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "vvmux server startup timed out",
+                ));
+            }
+            if !self.poll_readable(remaining)? {
+                continue;
+            }
+            match self.reader.read(&mut chunk) {
+                Ok(0) => return Ok(bytes),
+                Ok(read) => {
+                    if bytes.len() + read > READINESS_LIMIT {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vvmux server startup diagnostic exceeded 4 KiB",
+                        ));
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    // Success is a complete fixed token, so it needs no channel close to be
+                    // recognized. Only a diagnostic is read to the end.
+                    if bytes.as_slice() == b"OK\n" {
+                        return Ok(bytes);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn poll_readable(&self, timeout: Duration) -> io::Result<bool> {
+        let mut poll_fd = libc::pollfd {
+            fd: self.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let milliseconds = i32::try_from(timeout.as_millis().max(1)).unwrap_or(i32::MAX);
+        match unsafe { libc::poll(&mut poll_fd, 1, milliseconds) } {
+            -1 => {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+            0 => Ok(false),
+            _ => Ok(true),
+        }
+    }
+}
+
+pub struct DaemonLauncher;
+
+impl DaemonLauncher {
+    /// Start a detached session server and report what its startup actually did.
+    ///
+    /// Without the startup channel a server that exits before binding is indistinguishable from a
+    /// server that has not finished starting: the client only sees its own connect error, which for
+    /// a leftover endpoint file is a bare "connection refused" that names neither the session nor
+    /// the reason.
+    pub fn launch(name: &str, config_path: Option<&Path>) -> io::Result<()> {
+        let executable = std::env::current_exe()?;
+        let (readiness, writer) = readiness_pipe()?;
+        let writer_descriptor = writer.as_raw_fd();
+        let mut command = Command::new(executable);
+        command.arg("__server").arg("--session").arg(name);
+        if let Some(path) = config_path {
+            command.arg("--config").arg(path);
+        }
+        command
+            .arg("--ready-handle")
+            .arg(writer_descriptor.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        scrub_daemon_environment(&mut command, std::env::vars_os());
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                // The startup channel is the one descriptor that must survive exec. Its reading end
+                // stays close-on-exec, so the launcher sees EOF the moment the server exits.
+                clear_close_on_exec(writer_descriptor)
+            });
+        }
+        let child = command.spawn()?;
+        // Only the server may hold the writing end now; otherwise EOF would never arrive.
+        drop(writer);
+        readiness.wait(child, STARTUP_TIMEOUT)
+    }
+}
+
+/// Keep the outer presenter's state out of a process that outlives the shell that started it.
+///
+/// The whole `VIVID_*` namespace goes, not just the credential pair, which is also what the Windows
+/// launcher does. A session server inherits its environment to every pane it spawns, so a surviving
+/// `VIVID_ANCHOR_TRANSPORT` from a remote `vvssh` login would make pane producers frame anchor
+/// markers for the *outer* platform's pseudoconsole while they are talking to this hop's virtual
+/// presenter, whose scanner does not recognize that envelope.
+fn scrub_daemon_environment(
+    command: &mut Command,
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) {
+    for (key, _) in environment {
+        if key.to_string_lossy().starts_with("VIVID_") {
+            command.env_remove(&key);
+        }
+    }
+}
+
+fn readiness_pipe() -> io::Result<(ReadinessReader, OwnedFd)> {
+    let (reader, writer) = io::pipe()?;
+    // Keep both ends clear of the standard descriptor numbers. A writing end that landed there
+    // would be replaced by the redirection `Command` applies after fork, and a reading end there
+    // would take over a standard slot this process still reports its own errors through.
+    let reader = PipeReader::from(relocate_above_standard_descriptors(OwnedFd::from(reader))?);
+    let writer = relocate_above_standard_descriptors(OwnedFd::from(writer))?;
+    Ok((ReadinessReader { reader }, writer))
+}
+
+fn relocate_above_standard_descriptors(descriptor: OwnedFd) -> io::Result<OwnedFd> {
+    if descriptor.as_raw_fd() > libc::STDERR_FILENO {
+        return Ok(descriptor);
+    }
+    let relocated = unsafe {
+        libc::fcntl(
+            descriptor.as_raw_fd(),
+            libc::F_DUPFD_CLOEXEC,
+            libc::STDERR_FILENO + 1,
+        )
+    };
+    if relocated == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(relocated) })
+}
+
+/// Async-signal-safe: only `fcntl` runs, as required between `fork` and `exec`.
+fn clear_close_on_exec(descriptor: RawFd) -> io::Result<()> {
+    update_close_on_exec(descriptor, false)
+}
+
+fn set_close_on_exec(descriptor: RawFd) -> io::Result<()> {
+    update_close_on_exec(descriptor, true)
+}
+
+fn update_close_on_exec(descriptor: RawFd, enabled: bool) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let updated = if enabled {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, updated) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub struct ClientTerminal {
@@ -277,5 +535,127 @@ fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
         Err(io::Error::last_os_error())
     } else {
         Ok(uid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::IntoRawFd;
+
+    fn writer_for(descriptor: OwnedFd) -> (ReadinessWriter, RawFd) {
+        let descriptor = descriptor.into_raw_fd();
+        let writer = ReadinessWriter::from_metadata(Some(descriptor as usize)).unwrap();
+        (writer, descriptor)
+    }
+
+    #[test]
+    fn startup_success_is_reported_without_waiting_for_the_channel_to_close() {
+        let (mut reader, descriptor) = readiness_pipe().unwrap();
+        let (mut writer, descriptor) = writer_for(descriptor);
+        // A pane process must not be able to hold the startup channel open, so the descriptor is
+        // close-on-exec again as soon as the server owns it.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        writer.success().unwrap();
+        // The writer is deliberately still alive: success must not depend on end-of-file.
+        assert_eq!(
+            reader.read_result(Duration::from_secs(5)).unwrap(),
+            b"OK\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn startup_failure_reports_the_servers_own_diagnostic() {
+        let (reader, descriptor) = readiness_pipe().unwrap();
+        let (mut writer, _) = writer_for(descriptor);
+        writer.failure(&io::Error::other(
+            "bind session endpoint: Permission denied",
+        ));
+        drop(writer);
+        let child = Command::new("true").spawn().unwrap();
+        let error = reader.wait(child, Duration::from_secs(5)).unwrap_err();
+        let described = error.to_string();
+        assert!(
+            described.starts_with("vvmux server startup failed: "),
+            "{described}"
+        );
+        assert!(described.contains("bind session endpoint"), "{described}");
+    }
+
+    #[test]
+    fn a_server_that_exits_silently_is_not_reported_as_a_connect_failure() {
+        let (reader, descriptor) = readiness_pipe().unwrap();
+        drop(descriptor);
+        let child = Command::new("true").spawn().unwrap();
+        let error = reader.wait(child, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn only_an_inherited_pipe_is_accepted_as_a_readiness_channel() {
+        // No channel at all: a server started by hand still runs.
+        assert!(ReadinessWriter::from_metadata(None).unwrap().file.is_none());
+        // Standard descriptors are redirected by the launcher, so they can never be the channel.
+        assert!(ReadinessWriter::from_metadata(Some(1)).is_err());
+        // A hidden argument is untrusted input: never report into an unrelated open file.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let descriptor = file.reopen().unwrap().into_raw_fd();
+        assert_eq!(
+            ReadinessWriter::from_metadata(Some(descriptor as usize))
+                .map(|_| ())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        unsafe { libc::close(descriptor) };
+    }
+
+    #[test]
+    fn a_daemon_inherits_no_vivid_state_from_the_shell_that_started_it() {
+        let mut command = Command::new("true");
+        scrub_daemon_environment(
+            &mut command,
+            [
+                ("VIVID_ENDPOINT", "unix:/tmp/outer.sock"),
+                ("VIVID_TOKEN", "secret"),
+                ("VIVID_ENDPOINT_BULK", "unix:/tmp/outer-bulk.sock"),
+                // A Windows presenter exports this through `vvssh`; a Unix session server and its
+                // panes must not keep it.
+                ("VIVID_ANCHOR_TRANSPORT", "conpty"),
+                ("VIVID_REMOTE", "1"),
+                ("PATH", "/usr/bin"),
+                ("TERM", "xterm-256color"),
+            ]
+            .map(|(key, value)| {
+                (
+                    std::ffi::OsString::from(key),
+                    std::ffi::OsString::from(value),
+                )
+            }),
+        );
+        let mut removed = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        removed.sort();
+        assert_eq!(
+            removed,
+            [
+                "VIVID_ANCHOR_TRANSPORT",
+                "VIVID_ENDPOINT",
+                "VIVID_ENDPOINT_BULK",
+                "VIVID_REMOTE",
+                "VIVID_TOKEN",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_readiness_channel_never_lands_on_a_standard_descriptor() {
+        let (reader, writer) = readiness_pipe().unwrap();
+        assert!(writer.as_raw_fd() > libc::STDERR_FILENO);
+        assert!(reader.reader.as_raw_fd() > libc::STDERR_FILENO);
     }
 }
