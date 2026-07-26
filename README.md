@@ -132,7 +132,7 @@ derived keys. `wait media` waits for either requested revision domain to advance
 
 Requests and input are limited to 1 MiB, decoded replies to 16 MiB, row requests and key repeats to
 1,000, and regular expressions to 8 KiB. The server bounds connections, in-flight requests,
-waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 5 is a hard
+waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 8 is a hard
 private-protocol cutover, so sessions created by older binaries must be restarted after upgrading.
 
 ## Network session gateway
@@ -209,9 +209,10 @@ authenticated anchor markers.
 
 Static encoded images and the latest raster are retained within the configured aggregate budget.
 Timed audio/video continues to receive credits while detached but payloads are discarded. On a new
-projection, live video gets `NEED_KEYFRAME` with a new minimum epoch; only that fresh keyframe and
-later packets are eligible for forwarding. Audio resumes with newly arriving packets. EOS video
-does not acquire a reconstructed poster.
+projection, live video gets `NEED_KEYFRAME`; relay-only loss accepts the next keyframe in the
+current epoch, while decoder loss can demand a greater epoch. Only the requested keyframe and later
+packets are eligible for forwarding. Audio resumes with newly arriving packets. EOS video does not
+acquire a reconstructed poster.
 
 The foreground client reconciles stable source and `(producer, node, fragment)` identities into the
 current Vivido session, reuses unchanged sources/media channels, resolves virtual anchors, and

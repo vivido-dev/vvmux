@@ -984,14 +984,15 @@ impl SessionActor {
                     self.schedule_render();
                 }
             }
-            ClientMessage::BridgeNeedKeyframes(sources) => {
+            ClientMessage::BridgeNeedKeyframes(requests) => {
                 if self.client_is(id) {
-                    self.vivid.request_keyframes(
-                        &sources
-                            .into_iter()
-                            .map(|source| (source.producer, source.source))
-                            .collect::<Vec<_>>(),
-                    );
+                    for request in requests {
+                        self.vivid.request_keyframe(
+                            (request.source.producer, request.source.source),
+                            request.minimum_epoch,
+                            request.reason,
+                        );
+                    }
                 }
             }
             ClientMessage::BridgeNeedFullFrames(sources) => {
