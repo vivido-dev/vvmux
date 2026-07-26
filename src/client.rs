@@ -34,6 +34,7 @@ const BRIDGE_MEDIA_CHUNK: usize = 128 * 1024;
 const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const DISPLAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DETACH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn attach(
     name: &str,
@@ -289,8 +290,16 @@ pub fn attach(
     let mut last_display = display;
     let mut float_mode: Option<u64> = None;
     let mut float_scanner = FloatEditScanner::default();
+    let mut detach_requested_at: Option<Instant> = None;
     let result = (|| -> io::Result<()> {
         while !stopped.load(Ordering::Acquire) {
+            if let Some(requested_at) = detach_requested_at {
+                if requested_at.elapsed() >= DETACH_ACK_TIMEOUT {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             while let Ok((mode_id, active)) = mode_receiver.try_recv() {
                 if active {
                     float_mode = Some(mode_id);
@@ -307,7 +316,8 @@ pub fn attach(
             if let Some(read) = terminal.read_input(&mut bytes, Duration::from_millis(100))? {
                 if read == 0 {
                     let _ = send_client(&writer, &ClientMessage::Detach);
-                    break;
+                    detach_requested_at = Some(Instant::now());
+                    continue;
                 }
                 let parsed = if let Some(mode_id) = float_mode {
                     // Scan edit keys before the ordinary prefix/mouse parser. In particular, that
@@ -340,7 +350,12 @@ pub fn attach(
                         }
                         ParsedInput::Detach => {
                             send_client(&writer, &ClientMessage::Detach)?;
-                            stopped.store(true, Ordering::Release);
+                            // Keep the reader alive until the session actor acknowledges Detach.
+                            // Closing IPC immediately can let a new attach overtake the old detach,
+                            // producing an empty alternate screen and then tearing down its newly
+                            // opened Vivid connection with a Windows socket reset.
+                            detach_requested_at = Some(Instant::now());
+                            break;
                         }
                     }
                 }
@@ -443,13 +458,15 @@ impl BridgeClientSender {
 }
 
 pub(crate) struct BridgeWorker {
-    media: mpsc::SyncSender<BridgeMedia>,
+    media: Option<mpsc::SyncSender<BridgeMedia>>,
     snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     dropped: Arc<Mutex<HashSet<u64>>>,
     generation: u64,
     /// Incremented by the reader thread when a media record cannot be queued; folded into the
     /// worker's periodic report so a drop storm is visible in `inspect-media`.
     queue_drops: Arc<AtomicU64>,
+    stopped: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl BridgeWorker {
@@ -477,7 +494,9 @@ impl BridgeWorker {
         let worker_snapshot = snapshot.clone();
         let worker_dropped = dropped.clone();
         let worker_drops = queue_drops.clone();
-        thread::Builder::new()
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = stopped.clone();
+        let thread = thread::Builder::new()
             .name("vvmux-media-bridge".into())
             .spawn(move || {
                 run_bridge_worker(
@@ -487,14 +506,17 @@ impl BridgeWorker {
                     worker_snapshot,
                     worker_dropped,
                     worker_drops,
+                    worker_stopped,
                 )
             })?;
         Ok(Self {
-            media,
+            media: Some(media),
             snapshot,
             dropped,
             generation: 0,
             queue_drops,
+            stopped,
+            thread: Some(thread),
         })
     }
 
@@ -510,7 +532,11 @@ impl BridgeWorker {
     pub(crate) fn queue_media(&mut self, mut media: BridgeMedia) -> bool {
         media.generation = self.generation;
         let delivery_id = media.delivery_id;
-        match self.media.try_send(media) {
+        let Some(sender) = &self.media else {
+            self.mark_dropped(delivery_id);
+            return false;
+        };
+        match sender.try_send(media) {
             Ok(()) => true,
             Err(mpsc::TrySendError::Full(_)) => {
                 self.mark_dropped(delivery_id);
@@ -532,6 +558,20 @@ impl BridgeWorker {
     }
 }
 
+impl Drop for BridgeWorker {
+    fn drop(&mut self) {
+        // The bridge owns the outer Vivid connection on its worker thread. Merely dropping the
+        // queue sender lets the foreground process return while that thread is still unwinding;
+        // process teardown can then reset the Windows socket before OuterBridge sends GOODBYE.
+        // Stop and join so detach does not complete until the protocol session is closed cleanly.
+        self.stopped.store(true, Ordering::Release);
+        self.media.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 fn run_bridge_worker(
     mut bridge: crate::bridge::OuterBridge,
     client_writer: BridgeClientSender,
@@ -539,6 +579,7 @@ fn run_bridge_worker(
     snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     dropped: Arc<Mutex<HashSet<u64>>>,
     queue_drops: Arc<AtomicU64>,
+    stopped: Arc<AtomicBool>,
 ) {
     let mut metrics = crate::metrics::BridgeMetrics::default();
     let mut metrics_reported_at = Instant::now();
@@ -555,6 +596,9 @@ fn run_bridge_worker(
     let mut force_replacement = false;
     let mut deferred = None;
     loop {
+        if stopped.load(Ordering::Acquire) {
+            break;
+        }
         // Report on a coarse interval rather than per record: this is diagnostic traffic and must
         // never compete with media for the client connection.
         if metrics_reported_at.elapsed() >= METRICS_REPORT_INTERVAL {
@@ -1476,11 +1520,13 @@ mod tests {
         let dropped = Arc::new(Mutex::new(HashSet::new()));
         let queue_drops = Arc::new(AtomicU64::new(0));
         let mut worker = BridgeWorker {
-            media,
+            media: Some(media),
             snapshot: Arc::new(Mutex::new(None)),
             dropped: dropped.clone(),
             generation: 1,
             queue_drops: queue_drops.clone(),
+            stopped: Arc::new(AtomicBool::new(false)),
+            thread: None,
         };
         let key = BridgeSourceKey {
             producer: 3,

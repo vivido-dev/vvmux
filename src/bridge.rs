@@ -3011,9 +3011,11 @@ mod tests {
     }
 
     #[test]
-    fn dropping_outer_bridge_sends_goodbye_before_reattach() {
+    fn dropping_bridge_worker_finishes_goodbye_before_returning() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let (goodbye_sender, goodbye_receiver) = mpsc::sync_channel(1);
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
         let server = thread::spawn(move || -> io::Result<()> {
             let (mut control, _) = listener.accept()?;
             control.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -3050,6 +3052,8 @@ mod tests {
             assert_eq!(goodbye.record_type, messages::GOODBYE);
             assert_eq!(goodbye.object_id, 0);
             let request = messages::request_id(&goodbye.body)?;
+            goodbye_sender.send(()).unwrap();
+            reply_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
             write_server_record(
                 &mut control,
                 &mut sequence,
@@ -3065,7 +3069,30 @@ mod tests {
             DisplayMetrics::default(),
         )
         .unwrap();
-        drop(bridge);
+
+        let worker = crate::client::BridgeWorker::spawn_with_sender(
+            bridge,
+            crate::client::BridgeClientSender::new(|_| Ok(())),
+            1,
+        )
+        .unwrap();
+        let (dropped_sender, dropped_receiver) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            drop(worker);
+            dropped_sender.send(()).unwrap();
+        });
+        goodbye_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            matches!(dropped_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "bridge worker drop returned before the outer GOODBYE completed"
+        );
+        reply_sender.send(()).unwrap();
+        dropped_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        dropper.join().unwrap();
         server.join().unwrap().unwrap();
     }
 
