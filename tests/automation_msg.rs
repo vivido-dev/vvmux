@@ -177,6 +177,15 @@ done
     ));
     assert_eq!(stable["pane_id"], 2);
 
+    let trace = json(command(
+        binary,
+        &name,
+        &["trace-media", "--pane-id", "2", "--limit", "16"],
+    ));
+    assert!(trace["current_sequence"].is_u64());
+    assert!(trace["oldest_sequence"].is_u64());
+    assert!(trace["events"].as_array().is_some());
+
     assert_success(&command(
         binary,
         &name,
