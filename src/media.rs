@@ -318,6 +318,36 @@ impl VirtualVivid {
         Self::start_with_events(endpoint, config, None)
     }
 
+    #[cfg(test)]
+    pub fn wait_for_retained_media(&self, pane: PaneId, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.lock();
+        loop {
+            let retained = state.sources.iter().any(|(key, source)| {
+                source.retained.is_some()
+                    && state
+                        .producers
+                        .get(&key.0)
+                        .is_some_and(|producer| producer.pane == pane)
+            });
+            if retained {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timeout) = self
+                .delivery_changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if timeout.timed_out() {
+                return false;
+            }
+        }
+    }
+
     pub fn start_with_events(
         endpoint: VirtualPresenterEndpoint,
         config: MediaConfig,
