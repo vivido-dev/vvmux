@@ -10,7 +10,7 @@ use vivid_protocol::anchor::{self, AnchorKey};
 use vivid_protocol::media::{self, MediaSequence};
 use vivid_protocol::messages::{
     self, DisplayChanged, ImageSourceConfig, ParsedAudioSourceConfig, ParsedSceneNode,
-    ParsedVideoSourceConfig, RasterSourceConfig, SourceReady,
+    ParsedVideoSourceConfig, RasterSourceConfig, RasterUpdateConfig, SourceReady,
 };
 use vivid_protocol::revision::{ObservationSequence, SceneRevision, SourceRevision};
 use vivid_protocol::trace::{TraceComponent, TraceGuard, TraceHop};
@@ -38,6 +38,8 @@ const MAX_PENDING_MEDIA_BARRIERS: usize = 64;
 const MEDIA_ORDER_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const OBSERVATION_QUEUE: usize = 64;
+const RASTER_DAMAGE_FRAME_EQUIVALENTS: u64 = 8;
+const RASTER_DAMAGE_INTERVAL: Duration = Duration::from_millis(100);
 
 pub type ProducerId = u64;
 pub type SourceKey = (ProducerId, u64);
@@ -124,7 +126,27 @@ pub struct MediaEvent {
 
 struct PendingDelivery {
     source: SourceKey,
-    bytes: u64,
+    credit_bytes: u64,
+    queued_bytes: usize,
+}
+
+enum IngestOutcome {
+    Accepted,
+    RasterDeltaRejected {
+        reason: u64,
+        notify: bool,
+        credit: DeliveryCredit,
+    },
+}
+
+struct PreparedRaster {
+    body: Arc<[u8]>,
+    sequence: MediaSequence,
+    frame_id: u64,
+    epoch: u32,
+    pts_us: i64,
+    damage_window_started: Instant,
+    damage_pixels: u64,
 }
 
 struct Producer {
@@ -185,6 +207,10 @@ struct Source {
     causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
     capture_policy: u64,
     semantic_descriptor: Option<messages::SourceDescriptor>,
+    raster_update: Option<RasterUpdateConfig>,
+    raster_requires_full_reason: Option<u64>,
+    raster_damage_window_started: Instant,
+    raster_damage_pixels: u64,
 }
 
 struct Ticket {
@@ -199,6 +225,7 @@ struct SourceCreation {
     causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
     capture_policy: u64,
     semantic_descriptor: Option<messages::SourceDescriptor>,
+    raster_update: Option<RasterUpdateConfig>,
 }
 
 #[derive(Clone, Copy)]
@@ -642,7 +669,10 @@ impl VirtualVivid {
                     .values()
                     .filter(|delivery| delivery.source == key)
                     .collect::<Vec<_>>();
-                let queued_bytes = queued.iter().map(|delivery| delivery.bytes).sum::<u64>();
+                let queued_bytes = queued
+                    .iter()
+                    .map(|delivery| delivery.credit_bytes)
+                    .sum::<u64>();
                 PaneMediaSourceStatus {
                     producer_id: key.0,
                     source_id: key.1,
@@ -753,7 +783,7 @@ impl VirtualVivid {
             };
             state.queued_bridge_bytes = state
                 .queued_bridge_bytes
-                .saturating_sub(pending.bytes as usize);
+                .saturating_sub(pending.queued_bytes);
             let writer = state
                 .producers
                 .get(&pending.source.0)
@@ -784,7 +814,8 @@ impl VirtualVivid {
                 messages::SOURCE_CHANGED_CREDIT_ACCOUNTING
             };
             let _ = advance_source(&mut state, pending.source, changed_fields);
-            let credits = prepare_credit_return(&mut state, pending.source, pending.bytes, 1);
+            let credits =
+                prepare_credit_return(&mut state, pending.source, pending.credit_bytes, 1);
             ((writer, pending.source, credits), request_keyframe)
         };
         self.delivery_changed.notify_all();
@@ -1320,11 +1351,11 @@ fn take_deliveries(state: &mut State, delivery_ids: &[u64]) -> Vec<DeliveryCredi
         };
         state.queued_bridge_bytes = state
             .queued_bridge_bytes
-            .saturating_sub(pending.bytes as usize);
+            .saturating_sub(pending.queued_bytes);
         released.push(prepare_credit_write(
             state,
             pending.source,
-            pending.bytes,
+            pending.credit_bytes,
             1,
         ));
     }
@@ -2225,9 +2256,23 @@ fn dispatch_control(
             )?;
         }
         messages::CREATE_RASTER => {
-            let (envelope, config, capture_policy, semantic_descriptor) =
-                messages::parse_create_raster_with_extensions(&record.body)?;
+            let (envelope, config, update, capture_policy, semantic_descriptor) =
+                messages::parse_create_raster_with_update_extensions(&record.body)?;
             writer.mark_source_policy(config.source_id, capture_policy);
+            if update.mode == messages::RASTER_FULL_FRAME_AND_DELTA
+                && !producer_has_feature(shared, producer, messages::FEATURE_RASTER_DELTA_V1)
+            {
+                writer.write_record(
+                    messages::ERROR,
+                    record.object_id,
+                    &messages::error(
+                        envelope.request_id,
+                        messages::ERROR_UNSUPPORTED_FEATURE,
+                        "raster delta updates were not negotiated",
+                    ),
+                )?;
+                return Ok(true);
+            }
             if envelope.payload.map_value(9).is_some()
                 && !producer_has_feature(
                     shared,
@@ -2271,6 +2316,7 @@ fn dispatch_control(
                     causation_id: envelope.causation_id,
                     capture_policy,
                     semantic_descriptor,
+                    raster_update: Some(update),
                 },
             )?;
         }
@@ -2321,6 +2367,7 @@ fn dispatch_control(
                     causation_id: envelope.causation_id,
                     capture_policy,
                     semantic_descriptor,
+                    raster_update: None,
                 },
             )?;
         }
@@ -2374,6 +2421,7 @@ fn dispatch_control(
                     causation_id: envelope.causation_id,
                     capture_policy,
                     semantic_descriptor,
+                    raster_update: None,
                 },
             )?;
         }
@@ -2427,6 +2475,7 @@ fn dispatch_control(
                     causation_id: envelope.causation_id,
                     capture_policy,
                     semantic_descriptor,
+                    raster_update: None,
                 },
             )?;
         }
@@ -2963,7 +3012,17 @@ fn create_source(
     if source_id == 0 || creation.object_id != source_id {
         return Err(invalid("source object ID mismatch"));
     }
-    let maximum = descriptor.maximum_body()?;
+    let mut maximum = descriptor.maximum_body()?;
+    if creation
+        .raster_update
+        .is_some_and(|update| update.mode == messages::RASTER_FULL_FRAME_AND_DELTA)
+    {
+        // Delta descriptors and independently compressed overwrite payloads can exceed the
+        // equivalent full-frame body even though the retained result cannot. Admit the protocol
+        // hard ceiling; the parser, per-frame operation limit, credit, and retained quota remain
+        // independently bounded.
+        maximum = vivid_protocol::HARD_MAX_RECORD_BODY;
+    }
     let mut ticket = [0; 32];
     getrandom::fill(&mut ticket).map_err(|error| io::Error::other(error.to_string()))?;
     let mut state = shared
@@ -3011,6 +3070,10 @@ fn create_source(
             causation_id: creation.causation_id,
             capture_policy: creation.capture_policy,
             semantic_descriptor: creation.semantic_descriptor,
+            raster_update: creation.raster_update,
+            raster_requires_full_reason: None,
+            raster_damage_window_started: Instant::now(),
+            raster_damage_pixels: 0,
         },
     );
     state.tickets.insert(
@@ -3051,7 +3114,10 @@ fn create_source(
                 rolling_packet_window: ROLLING_PACKET_CREDITS,
                 initial_source_revision: SourceRevision::new(1),
                 media_connection_required: true,
-                delta_operation_limit: None,
+                delta_operation_limit: creation
+                    .raster_update
+                    .filter(|update| update.mode == messages::RASTER_FULL_FRAME_AND_DELTA)
+                    .map(|update| u64::from(update.operation_limit)),
             },
         )?,
     )?;
@@ -3136,8 +3202,34 @@ fn handle_media(
         if record.object_id != ticket.source.1 {
             break Err(invalid("media object ID mismatch"));
         }
-        if let Err(error) = ingest_record(shared, delivery_changed, ticket.source, &record) {
-            break Err(error);
+        match ingest_record(shared, delivery_changed, ticket.source, &record) {
+            Ok(IngestOutcome::Accepted) => {}
+            Ok(IngestOutcome::RasterDeltaRejected {
+                reason,
+                notify,
+                credit,
+            }) => {
+                if let Some(writer) = &credit.0 {
+                    writer.write_record(
+                        messages::ERROR,
+                        ticket.source.1,
+                        &messages::error(
+                            0,
+                            messages::ERROR_BAD_STATE,
+                            "raster delta requires a new full frame",
+                        ),
+                    )?;
+                    if notify {
+                        writer.write_record(
+                            messages::NEED_FULL_FRAME,
+                            ticket.source.1,
+                            &messages::need_full_frame(ticket.source.1, reason)?,
+                        )?;
+                    }
+                }
+                write_delivery_credit(credit)?;
+            }
+            Err(error) => break Err(error),
         }
     };
     {
@@ -3187,12 +3279,255 @@ fn playback_delay(started: Instant, origin: i64, pts_us: i64, now: Instant) -> O
         .checked_duration_since(now)
 }
 
+fn canonical_raster_full_body(
+    epoch: u32,
+    frame_id: u64,
+    pts_us: i64,
+    duration_us: u64,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> io::Result<Arc<[u8]>> {
+    let mut body = media::raster_frame_body(epoch, frame_id, width, height, pixels)?;
+    body[24..32].copy_from_slice(&pts_us.to_be_bytes());
+    body[32..40].copy_from_slice(&duration_us.to_be_bytes());
+    Ok(Arc::from(body))
+}
+
+fn raster_damage_pixels(operations: &[media::ParsedRasterDeltaOperation<'_>]) -> io::Result<u64> {
+    let rectangles = operations
+        .iter()
+        .map(|operation| match operation {
+            media::ParsedRasterDeltaOperation::Overwrite {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => (*x, *y, *width, *height),
+            media::ParsedRasterDeltaOperation::Copy {
+                destination_x,
+                destination_y,
+                width,
+                height,
+                ..
+            } => (*destination_x, *destination_y, *width, *height),
+        })
+        .collect::<Vec<_>>();
+    let mut y_edges = rectangles
+        .iter()
+        .flat_map(|(_, y, _, height)| [*y, *y + *height])
+        .collect::<Vec<_>>();
+    y_edges.sort_unstable();
+    y_edges.dedup();
+    let mut pixels = 0_u64;
+    for band in y_edges.windows(2) {
+        let (top, bottom) = (band[0], band[1]);
+        let mut intervals = rectangles
+            .iter()
+            .filter(|(_, y, _, height)| *y <= top && *y + *height >= bottom)
+            .map(|(x, _, width, _)| (*x, *x + *width))
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+        let mut merged = Vec::<(u32, u32)>::new();
+        for interval in intervals {
+            if let Some(last) = merged.last_mut()
+                && interval.0 <= last.1
+            {
+                last.1 = last.1.max(interval.1);
+            } else {
+                merged.push(interval);
+            }
+        }
+        let width = merged.into_iter().try_fold(0_u64, |total, (left, right)| {
+            total.checked_add(u64::from(right - left))
+        });
+        let Some(width) = width else {
+            return Err(invalid("raster delta damage accounting overflowed"));
+        };
+        pixels = pixels
+            .checked_add(
+                width
+                    .checked_mul(u64::from(bottom - top))
+                    .ok_or_else(|| invalid("raster delta damage accounting overflowed"))?,
+            )
+            .ok_or_else(|| invalid("raster delta damage accounting overflowed"))?;
+    }
+    Ok(pixels)
+}
+
+fn apply_raster_delta_operation(
+    pixels: &mut [u8],
+    source_width: u32,
+    operation: &media::ParsedRasterDeltaOperation<'_>,
+) {
+    let stride = source_width as usize * 4;
+    match operation {
+        media::ParsedRasterDeltaOperation::Overwrite {
+            x,
+            y,
+            width,
+            height,
+            rgba,
+        } => {
+            let row_bytes = *width as usize * 4;
+            for row in 0..*height as usize {
+                let destination = (*y as usize + row) * stride + *x as usize * 4;
+                let source = row * row_bytes;
+                pixels[destination..destination + row_bytes]
+                    .copy_from_slice(&rgba[source..source + row_bytes]);
+            }
+        }
+        media::ParsedRasterDeltaOperation::Copy {
+            destination_x,
+            destination_y,
+            width,
+            height,
+            source_x,
+            source_y,
+        } => {
+            let row_bytes = *width as usize * 4;
+            if destination_y > source_y {
+                for row in (0..*height as usize).rev() {
+                    let source = (*source_y as usize + row) * stride + *source_x as usize * 4;
+                    let destination =
+                        (*destination_y as usize + row) * stride + *destination_x as usize * 4;
+                    pixels.copy_within(source..source + row_bytes, destination);
+                }
+            } else {
+                for row in 0..*height as usize {
+                    let source = (*source_y as usize + row) * stride + *source_x as usize * 4;
+                    let destination =
+                        (*destination_y as usize + row) * stride + *destination_x as usize * 4;
+                    pixels.copy_within(source..source + row_bytes, destination);
+                }
+            }
+        }
+    }
+}
+
+enum RasterPreparation {
+    Accepted(PreparedRaster),
+    Rejected { reason: u64, notify: bool },
+}
+
+fn prepare_raster(
+    source: &Source,
+    config: &RasterSourceConfig,
+    body: &[u8],
+    now: Instant,
+) -> io::Result<RasterPreparation> {
+    let flags = body
+        .get(4..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(|| invalid("raster frame header is truncated"))?;
+    if flags & media::RASTER_FRAME_DELTA == 0 {
+        let parsed = media::parse_full_raster_frame(body)?;
+        if (parsed.width, parsed.height) != (config.width, config.height) {
+            return Err(invalid("raster dimensions changed"));
+        }
+        let mut sequence = source.sequence;
+        let frame_id = parsed.frame_id;
+        let epoch = parsed.epoch;
+        let pts_us = parsed.pts_us;
+        let duration_us = parsed.duration_us;
+        let pixels = media::decode_raster_pixels(parsed)?;
+        let body = canonical_raster_full_body(
+            epoch,
+            frame_id,
+            pts_us,
+            duration_us,
+            config.width,
+            config.height,
+            &pixels,
+        )?;
+        sequence.accept(frame_id, epoch)?;
+        return Ok(RasterPreparation::Accepted(PreparedRaster {
+            body,
+            sequence,
+            frame_id,
+            epoch,
+            pts_us,
+            damage_window_started: now,
+            damage_pixels: 0,
+        }));
+    }
+    let Some(update) = source
+        .raster_update
+        .filter(|update| update.mode == messages::RASTER_FULL_FRAME_AND_DELTA)
+    else {
+        return Err(invalid("raster delta was not enabled by CREATE_RASTER"));
+    };
+    let frame =
+        media::parse_delta_raster_frame(body, config.width, config.height, update.operation_limit)?;
+    if let Some(reason) = source.raster_requires_full_reason {
+        return Ok(RasterPreparation::Rejected {
+            reason,
+            notify: false,
+        });
+    }
+    let Some(retained) = source.retained.as_deref() else {
+        return Ok(RasterPreparation::Rejected {
+            reason: messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
+            notify: true,
+        });
+    };
+    let current = media::parse_full_raster_frame(retained)?;
+    if frame.epoch != current.epoch || frame.base_frame_id != current.frame_id {
+        return Ok(RasterPreparation::Rejected {
+            reason: messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
+            notify: true,
+        });
+    }
+    let damaged_pixels = raster_damage_pixels(&frame.operations)?;
+    let mut damage_window_started = source.raster_damage_window_started;
+    let mut accumulated_damage = source.raster_damage_pixels;
+    if now.duration_since(damage_window_started) >= RASTER_DAMAGE_INTERVAL {
+        damage_window_started = now;
+        accumulated_damage = 0;
+    }
+    let budget = u64::from(config.width)
+        .saturating_mul(u64::from(config.height))
+        .saturating_mul(RASTER_DAMAGE_FRAME_EQUIVALENTS);
+    if accumulated_damage.saturating_add(damaged_pixels) > budget {
+        return Ok(RasterPreparation::Rejected {
+            reason: messages::NEED_FULL_FRAME_DAMAGE_BUDGET,
+            notify: true,
+        });
+    }
+    let mut pixels = media::decode_raster_pixels(current)?;
+    for operation in &frame.operations {
+        apply_raster_delta_operation(&mut pixels, config.width, operation);
+    }
+    let mut sequence = source.sequence;
+    sequence.accept(frame.frame_id, frame.epoch)?;
+    let canonical = canonical_raster_full_body(
+        frame.epoch,
+        frame.frame_id,
+        frame.pts_us,
+        frame.duration_us,
+        config.width,
+        config.height,
+        &pixels,
+    )?;
+    Ok(RasterPreparation::Accepted(PreparedRaster {
+        body: canonical,
+        sequence,
+        frame_id: frame.frame_id,
+        epoch: frame.epoch,
+        pts_us: frame.pts_us,
+        damage_window_started,
+        damage_pixels: accumulated_damage.saturating_add(damaged_pixels),
+    }))
+}
+
 fn ingest_record(
     shared: &Arc<Mutex<State>>,
     delivery_changed: &Condvar,
     key: SourceKey,
     record: &BorrowedRecord<'_>,
-) -> io::Result<()> {
+) -> io::Result<IngestOutcome> {
     let mut state = shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3200,22 +3535,48 @@ fn ingest_record(
     let projected_source = state.projected_sources.contains(&key);
     let limit = state.config.aggregate_retained_bytes as usize;
     let bridge_queue_limit = state.config.ipc_queue_bytes;
-    let (old_retained, retained_body, new_retained, pts, candidate_forward) = {
+    let raster_preparation = {
+        let source = state
+            .sources
+            .get(&key)
+            .ok_or_else(|| invalid("source no longer exists"))?;
+        match (&source.descriptor, record.record_type) {
+            (SourceDescriptor::Raster(config), messages::RASTER_FRAME) => {
+                Some(prepare_raster(source, config, record.body, Instant::now())?)
+            }
+            _ => None,
+        }
+    };
+    if let Some(RasterPreparation::Rejected { reason, notify }) = raster_preparation {
+        state
+            .sources
+            .get_mut(&key)
+            .expect("source exists")
+            .raster_requires_full_reason = Some(reason);
+        let credit = prepare_credit_write(&mut state, key, record.body.len() as u64, 1);
+        drop(state);
+        delivery_changed.notify_all();
+        return Ok(IngestOutcome::RasterDeltaRejected {
+            reason,
+            notify,
+            credit,
+        });
+    }
+    let mut prepared_raster = raster_preparation.and_then(|preparation| match preparation {
+        RasterPreparation::Accepted(prepared) => Some(prepared),
+        RasterPreparation::Rejected { .. } => None,
+    });
+    let (old_retained, retained_body, new_retained, pts, candidate_forward, forward_body) = {
         let source = state
             .sources
             .get_mut(&key)
             .ok_or_else(|| invalid("source no longer exists"))?;
         let new_retained = match (&source.descriptor, record.record_type) {
-            (SourceDescriptor::Raster(config), messages::RASTER_FRAME) => {
-                let parsed = media::parse_full_raster_frame(record.body)?;
-                if (parsed.width, parsed.height) != (config.width, config.height) {
-                    return Err(invalid("raster dimensions changed"));
-                }
-                source.sequence.accept(parsed.frame_id, parsed.epoch)?;
-                media::decode_raster_pixels(parsed)?;
-                source.last_pts_us = Some(parsed.pts_us);
-                source.last_media_id = parsed.frame_id;
-                Some(Arc::<[u8]>::from(record.body))
+            (SourceDescriptor::Raster(_), messages::RASTER_FRAME) => {
+                let prepared = prepared_raster
+                    .as_ref()
+                    .ok_or_else(|| invalid("raster preparation is missing"))?;
+                Some(prepared.body.clone())
             }
             (SourceDescriptor::Image(config), messages::IMAGE_DATA) => {
                 if source.retained.is_some() || record.body.len() != config.encoded_length as usize
@@ -3277,7 +3638,13 @@ fn ingest_record(
             SourceDescriptor::Raster(_) | SourceDescriptor::Video(_) | SourceDescriptor::Audio(_)
         ) && projected_source
             && !source.bridge_desynchronized;
-        (old, new_retained, new, source.last_pts_us, forward)
+        let forward_body = matches!(source.descriptor, SourceDescriptor::Raster(_))
+            .then(|| new_retained.clone())
+            .flatten();
+        let pts = prepared_raster
+            .as_ref()
+            .map_or(source.last_pts_us, |prepared| Some(prepared.pts_us));
+        (old, new_retained, new, pts, forward, forward_body)
     };
     let forward_timed = candidate_forward
         && match &state.sources.get(&key).expect("source exists").descriptor {
@@ -3294,7 +3661,16 @@ fn ingest_record(
     if projected > limit {
         return Err(invalid("aggregate retained media quota exceeded"));
     }
+    let forwarded = forward_body.unwrap_or_else(|| Arc::from(record.body));
     let source = state.sources.get_mut(&key).unwrap();
+    if let Some(prepared) = prepared_raster.take() {
+        source.sequence = prepared.sequence;
+        source.last_media_id = prepared.frame_id;
+        source.raster_requires_full_reason = None;
+        source.raster_damage_window_started = prepared.damage_window_started;
+        source.raster_damage_pixels = prepared.damage_pixels;
+        debug_assert_eq!(source.sequence.epoch(), prepared.epoch);
+    }
     let retained_requires_revision = matches!(source.descriptor, SourceDescriptor::Image(_));
     if let Some(retained) = retained_body {
         source.retained = Some(retained);
@@ -3333,19 +3709,20 @@ fn ingest_record(
     let delivery = if forward_timed
         && let Some(events) = state.events.clone()
         && (state.queued_bridge_bytes == 0
-            || state.queued_bridge_bytes.saturating_add(record.body.len()) <= bridge_queue_limit)
+            || state.queued_bridge_bytes.saturating_add(forwarded.len()) <= bridge_queue_limit)
     {
         state.next_delivery_id = state
             .next_delivery_id
             .checked_add(1)
             .ok_or_else(|| invalid("bridge delivery IDs exhausted"))?;
         let delivery_id = state.next_delivery_id;
-        state.queued_bridge_bytes = state.queued_bridge_bytes.saturating_add(record.body.len());
+        state.queued_bridge_bytes = state.queued_bridge_bytes.saturating_add(forwarded.len());
         state.deliveries.insert(
             delivery_id,
             PendingDelivery {
                 source: key,
-                bytes: record.body.len() as u64,
+                credit_bytes: record.body.len() as u64,
+                queued_bytes: forwarded.len(),
             },
         );
         Some((delivery_id, events))
@@ -3371,9 +3748,9 @@ fn ingest_record(
             delivery_id,
             source: key,
             record_type: record.record_type,
-            body: record.body.to_vec(),
+            body: forwarded.to_vec(),
         }) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(IngestOutcome::Accepted),
             Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
                 let credit = {
                     let mut state = shared
@@ -3382,12 +3759,12 @@ fn ingest_record(
                     let credit = if let Some(pending) = state.deliveries.remove(&delivery_id) {
                         state.queued_bridge_bytes = state
                             .queued_bridge_bytes
-                            .saturating_sub(pending.bytes as usize);
+                            .saturating_sub(pending.queued_bytes);
                         delivery_changed.notify_all();
                         Some(prepare_credit_write(
                             &mut state,
                             pending.source,
-                            pending.bytes,
+                            pending.credit_bytes,
                             1,
                         ))
                     } else {
@@ -3409,7 +3786,7 @@ fn ingest_record(
     if let Some(credit) = immediate_credit {
         write_delivery_credit(credit)?;
     }
-    Ok(())
+    Ok(IngestOutcome::Accepted)
 }
 
 fn apply_transaction(
@@ -3620,6 +3997,7 @@ fn supported_feature(feature: u64) -> bool {
             | messages::FEATURE_OBSERVABILITY_CORE_V1
             | messages::FEATURE_SOURCE_CAPTURE_POLICY_V1
             | messages::FEATURE_SOURCE_DESCRIPTOR_V1
+            | messages::FEATURE_RASTER_DELTA_V1
             | messages::FEATURE_MEDIA_ORDER_BARRIER_V1
     )
 }
@@ -3889,6 +4267,124 @@ mod tests {
         assert!(!descriptor.is_static());
     }
 
+    fn raster_source() -> Source {
+        let mut source = barrier_source(1);
+        source.descriptor = SourceDescriptor::Raster(RasterSourceConfig {
+            source_id: 1,
+            width: 2,
+            height: 3,
+            alpha_mode: messages::ALPHA_STRAIGHT,
+            compression_mode: messages::COMPRESSION_RAW_OR_ZSTD,
+        });
+        source.raster_update = Some(RasterUpdateConfig {
+            mode: messages::RASTER_FULL_FRAME_AND_DELTA,
+            operation_limit: 4,
+        });
+        let pixels = [
+            1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255, 5, 0, 0, 255, 6, 0, 0, 255,
+        ];
+        let retained = canonical_raster_full_body(1, 1, 0, 0, 2, 3, &pixels).unwrap();
+        source.retained_bytes = retained.len();
+        source.retained = Some(retained);
+        source.sequence.accept(1, 1).unwrap();
+        source.last_media_id = 1;
+        source
+    }
+
+    #[test]
+    fn raster_delta_composition_is_overlap_exact_and_budgeted() {
+        let source = raster_source();
+        let delta = media::raster_delta_frame_body(
+            1,
+            2,
+            1,
+            10,
+            20,
+            2,
+            3,
+            4,
+            &[
+                media::RasterDeltaOperation::Copy {
+                    destination_x: 0,
+                    destination_y: 1,
+                    width: 2,
+                    height: 2,
+                    source_x: 0,
+                    source_y: 0,
+                },
+                media::RasterDeltaOperation::Overwrite {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 1,
+                    rgba: &[9, 0, 0, 255, 8, 0, 0, 255],
+                },
+            ],
+            false,
+        )
+        .unwrap();
+        let prepared = match prepare_raster(
+            &source,
+            match &source.descriptor {
+                SourceDescriptor::Raster(config) => config,
+                _ => unreachable!(),
+            },
+            &delta,
+            source.raster_damage_window_started,
+        )
+        .unwrap()
+        {
+            RasterPreparation::Accepted(prepared) => prepared,
+            RasterPreparation::Rejected { .. } => panic!("valid delta was rejected"),
+        };
+        let frame = media::parse_full_raster_frame(&prepared.body).unwrap();
+        assert_eq!(&prepared.body[16..24], &[0; 8]);
+        assert_eq!(
+            media::decode_raster_pixels(frame).unwrap(),
+            [
+                9, 0, 0, 255, 8, 0, 0, 255, 1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255,
+            ]
+        );
+
+        let mut exhausted = source;
+        exhausted.raster_damage_pixels = 2 * 3 * RASTER_DAMAGE_FRAME_EQUIVALENTS;
+        let one_pixel = media::raster_delta_frame_body(
+            1,
+            2,
+            1,
+            0,
+            0,
+            2,
+            3,
+            4,
+            &[media::RasterDeltaOperation::Overwrite {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                rgba: &[0, 0, 0, 255],
+            }],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            prepare_raster(
+                &exhausted,
+                match &exhausted.descriptor {
+                    SourceDescriptor::Raster(config) => config,
+                    _ => unreachable!(),
+                },
+                &one_pixel,
+                exhausted.raster_damage_window_started,
+            )
+            .unwrap(),
+            RasterPreparation::Rejected {
+                reason: messages::NEED_FULL_FRAME_DAMAGE_BUDGET,
+                notify: true,
+            }
+        ));
+    }
+
     fn barrier_source(generation: u64) -> Source {
         Source {
             owner: 1,
@@ -3939,6 +4435,10 @@ mod tests {
             causation_id: None,
             capture_policy: 0,
             semantic_descriptor: None,
+            raster_update: None,
+            raster_requires_full_reason: None,
+            raster_damage_window_started: Instant::now(),
+            raster_damage_pixels: 0,
         }
     }
 
@@ -4350,12 +4850,24 @@ mod tests {
                 messages::CREATE_RASTER,
                 0,
                 9,
-                &messages::create_raster(2, 9, 2, 1),
+                &messages::create_raster_delta_config(
+                    2,
+                    &RasterSourceConfig {
+                        source_id: 9,
+                        width: 2,
+                        height: 2,
+                        alpha_mode: messages::ALPHA_STRAIGHT,
+                        compression_mode: messages::COMPRESSION_RAW_OR_ZSTD,
+                    },
+                    4,
+                )
+                .unwrap(),
             )
             .unwrap();
         let ready = messages::parse_source_ready(&control.read_record().unwrap().body).unwrap();
         assert_eq!(ready.packet_credits, 1);
         assert_eq!(ready.rolling_packet_window, ROLLING_PACKET_CREDITS);
+        assert_eq!(ready.delta_operation_limit, Some(4));
         let mut raster = Connection::open(&endpoint, ConnectionKind::Raster).unwrap();
         raster
             .write_record(
@@ -4367,7 +4879,10 @@ mod tests {
             .unwrap();
 
         let revision_before_frames = service.revision();
-        let first = media::raster_frame_body(1, 1, 2, 1, &[255, 0, 0, 255, 0, 0, 0, 255]).unwrap();
+        let first_pixels = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let first = media::raster_frame_body(1, 1, 2, 2, &first_pixels).unwrap();
         raster
             .write_record(messages::RASTER_FRAME, 0, 9, &first)
             .unwrap();
@@ -4383,13 +4898,47 @@ mod tests {
         assert_eq!(first_credit_body.packets, ROLLING_PACKET_CREDITS);
         assert_eq!(service.revision(), revision_before_frames);
 
-        let second = media::raster_frame_body(1, 2, 2, 1, &[0, 255, 0, 255, 0, 0, 0, 255]).unwrap();
+        let second = media::raster_delta_frame_body(
+            1,
+            2,
+            1,
+            10_000,
+            16_000,
+            2,
+            2,
+            4,
+            &[
+                media::RasterDeltaOperation::Copy {
+                    destination_x: 0,
+                    destination_y: 1,
+                    width: 2,
+                    height: 1,
+                    source_x: 0,
+                    source_y: 0,
+                },
+                media::RasterDeltaOperation::Overwrite {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                    rgba: &[0, 0, 0, 255],
+                },
+            ],
+            false,
+        )
+        .unwrap();
         raster
             .write_record(messages::RASTER_FRAME, 0, 9, &second)
             .unwrap();
         let second_event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(second_event.record_type, messages::RASTER_FRAME);
-        assert_eq!(second_event.body, second);
+        let expected_pixels = [0, 0, 0, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255];
+        let expected =
+            canonical_raster_full_body(1, 2, 10_000, 16_000, 2, 2, &expected_pixels).unwrap();
+        assert_eq!(second_event.body, expected.as_ref());
+        let outer_form = media::parse_full_raster_frame(&second_event.body).unwrap();
+        assert_eq!(outer_form.frame_id, 2);
+        assert_eq!(&second_event.body[16..24], &[0; 8]);
         assert!(second_event.delivery_id > first_event.delivery_id);
         assert_eq!(
             service.revision(),
@@ -4399,13 +4948,62 @@ mod tests {
         assert!(!service.complete_bridge_delivery(second_event.delivery_id, true));
         assert_eq!(control.read_record().unwrap().record_type, messages::CREDIT);
 
+        let bad_base = media::raster_delta_frame_body(
+            1,
+            3,
+            99,
+            20_000,
+            16_000,
+            2,
+            2,
+            4,
+            &[media::RasterDeltaOperation::Overwrite {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                rgba: &[1, 2, 3, 255],
+            }],
+            false,
+        )
+        .unwrap();
+        raster
+            .write_record(messages::RASTER_FRAME, 0, 9, &bad_base)
+            .unwrap();
+        let rejected = control.read_record().unwrap();
+        assert_eq!(rejected.record_type, messages::ERROR);
+        assert_eq!(
+            messages::parse_error_reply(&rejected.body).unwrap().code,
+            messages::ERROR_BAD_STATE
+        );
+        let need_full = control.read_record().unwrap();
+        assert_eq!(need_full.record_type, messages::NEED_FULL_FRAME);
+        assert_eq!(
+            messages::parse_need_full_frame(&need_full.body).unwrap(),
+            messages::NeedFullFrame {
+                source_id: 9,
+                reason: messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
+            }
+        );
+        assert_eq!(control.read_record().unwrap().record_type, messages::CREDIT);
+
+        let recovery_pixels = [7_u8; 16];
+        let recovery = media::raster_frame_body(1, 5, 2, 2, &recovery_pixels).unwrap();
+        raster
+            .write_record(messages::RASTER_FRAME, 0, 9, &recovery)
+            .unwrap();
+        let recovery_event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(recovery_event.body, recovery);
+        assert!(!service.complete_bridge_delivery(recovery_event.delivery_id, true));
+        assert_eq!(control.read_record().unwrap().record_type, messages::CREDIT);
+
         let snapshot = service.projection_snapshot(&HashSet::from([7]));
         assert_eq!(snapshot.sources.len(), 1);
         assert_eq!(
             snapshot.sources[0].retained.as_deref(),
-            Some(second.as_slice())
+            Some(recovery.as_slice())
         );
-        assert_eq!(snapshot.sources[0].last_inner_record_sequence, 3);
+        assert_eq!(snapshot.sources[0].last_inner_record_sequence, 5);
     }
 
     #[test]

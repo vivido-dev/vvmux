@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use vivid_protocol::cbor::PreservedField;
+use vivid_protocol::media;
 use vivid_protocol::messages::{
     self, AudioSourceConfig, ClipRect, HelloConfig, ImageSourceConfig, RasterSourceConfig,
     SceneNodeConfig, VideoSourceConfig,
@@ -600,6 +601,9 @@ pub struct OuterBridge {
     completions_tx: mpsc::Sender<MediaCompletion>,
     completions_rx: mpsc::Receiver<MediaCompletion>,
     source_kinds: HashMap<BridgeSourceKey, BridgeSourceKind>,
+    /// Hop-local raster identities. The bridge currently chooses full frames for every outer
+    /// raster update, but still re-originates IDs so an inner delta base can never leak outward.
+    raster_frame_ids: HashMap<BridgeSourceKey, u64>,
     active_sources: HashMap<BridgeSourceKey, BridgeSource>,
     node_ids: HashMap<(u64, u64, u8), u64>,
     display: DisplayMetrics,
@@ -747,6 +751,7 @@ impl OuterBridge {
             completions_tx,
             completions_rx,
             source_kinds: HashMap::new(),
+            raster_frame_ids: HashMap::new(),
             active_sources: HashMap::new(),
             node_ids: HashMap::new(),
             display,
@@ -932,6 +937,7 @@ impl OuterBridge {
                 obsolete_media.push(writer);
             }
             self.pending.remove(key);
+            self.raster_frame_ids.remove(key);
             self.reverse_source_ids.remove(upstream);
             if !requested.contains_key(key) {
                 self.source_ids.remove(key);
@@ -1250,7 +1256,7 @@ impl OuterBridge {
             ));
         }
         if last {
-            let pending = self.pending.remove(&key).unwrap();
+            let mut pending = self.pending.remove(&key).unwrap();
             if pending.bytes.len() != pending.total {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1260,6 +1266,24 @@ impl OuterBridge {
             let upstream = *self.source_ids.get(&key).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "projection source missing")
             })?;
+            let next_raster_id = if matches!(
+                self.source_kinds.get(&key),
+                Some(BridgeSourceKind::Raster { .. })
+            ) {
+                Some(
+                    self.raster_frame_ids
+                        .get(&key)
+                        .copied()
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or_else(|| exhausted("outer raster frame"))?,
+                )
+            } else {
+                None
+            };
+            if let Some(frame_id) = next_raster_id {
+                pending.bytes = reoriginated_full_raster(&pending.bytes, frame_id)?;
+            }
             self.media
                 .get(&key)
                 .ok_or_else(|| {
@@ -1282,6 +1306,9 @@ impl OuterBridge {
                         "outer source media writer stopped",
                     ),
                 })?;
+            if let Some(frame_id) = next_raster_id {
+                self.raster_frame_ids.insert(key, frame_id);
+            }
             return Ok(true);
         }
         Ok(false)
@@ -1525,6 +1552,9 @@ impl OuterBridge {
                 .or_default();
             *generation = generation.saturating_add(1);
             self.source_kinds.insert(source.key, source.kind.clone());
+            if matches!(source.kind, BridgeSourceKind::Raster { .. }) {
+                self.raster_frame_ids.insert(source.key, 0);
+            }
         }
         Ok(())
     }
@@ -1806,6 +1836,19 @@ fn bridge_source_pixels(source: &BridgeSource) -> u64 {
     }
 }
 
+fn reoriginated_full_raster(body: &[u8], frame_id: u64) -> io::Result<Vec<u8>> {
+    if frame_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "outer raster frame ID is zero",
+        ));
+    }
+    media::parse_full_raster_frame(body)?;
+    let mut body = body.to_vec();
+    body[8..16].copy_from_slice(&frame_id.to_be_bytes());
+    Ok(body)
+}
+
 fn bridge_source_media_body(source: &BridgeSource) -> u64 {
     let length = match &source.kind {
         BridgeSourceKind::Raster { width, height, .. } => {
@@ -1998,6 +2041,44 @@ mod tests {
     use crate::config::Media as MediaConfig;
     #[cfg(unix)]
     use crate::media::VirtualVivid;
+
+    #[test]
+    fn raster_frames_are_reoriginated_as_full_with_hop_local_identity() {
+        let inner = media::raster_frame_body(7, 99, 2, 1, &[1, 2, 3, 255, 4, 5, 6, 255]).unwrap();
+        let outer = reoriginated_full_raster(&inner, 1).unwrap();
+        let parsed = media::parse_full_raster_frame(&outer).unwrap();
+        assert_eq!(parsed.epoch, 7);
+        assert_eq!(parsed.frame_id, 1);
+        assert_eq!(&outer[16..24], &[0; 8]);
+        assert_eq!(
+            media::decode_raster_pixels(parsed).unwrap(),
+            [1, 2, 3, 255, 4, 5, 6, 255]
+        );
+
+        let delta = media::raster_delta_frame_body(
+            7,
+            100,
+            99,
+            0,
+            0,
+            2,
+            1,
+            1,
+            &[media::RasterDeltaOperation::Overwrite {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                rgba: &[0, 0, 0, 255],
+            }],
+            false,
+        )
+        .unwrap();
+        assert!(
+            reoriginated_full_raster(&delta, 2).is_err(),
+            "the outer hop must never forward a foreign delta base"
+        );
+    }
 
     #[test]
     fn outer_capability_changes_must_strictly_advance() {
