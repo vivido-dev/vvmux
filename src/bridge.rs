@@ -40,6 +40,7 @@ const OPTIONAL_FEATURES: &[u64] = &[
     messages::FEATURE_SOURCE_DESCRIPTOR_V1,
     messages::FEATURE_DELEGATED_CONTEXT_V1,
     messages::FEATURE_SOURCE_CAPTURE_POLICY_V1,
+    messages::FEATURE_IMAGE_CACHE_V1,
     messages::FEATURE_MEDIA_ORDER_BARRIER_V1,
 ];
 const MAX_PENDING_CONTROL_REPLIES: usize = 4096;
@@ -620,6 +621,8 @@ pub struct OuterBridge {
     capture_policy: bool,
     source_descriptors: bool,
     media_order_barrier: bool,
+    image_cache: bool,
+    cached_images: HashSet<BridgeSourceKey>,
     pane_contexts: HashMap<u64, PaneContextMapping>,
 }
 
@@ -633,6 +636,8 @@ struct PaneContextMapping {
 struct PendingBody {
     record_type: u16,
     total: usize,
+    received: usize,
+    cached_image: bool,
     bytes: Vec<u8>,
 }
 
@@ -727,6 +732,7 @@ impl OuterBridge {
             accepted_features.contains(&messages::FEATURE_SOURCE_DESCRIPTOR_V1);
         let media_order_barrier =
             accepted_features.contains(&messages::FEATURE_MEDIA_ORDER_BARRIER_V1);
+        let image_cache = accepted_features.contains(&messages::FEATURE_IMAGE_CACHE_V1);
         connection.set_send_body_limit(welcome.maximum_control_body)?;
         let control = ControlDispatcher::start(
             connection,
@@ -764,6 +770,8 @@ impl OuterBridge {
             capture_policy,
             source_descriptors,
             media_order_barrier,
+            image_cache,
+            cached_images: HashSet::new(),
             pane_contexts: HashMap::new(),
         };
         if accepted_features.contains(&messages::FEATURE_OBSERVABILITY_CORE_V1) {
@@ -938,6 +946,7 @@ impl OuterBridge {
             }
             self.pending.remove(key);
             self.raster_frame_ids.remove(key);
+            self.cached_images.remove(key);
             self.reverse_source_ids.remove(upstream);
             if !requested.contains_key(key) {
                 self.source_ids.remove(key);
@@ -1232,14 +1241,17 @@ impl OuterBridge {
         last: bool,
         bytes: Vec<u8>,
     ) -> io::Result<bool> {
+        let cached_image = self.cached_images.contains(&key);
         let pending = self.pending.entry(key).or_insert_with(|| PendingBody {
             record_type,
             total: total as usize,
-            bytes: Vec::with_capacity(total as usize),
+            received: 0,
+            cached_image,
+            bytes: Vec::with_capacity(if cached_image { 0 } else { total as usize }),
         });
         if pending.record_type != record_type
             || pending.total != total as usize
-            || pending.bytes.len() != offset as usize
+            || pending.received != offset as usize
         {
             self.pending.remove(&key);
             return Err(io::Error::new(
@@ -1247,8 +1259,12 @@ impl OuterBridge {
                 "media chunk sequence gap",
             ));
         }
-        pending.bytes.extend_from_slice(&bytes);
-        if pending.bytes.len() > pending.total {
+        let cached_image = pending.cached_image;
+        pending.received = pending.received.saturating_add(bytes.len());
+        if !cached_image {
+            pending.bytes.extend_from_slice(&bytes);
+        }
+        if pending.received > pending.total {
             self.pending.remove(&key);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1257,11 +1273,37 @@ impl OuterBridge {
         }
         if last {
             let mut pending = self.pending.remove(&key).unwrap();
-            if pending.bytes.len() != pending.total {
+            if pending.received != pending.total {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "incomplete media body",
                 ));
+            }
+            if cached_image {
+                if pending.record_type != messages::IMAGE_DATA
+                    || !matches!(
+                        self.source_kinds.get(&key),
+                        Some(BridgeSourceKind::Image { .. })
+                    )
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "cache-hit source received non-image media",
+                    ));
+                }
+                self.completions_tx
+                    .send(MediaCompletion {
+                        delivery_id,
+                        delivered: true,
+                        record_sequence: 0,
+                    })
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "outer media completion receiver stopped",
+                        )
+                    })?;
+                return Ok(true);
             }
             let upstream = *self.source_ids.get(&key).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "projection source missing")
@@ -1344,6 +1386,7 @@ impl OuterBridge {
             .collect::<Vec<_>>();
         for key in &losses {
             self.media.remove(key);
+            self.cached_images.remove(key);
             self.source_kinds.remove(key);
         }
         losses
@@ -1414,7 +1457,7 @@ impl OuterBridge {
                 } => (
                     messages::CREATE_IMAGE,
                     ConnectionKind::Blob,
-                    messages::create_image_with_extensions(
+                    messages::create_image_with_cache_extensions(
                         request,
                         &ImageSourceConfig {
                             source_id: upstream,
@@ -1424,9 +1467,12 @@ impl OuterBridge {
                             encoded_length: *encoded_length,
                             sha256: *sha256,
                         },
+                        self.image_cache
+                            && sha256.is_some()
+                            && source.capture_policy & messages::CAPTURE_POLICY_DENY_CACHE == 0,
                         source.capture_policy,
                         source.descriptor.as_ref().map(protocol_descriptor).as_ref(),
-                    ),
+                    )?,
                 ),
                 BridgeSourceKind::Video {
                     codec,
@@ -1530,6 +1576,24 @@ impl OuterBridge {
         // independently completed replies before attaching each source-specific media channel.
         for (source, request, upstream, kind) in pending {
             let ready = self.wait_source_ready(request, upstream)?;
+            self.source_kinds.insert(source.key, source.kind.clone());
+            let generation = self
+                .outer_attachment_generations
+                .entry(source.key)
+                .or_default();
+            *generation = generation.saturating_add(1);
+            if !ready.media_connection_required {
+                if kind != ConnectionKind::Blob
+                    || !matches!(source.kind, BridgeSourceKind::Image { .. })
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "outer presenter returned a cache hit for a non-image source",
+                    ));
+                }
+                self.cached_images.insert(source.key);
+                continue;
+            }
             self.control.register_source(&ready)?;
             let mut media = self.connection_factory.open(kind)?;
             media.set_send_body_limit(ready.max_media_body)?;
@@ -1546,12 +1610,7 @@ impl OuterBridge {
                 .name(format!("vvmux-media-{upstream}"))
                 .spawn(move || run_media_writer(media, shared, receiver, completions))?;
             self.media.insert(source.key, SourceMediaWriter { sender });
-            let generation = self
-                .outer_attachment_generations
-                .entry(source.key)
-                .or_default();
-            *generation = generation.saturating_add(1);
-            self.source_kinds.insert(source.key, source.kind.clone());
+            self.cached_images.remove(&source.key);
             if matches!(source.kind, BridgeSourceKind::Raster { .. }) {
                 self.raster_frame_ids.insert(source.key, 0);
             }
@@ -2410,6 +2469,174 @@ mod tests {
         assert_eq!(bridge.hello_extensions, hello_extensions);
         assert_eq!(bridge.welcome_extensions, welcome_extensions);
         server.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outer_image_cache_hit_skips_media_connection_and_acknowledges_rehydration() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("outer-image-cache.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping outer image-cache socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("fake outer presenter bind failed: {error}"),
+        };
+        let server = thread::spawn(move || -> io::Result<bool> {
+            let (mut control, _) = listener.accept()?;
+            let mut preface = [0; PREFACE_SIZE];
+            control.read_exact(&mut preface)?;
+            let hello_record = read_client_record(&mut control)?;
+            let (request, hello) = messages::parse_hello(&hello_record.body)?;
+            assert!(
+                hello
+                    .optional_features
+                    .contains(&messages::FEATURE_IMAGE_CACHE_V1)
+            );
+            let accepted = [
+                messages::FEATURE_RASTER_RGBA8,
+                messages::FEATURE_SCENE_TRANSACTIONS,
+                messages::FEATURE_GRID_CELL_NODES,
+                messages::FEATURE_CREDIT_FLOW_CONTROL,
+                messages::FEATURE_ENCODED_IMAGE_V1,
+                messages::FEATURE_NODE_CLIP_RECT_V1,
+                messages::FEATURE_IMAGE_CACHE_V1,
+            ];
+            let mut sequence = 0;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::WELCOME,
+                0,
+                &messages::welcome(
+                    request,
+                    1,
+                    &[1; 16],
+                    1,
+                    messages::DisplayChanged {
+                        display_generation: 1,
+                        viewport_width: 800,
+                        viewport_height: 600,
+                        grid_columns: 80,
+                        grid_rows: 24,
+                        cell_width: 10,
+                        cell_height: 25,
+                        settled: true,
+                    },
+                    &accepted,
+                ),
+            )?;
+
+            let create = read_client_record(&mut control)?;
+            assert_eq!(create.record_type, messages::CREATE_IMAGE);
+            let (envelope, _, cache_lookup, _, _) =
+                messages::parse_create_image_with_extensions(&create.body)?;
+            assert!(cache_lookup);
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::SOURCE_READY,
+                create.object_id,
+                &messages::source_ready_with_observability(
+                    envelope.request_id,
+                    &messages::SourceReady {
+                        source_id: create.object_id,
+                        media_ticket: Vec::new(),
+                        byte_credits: 0,
+                        packet_credits: 0,
+                        fragment_credits: 0,
+                        max_media_body: 0,
+                        rolling_byte_window: 0,
+                        rolling_packet_window: 0,
+                        initial_source_revision: SourceRevision::new(1),
+                        media_connection_required: false,
+                        delta_operation_limit: None,
+                    },
+                )?,
+            )?;
+
+            for expected in [messages::BEGIN_TXN, messages::COMMIT_TXN] {
+                let record = read_client_record(&mut control)?;
+                assert_eq!(record.record_type, expected);
+                let reply = if expected == messages::COMMIT_TXN {
+                    messages::PRESENTED
+                } else {
+                    messages::OK
+                };
+                write_server_record(
+                    &mut control,
+                    &mut sequence,
+                    reply,
+                    record.object_id,
+                    &messages::ok(messages::request_id(&record.body)?),
+                )?;
+            }
+            listener.set_nonblocking(true)?;
+            Ok(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock))
+        });
+
+        let mut bridge = match OuterBridge::connect(
+            format!("unix:{}", socket.display()),
+            Zeroizing::new("11".repeat(32)),
+            DisplayMetrics::default(),
+        ) {
+            Ok(bridge) => bridge,
+            Err(error) => panic!(
+                "outer bridge connection failed: {error}; server: {:?}",
+                server.join().unwrap()
+            ),
+        };
+        let source = BridgeSource {
+            key: BridgeSourceKey {
+                producer: 3,
+                source: 9,
+            },
+            kind: BridgeSourceKind::Image {
+                encoding: messages::IMAGE_PNG,
+                width: 1,
+                height: 1,
+                encoded_length: 4,
+                sha256: Some([7; 32]),
+            },
+            capture_policy: 0,
+            descriptor: None,
+            playing: false,
+            eos_epoch: None,
+            causation_id: None,
+            play_request: crate::ipc::BridgePlayRequest {
+                start_pts_us: 0,
+                minimum_buffer_us: 0,
+                maximum_latency_us: 500_000,
+                rate_32_32: 1_i64 << 32,
+                late_policy: messages::LATE_DROP_PRESENTATION,
+                loop_count: 0,
+                start_policy: messages::START_AFTER_MINIMUM_BUFFER,
+            },
+        };
+        bridge.rebuild(std::slice::from_ref(&source), &[]).unwrap();
+        assert!(bridge.cached_images.contains(&source.key));
+        assert!(
+            bridge
+                .media_chunk(
+                    77,
+                    source.key,
+                    messages::IMAGE_DATA,
+                    0,
+                    4,
+                    true,
+                    vec![1, 2, 3, 4],
+                )
+                .unwrap()
+        );
+        assert_eq!(bridge.take_media_completions(), vec![(77, true, 0)]);
+        assert!(
+            server.join().unwrap().unwrap(),
+            "cache hit must not open or attach an outer blob connection"
+        );
     }
 
     #[cfg(unix)]
