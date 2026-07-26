@@ -680,6 +680,8 @@ pub struct OuterBridge {
     welcome_extensions: Vec<PreservedField>,
     /// Local acknowledgement domain for successfully reconciled outer snapshots.
     outer_applied_revision: u64,
+    /// Changes whenever this worker replaces its outer presenter session.
+    diagnostic_instance_generation: u64,
     outer_attachment_generations: HashMap<BridgeSourceKey, u64>,
     delegated_contexts: bool,
     capture_policy: bool,
@@ -744,7 +746,7 @@ impl OuterBridge {
     pub(crate) fn connect_with_factory_and_extensions(
         connection_factory: Arc<dyn ConnectionFactory>,
         token: Zeroizing<String>,
-        display: DisplayMetrics,
+        _display: DisplayMetrics,
         hello_extensions: &[PreservedField],
     ) -> io::Result<Self> {
         let mut connection = connection_factory.open(ConnectionKind::Control)?;
@@ -791,6 +793,12 @@ impl OuterBridge {
                 "outer WELCOME accepted features are unsorted, duplicated, or were not offered",
             ));
         }
+        let display = presenter_display_metrics(
+            welcome.grid_columns,
+            welcome.grid_rows,
+            welcome.cell_width,
+            welcome.cell_height,
+        )?;
         let decoder_description =
             accepted_features.contains(&messages::FEATURE_DECODER_DESCRIPTION_V1);
         let delegated_contexts =
@@ -838,6 +846,7 @@ impl OuterBridge {
             hello_extensions: hello_extensions.to_vec(),
             welcome_extensions: welcome.preserved_fields,
             outer_applied_revision: 0,
+            diagnostic_instance_generation: 1,
             outer_attachment_generations: HashMap::new(),
             delegated_contexts,
             capture_policy,
@@ -862,9 +871,17 @@ impl OuterBridge {
         Ok(bridge)
     }
 
+    pub fn display_metrics(&self) -> DisplayMetrics {
+        self.display
+    }
+
     pub fn mark_projection_applied(&mut self) -> u64 {
         self.outer_applied_revision = self.outer_applied_revision.saturating_add(1);
         self.outer_applied_revision
+    }
+
+    pub fn diagnostic_instance_generation(&self) -> u64 {
+        self.diagnostic_instance_generation
     }
 
     pub fn attachment_generations(&self) -> Vec<(BridgeSourceKey, u64)> {
@@ -899,6 +916,8 @@ impl OuterBridge {
             &self.hello_extensions,
         )?;
         let recreated = replacement.reconcile(sources, nodes)?;
+        replacement.diagnostic_instance_generation =
+            self.diagnostic_instance_generation.saturating_add(1);
         *self = replacement;
         Ok(recreated)
     }
@@ -920,6 +939,8 @@ impl OuterBridge {
             &self.hello_extensions,
         )?;
         let recreated = replacement.reconcile(sources, nodes)?;
+        replacement.diagnostic_instance_generation =
+            self.diagnostic_instance_generation.saturating_add(1);
         *self = replacement;
         Ok(recreated)
     }
@@ -2204,6 +2225,34 @@ fn raster_damage_pixels(operations: &[media::ParsedRasterDeltaOperation<'_>]) ->
     })
 }
 
+fn presenter_display_metrics(
+    grid_columns: u64,
+    grid_rows: u64,
+    cell_width: u32,
+    cell_height: u32,
+) -> io::Result<DisplayMetrics> {
+    let columns = u16::try_from(grid_columns)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "outer grid width exceeds u16"))?;
+    let rows = u16::try_from(grid_rows)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "outer grid height exceeds u16"))?;
+    let cell_width = u16::try_from(cell_width)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "outer cell width exceeds u16"))?;
+    let cell_height = u16::try_from(cell_height)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "outer cell height exceeds u16"))?;
+    if columns == 0 || rows == 0 || cell_width == 0 || cell_height == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "outer presenter reported zero display geometry",
+        ));
+    }
+    Ok(DisplayMetrics {
+        columns,
+        rows,
+        cell_width,
+        cell_height,
+    })
+}
+
 /// State of one outgoing raster delta chain.
 ///
 /// The chain is entirely vvmux's own: `base_frame_id` is the identity this hop last wrote and had
@@ -2971,6 +3020,23 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn outer_presenter_metrics_replace_client_console_font_metrics() {
+        let display = presenter_display_metrics(120, 42, 11, 23).unwrap();
+        assert_eq!(
+            display,
+            DisplayMetrics {
+                columns: 120,
+                rows: 42,
+                cell_width: 11,
+                cell_height: 23,
+            }
+        );
+        assert!(presenter_display_metrics(u64::from(u16::MAX) + 1, 42, 11, 23).is_err());
+        assert!(presenter_display_metrics(120, 42, 0, 23).is_err());
+    }
+
     #[cfg(unix)]
     use vivid_protocol::media::{self, VideoPacket};
     fn read_client_record(stream: &mut impl Read) -> io::Result<Record> {
@@ -3069,6 +3135,16 @@ mod tests {
             DisplayMetrics::default(),
         )
         .unwrap();
+        assert_eq!(
+            bridge.display_metrics(),
+            DisplayMetrics {
+                columns: 80,
+                rows: 24,
+                cell_width: 10,
+                cell_height: 25,
+            },
+            "the bridge must use the outer presenter's pixels, not client console font metrics"
+        );
 
         let worker = crate::client::BridgeWorker::spawn_with_sender(
             bridge,

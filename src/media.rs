@@ -44,6 +44,21 @@ const RASTER_DAMAGE_INTERVAL: Duration = Duration::from_millis(100);
 pub type ProducerId = u64;
 pub type SourceKey = (ProducerId, u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeRequestOutcome {
+    Forwarded,
+    Damped,
+    Ignored,
+}
+
+pub struct OuterMediaProjection<'a> {
+    pub compatibility_revision: u64,
+    pub apply_sequence: u64,
+    pub bridge_instance_id: Option<u64>,
+    pub bridge_local_revision: u64,
+    pub attachment_generations: &'a HashMap<crate::ipc::BridgeSourceKey, u64>,
+}
+
 #[derive(Debug, Clone)]
 pub enum SourceDescriptor {
     Raster(RasterSourceConfig),
@@ -123,6 +138,7 @@ pub struct MediaEvent {
     pub delivery_id: u64,
     pub source: SourceKey,
     pub record_type: u16,
+    pub recovered_keyframe: Option<(u32, i64)>,
     pub body: Vec<u8>,
 }
 
@@ -292,9 +308,44 @@ pub struct VirtualVivid {
 }
 
 impl VirtualVivid {
+    pub fn pane_for_source(&self, key: SourceKey) -> Option<PaneId> {
+        let state = self.lock();
+        state.producers.get(&key.0).map(|producer| producer.pane)
+    }
+
     #[cfg(test)]
     pub fn start(endpoint: VirtualPresenterEndpoint, config: MediaConfig) -> io::Result<Self> {
         Self::start_with_events(endpoint, config, None)
+    }
+
+    #[cfg(test)]
+    pub fn wait_for_retained_media(&self, pane: PaneId, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.lock();
+        loop {
+            let retained = state.sources.iter().any(|(key, source)| {
+                source.retained.is_some()
+                    && state
+                        .producers
+                        .get(&key.0)
+                        .is_some_and(|producer| producer.pane == pane)
+            });
+            if retained {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timeout) = self
+                .delivery_changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if timeout.timed_out() {
+                return false;
+            }
+        }
     }
 
     pub fn start_with_events(
@@ -675,8 +726,7 @@ impl VirtualVivid {
     pub fn pane_status(
         &self,
         pane: PaneId,
-        outer_projection_revision: u64,
-        outer_attachment_generations: &HashMap<crate::ipc::BridgeSourceKey, u64>,
+        outer: OuterMediaProjection<'_>,
         relay: crate::metrics::RelayMetrics,
     ) -> PaneMediaStatus {
         let state = self.lock();
@@ -740,12 +790,20 @@ impl VirtualVivid {
                     epoch: source.sequence.epoch(),
                     attachment_state: source.attachment_state,
                     attachment_generation: source.attachment_generation,
-                    outer_attachment_generation: outer_attachment_generations
+                    outer_attachment_generation: outer
+                        .attachment_generations
                         .get(&crate::ipc::BridgeSourceKey {
                             producer: key.0,
                             source: key.1,
                         })
                         .copied(),
+                    outer_mapping_fresh: outer.bridge_instance_id.is_some()
+                        && outer.attachment_generations.contains_key(
+                            &crate::ipc::BridgeSourceKey {
+                                producer: key.0,
+                                source: key.1,
+                            },
+                        ),
                     visible: state.projected_sources.contains(&key),
                     capture_policy: source.capture_policy,
                     descriptor: source.semantic_descriptor.as_ref().map(|descriptor| {
@@ -794,7 +852,10 @@ impl VirtualVivid {
         PaneMediaStatus {
             virtual_projection_revision: state.projection_revision,
             virtual_scene_revision,
-            outer_projection_revision,
+            outer_projection_revision: outer.compatibility_revision,
+            outer_apply_sequence: outer.apply_sequence,
+            bridge_instance_id: outer.bridge_instance_id,
+            bridge_local_revision: outer.bridge_local_revision,
             sources,
             nodes,
             relay: crate::metrics::RelayMetrics {
@@ -880,8 +941,21 @@ impl VirtualVivid {
         request_keyframe
     }
 
-    pub fn request_keyframe(&self, source: SourceKey, minimum_epoch: Option<u32>, reason: u64) {
-        request_keyframe_recoveries(&self.state, &[(source, minimum_epoch, reason)]);
+    pub fn request_keyframe(
+        &self,
+        source: SourceKey,
+        minimum_epoch: Option<u32>,
+        reason: u64,
+    ) -> KeyframeRequestOutcome {
+        let (forwarded, damped) =
+            request_keyframe_recoveries(&self.state, &[(source, minimum_epoch, reason)]);
+        if forwarded != 0 {
+            KeyframeRequestOutcome::Forwarded
+        } else if damped != 0 {
+            KeyframeRequestOutcome::Damped
+        } else {
+            KeyframeRequestOutcome::Ignored
+        }
     }
 
     /// Ask inner raster producers for a full frame.
@@ -957,10 +1031,12 @@ fn normalize_keyframe_reason(reason: u64) -> u64 {
 fn request_keyframe_recoveries(
     shared: &Arc<Mutex<State>>,
     requests: &[(SourceKey, Option<u32>, u64)],
-) {
+) -> (u64, u64) {
     let mut state = shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut forwarded = 0_u64;
+    let mut damped = 0_u64;
     for &(key, requested_minimum, requested_reason) in requests {
         let reason = normalize_keyframe_reason(requested_reason);
         let Some(source) = state.sources.get(&key) else {
@@ -992,6 +1068,7 @@ fn request_keyframe_recoveries(
                     .delivery_metrics
                     .keyframe_requests_damped
                     .saturating_add(1);
+                damped = damped.saturating_add(1);
                 continue;
             }
         }
@@ -1026,12 +1103,14 @@ fn request_keyframe_recoveries(
         source.bridge_desynchronized = true;
         state.delivery_metrics.keyframe_requests =
             state.delivery_metrics.keyframe_requests.saturating_add(1);
+        forwarded = forwarded.saturating_add(1);
         let _ = writer.write_record(
             messages::NEED_KEYFRAME,
             key.1,
             &messages::need_keyframe(key.1, emitted_minimum, emitted_reason, None),
         );
     }
+    (forwarded, damped)
 }
 
 fn advance_projection(state: &mut State) {
@@ -3780,6 +3859,7 @@ fn ingest_record(
         RasterPreparation::Accepted(prepared) => Some(prepared),
         RasterPreparation::Rejected { .. } => None,
     });
+    let mut recovered_keyframe = None;
     let (old_retained, retained_body, new_retained, pts, candidate_forward, forward_body) = {
         let source = state
             .sources
@@ -3814,6 +3894,7 @@ fn ingest_record(
                     && packet.epoch >= source.minimum_epoch
                     && packet.flags & media::VIDEO_PACKET_KEY != 0;
                 if recovered {
+                    recovered_keyframe = Some((packet.epoch, packet.pts_us));
                     source.bridge_desynchronized = false;
                     source.pending_keyframe_reason = None;
                 } else if !projected_source {
@@ -3983,6 +4064,7 @@ fn ingest_record(
             delivery_id,
             source: key,
             record_type: record.record_type,
+            recovered_keyframe,
             body: forwarded.to_vec(),
         }) {
             Ok(()) => {
@@ -4917,7 +4999,10 @@ mod tests {
         assert_eq!(after_first.2, 0);
 
         for _ in 0..32 {
-            service.request_keyframe(key, None, messages::KEYFRAME_REASON_DECODER_ERROR);
+            assert_eq!(
+                service.request_keyframe(key, None, messages::KEYFRAME_REASON_DECODER_ERROR),
+                KeyframeRequestOutcome::Damped
+            );
         }
         let state = service.lock();
         assert_eq!(
@@ -5635,6 +5720,7 @@ mod tests {
             .unwrap();
         let event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(event.source.1, 9);
+        assert_eq!(event.recovered_keyframe, None);
         assert!(service.complete_bridge_delivery(event.delivery_id, false));
         let credit = control.read_record().unwrap();
         assert_eq!(credit.record_type, messages::CREDIT);
@@ -5662,6 +5748,7 @@ mod tests {
             .write_record(messages::VIDEO_PACKET, 0, 9, &recovery_packet)
             .unwrap();
         let recovery_event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(recovery_event.recovered_keyframe, Some((1, 33_000)));
         assert!(!service.complete_bridge_delivery(recovery_event.delivery_id, true));
         assert_eq!(control.read_record().unwrap().record_type, messages::CREDIT);
 
@@ -5679,6 +5766,7 @@ mod tests {
             .write_record(messages::VIDEO_PACKET, 0, 9, &pending_packet)
             .unwrap();
         let pending_event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(pending_event.recovered_keyframe, None);
 
         let (reply_sender, reply_receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -6396,8 +6484,39 @@ mod tests {
             },
             7,
         )]);
-        let first = service.pane_status(7, 41, &outer_generations, Default::default());
-        let second = service.pane_status(7, 42, &outer_generations, Default::default());
+        let first = service.pane_status(
+            7,
+            OuterMediaProjection {
+                compatibility_revision: 41,
+                apply_sequence: 8,
+                bridge_instance_id: Some(3),
+                bridge_local_revision: 6,
+                attachment_generations: &outer_generations,
+            },
+            Default::default(),
+        );
+        let second = service.pane_status(
+            7,
+            OuterMediaProjection {
+                compatibility_revision: 42,
+                apply_sequence: 9,
+                bridge_instance_id: Some(3),
+                bridge_local_revision: 7,
+                attachment_generations: &outer_generations,
+            },
+            Default::default(),
+        );
+        let detached = service.pane_status(
+            7,
+            OuterMediaProjection {
+                compatibility_revision: 42,
+                apply_sequence: 9,
+                bridge_instance_id: None,
+                bridge_local_revision: 0,
+                attachment_generations: &outer_generations,
+            },
+            Default::default(),
+        );
         assert_eq!(first.virtual_scene_revision, second.virtual_scene_revision);
         assert_eq!(
             first.sources[0].source_revision, second.sources[0].source_revision,
@@ -6405,6 +6524,12 @@ mod tests {
         );
         assert_eq!(first.sources[0].attachment_generation, 0);
         assert_eq!(first.sources[0].outer_attachment_generation, Some(7));
+        assert!(first.sources[0].outer_mapping_fresh);
         assert_eq!(second.outer_projection_revision, 42);
+        assert_eq!(second.outer_apply_sequence, 9);
+        assert_eq!(second.bridge_instance_id, Some(3));
+        assert_eq!(second.bridge_local_revision, 7);
+        assert_eq!(detached.sources[0].outer_attachment_generation, Some(7));
+        assert!(!detached.sources[0].outer_mapping_fresh);
     }
 }

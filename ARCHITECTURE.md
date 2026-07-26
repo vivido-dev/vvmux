@@ -18,5 +18,18 @@ An operation that cannot complete promptly follows the pending-work pattern:
 
 `automation_input` is the reference implementation: PTY completion waits happen on a worker while
 the actor continues servicing media delivery, rendering, client events, and unrelated automation.
-New Vivid queries, waits, device operations, and Stage 2 status work must use the same pattern.
+Vivid queries, waits, device operations, and status work use the same pattern.
 Workers must never mutate `SessionActor` state directly or write session replies themselves.
+
+## Vivid 1.1 and revision domains
+
+The pane-facing virtual presenter and the outer presenter are different Vivid sessions. Virtual
+scene/source revisions, observation sequences, attachment generations, record sequences, raster
+frame bases, and EOS barriers never cross the boundary as identities. The session actor separately
+tracks a monotonic outer compatibility revision and apply sequence; the current foreground bridge
+reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
+backward or perturb pane-owned virtual revisions.
+
+Private VVMX version 9 is a hard cutover. It carries bounded binary render/media records,
+pane-scoped sanitized media status and waits, bridge-instance correlation, and metadata-only media
+traces. Mixed VVMX versions are rejected with restart guidance.
