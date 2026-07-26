@@ -1532,6 +1532,27 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn receive_bridge_message_until(
+        receiver: &mpsc::Receiver<ClientMessage>,
+        seen: &mut Vec<ClientMessage>,
+        description: &str,
+        predicate: impl Fn(&ClientMessage) -> bool,
+    ) -> usize {
+        loop {
+            let message = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|error| {
+                    panic!("timed out waiting for {description}: {error}; messages={seen:#?}")
+                });
+            seen.push(message);
+            let index = seen.len() - 1;
+            if predicate(&seen[index]) {
+                return index;
+            }
+        }
+    }
+
     #[test]
     fn prefix_parser_sends_literal_and_actions() {
         let mut parser = PrefixParser::default();
@@ -2204,80 +2225,78 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn delayed_retained_image_and_source_changes_preserve_mixed_media() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("outer-scene.sock");
-        let presenter = match VirtualVivid::start(socket.clone(), MediaConfig::default()) {
-            Ok(presenter) => presenter,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                eprintln!("skipping scene-only bridge socket test: {error}");
-                return;
-            }
-            Err(error) => panic!("virtual outer presenter start failed: {error}"),
-        };
-        let token = presenter.issue_pane_capability(7).unwrap();
-        presenter.update_metrics(7, 80, 22, (10, 20));
-        let bridge = crate::bridge::OuterBridge::connect(
-            format!("unix:{}", socket.display()),
-            Zeroizing::new(token),
-            DisplayMetrics::default(),
-        )
-        .unwrap();
-
-        let (client, server) = UnixStream::pair().unwrap();
-        let client_establish = thread::spawn(move || {
-            crate::ipc::establish(test_transport(client), ChannelKind::Control)
-        });
-        let (mut server_reader, _server_writer) =
-            establish(test_transport(server), ChannelKind::Control).unwrap();
-        let (_client_reader, client_writer) = client_establish.join().unwrap().unwrap();
-        let mut worker = BridgeWorker::spawn(bridge, client_writer, 8).unwrap();
-
-        let (keyframe_sender, keyframe_receiver) = mpsc::channel();
-        thread::spawn(move || {
-            while let Ok(message) = server_reader.recv::<ClientMessage>() {
-                if let ClientMessage::BridgeNeedKeyframes(sources) = message {
-                    let _ = keyframe_sender.send(sources);
+    fn two_three_pane_tabs_restore_video_and_audio_after_showing_an_image() {
+        for iteration in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory
+                .path()
+                .join(format!("outer-tab-recovery-{iteration}.sock"));
+            let presenter = match VirtualVivid::start(socket.clone(), MediaConfig::default()) {
+                Ok(presenter) => presenter,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    eprintln!("skipping tab recovery bridge socket test: {error}");
+                    return;
                 }
-            }
-        });
+                Err(error) => panic!("virtual outer presenter start failed: {error}"),
+            };
+            let token = presenter.issue_pane_capability(7).unwrap();
+            presenter.update_metrics(7, 80, 22, (10, 20));
+            let bridge = crate::bridge::OuterBridge::connect(
+                format!("unix:{}", socket.display()),
+                Zeroizing::new(token),
+                DisplayMetrics::default(),
+            )
+            .unwrap();
 
-        let video_key = BridgeSourceKey {
-            producer: 3,
-            source: 7,
-        };
-        let initial_keyframe = |source| BridgeKeyframeRequest {
-            source,
-            minimum_epoch: None,
-            reason: vivid_protocol::messages::KEYFRAME_REASON_INITIAL,
-        };
-        let video_source = BridgeSource {
-            key: video_key,
-            kind: BridgeSourceKind::Video {
-                codec_string: None,
-                decoder_config: None,
-                codec: "h264".into(),
-                packetization: "h264-annexb-au-v1".into(),
-                extradata: Vec::new(),
-                width: 16,
-                height: 16,
-                profile: 0,
-                level: 0,
-                bitrate: 0,
-                color_primaries: 1,
-                transfer: 1,
-                matrix: 1,
-                range: 1,
-                sar_num: 1,
-                sar_den: 1,
-                max_access_unit_bytes: 1024,
-            },
-            capture_policy: 0,
-            descriptor: None,
-            playing: true,
-            eos_epoch: None,
-            causation_id: None,
-            play_request: crate::ipc::BridgePlayRequest {
+            let (client, server) = UnixStream::pair().unwrap();
+            let client_establish = thread::spawn(move || {
+                crate::ipc::establish(test_transport(client), ChannelKind::Control)
+            });
+            let (mut server_reader, _server_writer) =
+                establish(test_transport(server), ChannelKind::Control).unwrap();
+            let (_client_reader, client_writer) = client_establish.join().unwrap().unwrap();
+            let mut worker = BridgeWorker::spawn(bridge, client_writer, 8).unwrap();
+
+            let (message_sender, message_receiver) = mpsc::channel();
+            thread::spawn(move || {
+                while let Ok(message) = server_reader.recv::<ClientMessage>() {
+                    let _ = message_sender.send(message);
+                }
+            });
+            let mut seen = Vec::new();
+
+            let tabs = [[1_u64, 2, 3], [4_u64, 5, 6]];
+            let tab_area = crate::layout::Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 22,
+            };
+            let three_pane_tab = |panes: [u64; 3]| {
+                let mut tree = crate::layout::TiledNode::leaf(panes[0]);
+                tree.split(panes[0], panes[1], crate::ipc::Axis::Vertical, tab_area)
+                    .unwrap();
+                tree.split(panes[1], panes[2], crate::ipc::Axis::Horizontal, tab_area)
+                    .unwrap();
+                tree
+            };
+            let video_tab = three_pane_tab(tabs[0]);
+            let image_tab = three_pane_tab(tabs[1]);
+            assert_eq!(video_tab.pane_ids(), tabs[0]);
+            assert_eq!(image_tab.pane_ids(), tabs[1]);
+            let video_pane = tabs[0][1];
+            let image_pane = tabs[1][1];
+            let video_rect = video_tab.geometry(tab_area)[&video_pane].content();
+            let image_rect = image_tab.geometry(tab_area)[&image_pane].content();
+            let video_key = BridgeSourceKey {
+                producer: video_pane,
+                source: 7,
+            };
+            let audio_key = BridgeSourceKey {
+                producer: video_pane,
+                source: 8,
+            };
+            let play_request = crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 33_000,
                 maximum_latency_us: 500_000,
@@ -2285,301 +2304,614 @@ mod tests {
                 late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
                 loop_count: 0,
                 start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
-            },
-        };
-        let node = |x: i64| BridgeNode {
-            producer: 3,
-            node: 1,
-            fragment: 0,
-            source: video_key,
-            x: x << 32,
-            y: 0,
-            width: 8_i64 << 32,
-            height: 4_i64 << 32,
-            z_index: 0,
-            visible: true,
-            clip: crate::ipc::BridgeClipRect {
-                x: x << 32,
-                y: 0,
-                width: 8_i64 << 32,
-                height: 4_i64 << 32,
-            },
-        };
-        let outer_video = |snapshot: &crate::media::ProjectionSnapshot| {
-            snapshot
-                .sources
-                .iter()
-                .find(|source| {
-                    matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
-                })
-                .map(|source| (source.key, source.playing))
-        };
-        let wait_for = |condition: &dyn Fn(&crate::media::ProjectionSnapshot) -> bool,
-                        what: &str| {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
-                if condition(&snapshot) {
-                    break snapshot;
-                }
-                assert!(Instant::now() < deadline, "timed out waiting for {what}");
-                thread::sleep(Duration::from_millis(2));
-            }
-        };
-
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            virtual_revision: 1,
-            sources: vec![video_source.clone()],
-            nodes: vec![node(0)],
-            videos_needing_keyframes: Vec::new(),
-        });
-        let snapshot = wait_for(
-            &|snapshot| {
-                outer_video(snapshot).is_some_and(|(_, playing)| playing)
-                    && !snapshot.nodes.is_empty()
-            },
-            "initial playing video projection",
-        );
-        let (outer_key, _) = outer_video(&snapshot).unwrap();
-        assert_eq!(
-            keyframe_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap(),
-            vec![initial_keyframe(video_key)],
-            "a newly created playing video requests one keyframe"
-        );
-
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            virtual_revision: 2,
-            sources: vec![video_source.clone()],
-            nodes: vec![node(5)],
-            videos_needing_keyframes: Vec::new(),
-        });
-        let snapshot = wait_for(
-            &|snapshot| {
-                snapshot
-                    .nodes
-                    .first()
-                    .is_some_and(|node| node.config.node.x == 5_i64 << 32)
-            },
-            "moved scene node",
-        );
-        assert_eq!(
-            outer_video(&snapshot).unwrap(),
-            (outer_key, true),
-            "a scene-only change must not pause or recreate the playing video"
-        );
-        assert!(
-            keyframe_receiver.try_recv().is_err(),
-            "a scene-only change must not request a keyframe"
-        );
-
-        let mut encoded = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut encoded)
-            .write_image(
-                &[0xff, 0x40, 0x20, 0xff],
-                1,
-                1,
-                image::ExtendedColorType::Rgba8,
-            )
-            .unwrap();
-        let image_key = BridgeSourceKey {
-            producer: 4,
-            source: 9,
-        };
-        let image_source = BridgeSource {
-            key: image_key,
-            kind: BridgeSourceKind::Image {
-                encoding: vivid_protocol::messages::IMAGE_PNG,
-                width: 1,
-                height: 1,
-                encoded_length: u32::try_from(encoded.len()).unwrap(),
-                sha256: None,
-            },
-            capture_policy: 0,
-            descriptor: None,
-            playing: false,
-            eos_epoch: None,
-            causation_id: None,
-            play_request: crate::ipc::BridgePlayRequest {
-                start_pts_us: 0,
-                minimum_buffer_us: 0,
-                maximum_latency_us: 500_000,
-                rate_32_32: 1_i64 << 32,
-                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
-                loop_count: 0,
-                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
-            },
-        };
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            virtual_revision: 3,
-            sources: vec![video_source.clone(), image_source.clone()],
-            nodes: vec![node(5)],
-            videos_needing_keyframes: Vec::new(),
-        });
-        let snapshot = wait_for(
-            &|snapshot| {
-                snapshot.sources.iter().any(|source| {
-                    matches!(source.descriptor, crate::media::SourceDescriptor::Image(_))
-                })
-            },
-            "added image source",
-        );
-        assert_eq!(
-            outer_video(&snapshot).unwrap(),
-            (outer_key, true),
-            "adding a source must reconcile in the current session without pausing playback"
-        );
-        assert!(keyframe_receiver.try_recv().is_err());
-
-        let image_node = BridgeNode {
-            producer: image_key.producer,
-            node: 2,
-            fragment: 0,
-            source: image_key,
-            x: 20_i64 << 32,
-            y: 0,
-            width: 1_i64 << 32,
-            height: 1_i64 << 32,
-            z_index: 0,
-            visible: true,
-            clip: crate::ipc::BridgeClipRect {
-                x: 20_i64 << 32,
-                y: 0,
-                width: 1_i64 << 32,
-                height: 1_i64 << 32,
-            },
-        };
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            virtual_revision: 4,
-            sources: vec![video_source.clone(), image_source.clone()],
-            nodes: vec![node(5), image_node.clone()],
-            videos_needing_keyframes: Vec::new(),
-        });
-        assert!(worker.queue_media(BridgeMedia {
-            generation: 0,
-            delivery_id: 0,
-            source: image_key,
-            record_type: vivid_protocol::messages::IMAGE_DATA,
-            offset: 0,
-            total: u32::try_from(encoded.len()).unwrap(),
-            last: true,
-            bytes: encoded.clone(),
-        }));
-        let snapshot = wait_for(
-            &|snapshot| {
+            };
+            let video_source = |playing, play_request| BridgeSource {
+                key: video_key,
+                kind: BridgeSourceKind::Video {
+                    codec_string: None,
+                    decoder_config: None,
+                    codec: "h264".into(),
+                    packetization: "h264-annexb-au-v1".into(),
+                    extradata: Vec::new(),
+                    width: 16,
+                    height: 16,
+                    profile: 0,
+                    level: 0,
+                    bitrate: 0,
+                    color_primaries: 1,
+                    transfer: 1,
+                    matrix: 1,
+                    range: 1,
+                    sar_num: 1,
+                    sar_den: 1,
+                    max_access_unit_bytes: 1024,
+                },
+                capture_policy: 0,
+                descriptor: None,
+                playing,
+                eos_epoch: None,
+                causation_id: None,
+                play_request,
+            };
+            let audio_source = BridgeSource {
+                key: audio_key,
+                kind: BridgeSourceKind::Audio {
+                    codec_string: None,
+                    linked_video: Some(video_key),
+                    codec: "pcm_s16le".into(),
+                    packetization: "pcm-packet-v1".into(),
+                    extradata: Vec::new(),
+                    sample_rate: 48_000,
+                    channels: 2,
+                    channel_mask: 3,
+                    bitrate: 0,
+                    max_access_unit_bytes: 1024,
+                },
+                capture_policy: 0,
+                descriptor: None,
+                playing: false,
+                eos_epoch: None,
+                causation_id: None,
+                play_request: crate::ipc::BridgePlayRequest {
+                    minimum_buffer_us: 0,
+                    ..play_request
+                },
+            };
+            let video_node = BridgeNode {
+                producer: video_key.producer,
+                node: 1,
+                fragment: 0,
+                source: video_key,
+                x: i64::from(video_rect.x) << 32,
+                y: i64::from(video_rect.y) << 32,
+                width: i64::from(video_rect.width) << 32,
+                height: i64::from(video_rect.height) << 32,
+                z_index: 0,
+                visible: true,
+                clip: crate::ipc::BridgeClipRect {
+                    x: i64::from(video_rect.x) << 32,
+                    y: i64::from(video_rect.y) << 32,
+                    width: i64::from(video_rect.width) << 32,
+                    height: i64::from(video_rect.height) << 32,
+                },
+            };
+            let outer_video = |snapshot: &crate::media::ProjectionSnapshot| {
                 snapshot
                     .sources
                     .iter()
-                    .any(|source| source.key.1 != 0 && source.retained.is_some())
-            },
-            "image body arriving after its source-creation generation",
-        );
-        assert_eq!(outer_video(&snapshot).unwrap(), (outer_key, true));
-
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            virtual_revision: 5,
-            sources: Vec::new(),
-            nodes: Vec::new(),
-            videos_needing_keyframes: Vec::new(),
-        });
-        wait_for(
-            &|snapshot| snapshot.sources.is_empty() && snapshot.nodes.is_empty(),
-            "empty projection after switching away from the image tab",
-        );
-
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            virtual_revision: 6,
-            sources: vec![image_source.clone()],
-            nodes: vec![image_node.clone()],
-            videos_needing_keyframes: Vec::new(),
-        });
-        assert!(worker.queue_media(BridgeMedia {
-            generation: 0,
-            delivery_id: 0,
-            source: image_key,
-            record_type: vivid_protocol::messages::IMAGE_DATA,
-            offset: 0,
-            total: u32::try_from(encoded.len()).unwrap(),
-            last: true,
-            bytes: encoded,
-        }));
-        wait_for(
-            &|snapshot| {
-                snapshot.sources.len() == 1
-                    && snapshot.sources[0].retained.is_some()
-                    && snapshot.nodes.len() == 1
-            },
-            "retained image after switching back to its tab",
-        );
-
-        let remaining_image_node = BridgeNode {
-            x: 0,
-            clip: crate::ipc::BridgeClipRect {
-                x: 0,
-                ..image_node.clip
-            },
-            ..image_node.clone()
-        };
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            virtual_revision: 7,
-            sources: vec![image_source.clone()],
-            nodes: vec![remaining_image_node.clone()],
-            videos_needing_keyframes: Vec::new(),
-        });
-        let snapshot = wait_for(
-            &|snapshot| {
-                snapshot.sources.len() == 1
-                    && snapshot.sources[0].retained.is_some()
-                    && snapshot
-                        .nodes
-                        .first()
-                        .is_some_and(|node| node.config.node.x == 0)
-            },
-            "remaining image after the video pane exits",
-        );
-        assert!(snapshot.sources[0].retained.is_some());
-
-        let replay_node = BridgeNode {
-            x: 0,
-            clip: crate::ipc::BridgeClipRect {
-                x: 0,
-                ..image_node.clip
-            },
-            ..node(0)
-        };
-        worker.replace_snapshot(BridgeSnapshot {
-            generation: 0,
-            virtual_revision: 8,
-            sources: vec![video_source],
-            nodes: vec![replay_node],
-            videos_needing_keyframes: Vec::new(),
-        });
-        let snapshot = wait_for(
-            &|snapshot| {
-                snapshot.nodes.len() == 1
-                    && outer_video(snapshot).is_some_and(|(_, playing)| playing)
-                    && snapshot.sources.iter().all(|source| {
-                        !matches!(source.descriptor, crate::media::SourceDescriptor::Image(_))
+                    .find(|source| {
+                        matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
                     })
-            },
-            "same video source after returning from the image-only tab",
-        );
-        assert_eq!(snapshot.nodes.len(), 1);
-        assert_eq!(
-            keyframe_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap(),
-            vec![initial_keyframe(video_key)],
-            "restoring the same playing source must initialize its new outer decoder"
-        );
+                    .map(|source| (source.key, source.playing))
+            };
+            let video_packet = |packet_id, pts_us, key| {
+                let key_access_unit = [0, 0, 0, 1, 0x65, 0x88];
+                let delta_access_unit = [0, 0, 0, 1, 0x41, 0x9a];
+                media::video_packet_body(VideoPacket {
+                    epoch: 1,
+                    packet_id,
+                    pts_us,
+                    dts_us: pts_us,
+                    duration_us: 33_000,
+                    key,
+                    data: if key {
+                        &key_access_unit
+                    } else {
+                        &delta_access_unit
+                    },
+                })
+                .unwrap()
+            };
+            let audio_packet = |packet_id, pts_us| {
+                media::audio_packet_body(AudioPacket {
+                    epoch: 1,
+                    packet_id,
+                    pts_us,
+                    dts_us: pts_us,
+                    duration_us: 20_000,
+                    trim_start_samples: 0,
+                    trim_end_samples: 0,
+                    data: &[0, 0, 0, 0],
+                })
+                .unwrap()
+            };
+
+            // Tab 1 becomes visible with all three panes, but only pane 2 contributes media. Deliver
+            // linked-audio pre-roll before the authoritative PLAY transition.
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision: 1,
+                sources: vec![video_source(false, play_request), audio_source.clone()],
+                nodes: vec![video_node.clone()],
+                videos_needing_keyframes: Vec::new(),
+            });
+            let initial_applied = receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "initial tab 1 projection",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeApplied {
+                            virtual_revision: 1,
+                            ..
+                        }
+                    )
+                },
+            );
+            let (bridge_instance_id, initial_attachment_generation) = match &seen[initial_applied] {
+                ClientMessage::BridgeApplied {
+                    bridge_instance_id,
+                    outer_attachment_generations,
+                    ..
+                } => (
+                    *bridge_instance_id,
+                    outer_attachment_generations
+                        .iter()
+                        .find_map(|(source, generation)| {
+                            (*source == video_key).then_some(*generation)
+                        })
+                        .unwrap(),
+                ),
+                _ => unreachable!(),
+            };
+            let initial_audio = audio_packet(1, 0);
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 10,
+                source: audio_key,
+                record_type: vivid_protocol::messages::AUDIO_PACKET,
+                offset: 0,
+                total: u32::try_from(initial_audio.len()).unwrap(),
+                last: true,
+                bytes: initial_audio,
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "linked audio pre-roll acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 10,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+
+            let initial_play_start = seen.len();
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision: 2,
+                sources: vec![video_source(true, play_request), audio_source.clone()],
+                nodes: vec![video_node.clone()],
+                videos_needing_keyframes: Vec::new(),
+            });
+            let initial_play_applied = receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "initial authoritative PLAY",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeApplied {
+                            virtual_revision: 2,
+                            ..
+                        }
+                    )
+                },
+            );
+            let initial_play_trace = seen[initial_play_start..=initial_play_applied]
+                .iter()
+                .position(|message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeTrace {
+                            event: BridgeMediaTraceEvent {
+                                source: Some(source),
+                                kind: MediaTraceKind::PlaybackControl {
+                                    control: MediaPlaybackControl::Play,
+                                    request: Some(request),
+                                },
+                                ..
+                            },
+                            ..
+                        } if *source == video_key && *request == play_request
+                    )
+                });
+            assert!(
+                initial_play_trace.is_some(),
+                "PLAY must be observable before its applied projection acknowledgement"
+            );
+            let opening_keyframe = video_packet(1, 0, true);
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 11,
+                source: video_key,
+                record_type: vivid_protocol::messages::VIDEO_PACKET,
+                offset: 0,
+                total: u32::try_from(opening_keyframe.len()).unwrap(),
+                last: true,
+                bytes: opening_keyframe,
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "opening video keyframe acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 11,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+
+            let mut encoded = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut encoded)
+                .write_image(
+                    &[0xff, 0x40, 0x20, 0xff],
+                    1,
+                    1,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .unwrap();
+            let image_key = BridgeSourceKey {
+                producer: image_pane,
+                source: 9,
+            };
+            let image_source = BridgeSource {
+                key: image_key,
+                kind: BridgeSourceKind::Image {
+                    encoding: vivid_protocol::messages::IMAGE_PNG,
+                    width: 1,
+                    height: 1,
+                    encoded_length: u32::try_from(encoded.len()).unwrap(),
+                    sha256: None,
+                },
+                capture_policy: 0,
+                descriptor: None,
+                playing: false,
+                eos_epoch: None,
+                causation_id: None,
+                play_request: crate::ipc::BridgePlayRequest {
+                    start_pts_us: 0,
+                    minimum_buffer_us: 0,
+                    maximum_latency_us: 500_000,
+                    rate_32_32: 1_i64 << 32,
+                    late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                    loop_count: 0,
+                    start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+                },
+            };
+            let image_node = BridgeNode {
+                producer: image_key.producer,
+                node: 2,
+                fragment: 0,
+                source: image_key,
+                x: i64::from(image_rect.x) << 32,
+                y: i64::from(image_rect.y) << 32,
+                width: i64::from(image_rect.width) << 32,
+                height: i64::from(image_rect.height) << 32,
+                z_index: 0,
+                visible: true,
+                clip: crate::ipc::BridgeClipRect {
+                    x: i64::from(image_rect.x) << 32,
+                    y: i64::from(image_rect.y) << 32,
+                    width: i64::from(image_rect.width) << 32,
+                    height: i64::from(image_rect.height) << 32,
+                },
+            };
+
+            // Switching tabs atomically removes tab 1's video/audio projection and replaces it with
+            // the image owned by pane 2 of tab 2.
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision: 3,
+                sources: vec![image_source.clone()],
+                nodes: vec![image_node.clone()],
+                videos_needing_keyframes: Vec::new(),
+            });
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "tab 2 image projection",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeApplied {
+                            virtual_revision: 3,
+                            ..
+                        }
+                    )
+                },
+            );
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 12,
+                source: image_key,
+                record_type: vivid_protocol::messages::IMAGE_DATA,
+                offset: 0,
+                total: u32::try_from(encoded.len()).unwrap(),
+                last: true,
+                bytes: encoded.clone(),
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "tab 2 image delivery acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 12,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+            assert!(
+                presenter.wait_for_retained_media(7, Duration::from_secs(2)),
+                "tab 2 image never reached the outer presenter's retained state"
+            );
+            let image_snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+            assert_eq!(image_snapshot.sources.len(), 1);
+            assert!(image_snapshot.sources[0].retained.is_some());
+            assert!(outer_video(&image_snapshot).is_none());
+
+            // Return to tab 1. Decoder recreation and the original authoritative PLAY must precede
+            // the applied acknowledgement, and the recreated attachment must request a keyframe.
+            let return_start = seen.len();
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision: 4,
+                sources: vec![video_source(true, play_request), audio_source.clone()],
+                nodes: vec![video_node.clone()],
+                videos_needing_keyframes: Vec::new(),
+            });
+            let return_applied = receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "tab 1 restored projection",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeApplied {
+                            virtual_revision: 4,
+                            ..
+                        }
+                    )
+                },
+            );
+            let (return_bridge_instance, return_attachment_generation) = match &seen[return_applied]
+            {
+                ClientMessage::BridgeApplied {
+                    bridge_instance_id,
+                    outer_attachment_generations,
+                    ..
+                } => (
+                    *bridge_instance_id,
+                    outer_attachment_generations
+                        .iter()
+                        .find_map(|(source, generation)| {
+                            (*source == video_key).then_some(*generation)
+                        })
+                        .unwrap(),
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                return_bridge_instance, bridge_instance_id,
+                "a tab switch reconciles sources without replacing the outer bridge session"
+            );
+            assert!(
+                return_attachment_generation > initial_attachment_generation,
+                "the video decoder attachment must be a new generation"
+            );
+            let return_messages = &seen[return_start..=return_applied];
+            let recreated = return_messages
+                .iter()
+                .position(|message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeTrace {
+                            event: BridgeMediaTraceEvent {
+                                source: Some(source),
+                                kind: MediaTraceKind::OuterSourceRecreated {
+                                    playing: true,
+                                    ..
+                                },
+                                ..
+                            },
+                            ..
+                        } if *source == video_key
+                    )
+                })
+                .expect("video decoder recreation was not traced");
+            let replayed_play = return_messages
+                .iter()
+                .position(|message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeTrace {
+                            event: BridgeMediaTraceEvent {
+                                source: Some(source),
+                                kind: MediaTraceKind::PlaybackControl {
+                                    control: MediaPlaybackControl::Play,
+                                    request: Some(request),
+                                },
+                                ..
+                            },
+                            ..
+                        } if *source == video_key && *request == play_request
+                    )
+                })
+                .expect("replayed PLAY was not traced");
+            assert!(
+                recreated < replayed_play,
+                "decoder recreation must precede its authoritative PLAY"
+            );
+            let expected_initial = BridgeKeyframeRequest {
+                source: video_key,
+                minimum_epoch: None,
+                reason: vivid_protocol::messages::KEYFRAME_REASON_INITIAL,
+            };
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "recreated video keyframe request",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeNeedKeyframes(requests)
+                            if requests == std::slice::from_ref(&expected_initial)
+                    )
+                },
+            );
+
+            // Vivi's fixed recovery behavior re-bases PLAY to the same-epoch recovery keyframe before
+            // submitting that packet. The worker must apply that playback-only update before media.
+            let recovery_pts_us = 8_033_333;
+            let recovery_play = crate::ipc::BridgePlayRequest {
+                start_pts_us: recovery_pts_us,
+                ..play_request
+            };
+            let recovery_play_start = seen.len();
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision: 5,
+                sources: vec![video_source(true, recovery_play), audio_source.clone()],
+                nodes: vec![video_node],
+                videos_needing_keyframes: Vec::new(),
+            });
+            let recovery_play_applied = receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "recovery PLAY rebase",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeApplied {
+                            virtual_revision: 5,
+                            ..
+                        }
+                    )
+                },
+            );
+            assert!(
+                seen[recovery_play_start..=recovery_play_applied]
+                    .iter()
+                    .any(|message| {
+                        matches!(
+                            message,
+                            ClientMessage::BridgeTrace {
+                                event: BridgeMediaTraceEvent {
+                                    source: Some(source),
+                                    kind: MediaTraceKind::PlaybackControl {
+                                        control: MediaPlaybackControl::Play,
+                                        request: Some(request),
+                                    },
+                                    ..
+                                },
+                                ..
+                            } if *source == video_key && *request == recovery_play
+                        )
+                    }),
+                "same-epoch recovery must publish its exact PLAY rebase before media"
+            );
+
+            let recovery_keyframe = video_packet(2, recovery_pts_us, true);
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 13,
+                source: video_key,
+                record_type: vivid_protocol::messages::VIDEO_PACKET,
+                offset: 0,
+                total: u32::try_from(recovery_keyframe.len()).unwrap(),
+                last: true,
+                bytes: recovery_keyframe,
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "same-epoch recovery keyframe acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 13,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+
+            let resumed_audio = audio_packet(2, recovery_pts_us + 7_000);
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 14,
+                source: audio_key,
+                record_type: vivid_protocol::messages::AUDIO_PACKET,
+                offset: 0,
+                total: u32::try_from(resumed_audio.len()).unwrap(),
+                last: true,
+                bytes: resumed_audio,
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "resumed linked audio acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 14,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+
+            let resumed_delta = video_packet(3, recovery_pts_us + 33_000, false);
+            assert!(worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 15,
+                source: video_key,
+                record_type: vivid_protocol::messages::VIDEO_PACKET,
+                offset: 0,
+                total: u32::try_from(resumed_delta.len()).unwrap(),
+                last: true,
+                bytes: resumed_delta,
+            }));
+            receive_bridge_message_until(
+                &message_receiver,
+                &mut seen,
+                "post-recovery video delta acknowledgement",
+                |message| {
+                    matches!(
+                        message,
+                        ClientMessage::BridgeMediaAck {
+                            delivery_id: 15,
+                            delivered: true
+                        }
+                    )
+                },
+            );
+
+            let restored = presenter.projection_snapshot(&HashSet::from([7]));
+            assert_eq!(restored.nodes.len(), 1);
+            assert!(outer_video(&restored).is_some_and(|(_, playing)| playing));
+            assert!(
+                restored.sources.iter().all(|source| {
+                    !matches!(source.descriptor, crate::media::SourceDescriptor::Image(_))
+                }),
+                "the hidden image tab must not remain in the outer projection"
+            );
+        }
     }
 
     #[test]
