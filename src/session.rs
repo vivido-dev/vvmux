@@ -889,7 +889,10 @@ impl SessionActor {
                     id,
                     writer: writer.clone(),
                     display,
-                    acknowledged_frame: 0,
+                    // This client never received the session's historical frames. Start its
+                    // flow-control window at the current frame so the forced full repaint below
+                    // becomes its first outstanding frame instead of being suppressed as stale.
+                    acknowledged_frame: self.frame_id,
                     vivid,
                     rendered_session_sequence: 0,
                     frame_sequences: VecDeque::new(),
