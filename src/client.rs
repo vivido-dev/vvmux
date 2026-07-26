@@ -5,6 +5,8 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(windows)]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
@@ -60,6 +62,8 @@ pub fn attach(
     let vivid = outer_endpoint.is_some() && outer_token.is_some();
     let terminal = ClientTerminal::enter()?;
     let display = terminal.display_metrics()?;
+    #[cfg(windows)]
+    let presenter_cell_size = Arc::new(AtomicU32::new(pack_cell_size(display)));
     send_client(
         &writer,
         &ClientMessage::Attach {
@@ -80,6 +84,8 @@ pub fn attach(
     let output = Arc::new(Mutex::new(output));
     let output_thread = TerminalOutput::spawn(output, writer.clone())?;
     let bridge_display = display;
+    #[cfg(windows)]
+    let bridge_cell_size = presenter_cell_size.clone();
     let bridge_queue_records =
         (client_config.media.ipc_queue_bytes / BRIDGE_MEDIA_CHUNK).clamp(1, 1024);
     let reader_thread = thread::Builder::new()
@@ -93,20 +99,32 @@ pub fn attach(
                         token,
                         bridge_display,
                     ) {
-                        Ok(bridge) => match BridgeWorker::spawn(
-                            bridge,
-                            read_writer.clone(),
-                            bridge_queue_records,
-                        ) {
-                            Ok(worker) => Some(worker),
-                            Err(error) => {
-                                write_title(
-                                    &output_thread,
-                                    &format!("vvmux media disabled: {error}"),
+                        Ok(bridge) => {
+                            let presenter_display = bridge.display_metrics();
+                            #[cfg(windows)]
+                            bridge_cell_size
+                                .store(pack_cell_size(presenter_display), Ordering::Release);
+                            if presenter_display != bridge_display {
+                                let _ = send_client(
+                                    &read_writer,
+                                    &ClientMessage::Resize(presenter_display),
                                 );
-                                None
                             }
-                        },
+                            match BridgeWorker::spawn(
+                                bridge,
+                                read_writer.clone(),
+                                bridge_queue_records,
+                            ) {
+                                Ok(worker) => Some(worker),
+                                Err(error) => {
+                                    write_title(
+                                        &output_thread,
+                                        &format!("vvmux media disabled: {error}"),
+                                    );
+                                    None
+                                }
+                            }
+                        }
                         Err(error) => {
                             write_title(&output_thread, &format!("vvmux media disabled: {error}"));
                             None
@@ -210,6 +228,8 @@ pub fn attach(
     #[cfg(windows)]
     let resize_writer = writer.clone();
     #[cfg(windows)]
+    let resize_cell_size = presenter_cell_size;
+    #[cfg(windows)]
     let resize_thread = match thread::Builder::new()
         .name("vvmux-display".into())
         .spawn(move || {
@@ -219,9 +239,10 @@ pub fn attach(
                 if resize_stopped.load(Ordering::Acquire) {
                     break;
                 }
-                let Ok(current) = crate::platform::current_display_metrics() else {
+                let Ok(mut current) = crate::platform::current_display_metrics() else {
                     continue;
                 };
+                apply_cell_size(&mut current, resize_cell_size.load(Ordering::Acquire));
                 if current != last_display {
                     if send_client(&resize_writer, &ClientMessage::Resize(current)).is_err() {
                         resize_stopped.store(true, Ordering::Release);
@@ -570,6 +591,17 @@ impl Drop for BridgeWorker {
             let _ = thread.join();
         }
     }
+}
+
+#[cfg(windows)]
+fn pack_cell_size(display: crate::ipc::DisplayMetrics) -> u32 {
+    u32::from(display.cell_width) | (u32::from(display.cell_height) << 16)
+}
+
+#[cfg(windows)]
+fn apply_cell_size(display: &mut crate::ipc::DisplayMetrics, packed: u32) {
+    display.cell_width = packed as u16;
+    display.cell_height = (packed >> 16) as u16;
 }
 
 fn run_bridge_worker(
