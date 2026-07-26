@@ -1,10 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-#[cfg(unix)]
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
@@ -1067,37 +1063,6 @@ pub fn create_detached(name: &str, config_path: Option<&Path>) -> io::Result<()>
     }
 }
 
-#[cfg(unix)]
-fn spawn_server(name: &str, config_path: Option<&Path>) -> io::Result<()> {
-    let executable = std::env::current_exe()?;
-    let mut command = Command::new(executable);
-    command.arg("__server").arg("--session").arg(name);
-    if let Some(path) = config_path {
-        command.arg("--config").arg(path);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("VIVID_ENDPOINT")
-        .env_remove("VIVID_ENDPOINT_BULK")
-        .env_remove("VIVID_TOKEN")
-        .env_remove("VIVID_SSH_ENDPOINT")
-        .env_remove("VIVID_SSH_TOKEN");
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    command.spawn()?;
-    Ok(())
-}
-
-#[cfg(windows)]
 fn spawn_server(name: &str, config_path: Option<&Path>) -> io::Result<()> {
     crate::platform::DaemonLauncher::launch(name, config_path)
 }
