@@ -191,6 +191,10 @@ struct Source {
     eos_epoch: Option<u32>,
     bridge_desynchronized: bool,
     minimum_epoch: u32,
+    /// Recovery reason already sent to the producer, or `None` when desynchronization has not yet
+    /// produced a request. Kept separate from `bridge_desynchronized` because hidden sources can
+    /// become desynchronized before they are projected again.
+    pending_keyframe_reason: Option<u64>,
     last_pts_us: Option<i64>,
     clock_started: Option<Instant>,
     clock_origin_pts_us: Option<i64>,
@@ -857,60 +861,13 @@ impl VirtualVivid {
         let source = credit.1;
         return_delivery_credits(vec![credit]);
         if request_keyframe {
-            self.request_keyframes(&[source]);
+            self.request_keyframe(source, None, messages::KEYFRAME_REASON_TRANSPORT_LOSS);
         }
         request_keyframe
     }
 
-    pub fn request_keyframes(&self, sources: &[SourceKey]) {
-        let mut state = self.lock();
-        for key in sources {
-            let minimum_epoch = {
-                let Some(source) = state.sources.get_mut(key) else {
-                    continue;
-                };
-                if !matches!(source.descriptor, SourceDescriptor::Video(_)) || source.ended {
-                    continue;
-                }
-                // Recovery is already outstanding when the source is desynchronized and the
-                // producer has not yet reached the epoch previously demanded. Asking again would
-                // push the bar further out, and a producer of encoded video cannot manufacture a
-                // key packet — it must wait for the next natural one, discarding up to a full GOP
-                // each time. Under load a burst of dropped packets would otherwise convert one
-                // hiccup into seconds of frozen video.
-                if source.bridge_desynchronized && source.minimum_epoch > source.sequence.epoch() {
-                    state.delivery_metrics.keyframe_requests_damped = state
-                        .delivery_metrics
-                        .keyframe_requests_damped
-                        .saturating_add(1);
-                    continue;
-                }
-                source.minimum_epoch = source
-                    .minimum_epoch
-                    .max(source.sequence.epoch())
-                    .saturating_add(1);
-                source.bridge_desynchronized = true;
-                source.minimum_epoch
-            };
-            if let Some(writer) = state
-                .producers
-                .get(&key.0)
-                .and_then(|producer| producer.writer.upgrade())
-            {
-                state.delivery_metrics.keyframe_requests =
-                    state.delivery_metrics.keyframe_requests.saturating_add(1);
-                let _ = writer.write_record(
-                    messages::NEED_KEYFRAME,
-                    key.1,
-                    &messages::need_keyframe(
-                        key.1,
-                        minimum_epoch,
-                        messages::KEYFRAME_REASON_DECODER_ERROR,
-                        None,
-                    ),
-                );
-            }
-        }
+    pub fn request_keyframe(&self, source: SourceKey, minimum_epoch: Option<u32>, reason: u64) {
+        request_keyframe_recoveries(&self.state, &[(source, minimum_epoch, reason)]);
     }
 
     /// Ask inner raster producers for a full frame.
@@ -969,6 +926,97 @@ impl VirtualVivid {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn normalize_keyframe_reason(reason: u64) -> u64 {
+    match reason {
+        messages::KEYFRAME_REASON_INITIAL
+        | messages::KEYFRAME_REASON_DECODER_ERROR
+        | messages::KEYFRAME_REASON_EPOCH_DISCONTINUITY
+        | messages::KEYFRAME_REASON_DEVICE_RESET
+        | messages::KEYFRAME_REASON_TRANSPORT_LOSS => reason,
+        _ => messages::KEYFRAME_REASON_DECODER_ERROR,
+    }
+}
+
+fn request_keyframe_recoveries(
+    shared: &Arc<Mutex<State>>,
+    requests: &[(SourceKey, Option<u32>, u64)],
+) {
+    let mut state = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for &(key, requested_minimum, requested_reason) in requests {
+        let reason = normalize_keyframe_reason(requested_reason);
+        let Some(source) = state.sources.get(&key) else {
+            continue;
+        };
+        if !matches!(source.descriptor, SourceDescriptor::Video(_)) || source.ended {
+            continue;
+        }
+
+        let current_epoch = source.sequence.epoch();
+        let minimum_epoch = if reason == messages::KEYFRAME_REASON_TRANSPORT_LOSS {
+            // Reason 5 promises that no epoch advance is required, even if a malformed or stale
+            // outer request supplied a larger value.
+            current_epoch
+        } else if let Some(minimum) = requested_minimum {
+            minimum.max(current_epoch)
+        } else if reason == messages::KEYFRAME_REASON_INITIAL {
+            current_epoch
+        } else {
+            current_epoch.saturating_add(1)
+        };
+
+        let pending_reason = source.pending_keyframe_reason;
+        if let Some(pending_reason) = pending_reason {
+            let stronger_reason = pending_reason == messages::KEYFRAME_REASON_TRANSPORT_LOSS
+                && reason != messages::KEYFRAME_REASON_TRANSPORT_LOSS;
+            if minimum_epoch <= source.minimum_epoch && !stronger_reason {
+                state.delivery_metrics.keyframe_requests_damped = state
+                    .delivery_metrics
+                    .keyframe_requests_damped
+                    .saturating_add(1);
+                continue;
+            }
+        }
+        let emitted_minimum = source.minimum_epoch.max(minimum_epoch);
+        let emitted_reason = if let Some(pending_reason) = pending_reason {
+            if pending_reason == reason
+                || pending_reason == messages::KEYFRAME_REASON_TRANSPORT_LOSS
+            {
+                reason
+            } else if reason == messages::KEYFRAME_REASON_TRANSPORT_LOSS {
+                pending_reason
+            } else {
+                messages::KEYFRAME_REASON_DECODER_ERROR
+            }
+        } else {
+            reason
+        };
+
+        let Some(writer) = state
+            .producers
+            .get(&key.0)
+            .and_then(|producer| producer.writer.upgrade())
+        else {
+            continue;
+        };
+        let source = state
+            .sources
+            .get_mut(&key)
+            .expect("source was validated above");
+        source.minimum_epoch = emitted_minimum;
+        source.pending_keyframe_reason = Some(emitted_reason);
+        source.bridge_desynchronized = true;
+        state.delivery_metrics.keyframe_requests =
+            state.delivery_metrics.keyframe_requests.saturating_add(1);
+        let _ = writer.write_record(
+            messages::NEED_KEYFRAME,
+            key.1,
+            &messages::need_keyframe(key.1, emitted_minimum, emitted_reason, None),
+        );
     }
 }
 
@@ -3149,6 +3197,7 @@ fn create_source(
             ended: false,
             bridge_desynchronized: false,
             minimum_epoch: 0,
+            pending_keyframe_reason: None,
             last_pts_us: None,
             clock_started: None,
             clock_origin_pts_us: None,
@@ -3752,6 +3801,7 @@ fn ingest_record(
                     && packet.flags & media::VIDEO_PACKET_KEY != 0;
                 if recovered {
                     source.bridge_desynchronized = false;
+                    source.pending_keyframe_reason = None;
                 } else if !projected_source {
                     source.bridge_desynchronized = true;
                 }
@@ -3868,6 +3918,7 @@ fn ingest_record(
         .then(|| headless_playback_delay(&mut state, key, pts))
         .flatten();
     let media_wakeup = state.media_wakeup.clone();
+    let mut request_keyframe = false;
     let delivery = if forward_timed
         && let Some(events) = state.events.clone()
         && (state.queued_bridge_bytes == 0
@@ -3901,6 +3952,7 @@ fn ingest_record(
             && matches!(source.descriptor, SourceDescriptor::Video(_))
         {
             source.bridge_desynchronized = true;
+            request_keyframe = true;
         }
         None
     };
@@ -3952,6 +4004,7 @@ fn ingest_record(
                         && matches!(source.descriptor, SourceDescriptor::Video(_))
                     {
                         source.bridge_desynchronized = true;
+                        request_keyframe = true;
                     }
                     credit
                 };
@@ -3963,6 +4016,12 @@ fn ingest_record(
     }
     if let Some(credit) = immediate_credit {
         write_delivery_credit(credit)?;
+    }
+    if request_keyframe {
+        request_keyframe_recoveries(
+            shared,
+            &[(key, None, messages::KEYFRAME_REASON_TRANSPORT_LOSS)],
+        );
     }
     Ok(IngestOutcome::Accepted)
 }
@@ -4597,6 +4656,7 @@ mod tests {
             eos_epoch: None,
             bridge_desynchronized: false,
             minimum_epoch: 0,
+            pending_keyframe_reason: None,
             last_pts_us: None,
             clock_started: None,
             clock_origin_pts_us: None,
@@ -4825,11 +4885,13 @@ mod tests {
             let mut state = service.lock();
             let mut source = barrier_source(1);
             source.playing = true;
+            source.bridge_desynchronized = true;
+            source.minimum_epoch = 1;
+            source.pending_keyframe_reason = Some(messages::KEYFRAME_REASON_DECODER_ERROR);
             state.sources.insert(key, source);
             state.projected_sources.insert(key);
         }
 
-        service.request_keyframes(&[key]);
         let after_first = {
             let state = service.lock();
             (
@@ -4838,10 +4900,10 @@ mod tests {
                 state.delivery_metrics.keyframe_requests_damped,
             )
         };
-        assert_eq!(after_first.2, 0, "the first request is not damped");
+        assert_eq!(after_first.2, 0);
 
         for _ in 0..32 {
-            service.request_keyframes(&[key]);
+            service.request_keyframe(key, None, messages::KEYFRAME_REASON_DECODER_ERROR);
         }
         let state = service.lock();
         assert_eq!(
@@ -5049,9 +5111,30 @@ mod tests {
         assert_eq!(playing.sources[0].play_request.minimum_buffer_us, 250_000);
         let key = playing.sources[0].key;
 
-        service.request_keyframes(&[key]);
+        service.request_keyframe(key, None, messages::KEYFRAME_REASON_TRANSPORT_LOSS);
         let need_keyframe = control.read_record().unwrap();
         assert_eq!(need_keyframe.record_type, messages::NEED_KEYFRAME);
+        let request = messages::parse_need_keyframe(&need_keyframe.body).unwrap();
+        assert_eq!(request.minimum_epoch, 0);
+        assert_eq!(request.reason, messages::KEYFRAME_REASON_TRANSPORT_LOSS);
+
+        service.request_keyframe(key, None, messages::KEYFRAME_REASON_TRANSPORT_LOSS);
+        {
+            let state = service.lock();
+            assert_eq!(state.delivery_metrics.keyframe_requests, 1);
+            assert_eq!(state.delivery_metrics.keyframe_requests_damped, 1);
+        }
+
+        service.request_keyframe(key, None, messages::KEYFRAME_REASON_DECODER_ERROR);
+        let escalated = control.read_record().unwrap();
+        assert_eq!(escalated.record_type, messages::NEED_KEYFRAME);
+        let escalated = messages::parse_need_keyframe(&escalated.body).unwrap();
+        assert_eq!(escalated.minimum_epoch, 1);
+        assert_eq!(
+            escalated.reason,
+            messages::KEYFRAME_REASON_DECODER_ERROR,
+            "decoder loss must escalate an outstanding transport-only recovery"
+        );
         let recovering = service.projection_snapshot(&HashSet::from([7]));
         assert_eq!(recovering.videos_needing_keyframes, vec![key]);
         let recovery_revision = recovering.revision;
@@ -5538,6 +5621,50 @@ mod tests {
             .unwrap();
         let event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(event.source.1, 9);
+        assert!(service.complete_bridge_delivery(event.delivery_id, false));
+        let credit = control.read_record().unwrap();
+        assert_eq!(credit.record_type, messages::CREDIT);
+        let recovery = control.read_record().unwrap();
+        assert_eq!(recovery.record_type, messages::NEED_KEYFRAME);
+        let recovery = messages::parse_need_keyframe(&recovery.body).unwrap();
+        assert_eq!(recovery.minimum_epoch, 1);
+        assert_eq!(
+            recovery.reason,
+            messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+            "a failed outer delivery must preserve the current epoch"
+        );
+
+        let recovery_packet = media::video_packet_body(media::VideoPacket {
+            epoch: 1,
+            packet_id: 2,
+            pts_us: 33_000,
+            dts_us: 33_000,
+            duration_us: 33_000,
+            key: true,
+            data: &[0, 0, 0, 1, 0x65, 0x99],
+        })
+        .unwrap();
+        video_media
+            .write_record(messages::VIDEO_PACKET, 0, 9, &recovery_packet)
+            .unwrap();
+        let recovery_event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!service.complete_bridge_delivery(recovery_event.delivery_id, true));
+        assert_eq!(control.read_record().unwrap().record_type, messages::CREDIT);
+
+        let pending_packet = media::video_packet_body(media::VideoPacket {
+            epoch: 1,
+            packet_id: 3,
+            pts_us: 66_000,
+            dts_us: 66_000,
+            duration_us: 33_000,
+            key: false,
+            data: &[0, 0, 0, 1, 0x41, 0xaa],
+        })
+        .unwrap();
+        video_media
+            .write_record(messages::VIDEO_PACKET, 0, 9, &pending_packet)
+            .unwrap();
+        let pending_event = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let (reply_sender, reply_receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -5554,7 +5681,7 @@ mod tests {
                 .is_err(),
             "video credit and EOS must wait for outer bridge completion"
         );
-        assert!(!service.complete_bridge_delivery(event.delivery_id, true));
+        assert!(!service.complete_bridge_delivery(pending_event.delivery_id, true));
         let (mut control, credit, eos) =
             reply_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(credit.record_type, messages::CREDIT);

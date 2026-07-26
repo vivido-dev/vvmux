@@ -16,8 +16,8 @@ use vivid_protocol::{VIVID_MAJOR, VIVID_MINOR};
 use zeroize::Zeroizing;
 
 use crate::ipc::{
-    BridgeNode, BridgeSource, BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind,
-    DisplayMetrics,
+    BridgeKeyframeRequest, BridgeNode, BridgeSource, BridgeSourceDescriptor, BridgeSourceKey,
+    BridgeSourceKind, DisplayMetrics,
 };
 
 const REQUIRED_FEATURES: &[u64] = &[
@@ -1602,11 +1602,20 @@ impl OuterBridge {
             .collect()
     }
 
-    pub fn take_keyframe_requests(&self) -> Vec<BridgeSourceKey> {
+    pub fn take_keyframe_requests(&self) -> Vec<BridgeKeyframeRequest> {
         self.control
             .take_keyframes()
             .into_iter()
-            .filter_map(|request| self.reverse_source_ids.get(&request.source_id).copied())
+            .filter_map(|request| {
+                self.reverse_source_ids
+                    .get(&request.source_id)
+                    .copied()
+                    .map(|source| BridgeKeyframeRequest {
+                        source,
+                        minimum_epoch: Some(request.minimum_epoch),
+                        reason: request.reason,
+                    })
+            })
             .collect()
     }
 

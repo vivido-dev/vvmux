@@ -21,8 +21,8 @@ use crate::ipc::DisplayMetrics;
 #[cfg(test)]
 use crate::ipc::{Action, Axis, Direction, MouseEvent, MouseKind};
 use crate::ipc::{
-    BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind, ClientMessage,
-    FloatingEditCommand, ServerMessage, SharedWriter,
+    BridgeKeyframeRequest, BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind,
+    ClientMessage, FloatingEditCommand, ServerMessage, SharedWriter,
 };
 use crate::platform::ClientTerminal;
 
@@ -628,17 +628,44 @@ fn run_bridge_worker(
             force_sources = false;
             force_replacement = false;
             active_generation = pending.generation;
-            let mut keyframes = pending.videos_needing_keyframes;
-            keyframes.extend(desynchronized_sources.drain());
+            let mut keyframes = pending
+                .videos_needing_keyframes
+                .into_iter()
+                .map(|source| {
+                    (
+                        source,
+                        BridgeKeyframeRequest {
+                            source,
+                            minimum_epoch: None,
+                            reason: vivid_protocol::messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            keyframes.extend(desynchronized_sources.drain().map(|source| {
+                (
+                    source,
+                    BridgeKeyframeRequest {
+                        source,
+                        minimum_epoch: None,
+                        reason: vivid_protocol::messages::KEYFRAME_REASON_DECODER_ERROR,
+                    },
+                )
+            }));
             if change == ProjectionChange::Sources {
                 keyframes.extend(pending.sources.iter().filter_map(|source| {
                     (recreated.contains(&source.key)
                         && source.playing
                         && matches!(source.kind, BridgeSourceKind::Video { .. }))
-                    .then_some(source.key)
+                    .then_some((
+                        source.key,
+                        BridgeKeyframeRequest {
+                            source: source.key,
+                            minimum_epoch: None,
+                            reason: vivid_protocol::messages::KEYFRAME_REASON_INITIAL,
+                        },
+                    ))
                 }));
-                keyframes.sort_by_key(|source| (source.producer, source.source));
-                keyframes.dedup();
             }
             active_sources = pending.sources;
             active_nodes = pending.nodes;
@@ -649,6 +676,8 @@ fn run_bridge_worker(
                     .map(|source| source.key),
             );
             if !keyframes.is_empty() {
+                let mut keyframes = keyframes.into_values().collect::<Vec<_>>();
+                keyframes.sort_by_key(|request| (request.source.producer, request.source.source));
                 let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(keyframes));
             }
             continue;
@@ -1814,6 +1843,11 @@ mod tests {
             producer: 3,
             source: 7,
         };
+        let initial_keyframe = |source| BridgeKeyframeRequest {
+            source,
+            minimum_epoch: None,
+            reason: vivid_protocol::messages::KEYFRAME_REASON_INITIAL,
+        };
         let video_source = BridgeSource {
             key: video_key,
             kind: BridgeSourceKind::Video {
@@ -1909,7 +1943,7 @@ mod tests {
             keyframe_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            vec![video_key],
+            vec![initial_keyframe(video_key)],
             "a newly created playing video requests one keyframe"
         );
 
@@ -2158,7 +2192,7 @@ mod tests {
             keyframe_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            vec![replay_key]
+            vec![initial_keyframe(replay_key)]
         );
     }
 

@@ -9,12 +9,12 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Bumped to 7 when render and media byte payloads moved off the JSON encoding.
+/// Bumped to 8 when keyframe recovery began carrying its minimum epoch and reason end to end.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// have very different cost, and silently keeping the expensive one on an upgraded client would
 /// hide exactly the regression this version exists to remove.
-pub const VERSION: u16 = 7;
+pub const VERSION: u16 = 8;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -337,6 +337,14 @@ pub struct BridgeSourceKey {
     pub source: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeKeyframeRequest {
+    pub source: BridgeSourceKey,
+    /// `None` asks the virtual presenter to choose the minimum from its current source state.
+    pub minimum_epoch: Option<u32>,
+    pub reason: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BridgeSourceKind {
     Raster {
@@ -472,7 +480,7 @@ pub enum ClientMessage {
     ///
     /// Frame diffs are incremental, so the only safe recovery is a full redraw.
     RenderResync,
-    BridgeNeedKeyframes(Vec<BridgeSourceKey>),
+    BridgeNeedKeyframes(Vec<BridgeKeyframeRequest>),
     /// Raster sources whose outgoing delta chain broke on the outer hop.
     ///
     /// The bridge cannot synthesize a full frame — it never retains one — so recovery goes to the
@@ -1058,6 +1066,16 @@ mod tests {
             server_reader.recv::<ClientMessage>().unwrap(),
             ClientMessage::Ping
         );
+        let recovery = ClientMessage::BridgeNeedKeyframes(vec![BridgeKeyframeRequest {
+            source: BridgeSourceKey {
+                producer: 7,
+                source: 11,
+            },
+            minimum_epoch: Some(3),
+            reason: vivid_protocol::messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+        }]);
+        client_writer.lock().unwrap().send(&recovery).unwrap();
+        assert_eq!(server_reader.recv::<ClientMessage>().unwrap(), recovery);
         server_writer
             .lock()
             .unwrap()
