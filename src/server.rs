@@ -188,6 +188,7 @@ fn clean_stale(paths: &RuntimePaths) -> io::Result<()> {
             "session already exists",
         ));
     }
+    discard_unusable_registry(paths)?;
     match paths.read_registry() {
         Ok(registry) => {
             if registry_process_matches(&registry) {
@@ -210,6 +211,47 @@ fn clean_stale(paths: &RuntimePaths) -> io::Result<()> {
     #[cfg(unix)]
     paths.remove_stale_endpoints();
     Ok(())
+}
+
+/// Reclaim a dead session whose registry this build cannot validate.
+///
+/// A registry written by a different VVMX version, a newer schema, or a truncated write cannot be
+/// matched against an exact instance, and the caller has already proven that the recorded endpoint
+/// accepts nothing. Refusing to start here would strand the session name until someone deleted the
+/// runtime files by hand — and because the client only sees the stale endpoint's own connect error,
+/// the reason would never reach the user. Reclaim the name instead, unless the process that wrote
+/// the registry is still running.
+fn discard_unusable_registry(paths: &RuntimePaths) -> io::Result<()> {
+    let error = match paths.read_registry() {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => error,
+    };
+    if let Some(registry) = paths.read_unvalidated_registry()
+        && registry_process_matches(&registry)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "session server PID {} {} is running but its endpoint is unavailable; stop it before starting this build",
+                registry.pid,
+                describe_recorded_version(registry.vvmx_version)
+            ),
+        ));
+    }
+    paths.remove_unusable_registry();
+    match paths.read_registry() {
+        Ok(_) => Ok(()),
+        Err(retry) if retry.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(context("validate stale session registry", error)),
+    }
+}
+
+fn describe_recorded_version(version: Option<u16>) -> String {
+    match version {
+        Some(version) => format!("(VVMX v{version})"),
+        None => "(no recorded VVMX version)".to_owned(),
+    }
 }
 
 #[cfg(unix)]
@@ -309,5 +351,76 @@ mod tests {
         let original = io::Error::new(io::ErrorKind::InvalidData, "bad VVMX magic");
         let described = describe_peer_version(&fixture.paths, original).to_string();
         assert_eq!(described, "bad VVMX magic");
+    }
+
+    /// A leftover endpoint file with no listener, exactly as a server killed without cleanup
+    /// leaves behind. Dropping the listener does not unlink the path, so connecting to it is
+    /// refused rather than reported as missing.
+    fn leave_stale_endpoint(paths: &RuntimePaths) -> Option<()> {
+        match std::os::unix::net::UnixListener::bind(&paths.socket) {
+            Ok(listener) => {
+                drop(listener);
+                Some(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping stale-endpoint socket test: {error}");
+                None
+            }
+            Err(error) => panic!("could not stage a stale session endpoint: {error}"),
+        }
+    }
+
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn a_dead_session_recorded_by_another_version_is_reclaimed() {
+        let fixture = ForeignRegistry::write("vvmx-reclaim-fixture", ipc::VERSION - 1, dead_pid());
+        let Some(()) = leave_stale_endpoint(&fixture.paths) else {
+            return;
+        };
+        assert!(!platform::session_is_connectable(&fixture.paths.socket));
+
+        clean_stale(&fixture.paths).expect("a dead foreign session must not block startup");
+
+        // Both the unusable registry and the endpoint nobody answers on are gone, so the very
+        // next bind succeeds instead of leaving every client to report "connection refused".
+        assert!(!fixture.paths.artifacts_exist());
+        SessionListener::bind(&fixture.paths.socket).unwrap();
+        let _ = fs::remove_file(&fixture.paths.socket);
+    }
+
+    #[test]
+    fn a_live_session_recorded_by_another_version_is_never_reclaimed() {
+        let fixture = ForeignRegistry::write(
+            "vvmx-live-foreign-fixture",
+            ipc::VERSION - 1,
+            std::process::id(),
+        );
+        let Some(()) = leave_stale_endpoint(&fixture.paths) else {
+            return;
+        };
+
+        let error = clean_stale(&fixture.paths).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        let described = error.to_string();
+        assert!(
+            described.contains(&format!("PID {}", std::process::id())),
+            "{described}"
+        );
+        assert!(
+            described.contains(&format!("VVMX v{}", ipc::VERSION - 1)),
+            "{described}"
+        );
+        assert!(
+            fixture.paths.registry.exists(),
+            "a running owner's registry must survive"
+        );
+        let _ = fs::remove_file(&fixture.paths.socket);
     }
 }
