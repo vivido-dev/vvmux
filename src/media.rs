@@ -525,7 +525,16 @@ impl VirtualVivid {
         advance_projection(&mut state);
     }
 
+    #[cfg(test)]
     pub fn projection_snapshot(&self, panes: &HashSet<PaneId>) -> ProjectionSnapshot {
+        self.projection_snapshot_with_viewports(panes, &HashMap::new())
+    }
+
+    pub fn projection_snapshot_with_viewports(
+        &self,
+        panes: &HashSet<PaneId>,
+        viewport_offsets: &HashMap<PaneId, usize>,
+    ) -> ProjectionSnapshot {
         let mut state = self.lock();
         let mut live_nodes = state.nodes.keys().copied().collect::<Vec<_>>();
         live_nodes.sort_unstable();
@@ -547,7 +556,12 @@ impl VirtualVivid {
                         .and_then(|producer| producer.anchors.get(&anchor_id).copied())
                         .or(node.retained_anchor)?;
                     let offset_x = (column as i64) << 32;
-                    let offset_y = i64::from(line) << 32;
+                    let viewport_offset =
+                        i64::try_from(viewport_offsets.get(&node.pane).copied().unwrap_or(0))
+                            .ok()?;
+                    let offset_y = i64::from(line)
+                        .checked_add(viewport_offset)?
+                        .checked_mul(1_i64 << 32)?;
                     resolved.config.node.x = resolved.config.node.x.checked_add(offset_x)?;
                     resolved.config.node.y = resolved.config.node.y.checked_add(offset_y)?;
                     if let Some(clip) = &mut resolved.config.clip {
@@ -5428,6 +5442,17 @@ mod tests {
             {
                 assert_eq!(image.unwrap().retained.as_deref(), Some(encoded.as_slice()));
                 assert_eq!(raster.unwrap().retained.as_deref(), Some(body.as_slice()));
+                let live = service.projection_snapshot(&HashSet::from([7]));
+                assert_eq!(live.nodes[0].config.node.y, 3_i64 << 32);
+                let scrolled = service.projection_snapshot_with_viewports(
+                    &HashSet::from([7]),
+                    &HashMap::from([(7, 5)]),
+                );
+                assert_eq!(
+                    scrolled.nodes[0].config.node.y,
+                    8_i64 << 32,
+                    "copy-mode scrollback must move text-anchored media with its semantic line"
+                );
                 retained = true;
                 break;
             }

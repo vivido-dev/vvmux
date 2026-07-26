@@ -2193,6 +2193,8 @@ impl SessionActor {
             return;
         }
         let mut translated = None;
+        let mut copy_view_render = false;
+        let mut media_view_changed = false;
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             let modes = pane.terminal.modes();
             let application_mouse = !mouse.shift
@@ -2216,6 +2218,8 @@ impl SessionActor {
                     mouse.y - content.y + 1
                 ));
             } else if mouse.kind == MouseKind::Wheel || mouse.shift {
+                copy_view_render = true;
+                let previous_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
                 let copy = pane.copy.get_or_insert(CopyState {
                     offset: 0,
                     row: 0,
@@ -2230,8 +2234,14 @@ impl SessionActor {
                         pane.copy = None;
                     }
                 }
-                self.schedule_render();
+                media_view_changed =
+                    previous_offset != pane.copy.as_ref().map_or(0, |copy| copy.offset);
             }
+        }
+        if media_view_changed {
+            self.projection_changed();
+        } else if copy_view_render {
+            self.schedule_render();
         }
         if let Some(translated) = translated {
             self.send_pane_input(pane_id, translated.as_bytes());
@@ -3146,7 +3156,18 @@ impl SessionActor {
         let panes = projections
             .iter()
             .map(|projection| projection.pane_id)
-            .collect();
+            .collect::<HashSet<_>>();
+        let viewport_offsets = panes
+            .iter()
+            .filter_map(|pane_id| {
+                let offset = self
+                    .panes
+                    .get(pane_id)
+                    .and_then(|pane| pane.copy.as_ref())
+                    .map_or(0, |copy| copy.offset);
+                (offset != 0).then_some((*pane_id, offset))
+            })
+            .collect::<HashMap<_, _>>();
         let projection_key = MediaProjectionKey {
             virtual_revision: self.vivid.revision(),
             layout_revision: self.layout_revision,
@@ -3156,7 +3177,9 @@ impl SessionActor {
         }
         // projection_snapshot marks active video sources as requiring a fresh keyframe. Only call
         // it after deciding that the client will actually rebuild its outer Vivid session.
-        let mut snapshot = self.vivid.projection_snapshot(&panes);
+        let mut snapshot = self
+            .vivid
+            .projection_snapshot_with_viewports(&panes, &viewport_offsets);
         let projection_key = MediaProjectionKey {
             virtual_revision: snapshot.revision,
             layout_revision: self.layout_revision,
@@ -3436,10 +3459,16 @@ impl SessionActor {
             _ => {}
         }
         let changed = previous != pane.copy;
+        let media_view_changed = previous.as_ref().map_or(0, |copy| copy.offset)
+            != pane.copy.as_ref().map_or(0, |copy| copy.offset);
         if changed {
             self.mark_pane_screen_change(pane_id, None);
         }
-        self.schedule_render();
+        if media_view_changed {
+            self.projection_changed();
+        } else {
+            self.schedule_render();
+        }
     }
 
     fn paste(&mut self) {
