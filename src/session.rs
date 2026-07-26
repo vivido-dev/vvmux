@@ -3221,11 +3221,7 @@ impl SessionActor {
 
     fn resize_all(&mut self) {
         let area = self.content_area();
-        let display = self
-            .attached
-            .as_ref()
-            .map(|client| client.display)
-            .unwrap_or_default();
+        let display = self.layout_display();
         let mut resize_failures = Vec::new();
         let mut resized_panes = 0_u64;
         for tab in &self.tabs {
@@ -3804,11 +3800,21 @@ impl SessionActor {
         self.traced_projected_sources = current.clone();
     }
 
-    fn content_area(&self) -> Rect {
-        let display = self
-            .attached
+    /// Host metrics that back layout and the pane geometry published to producers.
+    ///
+    /// A detached session keeps the last attached host's metrics. `DisplayMetrics::default()` has a
+    /// zero cell size, and a relayout while detached (a pane exiting, an automation split) would
+    /// otherwise publish a zero-viewport `DISPLAY_CHANGED` — geometry no producer can honor — and
+    /// then publish real metrics again on reattach, resizing every live source twice for a host
+    /// that never changed.
+    fn layout_display(&self) -> DisplayMetrics {
+        self.attached
             .as_ref()
-            .map_or(self.last_display, |client| client.display);
+            .map_or(self.last_display, |client| client.display)
+    }
+
+    fn content_area(&self) -> Rect {
+        let display = self.layout_display();
         Rect {
             x: 0,
             y: 0,

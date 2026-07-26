@@ -482,6 +482,13 @@ impl VirtualVivid {
             cell_height: u32::from(cell.1),
             settled: true,
         };
+        if !usable_display(&display) {
+            // Vivid requires a nonzero viewport, grid, and cell size. A caller that cannot supply
+            // one — a relayout computed while no host is attached — must not replace a pane's
+            // usable geometry with a display every producer would have to reject, and must not
+            // walk live sources through a phantom resize and back.
+            return;
+        }
         state.metrics.insert(pane, display);
         for producer in state
             .producers
@@ -5321,6 +5328,55 @@ mod tests {
         assert_eq!(welcome.cell_height, 20);
         assert_eq!(welcome.viewport_width, 800);
         assert_eq!(welcome.viewport_height, 440);
+    }
+
+    /// A relayout while no host is attached has no cell size. The pane keeps its last usable
+    /// geometry instead of walking every live producer through a zero-sized display and back,
+    /// which is what a detach followed by a reattach used to do to a running reader.
+    #[test]
+    fn a_degenerate_display_never_reaches_producers() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = test_virtual_endpoint(&directory, "vivid-degenerate-metrics.sock");
+        let service = match VirtualVivid::start(socket, MediaConfig::default()) {
+            Ok(service) => service,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping virtual presenter metrics socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("virtual presenter start failed: {error}"),
+        };
+        let token = service.issue_pane_capability(7).unwrap();
+        let endpoint = service_endpoint(&service);
+        service.update_metrics(7, 80, 22, (10, 20));
+
+        let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        control
+            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &token))
+            .unwrap();
+        assert_eq!(
+            control.read_record().unwrap().record_type,
+            messages::WELCOME
+        );
+
+        // The detached relayout is dropped, so the next record the producer sees is the reattach.
+        service.update_metrics(7, 80, 22, (0, 0));
+        service.update_metrics(7, 80, 22, (10, 21));
+        let record = control.read_record().unwrap();
+        assert_eq!(record.record_type, messages::DISPLAY_CHANGED);
+        let display = messages::parse_display_changed(&record.body).unwrap();
+        assert_eq!((display.cell_width, display.cell_height), (10, 21));
+        assert_eq!((display.grid_columns, display.grid_rows), (80, 22));
+        assert_eq!(
+            (display.viewport_width, display.viewport_height),
+            (800, 462)
+        );
+        assert!(
+            service
+                .lock()
+                .metrics
+                .get(&7)
+                .is_some_and(super::usable_display)
+        );
     }
 
     /// A realistic surface: a small damaged region should cross the hop as a delta rather than as
