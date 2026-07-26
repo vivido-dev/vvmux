@@ -8,6 +8,9 @@ use clap::{Args, Subcommand, ValueEnum};
 use crate::ipc::{
     AutomationMethod, AutomationRequest, AutomationResponse, Axis, ClientMessage, ServerMessage,
 };
+use crate::media_trace::{
+    MAX_MEDIA_TRACE_QUERY_EVENTS, MediaTraceBatch, MediaTraceCategory, MediaTraceFilter,
+};
 
 const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -41,6 +44,29 @@ pub enum MsgCommand {
     ListPanes,
     /// Inspect one pane.
     Inspect(PaneTarget),
+    /// Inspect sanitized Vivid media state owned by one pane.
+    InspectMedia(PaneTarget),
+    /// Read or follow the bounded media transition journal for one pane.
+    TraceMedia {
+        #[arg(long)]
+        after: Option<u64>,
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(1..=i64::from(MAX_MEDIA_TRACE_QUERY_EVENTS)))]
+        limit: u16,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long)]
+        producer_id: Option<u64>,
+        #[arg(long, requires = "producer_id")]
+        source_id: Option<u64>,
+        #[arg(long, value_enum)]
+        category: Option<MediaTraceCategory>,
+        #[arg(long)]
+        recovery_only: bool,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Split a tiled pane without changing the active tab.
     Split {
         #[arg(value_enum)]
@@ -155,6 +181,17 @@ pub enum WaitCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Wait for a newer virtual or outer media projection revision.
+    Media {
+        #[arg(long)]
+        after_virtual: Option<u64>,
+        #[arg(long)]
+        after_outer: Option<u64>,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
 }
 
 pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()> {
@@ -185,19 +222,11 @@ pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()>
         method,
     };
     let (mut reader, writer) = crate::server::connect(&target)?;
-    writer
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .send(&ClientMessage::Automation(request))?;
-    let response = receive_response(&mut reader, 1)?;
-    if !response.ok {
-        let error = response
-            .error
-            .map(|error| format!("{}: {}", error.code, error.message))
-            .unwrap_or_else(|| "automation request failed".into());
-        return Err(io::Error::other(error));
+    if matches!(output, Output::TraceFollow) {
+        return run_trace_follow(&mut reader, &writer, request);
     }
-    let result = response.result.unwrap_or(serde_json::Value::Null);
+    send_automation_request(&writer, request.clone())?;
+    let result = response_result(receive_response(&mut reader, request.id)?)?;
     match output {
         Output::Silent => Ok(()),
         Output::Text => {
@@ -214,6 +243,76 @@ pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()>
             println!();
             Ok(())
         }
+        Output::TraceFollow => unreachable!(),
+    }
+}
+
+fn send_automation_request(
+    writer: &crate::ipc::SharedWriter,
+    request: AutomationRequest,
+) -> io::Result<()> {
+    writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .send(&ClientMessage::Automation(request))
+}
+
+fn response_result(response: AutomationResponse) -> io::Result<serde_json::Value> {
+    if !response.ok {
+        let error = response
+            .error
+            .map(|error| format!("{}: {}", error.code, error.message))
+            .unwrap_or_else(|| "automation request failed".into());
+        return Err(io::Error::other(error));
+    }
+    Ok(response.result.unwrap_or(serde_json::Value::Null))
+}
+
+fn run_trace_follow(
+    reader: &mut crate::ipc::RecordReader,
+    writer: &crate::ipc::SharedWriter,
+    mut request: AutomationRequest,
+) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    loop {
+        send_automation_request(writer, request.clone())?;
+        let result = response_result(receive_response(reader, request.id)?)?;
+        let batch: MediaTraceBatch = serde_json::from_value(result).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid media trace response: {error}"),
+            )
+        })?;
+        if let Some(gap) = &batch.gap {
+            serde_json::to_writer(&mut stdout, &serde_json::json!({"type": "gap", "gap": gap}))
+                .map_err(io::Error::other)?;
+            writeln!(stdout)?;
+        }
+        for event in &batch.events {
+            serde_json::to_writer(&mut stdout, event).map_err(io::Error::other)?;
+            writeln!(stdout)?;
+        }
+        stdout.flush()?;
+        let requested_after = match &request.method {
+            AutomationMethod::TraceMedia { after_sequence, .. } => *after_sequence,
+            _ => unreachable!(),
+        };
+        let after = batch.events.last().map_or_else(
+            || {
+                requested_after
+                    .unwrap_or(batch.current_sequence)
+                    .max(batch.current_sequence)
+            },
+            |event| event.sequence,
+        );
+        let AutomationMethod::TraceMedia { after_sequence, .. } = &mut request.method else {
+            unreachable!();
+        };
+        *after_sequence = Some(after);
+        request.id = request
+            .id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("automation request ID exhausted"))?;
     }
 }
 
@@ -222,6 +321,7 @@ enum Output {
     Silent,
     Text,
     Json,
+    TraceFollow,
 }
 
 fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u64>, bool, Output)> {
@@ -233,6 +333,42 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             target.pane_id,
             true,
             Output::Json,
+        ),
+        MsgCommand::InspectMedia(target) => (
+            AutomationMethod::InspectMedia,
+            target.pane_id,
+            true,
+            Output::Json,
+        ),
+        MsgCommand::TraceMedia {
+            after,
+            limit,
+            timeout,
+            follow,
+            producer_id,
+            source_id,
+            category,
+            recovery_only,
+            pane_id,
+        } => (
+            AutomationMethod::TraceMedia {
+                after_sequence: after,
+                limit,
+                timeout_ms: if follow { millis(timeout) } else { 0 },
+                filter: MediaTraceFilter {
+                    producer_id,
+                    source_id,
+                    category,
+                    recovery_only,
+                },
+            },
+            pane_id,
+            true,
+            if follow {
+                Output::TraceFollow
+            } else {
+                Output::Json
+            },
         ),
         MsgCommand::Split { axis, pane_id } => (
             AutomationMethod::Split { axis: axis.into() },
@@ -377,6 +513,21 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 true,
                 Output::Json,
             ),
+            WaitCommand::Media {
+                after_virtual,
+                after_outer,
+                timeout,
+                pane_id,
+            } => (
+                AutomationMethod::WaitMedia {
+                    after_virtual_revision: after_virtual,
+                    after_outer_revision: after_outer,
+                    timeout_ms: millis(timeout),
+                },
+                pane_id,
+                true,
+                Output::Json,
+            ),
         },
     };
     Ok(tuple)
@@ -389,7 +540,7 @@ fn receive_response(
     let mut chunks = Vec::new();
     let mut next_index = 0;
     loop {
-        match reader.recv::<ServerMessage>()? {
+        match reader.recv_server()? {
             ServerMessage::Automation(response) if response.id == id => return Ok(response),
             ServerMessage::AutomationChunk {
                 request_id,
@@ -488,5 +639,40 @@ mod tests {
         assert_eq!(parse_timeout("24h").unwrap(), Duration::from_secs(86_400));
         assert!(parse_timeout("0").is_err());
         assert!(parse_timeout("25h").is_err());
+    }
+
+    #[test]
+    fn trace_follow_uses_bounded_long_polling_while_snapshot_is_immediate() {
+        let command = |follow| MsgCommand::TraceMedia {
+            after: Some(9),
+            limit: 32,
+            timeout: Duration::from_secs(2),
+            follow,
+            producer_id: Some(3),
+            source_id: Some(7),
+            category: Some(MediaTraceCategory::Recovery),
+            recovery_only: true,
+            pane_id: Some(2),
+        };
+        let (snapshot, _, _, output) = build_request(command(false)).unwrap();
+        assert!(matches!(output, Output::Json));
+        assert!(matches!(
+            snapshot,
+            AutomationMethod::TraceMedia {
+                after_sequence: Some(9),
+                limit: 32,
+                timeout_ms: 0,
+                ..
+            }
+        ));
+        let (follow, _, _, output) = build_request(command(true)).unwrap();
+        assert!(matches!(output, Output::TraceFollow));
+        assert!(matches!(
+            follow,
+            AutomationMethod::TraceMedia {
+                timeout_ms: 2_000,
+                ..
+            }
+        ));
     }
 }

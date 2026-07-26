@@ -8,6 +8,8 @@ mod gateway;
 mod ipc;
 mod layout;
 mod media;
+mod media_trace;
+mod metrics;
 mod platform;
 mod region;
 mod runtime;
@@ -213,6 +215,40 @@ mod tests {
         assert!(
             Cli::try_parse_from(["vvmux", "msg", "wait", "screen-stable", "--quiet", "25h",])
                 .is_err()
+        );
+        assert!(Cli::try_parse_from(["vvmux", "msg", "inspect-media", "--pane-id", "7"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "vvmux",
+                "msg",
+                "trace-media",
+                "--pane-id",
+                "7",
+                "--follow",
+                "--producer-id",
+                "3",
+                "--source-id",
+                "9",
+                "--category",
+                "recovery",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["vvmux", "msg", "trace-media", "--source-id", "9",]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "vvmux",
+                "msg",
+                "wait",
+                "media",
+                "--after-virtual",
+                "4",
+                "--after-outer",
+                "9",
+                "--pane-id",
+                "7",
+            ])
+            .is_ok()
         );
     }
 }

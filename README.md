@@ -81,6 +81,7 @@ Available commands are:
 capabilities
 list-panes
 inspect [--pane-id ID]
+inspect-media [--pane-id ID]
 split vertical|horizontal [--pane-id ID]
 focus [--pane-id ID]
 close-pane --pane-id ID
@@ -94,6 +95,7 @@ wait screen-change [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait screen-stable [--quiet DURATION] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait rendered --after-session SEQ [--timeout DURATION]
 wait exit [--timeout DURATION] [--pane-id ID]
+wait media [--after-virtual REV] [--after-outer REV] [--timeout DURATION] [--pane-id ID]
 ```
 
 `typing`, `key`, and `paste` bypass prefix and copy-mode handling and acknowledge only after the
@@ -121,9 +123,16 @@ durations from 1 ms through 24 hours. `wait rendered` means the attached client 
 acknowledged a composite terminal frame covering the requested session sequence; it does not claim
 that Vivido presented a GPU frame. Use `vivido msg wait frame` when GPU presentation matters.
 
+`inspect-media` reports only pane-scoped, sanitized metadata: virtual scene/projection revisions,
+the independently acknowledged outer projection revision, source kind/lifecycle/revision/epoch,
+separate inner and outer attachment generations, visibility and milestones, bounded queue/credit utilization, and
+node geometry. It never includes capability tokens, media tickets, payload bytes, hashes, or
+derived keys. `wait media` waits for either requested revision domain to advance; when both
+`--after-virtual` and `--after-outer` are supplied, both predicates must become true.
+
 Requests and input are limited to 1 MiB, decoded replies to 16 MiB, row requests and key repeats to
 1,000, and regular expressions to 8 KiB. The server bounds connections, in-flight requests,
-waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 4 is a hard
+waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 9 is a hard
 private-protocol cutover, so sessions created by older binaries must be restarted after upgrading.
 
 ## Network session gateway
@@ -147,7 +156,7 @@ record.
 
 The gateway lists, creates, and exclusively attaches to sessions. It serves no HTML or JavaScript
 and does not expose session kill operations. Plain xterm.js clients can attach text-only;
-Vivido.js's built-in `connectVvmux` coordinator also routes Vivid 1.0 over authenticated binary
+Vivido.js's built-in `connectVvmux` coordinator also routes Vivid 1.1 over authenticated binary
 WebSockets, so images and timed media remain synchronized with the session. See
 [VVWS-1.md](VVWS-1.md) for the normative wire contract and client integration shape.
 
@@ -200,9 +209,10 @@ authenticated anchor markers.
 
 Static encoded images and the latest raster are retained within the configured aggregate budget.
 Timed audio/video continues to receive credits while detached but payloads are discarded. On a new
-projection, live video gets `NEED_KEYFRAME` with a new minimum epoch; only that fresh keyframe and
-later packets are eligible for forwarding. Audio resumes with newly arriving packets. EOS video
-does not acquire a reconstructed poster.
+projection, live video gets `NEED_KEYFRAME`; relay-only loss accepts the next keyframe in the
+current epoch, while decoder loss can demand a greater epoch. Only the requested keyframe and later
+packets are eligible for forwarding. Audio resumes with newly arriving packets. EOS video does not
+acquire a reconstructed poster.
 
 The foreground client reconciles stable source and `(producer, node, fragment)` identities into the
 current Vivido session, reuses unchanged sources/media channels, resolves virtual anchors, and
