@@ -2241,55 +2241,38 @@ mod tests {
         );
         assert!(snapshot.sources[0].retained.is_some());
 
-        let replay_key = BridgeSourceKey {
-            producer: 5,
-            source: 10,
-        };
-        let replay_video = BridgeSource {
-            key: replay_key,
-            kind: video_source.kind,
-            capture_policy: 0,
-            descriptor: None,
-            playing: true,
-            eos_epoch: None,
-            causation_id: None,
-            play_request: video_source.play_request,
-        };
         let replay_node = BridgeNode {
-            producer: replay_key.producer,
-            node: 3,
-            source: replay_key,
-            x: 20_i64 << 32,
+            x: 0,
             clip: crate::ipc::BridgeClipRect {
-                x: 20_i64 << 32,
+                x: 0,
                 ..image_node.clip
             },
-            ..image_node.clone()
+            ..node(0)
         };
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
             virtual_revision: 8,
-            sources: vec![image_source, replay_video],
-            nodes: vec![replay_node, remaining_image_node],
+            sources: vec![video_source],
+            nodes: vec![replay_node],
             videos_needing_keyframes: Vec::new(),
         });
         let snapshot = wait_for(
             &|snapshot| {
-                snapshot.nodes.len() == 2
+                snapshot.nodes.len() == 1
                     && outer_video(snapshot).is_some_and(|(_, playing)| playing)
-                    && snapshot.sources.iter().any(|source| {
-                        matches!(source.descriptor, crate::media::SourceDescriptor::Image(_))
-                            && source.retained.is_some()
+                    && snapshot.sources.iter().all(|source| {
+                        !matches!(source.descriptor, crate::media::SourceDescriptor::Image(_))
                     })
             },
-            "replayed video node alongside the retained image",
+            "same video source after returning from the image-only tab",
         );
-        assert_eq!(snapshot.nodes.len(), 2);
+        assert_eq!(snapshot.nodes.len(), 1);
         assert_eq!(
             keyframe_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            vec![initial_keyframe(replay_key)]
+            vec![initial_keyframe(video_key)],
+            "restoring the same playing source must initialize its new outer decoder"
         );
     }
 
