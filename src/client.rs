@@ -32,6 +32,8 @@ const BRIDGE_MEDIA_CHUNK: usize = 128 * 1024;
 /// Coarse on purpose: these are diagnostics and must not add measurable traffic to the client
 /// connection they are measuring.
 const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const DISPLAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub fn attach(
     name: &str,
@@ -202,6 +204,40 @@ pub fn attach(
             read_stopped.store(true, Ordering::Release);
         })?;
 
+    #[cfg(windows)]
+    let resize_stopped = stopped.clone();
+    #[cfg(windows)]
+    let resize_writer = writer.clone();
+    #[cfg(windows)]
+    let resize_thread = match thread::Builder::new()
+        .name("vvmux-display".into())
+        .spawn(move || {
+            let mut last_display = display;
+            while !resize_stopped.load(Ordering::Acquire) {
+                thread::sleep(DISPLAY_POLL_INTERVAL);
+                if resize_stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let Ok(current) = crate::platform::current_display_metrics() else {
+                    continue;
+                };
+                if current != last_display {
+                    if send_client(&resize_writer, &ClientMessage::Resize(current)).is_err() {
+                        resize_stopped.store(true, Ordering::Release);
+                        break;
+                    }
+                    last_display = current;
+                }
+            }
+        }) {
+        Ok(thread) => thread,
+        Err(error) => {
+            ipc_cancel.cancel();
+            let _ = reader_thread.join();
+            return Err(error);
+        }
+    };
+
     #[cfg(unix)]
     let signal_stopped = stopped.clone();
     #[cfg(unix)]
@@ -234,8 +270,11 @@ pub fn attach(
     };
 
     let mut workers = ClientWorkers {
+        stopped: stopped.clone(),
         ipc_cancel,
         reader_thread: Some(reader_thread),
+        #[cfg(windows)]
+        resize_thread: Some(resize_thread),
         #[cfg(unix)]
         signal_handle,
         #[cfg(unix)]
@@ -246,6 +285,7 @@ pub fn attach(
         crate::config::parse_control_chord(&client_config.general.prefix).unwrap_or(0x02),
         &client_config.keys.prefix,
     );
+    #[cfg(not(windows))]
     let mut last_display = display;
     let mut float_mode: Option<u64> = None;
     let mut float_scanner = FloatEditScanner::default();
@@ -310,11 +350,14 @@ pub fn attach(
                 send_client(&writer, &ClientMessage::FloatingEdit { mode_id, command })?;
                 float_mode = None;
             }
-            if let Ok(display) = terminal.display_metrics()
-                && display != last_display
+            #[cfg(not(windows))]
             {
-                send_client(&writer, &ClientMessage::Resize(display))?;
-                last_display = display;
+                if let Ok(display) = terminal.display_metrics()
+                    && display != last_display
+                {
+                    send_client(&writer, &ClientMessage::Resize(display))?;
+                    last_display = display;
+                }
             }
         }
         Ok(())
@@ -325,8 +368,11 @@ pub fn attach(
 }
 
 struct ClientWorkers {
+    stopped: Arc<AtomicBool>,
     ipc_cancel: crate::platform::ConnectionCancel,
     reader_thread: Option<thread::JoinHandle<()>>,
+    #[cfg(windows)]
+    resize_thread: Option<thread::JoinHandle<()>>,
     #[cfg(unix)]
     signal_handle: signal_hook::iterator::Handle,
     #[cfg(unix)]
@@ -335,8 +381,13 @@ struct ClientWorkers {
 
 impl ClientWorkers {
     fn stop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
         self.ipc_cancel.cancel();
         if let Some(thread) = self.reader_thread.take() {
+            let _ = thread.join();
+        }
+        #[cfg(windows)]
+        if let Some(thread) = self.resize_thread.take() {
             let _ = thread.join();
         }
         #[cfg(unix)]
