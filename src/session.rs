@@ -541,6 +541,7 @@ struct SessionActor {
     exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
     vivid: VirtualVivid,
+    media_projection_pending: Arc<AtomicBool>,
     /// Latest foreground-bridge counter report. Diagnostic only; retained across a detach so
     /// `inspect-media` still describes the last live bridge.
     bridge_metrics: crate::metrics::BridgeMetrics,
@@ -559,11 +560,15 @@ pub fn start(
     let shutdown = Arc::new(AtomicBool::new(false));
     let vivid =
         VirtualVivid::start_with_events(vivid_endpoint, config.media.clone(), Some(media_sender))?;
+    let media_projection_pending = Arc::new(AtomicBool::new(false));
     {
-        // Losing a wakeup to a full queue is harmless: the actor drains media around every event
-        // and on every idle tick regardless, so `try_send` here must never block ingest.
+        // Never block ingest on the actor's general queue. The atomic dirty bit makes a lost
+        // coalescible wake harmless even for immutable images, which advance retained projection
+        // state without placing a payload on the dedicated media queue.
         let wakeup = sender.clone();
+        let pending = media_projection_pending.clone();
         vivid.set_media_wakeup(Arc::new(move || {
+            pending.store(true, Ordering::Release);
             let _ = wakeup.try_send(ActorEvent::MediaReady);
         }));
     }
@@ -644,6 +649,7 @@ pub fn start(
         exit_tombstones: VecDeque::new(),
         shutdown: shutdown.clone(),
         vivid,
+        media_projection_pending,
         bridge_metrics: crate::metrics::BridgeMetrics::default(),
         client_ipc: None,
     };
@@ -679,6 +685,7 @@ impl SessionActor {
                         self.force_full = true;
                     }
                     self.drain_media(&media_receiver);
+                    self.sync_pending_media_projection();
                     if self.pending_render && render_at <= Instant::now() {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -691,6 +698,7 @@ impl SessionActor {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.drain_media(&media_receiver);
+                    self.sync_pending_media_projection();
                     if self.pending_render {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -715,6 +723,12 @@ impl SessionActor {
     fn drain_media(&mut self, media_receiver: &mpsc::Receiver<crate::media::MediaEvent>) {
         while let Ok(event) = media_receiver.try_recv() {
             self.forward_media(event);
+        }
+    }
+
+    fn sync_pending_media_projection(&mut self) {
+        if self.media_projection_pending.swap(false, Ordering::AcqRel) {
+            self.sync_media(false);
         }
     }
 
@@ -903,8 +917,7 @@ impl SessionActor {
                     self.reply_automation_error(reply, AutomationError::new("pty_closed", message));
                 }
             },
-            // The payload arrives on the dedicated media receiver, which the run loop drains
-            // around every event; this wakeup only ensures it happens promptly.
+            // The payload or retained-projection dirty bit is drained by the run loop.
             ActorEvent::MediaReady => {}
         }
         Ok(())
@@ -950,6 +963,7 @@ impl SessionActor {
                 self.bridge_metrics = crate::metrics::BridgeMetrics::default();
                 self.bridge_instance_id = None;
                 self.bridge_local_revision = 0;
+                self.outer_attachment_generations.clear();
                 self.traced_recovery_deliveries.clear();
                 self.attached = Some(AttachedClient {
                     id,
@@ -1147,6 +1161,7 @@ impl SessionActor {
                     // The worker requests this only when it will rebuild a replacement outer
                     // session. Fragment identities are scoped to that outer session.
                     self.fragment_assignments.clear();
+                    self.outer_attachment_generations.clear();
                     self.last_media_projection = None;
                     self.sync_media(true);
                 }
@@ -3308,12 +3323,14 @@ impl SessionActor {
         let Some(client) = &self.attached else {
             return;
         };
+        let display = client.display;
+        let writer = client.writer.clone();
         #[cfg(windows)]
         let focused_bracketed_paste = self
             .active_tab()
             .and_then(|tab| self.panes.get(&tab.focused))
             .is_some_and(|pane| pane.terminal.modes().bracketed_paste);
-        let mut screen = ScreenBuffer::new(client.display.columns, client.display.rows);
+        let mut screen = ScreenBuffer::new(display.columns, display.rows);
         let area = self.content_area();
         if let Some(tab) = self.active_tab() {
             // Composition follows the ordered projection list; later projections overwrite
@@ -3415,8 +3432,12 @@ impl SessionActor {
         if let Some(transition) = bracketed_paste_transition {
             prepend_bracketed_paste_transition(&mut bytes, transition);
         }
+        // Put the media projection on the ordered client stream before the terminal frame that
+        // exposes the new tab. The client can then reconcile the retained scene concurrently
+        // with terminal painting instead of always showing pane text first and the image later.
+        self.sync_media(false);
         let sent = crate::ipc::send_render_record(
-            &client.writer,
+            &writer,
             self.frame_id,
             self.session_sequence,
             self.force_full,
@@ -3428,7 +3449,7 @@ impl SessionActor {
             // failed frame silently detached the session while the client kept running against a
             // frozen outer scene, which is indistinguishable from a hang.
             let _ = crate::ipc::send(
-                &client.writer,
+                &writer,
                 &ServerMessage::Detached {
                     reason: "frame delivery failed".into(),
                 },
@@ -3455,7 +3476,6 @@ impl SessionActor {
             }
         }
         self.force_full = false;
-        self.sync_media(false);
     }
 
     fn sync_media(&mut self, force: bool) {
@@ -3686,10 +3706,19 @@ impl SessionActor {
             },
         );
         for source in snapshot.sources {
-            if !should_replay_retained(source.key, live_delivery_source) {
+            if !should_replay_retained(
+                source.key,
+                live_delivery_source,
+                matches!(&source.descriptor, crate::media::SourceDescriptor::Image(_))
+                    && source.first_visible_presented,
+                self.outer_attachment_generations
+                    .contains_key(&bridge_key(source.key)),
+            ) {
                 // The MediaEvent that triggered this projection sync follows immediately. Do not
                 // also send the same retained raster body as delivery 0: the outer source would
-                // observe the same frame ID twice and reject the live update.
+                // observe the same frame ID twice and reject the live update. Likewise, an
+                // already-presented retained body needs no IPC replay while its outer attachment
+                // remains resident.
                 continue;
             }
             if let Some(body) = source.retained {
@@ -4464,8 +4493,11 @@ fn encode_automation_key(
 fn should_replay_retained(
     source: crate::media::SourceKey,
     live_delivery_source: Option<crate::media::SourceKey>,
+    reusable_presented_image: bool,
+    outer_attachment_resident: bool,
 ) -> bool {
     Some(source) != live_delivery_source
+        && (!reusable_presented_image || !outer_attachment_resident)
 }
 
 #[cfg(unix)]
@@ -5177,9 +5209,14 @@ mod tests {
     #[test]
     fn projection_sync_does_not_duplicate_the_triggering_live_raster() {
         let raster = (3, 7);
-        assert!(!should_replay_retained(raster, Some(raster)));
-        assert!(should_replay_retained(raster, None));
-        assert!(should_replay_retained(raster, Some((3, 8))));
+        assert!(!should_replay_retained(raster, Some(raster), false, false));
+        assert!(should_replay_retained(raster, None, false, true));
+        assert!(should_replay_retained(raster, Some((3, 8)), true, false));
+        assert!(
+            !should_replay_retained(raster, None, true, true),
+            "an already-presented retained body must not cross IPC again while its outer source \
+             remains resident"
+        );
     }
 
     #[test]
@@ -5426,6 +5463,7 @@ mod tests {
             exit_tombstones: VecDeque::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             vivid,
+            media_projection_pending: Arc::new(AtomicBool::new(false)),
             bridge_metrics: crate::metrics::BridgeMetrics::default(),
             client_ipc: None,
             attached: Some(AttachedClient {
@@ -5449,6 +5487,22 @@ mod tests {
                 cell_height: 20,
             },
         };
+
+        actor.render();
+        assert!(
+            matches!(
+                client_reader.recv_server().unwrap(),
+                ServerMessage::MediaSnapshot { .. }
+            ),
+            "a composite change must submit its media projection before exposing the terminal frame"
+        );
+        assert!(
+            matches!(
+                client_reader.recv_server().unwrap(),
+                ServerMessage::Render { .. }
+            ),
+            "the terminal frame must immediately follow its media projection"
+        );
 
         let endpoint = Endpoint::Unix(socket);
         let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();

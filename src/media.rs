@@ -121,6 +121,7 @@ pub struct SnapshotSource {
     pub key: SourceKey,
     pub descriptor: SourceDescriptor,
     pub retained: Option<Arc<[u8]>>,
+    pub first_visible_presented: bool,
     pub playing: bool,
     pub play_request: messages::PlayRequest,
     pub eos_epoch: Option<u32>,
@@ -655,16 +656,43 @@ impl VirtualVivid {
             .iter()
             .map(|node| (node.producer, node.config.node.source_id))
             .collect::<HashSet<_>>();
+        let live_referenced_sources = state
+            .nodes
+            .values()
+            .map(|node| (node.producer, node.config.node.source_id))
+            .collect::<HashSet<_>>();
         let mut sources = Vec::new();
+        let mut projected_sources = HashSet::new();
         let mut videos_needing_keyframes = Vec::new();
         for (key, source) in &mut state.sources {
-            if !active_producers.contains(&source.owner) && !referenced_sources.contains(key) {
+            let projected =
+                active_producers.contains(&source.owner) || referenced_sources.contains(key);
+            // An immutable image that has already reached the outer presenter is cheap and safe
+            // to keep resident while its tab is hidden. Keeping the decoded source alive turns a
+            // later tab switch into a node-only transaction instead of DELETE_SOURCE followed by
+            // CREATE_IMAGE, cache lookup, attachment setup, and retained-body replay.
+            //
+            // Do not preload never-presented hidden images: projected_sources remains the
+            // authoritative visibility set, and first-visible waits must still be driven by an
+            // actual outer presentation.
+            let resident_image = !projected
+                && matches!(source.descriptor, SourceDescriptor::Image(_))
+                && source.retained.is_some()
+                && source.milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION != 0
+                && live_referenced_sources.contains(key);
+            if !projected && !resident_image {
                 continue;
+            }
+            if projected {
+                projected_sources.insert(*key);
             }
             sources.push(SnapshotSource {
                 key: *key,
                 descriptor: source.descriptor.clone(),
                 retained: source.retained.clone(),
+                first_visible_presented: source.milestones
+                    & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION
+                    != 0,
                 playing: source.playing,
                 play_request: source.play_request,
                 eos_epoch: source.eos_epoch,
@@ -685,10 +713,6 @@ impl VirtualVivid {
                 videos_needing_keyframes.push(*key);
             }
         }
-        let projected_sources = sources
-            .iter()
-            .map(|source| source.key)
-            .collect::<HashSet<_>>();
         let hidden_deliveries = state
             .deliveries
             .iter()
@@ -4038,7 +4062,9 @@ fn ingest_record(
         source.milestones |= messages::MILESTONE_RANDOM_ACCESS_ACCEPTED;
     }
     state.retained_bytes = projected;
-    if retained_requires_revision && new_retained > 0 && old_retained == 0 {
+    let retained_projection_changed =
+        retained_requires_revision && new_retained > 0 && old_retained == 0;
+    if retained_projection_changed {
         // Immutable images have no live MediaEvent, so their first retained body must trigger
         // hydration. Raster bodies are exclusively live while projected and are picked up from
         // retained state only on an independently required source/layout rebuild.
@@ -4154,6 +4180,12 @@ fn ingest_record(
     }
     if let Some(credit) = immediate_credit {
         write_delivery_credit(credit)?;
+    }
+    if retained_projection_changed && let Some(wakeup) = media_wakeup {
+        // Immutable images deliberately have no live MediaEvent. Wake the session actor anyway:
+        // otherwise it notices the new retained projection only on its one-second idle tick,
+        // delaying both the first image and WAIT_FIRST_VISIBLE_PRESENTATION by a full second.
+        wakeup();
     }
     if request_keyframe {
         request_keyframe_recoveries(
@@ -4436,6 +4468,7 @@ fn diagnostic_trace_guard() -> io::Result<Option<TraceGuard>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
     use vivid_protocol::wire::{Connection, Endpoint};
 
     #[test]
@@ -6100,6 +6133,11 @@ mod tests {
             }
             Err(error) => panic!("virtual presenter start failed: {error}"),
         };
+        let projection_wakeups = Arc::new(AtomicU64::new(0));
+        let counted_wakeups = projection_wakeups.clone();
+        service.set_media_wakeup(Arc::new(move || {
+            counted_wakeups.fetch_add(1, Ordering::Relaxed);
+        }));
         let token = service.issue_pane_capability(7).unwrap();
         service.update_metrics(7, 80, 22, (10, 20));
 
@@ -6271,12 +6309,19 @@ mod tests {
                     8_i64 << 32,
                     "copy-mode scrollback must move text-anchored media with its semantic line"
                 );
+                service.complete_retained_hydration((welcome.session_id, 1));
                 retained = true;
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
         assert!(retained, "virtual presenter did not retain static media");
+        assert_eq!(
+            projection_wakeups.load(Ordering::Relaxed),
+            1,
+            "the immutable image must wake projection immediately instead of waiting for the \
+             session actor's one-second idle tick"
+        );
 
         control
             .write_record(messages::GOODBYE, 0, 0, &messages::goodbye(7))
@@ -6301,7 +6346,19 @@ mod tests {
                 assert_eq!(snapshot.nodes[0].config.node.y, 3_i64 << 32);
                 let other_tab = service.projection_snapshot(&HashSet::from([8]));
                 assert!(other_tab.nodes.is_empty());
-                assert!(other_tab.sources.is_empty());
+                assert_eq!(
+                    other_tab.sources.len(),
+                    1,
+                    "an already-presented immutable image stays decoded while its tab is hidden"
+                );
+                assert_eq!(other_tab.sources[0].key, (welcome.session_id, 1));
+                assert!(
+                    !service
+                        .lock()
+                        .projected_sources
+                        .contains(&(welcome.session_id, 1)),
+                    "outer residency must not be reported as visible projection"
+                );
                 assert_eq!(
                     other_tab.live_nodes.len(),
                     1,
