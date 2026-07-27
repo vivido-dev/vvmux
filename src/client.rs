@@ -794,9 +794,14 @@ fn run_bridge_worker(
                     result.map(|sources| recreated = sources)
                 }
             };
-            if applied.is_err() {
-                force_sources = true;
-                force_replacement = true;
+            if let Err(error) = applied {
+                // A display generation can change between BEGIN_TXN and COMMIT_TXN. The bridge
+                // retries that transaction in place; if the display remains unsettled through its
+                // bounded retry window, request a fresh authoritative projection without tearing
+                // down healthy sources or replacing the presenter session.
+                let display_unsettled = error.kind() == io::ErrorKind::WouldBlock;
+                force_sources = !display_unsettled;
+                force_replacement = !display_unsettled;
                 let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
                 continue;
             }

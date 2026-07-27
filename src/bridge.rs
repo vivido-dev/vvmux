@@ -60,6 +60,30 @@ const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// pin the writer thread forever.
 const OUTER_CREDIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// Bound retries on one continuously changing display.
+///
+/// A stale commit is recoverable in-place, but an unbounded retry loop here would monopolize the
+/// single bridge worker while a browser is being resized continuously. After this many immediate
+/// retries the worker asks the session actor for a fresh snapshot and tries again later.
+const DISPLAY_COMMIT_RETRIES: usize = 8;
+
+#[derive(Debug)]
+struct OuterProtocolError {
+    code: u64,
+    diagnostic: String,
+}
+
+impl std::fmt::Display for OuterProtocolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "presenter error {}: {}",
+            self.code, self.diagnostic
+        )
+    }
+}
+
+impl std::error::Error for OuterProtocolError {}
 
 struct ControlState {
     replies: HashMap<u64, Record>,
@@ -905,8 +929,13 @@ impl OuterBridge {
         nodes: &[BridgeNode],
     ) -> io::Result<std::collections::HashSet<BridgeSourceKey>> {
         validate_snapshot(sources, nodes)?;
-        if let Ok(recreated) = self.reconcile(sources, nodes) {
-            return Ok(recreated);
+        match self.reconcile(sources, nodes) {
+            Ok(recreated) => return Ok(recreated),
+            // Display changes are ordinary concurrent state, not evidence that the session is
+            // corrupt. Replacing the session here adds latency on native presenters and deadlocks
+            // browser presenters waiting for a WebSocket that they were never asked to open.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
+            Err(_) => {}
         }
         // A failed reconciliation may have applied a prefix of ordered control requests. Stop
         // audible output from the uncertain session, close it, and rebuild exactly once from the
@@ -1919,6 +1948,53 @@ impl OuterBridge {
     }
 
     fn reconcile_nodes(&mut self, nodes: &[BridgeNode]) -> io::Result<()> {
+        let mut next_node_ids = self.node_ids.clone();
+        for node in nodes {
+            let stable_key = (node.producer, node.node, node.fragment);
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                next_node_ids.entry(stable_key)
+            {
+                self.next_node = self
+                    .next_node
+                    .checked_add(1)
+                    .ok_or_else(|| exhausted("node"))?;
+                entry.insert(self.next_node);
+            }
+        }
+        let current_keys = nodes
+            .iter()
+            .map(|node| (node.producer, node.node, node.fragment))
+            .collect::<HashSet<_>>();
+        next_node_ids.retain(|stable_key, _| current_keys.contains(stable_key));
+
+        for attempt in 0..DISPLAY_COMMIT_RETRIES {
+            match self.reconcile_nodes_once(nodes, &next_node_ids) {
+                Ok(()) => {
+                    self.node_ids = next_node_ids;
+                    return Ok(());
+                }
+                Err(error)
+                    if protocol_error_code(&error)
+                        == Some(messages::ERROR_STALE_DISPLAY_GENERATION) =>
+                {
+                    if attempt + 1 == DISPLAY_COMMIT_RETRIES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "outer display kept changing during scene commit",
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("display commit retry loop has a nonzero fixed bound")
+    }
+
+    fn reconcile_nodes_once(
+        &mut self,
+        nodes: &[BridgeNode],
+        next_node_ids: &HashMap<(u64, u64, u8), u64>,
+    ) -> io::Result<()> {
         self.next_transaction = self
             .next_transaction
             .checked_add(1)
@@ -1932,19 +2008,14 @@ impl OuterBridge {
             &messages::begin_transaction(begin_request, transaction),
         )?;
 
-        let mut next_node_ids = self.node_ids.clone();
         let mut mutation_requests = Vec::new();
         for node in nodes {
             let stable_key = (node.producer, node.node, node.fragment);
-            let (record_type, node_id) = if let Some(node_id) = next_node_ids.get(&stable_key) {
-                (messages::UPDATE_NODE, *node_id)
+            let node_id = next_node_ids[&stable_key];
+            let record_type = if self.node_ids.contains_key(&stable_key) {
+                messages::UPDATE_NODE
             } else {
-                self.next_node = self
-                    .next_node
-                    .checked_add(1)
-                    .ok_or_else(|| exhausted("node"))?;
-                next_node_ids.insert(stable_key, self.next_node);
-                (messages::CREATE_NODE, self.next_node)
+                messages::CREATE_NODE
             };
             let source_id = *self
                 .source_ids
@@ -1978,17 +2049,13 @@ impl OuterBridge {
             mutation_requests.push((request, node_id));
         }
 
-        let current_keys = nodes
-            .iter()
-            .map(|node| (node.producer, node.node, node.fragment))
-            .collect::<std::collections::HashSet<_>>();
         let removed = self
             .node_ids
             .iter()
-            .filter(|(stable_key, _)| !current_keys.contains(stable_key))
-            .map(|(stable_key, node_id)| (*stable_key, *node_id))
+            .filter(|(stable_key, _)| !next_node_ids.contains_key(stable_key))
+            .map(|(_, node_id)| *node_id)
             .collect::<Vec<_>>();
-        for (stable_key, node_id) in removed {
+        for node_id in removed {
             let request = self.request_id()?;
             self.control.write_record(
                 messages::DELETE_NODE,
@@ -1997,7 +2064,6 @@ impl OuterBridge {
                 &messages::delete_node(request, transaction, node_id),
             )?;
             mutation_requests.push((request, node_id));
-            next_node_ids.remove(&stable_key);
         }
 
         let commit_request = self.request_id()?;
@@ -2016,9 +2082,24 @@ impl OuterBridge {
         for (request, node_id) in mutation_requests {
             self.wait_for(request, messages::OK, node_id)?;
         }
-        self.wait_for(commit_request, messages::PRESENTED, 0)?;
-        self.node_ids = next_node_ids;
-        Ok(())
+        match self.wait_for(commit_request, messages::PRESENTED, 0) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if protocol_error_code(&error)
+                    == Some(messages::ERROR_STALE_DISPLAY_GENERATION) =>
+            {
+                let abort_request = self.request_id()?;
+                self.control.write_record(
+                    messages::ABORT_TXN,
+                    0,
+                    0,
+                    &messages::abort_transaction(abort_request, transaction),
+                )?;
+                self.wait_for(abort_request, messages::OK, 0)?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn play_source(&mut self, source: &BridgeSource) -> io::Result<()> {
@@ -2605,8 +2686,20 @@ fn reserve_outer_credit(shared: &SharedControl, source_id: u64, bytes: u64) -> i
 }
 
 fn protocol_error(body: &[u8]) -> io::Error {
-    let message = messages::parse_error(body).unwrap_or_else(|_| "outer Vivid error".into());
-    io::Error::other(message)
+    match messages::parse_error_reply(body) {
+        Ok(error) => io::Error::other(OuterProtocolError {
+            code: error.code,
+            diagnostic: error.diagnostic,
+        }),
+        Err(_) => io::Error::other("outer Vivid error"),
+    }
+}
+
+fn protocol_error_code(error: &io::Error) -> Option<u64> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<OuterProtocolError>())
+        .map(|error| error.code)
 }
 
 fn with_causation(
@@ -3185,6 +3278,147 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
         dropper.join().unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn stale_display_commit_aborts_and_retries_on_the_same_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> io::Result<()> {
+            let (mut control, _) = listener.accept()?;
+            control.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut preface = [0; PREFACE_SIZE];
+            control.read_exact(&mut preface)?;
+            let hello = read_client_record(&mut control)?;
+            let mut sequence = 0;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::WELCOME,
+                0,
+                &messages::welcome(
+                    messages::request_id(&hello.body)?,
+                    1,
+                    &[1; 16],
+                    1,
+                    messages::DisplayChanged {
+                        display_generation: 1,
+                        viewport_width: 800,
+                        viewport_height: 600,
+                        grid_columns: 80,
+                        grid_rows: 24,
+                        cell_width: 10,
+                        cell_height: 25,
+                        settled: true,
+                    },
+                    REQUIRED_FEATURES,
+                ),
+            )?;
+
+            let begin = read_client_record(&mut control)?;
+            let commit = read_client_record(&mut control)?;
+            assert_eq!(begin.record_type, messages::BEGIN_TXN);
+            assert_eq!(commit.record_type, messages::COMMIT_TXN);
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                0,
+                &messages::ok(messages::request_id(&begin.body)?),
+            )?;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::DISPLAY_CHANGED,
+                0,
+                &messages::display_changed(
+                    0,
+                    messages::DisplayChanged {
+                        display_generation: 2,
+                        viewport_width: 810,
+                        viewport_height: 600,
+                        grid_columns: 81,
+                        grid_rows: 24,
+                        cell_width: 10,
+                        cell_height: 25,
+                        settled: true,
+                    },
+                ),
+            )?;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::ERROR,
+                0,
+                &messages::error(
+                    messages::request_id(&commit.body)?,
+                    messages::ERROR_STALE_DISPLAY_GENERATION,
+                    "display generation is stale",
+                ),
+            )?;
+
+            let abort = read_client_record(&mut control)?;
+            assert_eq!(abort.record_type, messages::ABORT_TXN);
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                0,
+                &messages::ok(messages::request_id(&abort.body)?),
+            )?;
+
+            let retried_begin = read_client_record(&mut control)?;
+            let retried_commit = read_client_record(&mut control)?;
+            assert_eq!(retried_begin.record_type, messages::BEGIN_TXN);
+            assert_eq!(retried_commit.record_type, messages::COMMIT_TXN);
+            assert_eq!(
+                messages::decode_control(&retried_commit.body)?.expected_generation,
+                Some(2),
+                "the retry must use the DISPLAY_CHANGED generation sent before the stale error"
+            );
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                0,
+                &messages::ok(messages::request_id(&retried_begin.body)?),
+            )?;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::PRESENTED,
+                0,
+                &messages::presented(
+                    messages::request_id(&retried_commit.body)?,
+                    SceneRevision::new(1),
+                ),
+            )?;
+
+            let goodbye = read_client_record(&mut control)?;
+            assert_eq!(goodbye.record_type, messages::GOODBYE);
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                0,
+                &messages::ok(messages::request_id(&goodbye.body)?),
+            )
+        });
+
+        let mut bridge = OuterBridge::connect(
+            format!("tcp:{address}"),
+            Zeroizing::new("11".repeat(32)),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        bridge.update_nodes(&[]).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a stale display generation must not incur session-replacement latency"
+        );
+        drop(bridge);
         server.join().unwrap().unwrap();
     }
 

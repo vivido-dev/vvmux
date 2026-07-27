@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use base64::Engine;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use vivid_protocol::wire::{Connection, ConnectionKind};
@@ -56,7 +56,7 @@ struct OutgoingChunk {
 }
 
 struct SocketReader {
-    receiver: std_mpsc::Receiver<IncomingChunk>,
+    receiver: mpsc::Receiver<IncomingChunk>,
     current: Vec<u8>,
     offset: usize,
 }
@@ -203,7 +203,7 @@ impl Read for SocketReader {
             return Ok(0);
         }
         while self.offset == self.current.len() {
-            let chunk = self.receiver.recv().map_err(|_| {
+            let chunk = self.receiver.blocking_recv().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "Vivid WebSocket input closed")
             })?;
             self.current = chunk.bytes;
@@ -245,11 +245,11 @@ impl Write for SocketWriter {
 }
 
 pub(crate) async fn serve_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     broker: Arc<VividBroker>,
     kind: ConnectionKind,
 ) -> io::Result<()> {
-    let (incoming_sender, incoming_receiver) = std_mpsc::sync_channel(CHANNEL_CHUNKS);
+    let (incoming_sender, incoming_receiver) = mpsc::channel(CHANNEL_CHUNKS);
     let (outgoing_sender, mut outgoing_receiver) = mpsc::channel(CHANNEL_CHUNKS);
     let transport_id = broker.register(
         kind,
@@ -266,50 +266,83 @@ pub(crate) async fn serve_socket(
         },
     )?;
 
-    let result = async {
-        loop {
-            let shutdown = broker.shutdown.notified();
-            tokio::pin!(shutdown);
-            if broker.closed.load(Ordering::Acquire) {
-                break;
-            }
-            tokio::select! {
-            _ = &mut shutdown => break,
-            incoming = socket.next() => match incoming {
-                Some(Ok(Message::Binary(bytes))) => {
-                    incoming_sender.try_send(IncomingChunk { bytes: bytes.to_vec() }).map_err(|error| {
-                        io::Error::new(io::ErrorKind::WouldBlock, format!("Vivid WebSocket input queue is full: {error}"))
+    let (mut socket_writer, mut socket_reader) = socket.split();
+    let (pong_sender, mut pong_receiver) = mpsc::channel(CHANNEL_CHUNKS);
+    let read_socket = async move {
+        while let Some(incoming) = socket_reader.next().await {
+            match incoming {
+                Ok(Message::Binary(bytes)) => {
+                    // Waiting for capacity pauses only this WebSocket's input. The independent
+                    // writer below remains live, so bounded backpressure cannot deadlock a
+                    // correlated reply behind presenter output.
+                    incoming_sender
+                        .send(IncomingChunk {
+                            bytes: bytes.to_vec(),
+                        })
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "Vivid WebSocket input reader closed",
+                            )
+                        })?;
+                }
+                Ok(Message::Ping(bytes)) => {
+                    pong_sender.send(bytes).await.map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "Vivid WebSocket output closed")
                     })?;
                 }
-                Some(Ok(Message::Ping(bytes))) => {
-                    socket.send(Message::Pong(bytes)).await.map_err(io::Error::other)?;
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(_)) => return Ok(()),
+                Ok(Message::Text(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "text is forbidden on an established Vivid WebSocket",
+                    ));
                 }
-                Some(Ok(Message::Pong(_))) => {}
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(Message::Text(_))) => {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "text is forbidden on an established Vivid WebSocket"));
-                }
-                Some(Err(error)) => return Err(io::Error::other(error)),
-            },
-            outgoing = outgoing_receiver.recv() => match outgoing {
-                Some(chunk) => {
-                    let result = socket
-                        .send(Message::Binary(chunk.bytes.into()))
-                        .await
-                        .map_err(io::Error::other);
-                    let report = result.as_ref().map(|_| ()).map_err(|error| {
-                        io::Error::new(error.kind(), error.to_string())
-                    });
-                    let _ = chunk.completion.send(report);
-                    result?;
-                }
-                None => break,
-            }
+                Err(error) => return Err(io::Error::other(error)),
             }
         }
         Ok(())
-    }
-    .await;
+    };
+    let write_socket = async move {
+        loop {
+            tokio::select! {
+                outgoing = outgoing_receiver.recv() => match outgoing {
+                    Some(chunk) => {
+                        let result = socket_writer
+                            .send(Message::Binary(chunk.bytes.into()))
+                            .await
+                            .map_err(io::Error::other);
+                        let report = result.as_ref().map(|_| ()).map_err(|error| {
+                            io::Error::new(error.kind(), error.to_string())
+                        });
+                        let _ = chunk.completion.send(report);
+                        result?;
+                    }
+                    None => return Ok(()),
+                },
+                pong = pong_receiver.recv() => match pong {
+                    Some(bytes) => socket_writer
+                        .send(Message::Pong(bytes))
+                        .await
+                        .map_err(io::Error::other)?,
+                    None => return Ok(()),
+                }
+            }
+        }
+    };
+    let shutdown = broker.shutdown.notified();
+    tokio::pin!(shutdown);
+    let result = if broker.closed.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        tokio::select! {
+            _ = &mut shutdown => Ok(()),
+            result = read_socket => result,
+            result = write_socket => result,
+        }
+    };
     broker.unregister(kind, transport_id);
     result
 }
@@ -354,10 +387,10 @@ mod tests {
             },
         );
 
-        let (incoming_sender, incoming_receiver) = std_mpsc::sync_channel(hello.len().div_ceil(7));
+        let (incoming_sender, incoming_receiver) = mpsc::channel(hello.len().div_ceil(7));
         for chunk in hello.chunks(7) {
             incoming_sender
-                .send(IncomingChunk {
+                .blocking_send(IncomingChunk {
                     bytes: chunk.to_vec(),
                 })
                 .unwrap();
@@ -385,5 +418,36 @@ mod tests {
         };
         writer.write_all(&hello).unwrap();
         relay.join().unwrap();
+    }
+
+    #[test]
+    fn browser_reply_bursts_wait_for_the_reader_without_losing_chunks() {
+        let (incoming_sender, incoming_receiver) = mpsc::channel(CHANNEL_CHUNKS);
+        let (completed_sender, completed_receiver) = std_mpsc::sync_channel(1);
+        let burst = CHANNEL_CHUNKS + 3;
+        let sender = thread::spawn(move || {
+            for value in 0..burst {
+                incoming_sender
+                    .blocking_send(IncomingChunk {
+                        bytes: vec![value.try_into().unwrap()],
+                    })
+                    .unwrap();
+            }
+            completed_sender.send(()).unwrap();
+        });
+
+        let mut reader = SocketReader {
+            receiver: incoming_receiver,
+            current: Vec::new(),
+            offset: 0,
+        };
+        for expected in 0..burst {
+            let mut byte = [0];
+            reader.read_exact(&mut byte).unwrap();
+            assert_eq!(usize::from(byte[0]), expected);
+        }
+
+        completed_receiver.recv_timeout(IO_WAIT).unwrap();
+        sender.join().unwrap();
     }
 }
