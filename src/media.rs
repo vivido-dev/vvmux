@@ -6309,6 +6309,14 @@ mod tests {
                     8_i64 << 32,
                     "copy-mode scrollback must move text-anchored media with its semantic line"
                 );
+                service.scroll_anchors(7, 2);
+                let grid_scrolled = service.projection_snapshot(&HashSet::from([7]));
+                assert_eq!(
+                    grid_scrolled.nodes[0].config.node.y,
+                    1_i64 << 32,
+                    "PTY grid scroll must move the anchor instead of leaving an absolute node \
+                     below the viewport"
+                );
                 service.complete_retained_hydration((welcome.session_id, 1));
                 retained = true;
                 break;
@@ -6343,7 +6351,11 @@ mod tests {
                 assert_eq!(snapshot.nodes[0].config.node.source_id, 1);
                 assert_eq!(snapshot.nodes[0].config.node.anchor_id, None);
                 assert_eq!(snapshot.nodes[0].config.node.x, 4_i64 << 32);
-                assert_eq!(snapshot.nodes[0].config.node.y, 3_i64 << 32);
+                assert_eq!(
+                    snapshot.nodes[0].config.node.y,
+                    1_i64 << 32,
+                    "an anchored image must retain its scrolled position after the producer exits"
+                );
                 let other_tab = service.projection_snapshot(&HashSet::from([8]));
                 assert!(other_tab.nodes.is_empty());
                 assert_eq!(
