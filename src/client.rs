@@ -1,9 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
-#[cfg(windows)]
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -61,7 +59,6 @@ pub fn attach(
     let vivid = outer_endpoint.is_some() && outer_token.is_some();
     let terminal = ClientTerminal::enter()?;
     let display = terminal.display_metrics()?;
-    #[cfg(windows)]
     let presenter_cell_size = Arc::new(AtomicU32::new(pack_cell_size(display)));
     send_client(
         &writer,
@@ -83,7 +80,6 @@ pub fn attach(
     let output = Arc::new(Mutex::new(output));
     let output_thread = TerminalOutput::spawn(output, writer.clone())?;
     let bridge_display = display;
-    #[cfg(windows)]
     let bridge_cell_size = presenter_cell_size.clone();
     let bridge_queue_records =
         (client_config.media.ipc_queue_bytes / BRIDGE_MEDIA_CHUNK).clamp(1, 1024);
@@ -100,7 +96,6 @@ pub fn attach(
                     ) {
                         Ok(bridge) => {
                             let presenter_display = bridge.display_metrics();
-                            #[cfg(windows)]
                             bridge_cell_size
                                 .store(pack_cell_size(presenter_display), Ordering::Release);
                             if presenter_display != bridge_display {
@@ -387,11 +382,17 @@ pub fn attach(
             }
             #[cfg(not(windows))]
             {
-                if let Ok(display) = terminal.display_metrics()
-                    && display != last_display
-                {
-                    send_client(&writer, &ClientMessage::Resize(display))?;
-                    last_display = display;
+                if let Ok(mut display) = terminal.display_metrics() {
+                    // The TTY remains authoritative for its live grid, but its pixel metrics are
+                    // not the geometry the outer Vivid presenter actually renders. In particular,
+                    // Linux TIOCGWINSZ values can differ from Vivido's WELCOME metrics. Publishing
+                    // those values makes nested raster producers size their source differently
+                    // from the projected node and forces the outer renderer to resample it.
+                    apply_cell_size(&mut display, presenter_cell_size.load(Ordering::Acquire));
+                    if display != last_display {
+                        send_client(&writer, &ClientMessage::Resize(display))?;
+                        last_display = display;
+                    }
                 }
             }
         }
@@ -618,12 +619,10 @@ fn send_bridge_trace(
     });
 }
 
-#[cfg(windows)]
 fn pack_cell_size(display: crate::ipc::DisplayMetrics) -> u32 {
     u32::from(display.cell_width) | (u32::from(display.cell_height) << 16)
 }
 
-#[cfg(windows)]
 fn apply_cell_size(display: &mut crate::ipc::DisplayMetrics, packed: u32) {
     display.cell_width = packed as u16;
     display.cell_height = (packed >> 16) as u16;
@@ -1531,6 +1530,31 @@ mod tests {
     use image::ImageEncoder;
     #[cfg(unix)]
     use vivid_protocol::media::{self, AudioPacket, VideoPacket};
+
+    #[test]
+    fn presenter_cell_size_survives_terminal_grid_polling() {
+        let presenter = crate::ipc::DisplayMetrics {
+            columns: 120,
+            rows: 42,
+            cell_width: 10,
+            cell_height: 25,
+        };
+        let mut terminal_resize = crate::ipc::DisplayMetrics {
+            columns: 121,
+            rows: 43,
+            cell_width: 9,
+            cell_height: 24,
+        };
+
+        apply_cell_size(&mut terminal_resize, pack_cell_size(presenter));
+
+        assert_eq!((terminal_resize.columns, terminal_resize.rows), (121, 43));
+        assert_eq!(
+            (terminal_resize.cell_width, terminal_resize.cell_height),
+            (10, 25),
+            "the TTY supplies the live grid, but nested raster pixels must use presenter cells"
+        );
+    }
 
     #[cfg(unix)]
     fn test_transport(stream: UnixStream) -> crate::platform::Transport {
