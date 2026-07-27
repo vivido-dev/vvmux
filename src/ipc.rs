@@ -509,6 +509,10 @@ pub enum ClientMessage {
         delivered: bool,
     },
     BridgeSnapshotRetry,
+    /// A retained body for one source reached the outer presenter.
+    BridgeRetainedHydrated {
+        source: BridgeSourceKey,
+    },
     BridgeApplied {
         bridge_instance_id: u64,
         virtual_revision: u64,

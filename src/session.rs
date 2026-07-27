@@ -1006,20 +1006,31 @@ impl SessionActor {
             }
             ClientMessage::Resize(display) => {
                 if self.client_is(id) {
-                    self.cancel_pointer_drag(true);
-                    self.end_float_mode(true);
-                    if let Some(client) = &mut self.attached {
-                        client.display =
-                            normalized_display(display, self.config.general.status_visible);
-                        self.last_display = client.display;
+                    let display = normalized_display(display, self.config.general.status_visible);
+                    // A client may re-send its display without changing it: browser presenters
+                    // report every dimension probe, not only real resizes. Relaying a phantom
+                    // resize would bump `layout_revision`, so `should_sync_media` would rebuild
+                    // the outer Vivid session on each one and destroy media that is still being
+                    // projected. Only a display that actually changed is a resize.
+                    let changed = is_display_change(
+                        self.attached.as_ref().map(|client| client.display),
+                        display,
+                    );
+                    if changed {
+                        self.cancel_pointer_drag(true);
+                        self.end_float_mode(true);
+                        if let Some(client) = &mut self.attached {
+                            client.display = display;
+                            self.last_display = client.display;
+                        }
+                        // Deterministic host-resize clamp: size before position, per float.
+                        let area = self.content_area();
+                        for tab in &mut self.tabs {
+                            tab.floating.clamp_all(area);
+                        }
+                        self.force_full = true;
+                        self.relayout();
                     }
-                    // Deterministic host-resize clamp: size before position, per float.
-                    let area = self.content_area();
-                    for tab in &mut self.tabs {
-                        tab.floating.clamp_all(area);
-                    }
-                    self.force_full = true;
-                    self.relayout();
                 }
             }
             ClientMessage::Action(action) => {
@@ -1117,6 +1128,12 @@ impl SessionActor {
                         self.last_media_projection = None;
                         self.sync_media(true);
                     }
+                }
+            }
+            ClientMessage::BridgeRetainedHydrated { source } => {
+                if self.client_is(id) {
+                    self.vivid
+                        .complete_retained_hydration((source.producer, source.source));
                 }
             }
             ClientMessage::BridgeSnapshotRetry => {
@@ -4732,6 +4749,16 @@ fn normalized_display(display: DisplayMetrics, status_visible: bool) -> DisplayM
     }
 }
 
+/// Whether a reported display is a real resize rather than a repeat of the current one.
+///
+/// Browser presenters report every dimension re-measurement, not only genuine resizes, so an
+/// unchanged display arrives many times a second. Acting on one bumps `layout_revision`, which
+/// makes `should_sync_media` rebuild the outer Vivid session and tears down media that is still
+/// being projected, so an unchanged display must not be treated as a resize.
+fn is_display_change(current: Option<DisplayMetrics>, next: DisplayMetrics) -> bool {
+    current.is_none_or(|display| display != next)
+}
+
 fn terminfo_installed() -> bool {
     let candidates = [
         std::env::var_os("TERMINFO").map(PathBuf::from),
@@ -5103,6 +5130,48 @@ mod tests {
         };
         assert!(should_sync_media(false, Some(first_tab), second_tab));
         assert!(should_sync_media(true, Some(second_tab), second_tab));
+    }
+
+    #[test]
+    fn repeated_identical_displays_are_not_resizes() {
+        let display = DisplayMetrics {
+            columns: 80,
+            rows: 24,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        // The first display from a newly attached client is always a change.
+        assert!(is_display_change(None, display));
+
+        // A browser re-measurement that reports the same geometry must not relayout: doing so
+        // bumps layout_revision and rebuilds the outer Vivid session, which destroys an image
+        // that is still being projected.
+        assert!(!is_display_change(Some(display), display));
+
+        for changed in [
+            DisplayMetrics {
+                columns: 81,
+                ..display
+            },
+            DisplayMetrics {
+                rows: 25,
+                ..display
+            },
+            DisplayMetrics {
+                cell_width: 9,
+                ..display
+            },
+            DisplayMetrics {
+                cell_height: 17,
+                ..display
+            },
+        ] {
+            assert!(
+                is_display_change(Some(display), changed),
+                "a genuine geometry change must still resize: {changed:?}"
+            );
+        }
     }
 
     #[test]

@@ -620,6 +620,11 @@ struct MediaCompletion {
     delivery_id: u64,
     delivered: bool,
     record_sequence: u64,
+    /// Outer source the body was written to.
+    ///
+    /// Retained hydration carries delivery ID 0, so the source is the only way to report which
+    /// image the outer presenter actually received.
+    object_id: u64,
 }
 
 struct SourceMediaWriter {
@@ -1400,6 +1405,7 @@ impl OuterBridge {
                         delivery_id,
                         delivered: true,
                         record_sequence: 0,
+                        object_id: self.source_ids.get(&key).copied().unwrap_or(0),
                     })
                     .map_err(|_| {
                         io::Error::new(
@@ -1443,6 +1449,7 @@ impl OuterBridge {
                                 delivery_id,
                                 delivered: false,
                                 record_sequence: 0,
+                                object_id: upstream,
                             })
                             .map_err(|_| {
                                 io::Error::new(
@@ -1610,7 +1617,7 @@ impl OuterBridge {
         }))
     }
 
-    pub fn take_media_completions(&self) -> Vec<(u64, bool, u64)> {
+    pub fn take_media_completions(&self) -> Vec<(u64, bool, u64, u64)> {
         self.completions_rx
             .try_iter()
             .map(|completion| {
@@ -1618,9 +1625,17 @@ impl OuterBridge {
                     completion.delivery_id,
                     completion.delivered,
                     completion.record_sequence,
+                    completion.object_id,
                 )
             })
             .collect()
+    }
+
+    /// Map an outer source object ID back to the projection key that owns it.
+    pub fn source_for_outer_object(&self, object_id: u64) -> Option<BridgeSourceKey> {
+        self.source_ids
+            .iter()
+            .find_map(|(key, id)| (*id == object_id).then_some(*key))
     }
 
     pub fn take_keyframe_requests(&self) -> Vec<BridgeKeyframeRequest> {
@@ -2459,6 +2474,7 @@ fn run_media_writer(
                 delivery_id: write.delivery_id,
                 delivered,
                 record_sequence,
+                object_id: write.object_id,
             })
             .is_err()
         {
@@ -3407,7 +3423,10 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert_eq!(bridge.take_media_completions(), vec![(77, true, 0)]);
+        let completions = bridge.take_media_completions();
+        assert_eq!(completions.len(), 1);
+        let (delivery_id, delivered, record_sequence, _object_id) = completions[0];
+        assert_eq!((delivery_id, delivered, record_sequence), (77, true, 0));
         assert!(
             server.join().unwrap().unwrap(),
             "cache hit must not open or attach an outer blob connection"
@@ -3892,7 +3911,9 @@ mod tests {
         let mut completed = HashMap::new();
         while completed.len() < 3 && Instant::now() < deadline {
             completed.extend(bridge.take_media_completions().into_iter().filter_map(
-                |(delivery, delivered, sequence)| delivered.then_some((delivery, sequence)),
+                |(delivery, delivered, sequence, _object)| {
+                    delivered.then_some((delivery, sequence))
+                },
             ));
             thread::sleep(Duration::from_millis(2));
         }

@@ -692,9 +692,19 @@ fn run_bridge_worker(
             let _ = client_writer.send(ClientMessage::BridgeMetrics(metrics));
             metrics_reported_at = Instant::now();
         }
-        for (delivery_id, delivered, _outer_record_sequence) in bridge.take_media_completions() {
+        for (delivery_id, delivered, _outer_record_sequence, object_id) in
+            bridge.take_media_completions()
+        {
             if delivery_id != 0 {
                 acknowledge_bridge_delivery(&client_writer, delivery_id, delivered);
+            } else if delivered {
+                // Retained hydration carries no delivery ID, so its success would otherwise be
+                // invisible to the server. Report it: a retained image reaching the outer
+                // presenter is the moment it is genuinely presented, and a producer waiting on
+                // first visible presentation must not be released before then.
+                if let Some(source) = bridge.source_for_outer_object(object_id) {
+                    let _ = client_writer.send(ClientMessage::BridgeRetainedHydrated { source });
+                }
             }
         }
         let outer_keyframes = bridge.take_keyframe_requests();

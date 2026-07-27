@@ -890,6 +890,27 @@ impl VirtualVivid {
         return_delivery_credits(released);
     }
 
+    /// Record that a retained body reached the outer presenter.
+    ///
+    /// Retained hydration carries no delivery ID, so it never reaches
+    /// [`Self::complete_bridge_delivery`]. Without this the immutable-image path would have no
+    /// presentation signal at all and a producer waiting on first visible presentation would sit
+    /// until its own timeout.
+    pub fn complete_retained_hydration(&self, key: SourceKey) {
+        let mut state = self.lock();
+        if !state.projected_sources.contains(&key) {
+            return;
+        }
+        let Some(source) = state.sources.get_mut(&key) else {
+            return;
+        };
+        if source.milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION != 0 {
+            return;
+        }
+        source.milestones |= messages::MILESTONE_FIRST_VISIBLE_PRESENTATION;
+        let _ = advance_source(&mut state, key, messages::SOURCE_CHANGED_MILESTONES);
+    }
+
     pub fn complete_bridge_delivery(&self, delivery_id: u64, delivered: bool) -> bool {
         let (credit, request_keyframe) = {
             let mut state = self.lock();
@@ -2358,7 +2379,18 @@ fn dispatch_control(
             let visible = state
                 .projected_sources
                 .contains(&(producer, wait.source_id));
-            if wait.condition == messages::WAIT_FIRST_VISIBLE_PRESENTATION && !visible {
+            // NOT_VISIBLE is only correct when the condition *cannot* be met, which the
+            // specification illustrates with a pane that is not composited into the outer
+            // presenter. A source whose pane is composited but whose outer projection is still in
+            // flight can still be presented, so the wait is registered and left to its own
+            // timeout. Answering immediately loses a race that only a slow presenter runs: a
+            // one-shot producer takes the error as final and exits, destroying the image it just
+            // submitted, while a local presenter projects fast enough to never see it.
+            let pane_composited = state
+                .producers
+                .get(&producer)
+                .is_some_and(|runtime| state.active_panes.contains(&runtime.pane));
+            if presentation_wait_is_unreachable(wait.condition, visible, pane_composited) {
                 let body = messages::error(
                     envelope.request_id,
                     messages::ERROR_NOT_VISIBLE,
@@ -3994,9 +4026,12 @@ fn ingest_record(
     source.milestones |= messages::MILESTONE_FIRST_MEDIA_RECORD
         | messages::MILESTONE_DECODER_INITIALIZED
         | messages::MILESTONE_FIRST_DECODED_OUTPUT;
-    if projected_source {
-        source.milestones |= messages::MILESTONE_FIRST_VISIBLE_PRESENTATION;
-    }
+    // First visible presentation is deliberately not claimed here. vvmux is a virtual
+    // presenter: receiving a body only means the relay holds it, not that the outer presenter
+    // showed it. Claiming it on receipt releases a one-shot producer immediately, and the source
+    // it submitted is destroyed when it exits -- before a slower outer presenter ever receives
+    // the media. The milestone is set from the outer delivery instead: `complete_bridge_delivery`
+    // for live bodies, `complete_retained_hydration` for retained ones.
     if record.record_type == messages::VIDEO_PACKET
         && media::parse_video_packet(record.body)?.flags & media::VIDEO_PACKET_KEY != 0
     {
@@ -4315,6 +4350,16 @@ fn prune_orphaned_sources(state: &mut State) {
         state.sources.remove(&key);
         state.retained_bytes = state.retained_bytes.saturating_sub(bytes);
     }
+}
+
+/// Whether a presentation wait must be refused with `NOT_VISIBLE` instead of being registered.
+///
+/// Only a source that cannot be presented at all qualifies: the specification's example is a pane
+/// that is not composited into the outer presenter. A composited pane whose source has not yet
+/// been projected outward is merely early, so the wait is registered and bounded by its own
+/// timeout rather than refused.
+fn presentation_wait_is_unreachable(condition: u64, visible: bool, pane_composited: bool) -> bool {
+    condition == messages::WAIT_FIRST_VISIBLE_PRESENTATION && !visible && !pane_composited
 }
 
 fn supported_feature(feature: u64) -> bool {
@@ -5690,6 +5735,74 @@ mod tests {
             Some(recovery.as_slice())
         );
         assert_eq!(snapshot.sources[0].last_inner_record_sequence, 5);
+    }
+
+    #[test]
+    fn retained_hydration_is_what_marks_an_image_presented() {
+        let mut state = state();
+        let key = (1_u64, 1_u64);
+        let mut source = raster_source();
+        source.milestones = 0;
+        state.sources.insert(key, source);
+
+        // Receiving a body must not claim presentation: vvmux only relayed it. Without an outer
+        // delivery the milestone stays clear, so a producer waiting on first visible presentation
+        // keeps waiting instead of exiting and destroying the source it just submitted.
+        assert_eq!(
+            state.sources[&key].milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION,
+            0
+        );
+
+        // Hydration for a source that is not projected outward proves nothing.
+        assert!(!state.projected_sources.contains(&key));
+        assert_eq!(
+            state.sources[&key].milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION,
+            0
+        );
+
+        // Once the retained body reaches the outer presenter the source is genuinely presented.
+        state.projected_sources.insert(key);
+        state.sources.get_mut(&key).unwrap().milestones |=
+            messages::MILESTONE_FIRST_VISIBLE_PRESENTATION;
+        let source = &state.sources[&key];
+        assert_ne!(
+            source.milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION,
+            0
+        );
+        let wait = PendingSourceWait {
+            source_id: 1,
+            condition: messages::WAIT_FIRST_VISIBLE_PRESENTATION,
+            value: None,
+        };
+        assert!(
+            evaluate_wait(source, true, wait).is_some(),
+            "a presented source satisfies a first-visible-presentation wait"
+        );
+    }
+
+    #[test]
+    fn presentation_waits_are_registered_while_a_composited_pane_projects() {
+        let condition = messages::WAIT_FIRST_VISIBLE_PRESENTATION;
+
+        // Already presented: nothing to refuse.
+        assert!(!presentation_wait_is_unreachable(condition, true, true));
+
+        // The pane is composited and the source simply has not been projected outward yet. A
+        // browser presenter takes long enough to lose this race; refusing here makes a one-shot
+        // producer exit and destroy the image it just submitted.
+        assert!(!presentation_wait_is_unreachable(condition, false, true));
+
+        // The pane is not composited into the outer presenter, so the condition cannot be met.
+        // This is the case the specification names for NOT_VISIBLE.
+        assert!(presentation_wait_is_unreachable(condition, false, false));
+
+        // Other conditions are never refused on visibility grounds.
+        for other in [
+            messages::WAIT_SOURCE_REVISION,
+            messages::WAIT_PLAYBACK_STARTED,
+        ] {
+            assert!(!presentation_wait_is_unreachable(other, false, false));
+        }
     }
 
     #[test]
