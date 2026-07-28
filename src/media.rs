@@ -3544,13 +3544,68 @@ fn handle_media(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A media channel that closes before EOS ends the source: no further access units can
+        // arrive, so the producer is told rather than left holding a source that will never
+        // advance again. After EOS the producer is expected to close the channel, and the
+        // source stays alive so its buffered media can still be presented.
+        let lost = state
+            .sources
+            .get(&ticket.source)
+            .is_some_and(|source| !source.ended);
         if let Some(source) = state.sources.get_mut(&ticket.source) {
             source.attachment_state = messages::ATTACHMENT_CLOSED;
+            if lost {
+                source.milestones |= messages::MILESTONE_SOURCE_LOST;
+            }
             let _ = advance_source(
                 &mut state,
                 ticket.source,
-                messages::SOURCE_CHANGED_ATTACHMENT,
+                messages::SOURCE_CHANGED_ATTACHMENT
+                    | if lost {
+                        messages::SOURCE_CHANGED_LIFECYCLE
+                    } else {
+                        0
+                    },
             );
+        }
+        if lost {
+            let revision = state
+                .sources
+                .get(&ticket.source)
+                .map_or(SourceRevision::ZERO, |source| source.revision);
+            let writer = state
+                .producers
+                .get(&ticket.source.0)
+                .and_then(|producer| producer.writer.upgrade());
+            let retained = state
+                .sources
+                .remove(&ticket.source)
+                .map_or(0, |source| source.retained_bytes);
+            state.retained_bytes = state.retained_bytes.saturating_sub(retained);
+            state
+                .nodes
+                .retain(|_, node| node.config.node.source_id != ticket.source.1);
+            state.projected_sources.remove(&ticket.source);
+            advance_projection(&mut state);
+            let delivery_ids = state
+                .deliveries
+                .iter()
+                .filter_map(|(id, pending)| (pending.source == ticket.source).then_some(*id))
+                .collect::<Vec<_>>();
+            let released = take_deliveries(&mut state, &delivery_ids);
+            drop(state);
+            return_delivery_credits(released);
+            if let Some(writer) = writer
+                && let Ok(body) = messages::source_lost_with_observability(
+                    ticket.source.1,
+                    messages::ERROR_BAD_STATE,
+                    "media connection closed before EOS",
+                    revision,
+                    &messages::ErrorDetail::new(),
+                )
+            {
+                let _ = writer.write_record(messages::SOURCE_LOST, ticket.source.1, &body);
+            }
         }
     }
     delivery_changed.notify_all();

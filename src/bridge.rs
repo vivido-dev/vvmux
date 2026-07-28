@@ -4343,9 +4343,7 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         };
         assert_eq!(losses, vec![key]);
-        let recreated = bridge
-            .rebuild(std::slice::from_ref(&rebased), &[])
-            .unwrap();
+        let recreated = bridge.rebuild(std::slice::from_ref(&rebased), &[]).unwrap();
         assert_eq!(recreated, HashSet::from([key]));
         assert_eq!(
             bridge.diagnostic_instance_generation(),
