@@ -1281,6 +1281,12 @@ fn advance_source(
         let satisfied = producer
             .waits
             .iter()
+            // A producer's waits are keyed by request ID across all of its sources, so evaluate
+            // only those registered against the source that actually changed. Without this a
+            // linked audio transition satisfies a wait registered on its video source and the
+            // reply carries the wrong object ID, which the producer rejects as a mismatched
+            // reply while the wait it was actually holding is silently dropped.
+            .filter(|(_, wait)| wait.source_id == key.1)
             .filter_map(|(&request_id, wait)| {
                 evaluate_wait(source, visible, *wait).map(|observed_value| {
                     (
@@ -4015,14 +4021,12 @@ fn ingest_record(
             .map_or(source.last_pts_us, |prepared| Some(prepared.pts_us));
         (old, new_retained, new, pts, forward, forward_body)
     };
-    let forward_timed = candidate_forward
-        && match &state.sources.get(&key).expect("source exists").descriptor {
-            SourceDescriptor::Audio(config) => config
-                .linked_video_source_id
-                .and_then(|source_id| state.sources.get(&(key.0, source_id)))
-                .is_none_or(|video| !video.bridge_desynchronized),
-            _ => true,
-        };
+    // Audio is forwarded while its linked video awaits keyframe recovery. Every audio access
+    // unit is independently decodable, so discarding one recovers nothing: it deletes content
+    // outright, and a presenter that labels decoded output by sample accumulation rather than by
+    // access unit will carry the resulting gap as a permanent audio/video offset. Video recovers
+    // through NEED_KEYFRAME; audio has no equivalent, so the samples must survive the window.
+    let forward_timed = candidate_forward;
     let projected = state
         .retained_bytes
         .saturating_sub(old_retained)
@@ -4861,6 +4865,60 @@ mod tests {
             raster_damage_window_started: Instant::now(),
             raster_damage_pixels: 0,
         }
+    }
+
+    #[test]
+    fn a_source_change_only_satisfies_waits_registered_against_that_source() {
+        let mut state = state();
+        let (observation_sender, _observation_receiver) = mpsc::sync_channel(8);
+        state.producers.insert(
+            1,
+            Producer {
+                pane: 7,
+                tag: [0; 16],
+                anchor_key: anchor::derive_key(&[0; 32], &[0; 16]),
+                writer: Weak::new(),
+                observation_sender,
+                features: HashSet::from([messages::FEATURE_OBSERVABILITY_CORE_V1]),
+                anchors: HashMap::new(),
+                seen_anchors: HashSet::new(),
+                scene_revision: SceneRevision::ZERO,
+                observation_mask: messages::OBSERVE_SOURCE_TRANSITIONS,
+                observation_sequence: ObservationSequence::ZERO,
+                first_lost_source_sequence: None,
+                first_lost_scene_sequence: None,
+                waits: HashMap::new(),
+            },
+        );
+        // A video source and its linked audio, as a linked playback group arrives.
+        state.sources.insert((1, 1), barrier_source(1));
+        state.sources.insert((1, 3), barrier_source(1));
+        state.projected_sources.insert((1, 1));
+        state.projected_sources.insert((1, 3));
+        // The producer waits on the video source only, exactly as vivi does for playback end.
+        state.producers.get_mut(&1).unwrap().waits.insert(
+            14,
+            PendingSourceWait {
+                source_id: 1,
+                condition: messages::WAIT_SOURCE_REVISION,
+                value: Some(1),
+            },
+        );
+
+        // The linked audio changes first. Its revision also satisfies the condition, so an
+        // unscoped evaluation would answer request 14 while naming the audio source.
+        advance_source(&mut state, (1, 3), messages::SOURCE_CHANGED_LIFECYCLE).unwrap();
+        assert!(
+            state.producers[&1].waits.contains_key(&14),
+            "a linked audio transition consumed a wait registered against its video source"
+        );
+
+        // The source the wait names still resolves it.
+        advance_source(&mut state, (1, 1), messages::SOURCE_CHANGED_LIFECYCLE).unwrap();
+        assert!(
+            !state.producers[&1].waits.contains_key(&14),
+            "the wait was not satisfied by a change to the source it names"
+        );
     }
 
     #[test]
