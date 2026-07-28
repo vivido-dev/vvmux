@@ -53,6 +53,12 @@ const MEDIA_WRITER_QUEUE: usize = 32;
 /// boundary — but finite, because this wait happens on the single bridge worker thread that also
 /// forwards media and applies projections.
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Browser presenters may initialize a hardware or software codec before accepting `CREATE_VIDEO`.
+///
+/// Some WebCodecs implementations take tens of seconds to initialize AV1 while keeping their
+/// control connection responsive. Treat that bounded initialization as a slow source capability
+/// check, not as a dead presenter that requires replacement.
+const SOURCE_READY_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 /// How long a media writer may wait for outer credit before failing its delivery.
 ///
 /// Longer than the control deadline: withholding credit is legitimate backpressure, not a fault.
@@ -486,7 +492,28 @@ impl ControlDispatcher {
         expected: u16,
         expected_object_id: u64,
     ) -> io::Result<Record> {
-        wait_reply_on(&self.shared, request_id, expected, expected_object_id)
+        self.wait_reply_with_timeout(
+            request_id,
+            expected,
+            expected_object_id,
+            CONTROL_REPLY_TIMEOUT,
+        )
+    }
+
+    fn wait_reply_with_timeout(
+        &self,
+        request_id: u64,
+        expected: u16,
+        expected_object_id: u64,
+        timeout: Duration,
+    ) -> io::Result<Record> {
+        wait_reply_on(
+            &self.shared,
+            request_id,
+            expected,
+            expected_object_id,
+            timeout,
+        )
     }
 
     /// Retire a destroyed source's credit ledger so any waiter fails instead of parking forever.
@@ -1904,7 +1931,11 @@ impl OuterBridge {
         // All CREATE requests are now in flight on the ordered control stream. Correlate their
         // independently completed replies before attaching each source-specific media channel.
         for (source, request, upstream, kind) in pending {
-            let ready = self.wait_source_ready(request, upstream)?;
+            let ready = self.wait_source_ready(
+                request,
+                upstream,
+                source_ready_timeout(matches!(&source.kind, BridgeSourceKind::Video { .. })),
+            )?;
             self.source_kinds.insert(source.key, source.kind.clone());
             let generation = self
                 .outer_attachment_generations
@@ -2238,10 +2269,14 @@ impl OuterBridge {
         &self,
         request_id: u64,
         source_id: u64,
+        timeout: Duration,
     ) -> io::Result<messages::SourceReady> {
-        let record = self
-            .control
-            .wait_reply(request_id, messages::SOURCE_READY, source_id)?;
+        let record = self.control.wait_reply_with_timeout(
+            request_id,
+            messages::SOURCE_READY,
+            source_id,
+            timeout,
+        )?;
         let ready = messages::parse_source_ready(&record.body)?;
         if record.object_id != source_id || ready.source_id != source_id {
             return Err(io::Error::new(
@@ -2567,7 +2602,7 @@ fn run_media_writer(
     }
 }
 
-/// Await one correlated outer reply, or fail at [`CONTROL_REPLY_TIMEOUT`].
+/// Await one correlated outer reply, or fail at the supplied operation-specific deadline.
 ///
 /// Free-standing so the deadline can be exercised against control state alone, without standing up
 /// a transport.
@@ -2576,9 +2611,10 @@ fn wait_reply_on(
     request_id: u64,
     expected: u16,
     expected_object_id: u64,
+    timeout: Duration,
 ) -> io::Result<Record> {
     let started = Instant::now();
-    let deadline = started + CONTROL_REPLY_TIMEOUT;
+    let deadline = started + timeout;
     let mut state = shared
         .state
         .lock()
@@ -2642,6 +2678,14 @@ fn wait_reply_on(
             .wait_timeout(state, remaining)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state = next;
+    }
+}
+
+fn source_ready_timeout(is_video: bool) -> Duration {
+    if is_video {
+        SOURCE_READY_REPLY_TIMEOUT
+    } else {
+        CONTROL_REPLY_TIMEOUT
     }
 }
 
@@ -2887,7 +2931,7 @@ mod tests {
             .pending_requests
             .insert(77);
         let started = Instant::now();
-        let outcome = wait_reply_on(&shared, 77, messages::OK, 0);
+        let outcome = wait_reply_on(&shared, 77, messages::OK, 0, CONTROL_REPLY_TIMEOUT);
         let elapsed = started.elapsed();
         stop.store(true, std::sync::atomic::Ordering::Release);
         chatter_thread.join().unwrap();
@@ -2912,6 +2956,14 @@ mod tests {
         assert!(state.abandoned_requests.contains(&77));
         assert_eq!(state.wait_timeouts, 1);
         assert!(state.wait_us > 0);
+    }
+
+    #[test]
+    fn source_creation_allows_bounded_browser_codec_initialization() {
+        assert_eq!(source_ready_timeout(true), SOURCE_READY_REPLY_TIMEOUT);
+        assert_eq!(source_ready_timeout(false), CONTROL_REPLY_TIMEOUT);
+        assert!(SOURCE_READY_REPLY_TIMEOUT > CONTROL_REPLY_TIMEOUT);
+        assert!(SOURCE_READY_REPLY_TIMEOUT < OUTER_CREDIT_TIMEOUT * 10);
     }
 
     #[test]
