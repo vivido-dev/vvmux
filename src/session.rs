@@ -1150,7 +1150,9 @@ impl SessionActor {
                         .complete_retained_hydration((source.producer, source.source));
                 }
             }
-            ClientMessage::BridgeSnapshotRetry => {
+            ClientMessage::BridgeSnapshotRetry {
+                reset_outer_session,
+            } => {
                 if self.client_is(id) {
                     self.record_media_trace(
                         None,
@@ -1158,11 +1160,14 @@ impl SessionActor {
                         None,
                         MediaTraceKind::SnapshotRetry,
                     );
-                    // The worker requests this only when it will rebuild a replacement outer
-                    // session. Fragment identities are scoped to that outer session.
-                    self.fragment_assignments.clear();
-                    self.outer_attachment_generations.clear();
-                    self.last_media_projection = None;
+                    if reset_outer_session {
+                        // Fragment and attachment identities are scoped to the outer session.
+                        // Source-scoped recovery reuses that session and must preserve unrelated
+                        // mappings; only a confirmed replacement invalidates all of them.
+                        self.fragment_assignments.clear();
+                        self.outer_attachment_generations.clear();
+                        self.last_media_projection = None;
+                    }
                     self.sync_media(true);
                 }
             }

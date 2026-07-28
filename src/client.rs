@@ -740,7 +740,9 @@ fn run_bridge_worker(
             }
             desynchronized_sources.extend(source_losses);
             force_sources = true;
-            let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
+            let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+                reset_outer_session: false,
+            });
         }
         for changed in bridge.take_capability_changes() {
             let _ = client_writer.send(ClientMessage::BridgeCapabilitiesChanged {
@@ -770,6 +772,7 @@ fn run_bridge_worker(
                 )
             };
             let mut recreated = HashSet::new();
+            let source_scoped_recovery = !desynchronized_sources.is_empty();
             if change == ProjectionChange::Sources && force_replacement {
                 metrics.session_replacements = metrics.session_replacements.saturating_add(1);
             }
@@ -798,10 +801,13 @@ fn run_bridge_worker(
                 // retries that transaction in place; if the display remains unsettled through its
                 // bounded retry window, request a fresh authoritative projection without tearing
                 // down healthy sources or replacing the presenter session.
-                let display_unsettled = error.kind() == io::ErrorKind::WouldBlock;
-                force_sources = !display_unsettled;
-                force_replacement = !display_unsettled;
-                let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
+                let same_session_retry =
+                    error.kind() == io::ErrorKind::WouldBlock || source_scoped_recovery;
+                force_sources = source_scoped_recovery || !same_session_retry;
+                force_replacement = !same_session_retry;
+                let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+                    reset_outer_session: !same_session_retry,
+                });
                 continue;
             }
             let next_generation = bridge.diagnostic_instance_generation();
@@ -878,15 +884,22 @@ fn run_bridge_worker(
                     )
                 })
                 .collect::<HashMap<_, _>>();
-            keyframes.extend(desynchronized_sources.drain().map(|source| {
-                (
-                    source,
-                    BridgeKeyframeRequest {
+            keyframes.extend(desynchronized_sources.drain().filter_map(|source| {
+                pending
+                    .sources
+                    .iter()
+                    .any(|candidate| {
+                        candidate.key == source
+                            && matches!(&candidate.kind, BridgeSourceKind::Video { .. })
+                    })
+                    .then_some((
                         source,
-                        minimum_epoch: None,
-                        reason: vivid_protocol::messages::KEYFRAME_REASON_DECODER_ERROR,
-                    },
-                )
+                        BridgeKeyframeRequest {
+                            source,
+                            minimum_epoch: None,
+                            reason: vivid_protocol::messages::KEYFRAME_REASON_DECODER_ERROR,
+                        },
+                    ))
             }));
             if change == ProjectionChange::Sources {
                 keyframes.extend(pending.sources.iter().filter_map(|source| {
@@ -1287,7 +1300,9 @@ fn complete_dropped_deliveries(
         }
     }
     if retry_snapshot {
-        let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
+        let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+            reset_outer_session: true,
+        });
     }
     retry_snapshot
 }

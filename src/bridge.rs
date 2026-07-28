@@ -725,6 +725,12 @@ pub struct OuterBridge {
     raster_chains: HashMap<BridgeSourceKey, RasterChain>,
     /// Sources whose outgoing chain is broken and need a full frame from the inner producer.
     raster_needs_full: HashSet<BridgeSourceKey>,
+    /// Outer sources explicitly removed by `SOURCE_LOST`.
+    ///
+    /// Their source and node object IDs no longer exist in the presenter, so reconciliation must
+    /// recreate them without sending `DESTROY_SOURCE` or updating their automatically removed
+    /// nodes.
+    lost_sources: HashSet<BridgeSourceKey>,
     active_sources: HashMap<BridgeSourceKey, BridgeSource>,
     node_ids: HashMap<(u64, u64, u8), u64>,
     display: DisplayMetrics,
@@ -895,6 +901,7 @@ impl OuterBridge {
             raster_frame_ids: HashMap::new(),
             raster_chains: HashMap::new(),
             raster_needs_full: HashSet::new(),
+            lost_sources: HashSet::new(),
             active_sources: HashMap::new(),
             node_ids: HashMap::new(),
             display,
@@ -956,31 +963,11 @@ impl OuterBridge {
         nodes: &[BridgeNode],
     ) -> io::Result<std::collections::HashSet<BridgeSourceKey>> {
         validate_snapshot(sources, nodes)?;
-        match self.reconcile(sources, nodes) {
-            Ok(recreated) => return Ok(recreated),
-            // Display changes are ordinary concurrent state, not evidence that the session is
-            // corrupt. Replacing the session here adds latency on native presenters and deadlocks
-            // browser presenters waiting for a WebSocket that they were never asked to open.
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
-            Err(_) => {}
-        }
-        // A failed reconciliation may have applied a prefix of ordered control requests. Stop
-        // audible output from the uncertain session, close it, and rebuild exactly once from the
-        // newest authoritative snapshot; the replacement session re-creates and re-plays every
-        // playing source.
-        let previous = self.active_sources.values().cloned().collect::<Vec<_>>();
-        let _ = self.pause_playing_sources(&previous);
-        let mut replacement = Self::connect_with_factory_and_extensions(
-            self.connection_factory.clone(),
-            Zeroizing::new((*self.token).clone()),
-            self.display,
-            &self.hello_extensions,
-        )?;
-        let recreated = replacement.reconcile(sources, nodes)?;
-        replacement.diagnostic_instance_generation =
-            self.diagnostic_instance_generation.saturating_add(1);
-        *self = replacement;
-        Ok(recreated)
+        // Reconcile on the existing session. The worker decides whether a failure means
+        // source-scoped retry, display churn, or a genuinely uncertain control session. Hidden
+        // replacement here waits for a new browser WebSocket that the embedding was never asked
+        // to open and turns a recoverable source loss into a repeated connection timeout.
+        self.reconcile(sources, nodes)
     }
 
     /// Build a known-clean replacement session without first touching an already-uncertain
@@ -1064,7 +1051,10 @@ impl OuterBridge {
             .collect::<HashMap<_, _>>();
         let mut recreate = sources
             .iter()
-            .filter(|source| self.source_kinds.get(&source.key) != Some(&source.kind))
+            .filter(|source| {
+                self.lost_sources.contains(&source.key)
+                    || self.source_kinds.get(&source.key) != Some(&source.kind)
+            })
             .map(|source| source.key)
             .collect::<std::collections::HashSet<_>>();
         loop {
@@ -1168,6 +1158,16 @@ impl OuterBridge {
             )?;
             self.wait_for(request, messages::OK, upstream)?;
         }
+        // SOURCE_LOST removes every node that references the source in the outer presenter. Drop
+        // only those stale hop-local IDs so the next transaction recreates their nodes while
+        // preserving unrelated scene objects.
+        for node in nodes
+            .iter()
+            .filter(|node| self.lost_sources.contains(&node.source))
+        {
+            self.node_ids
+                .remove(&(node.producer, node.node, node.fragment));
+        }
         self.reconcile_nodes(nodes)?;
 
         let previous_sources = self.active_sources.values().cloned().collect::<Vec<_>>();
@@ -1207,6 +1207,8 @@ impl OuterBridge {
             .cloned()
             .map(|source| (source.key, source))
             .collect();
+        self.lost_sources
+            .retain(|source| !recreate.contains(source));
         Ok(recreate)
     }
 
@@ -1722,6 +1724,11 @@ impl OuterBridge {
             self.media.remove(key);
             self.cached_images.remove(key);
             self.source_kinds.remove(key);
+            self.lost_sources.insert(*key);
+            if let Some(source_id) = self.source_ids.remove(key) {
+                self.reverse_source_ids.remove(&source_id);
+                self.control.retire_source(source_id);
+            }
         }
         losses
     }
@@ -4321,6 +4328,33 @@ mod tests {
             snapshot.sources[0].play_request.start_pts_us, 30_000_000,
             "a playback-only update must re-base the outer PLAY without a rebuild"
         );
+
+        // A presenter-reported source loss removes that source automatically. Recreate only the
+        // lost source on the existing control session; attempting to destroy its stale object ID
+        // would fail with NOT_FOUND and previously triggered a whole-session replacement.
+        let instance_generation = bridge.diagnostic_instance_generation();
+        drop(bridge.media.remove(&key));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let losses = loop {
+            let losses = bridge.take_source_losses();
+            if !losses.is_empty() || Instant::now() >= deadline {
+                break losses;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(losses, vec![key]);
+        let recreated = bridge
+            .rebuild(std::slice::from_ref(&rebased), &[])
+            .unwrap();
+        assert_eq!(recreated, HashSet::from([key]));
+        assert_eq!(
+            bridge.diagnostic_instance_generation(),
+            instance_generation,
+            "source-scoped recovery must not replace the outer presenter session"
+        );
+        let recovered = presenter.projection_snapshot(&HashSet::from([7]));
+        assert_eq!(recovered.sources.len(), 1);
+        assert!(recovered.sources[0].playing);
 
         // Inner ingress ends. The outer epoch has to be closed explicitly: a presenter only
         // reaches its playback-ended milestone after EOS, so without this the inner producer
