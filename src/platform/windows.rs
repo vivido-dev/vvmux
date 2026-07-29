@@ -1344,10 +1344,15 @@ fn daemon_environment_from(
         let folded = key.to_string_lossy().to_uppercase();
         // cmd.exe stores hidden per-drive working directories under names that
         // begin with '=' ("=C:=C:\..."), and std::env::vars_os surfaces them;
-        // they are shell bookkeeping, not variables the daemon should inherit.
+        // they are shell bookkeeping, not variables the daemon should inherit. An outer tmux or
+        // screen identity is stale too: this daemon owns the new ConPTY boundary, and preserving
+        // those variables makes Vivid producers suppress anchors intended for its presenter.
         if folded.starts_with("VIVID_")
             || folded.starts_with('=')
-            || matches!(folded.as_str(), "SSH_AUTH_SOCK" | "SSH_AGENT_PID")
+            || matches!(
+                folded.as_str(),
+                "SSH_AUTH_SOCK" | "SSH_AGENT_PID" | "TMUX" | "TMUX_PANE" | "STY"
+            )
         {
             continue;
         }
@@ -1777,6 +1782,9 @@ mod tests {
             (OsString::from("VIVID_TOKEN"), OsString::from("secret")),
             (OsString::from("vivid_endpoint"), OsString::from("secret")),
             (OsString::from("SSH_AUTH_SOCK"), OsString::from("secret")),
+            (OsString::from("TMUX"), OsString::from("outer")),
+            (OsString::from("tmux_pane"), OsString::from("%1")),
+            (OsString::from("STY"), OsString::from("1234.outer")),
             (OsString::from("alpha"), OsString::from("first")),
         ])
         .unwrap();

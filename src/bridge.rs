@@ -53,6 +53,12 @@ const MEDIA_WRITER_QUEUE: usize = 32;
 /// boundary — but finite, because this wait happens on the single bridge worker thread that also
 /// forwards media and applies projections.
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Browser presenters may initialize a hardware or software codec before accepting `CREATE_VIDEO`.
+///
+/// Some WebCodecs implementations take tens of seconds to initialize AV1 while keeping their
+/// control connection responsive. Treat that bounded initialization as a slow source capability
+/// check, not as a dead presenter that requires replacement.
+const SOURCE_READY_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 /// How long a media writer may wait for outer credit before failing its delivery.
 ///
 /// Longer than the control deadline: withholding credit is legitimate backpressure, not a fault.
@@ -60,6 +66,30 @@ const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// pin the writer thread forever.
 const OUTER_CREDIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// Bound retries on one continuously changing display.
+///
+/// A stale commit is recoverable in-place, but an unbounded retry loop here would monopolize the
+/// single bridge worker while a browser is being resized continuously. After this many immediate
+/// retries the worker asks the session actor for a fresh snapshot and tries again later.
+const DISPLAY_COMMIT_RETRIES: usize = 8;
+
+#[derive(Debug)]
+struct OuterProtocolError {
+    code: u64,
+    diagnostic: String,
+}
+
+impl std::fmt::Display for OuterProtocolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "presenter error {}: {}",
+            self.code, self.diagnostic
+        )
+    }
+}
+
+impl std::error::Error for OuterProtocolError {}
 
 struct ControlState {
     replies: HashMap<u64, Record>,
@@ -462,7 +492,28 @@ impl ControlDispatcher {
         expected: u16,
         expected_object_id: u64,
     ) -> io::Result<Record> {
-        wait_reply_on(&self.shared, request_id, expected, expected_object_id)
+        self.wait_reply_with_timeout(
+            request_id,
+            expected,
+            expected_object_id,
+            CONTROL_REPLY_TIMEOUT,
+        )
+    }
+
+    fn wait_reply_with_timeout(
+        &self,
+        request_id: u64,
+        expected: u16,
+        expected_object_id: u64,
+        timeout: Duration,
+    ) -> io::Result<Record> {
+        wait_reply_on(
+            &self.shared,
+            request_id,
+            expected,
+            expected_object_id,
+            timeout,
+        )
     }
 
     /// Retire a destroyed source's credit ledger so any waiter fails instead of parking forever.
@@ -620,6 +671,11 @@ struct MediaCompletion {
     delivery_id: u64,
     delivered: bool,
     record_sequence: u64,
+    /// Outer source the body was written to.
+    ///
+    /// Retained hydration carries delivery ID 0, so the source is the only way to report which
+    /// image the outer presenter actually received.
+    object_id: u64,
 }
 
 struct SourceMediaWriter {
@@ -669,6 +725,12 @@ pub struct OuterBridge {
     raster_chains: HashMap<BridgeSourceKey, RasterChain>,
     /// Sources whose outgoing chain is broken and need a full frame from the inner producer.
     raster_needs_full: HashSet<BridgeSourceKey>,
+    /// Outer sources explicitly removed by `SOURCE_LOST`.
+    ///
+    /// Their source and node object IDs no longer exist in the presenter, so reconciliation must
+    /// recreate them without sending `DESTROY_SOURCE` or updating their automatically removed
+    /// nodes.
+    lost_sources: HashSet<BridgeSourceKey>,
     active_sources: HashMap<BridgeSourceKey, BridgeSource>,
     node_ids: HashMap<(u64, u64, u8), u64>,
     display: DisplayMetrics,
@@ -839,6 +901,7 @@ impl OuterBridge {
             raster_frame_ids: HashMap::new(),
             raster_chains: HashMap::new(),
             raster_needs_full: HashSet::new(),
+            lost_sources: HashSet::new(),
             active_sources: HashMap::new(),
             node_ids: HashMap::new(),
             display,
@@ -900,26 +963,11 @@ impl OuterBridge {
         nodes: &[BridgeNode],
     ) -> io::Result<std::collections::HashSet<BridgeSourceKey>> {
         validate_snapshot(sources, nodes)?;
-        if let Ok(recreated) = self.reconcile(sources, nodes) {
-            return Ok(recreated);
-        }
-        // A failed reconciliation may have applied a prefix of ordered control requests. Stop
-        // audible output from the uncertain session, close it, and rebuild exactly once from the
-        // newest authoritative snapshot; the replacement session re-creates and re-plays every
-        // playing source.
-        let previous = self.active_sources.values().cloned().collect::<Vec<_>>();
-        let _ = self.pause_playing_sources(&previous);
-        let mut replacement = Self::connect_with_factory_and_extensions(
-            self.connection_factory.clone(),
-            Zeroizing::new((*self.token).clone()),
-            self.display,
-            &self.hello_extensions,
-        )?;
-        let recreated = replacement.reconcile(sources, nodes)?;
-        replacement.diagnostic_instance_generation =
-            self.diagnostic_instance_generation.saturating_add(1);
-        *self = replacement;
-        Ok(recreated)
+        // Reconcile on the existing session. The worker decides whether a failure means
+        // source-scoped retry, display churn, or a genuinely uncertain control session. Hidden
+        // replacement here waits for a new browser WebSocket that the embedding was never asked
+        // to open and turns a recoverable source loss into a repeated connection timeout.
+        self.reconcile(sources, nodes)
     }
 
     /// Build a known-clean replacement session without first touching an already-uncertain
@@ -1003,7 +1051,10 @@ impl OuterBridge {
             .collect::<HashMap<_, _>>();
         let mut recreate = sources
             .iter()
-            .filter(|source| self.source_kinds.get(&source.key) != Some(&source.kind))
+            .filter(|source| {
+                self.lost_sources.contains(&source.key)
+                    || self.source_kinds.get(&source.key) != Some(&source.kind)
+            })
             .map(|source| source.key)
             .collect::<std::collections::HashSet<_>>();
         loop {
@@ -1107,6 +1158,16 @@ impl OuterBridge {
             )?;
             self.wait_for(request, messages::OK, upstream)?;
         }
+        // SOURCE_LOST removes every node that references the source in the outer presenter. Drop
+        // only those stale hop-local IDs so the next transaction recreates their nodes while
+        // preserving unrelated scene objects.
+        for node in nodes
+            .iter()
+            .filter(|node| self.lost_sources.contains(&node.source))
+        {
+            self.node_ids
+                .remove(&(node.producer, node.node, node.fragment));
+        }
         self.reconcile_nodes(nodes)?;
 
         let previous_sources = self.active_sources.values().cloned().collect::<Vec<_>>();
@@ -1146,6 +1207,8 @@ impl OuterBridge {
             .cloned()
             .map(|source| (source.key, source))
             .collect();
+        self.lost_sources
+            .retain(|source| !recreate.contains(source));
         Ok(recreate)
     }
 
@@ -1400,6 +1463,7 @@ impl OuterBridge {
                         delivery_id,
                         delivered: true,
                         record_sequence: 0,
+                        object_id: self.source_ids.get(&key).copied().unwrap_or(0),
                     })
                     .map_err(|_| {
                         io::Error::new(
@@ -1443,6 +1507,7 @@ impl OuterBridge {
                                 delivery_id,
                                 delivered: false,
                                 record_sequence: 0,
+                                object_id: upstream,
                             })
                             .map_err(|_| {
                                 io::Error::new(
@@ -1610,7 +1675,7 @@ impl OuterBridge {
         }))
     }
 
-    pub fn take_media_completions(&self) -> Vec<(u64, bool, u64)> {
+    pub fn take_media_completions(&self) -> Vec<(u64, bool, u64, u64)> {
         self.completions_rx
             .try_iter()
             .map(|completion| {
@@ -1618,9 +1683,17 @@ impl OuterBridge {
                     completion.delivery_id,
                     completion.delivered,
                     completion.record_sequence,
+                    completion.object_id,
                 )
             })
             .collect()
+    }
+
+    /// Map an outer source object ID back to the projection key that owns it.
+    pub fn source_for_outer_object(&self, object_id: u64) -> Option<BridgeSourceKey> {
+        self.source_ids
+            .iter()
+            .find_map(|(key, id)| (*id == object_id).then_some(*key))
     }
 
     pub fn take_keyframe_requests(&self) -> Vec<BridgeKeyframeRequest> {
@@ -1651,6 +1724,11 @@ impl OuterBridge {
             self.media.remove(key);
             self.cached_images.remove(key);
             self.source_kinds.remove(key);
+            self.lost_sources.insert(*key);
+            if let Some(source_id) = self.source_ids.remove(key) {
+                self.reverse_source_ids.remove(&source_id);
+                self.control.retire_source(source_id);
+            }
         }
         losses
     }
@@ -1860,7 +1938,11 @@ impl OuterBridge {
         // All CREATE requests are now in flight on the ordered control stream. Correlate their
         // independently completed replies before attaching each source-specific media channel.
         for (source, request, upstream, kind) in pending {
-            let ready = self.wait_source_ready(request, upstream)?;
+            let ready = self.wait_source_ready(
+                request,
+                upstream,
+                source_ready_timeout(matches!(&source.kind, BridgeSourceKind::Video { .. })),
+            )?;
             self.source_kinds.insert(source.key, source.kind.clone());
             let generation = self
                 .outer_attachment_generations
@@ -1904,6 +1986,53 @@ impl OuterBridge {
     }
 
     fn reconcile_nodes(&mut self, nodes: &[BridgeNode]) -> io::Result<()> {
+        let mut next_node_ids = self.node_ids.clone();
+        for node in nodes {
+            let stable_key = (node.producer, node.node, node.fragment);
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                next_node_ids.entry(stable_key)
+            {
+                self.next_node = self
+                    .next_node
+                    .checked_add(1)
+                    .ok_or_else(|| exhausted("node"))?;
+                entry.insert(self.next_node);
+            }
+        }
+        let current_keys = nodes
+            .iter()
+            .map(|node| (node.producer, node.node, node.fragment))
+            .collect::<HashSet<_>>();
+        next_node_ids.retain(|stable_key, _| current_keys.contains(stable_key));
+
+        for attempt in 0..DISPLAY_COMMIT_RETRIES {
+            match self.reconcile_nodes_once(nodes, &next_node_ids) {
+                Ok(()) => {
+                    self.node_ids = next_node_ids;
+                    return Ok(());
+                }
+                Err(error)
+                    if protocol_error_code(&error)
+                        == Some(messages::ERROR_STALE_DISPLAY_GENERATION) =>
+                {
+                    if attempt + 1 == DISPLAY_COMMIT_RETRIES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "outer display kept changing during scene commit",
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("display commit retry loop has a nonzero fixed bound")
+    }
+
+    fn reconcile_nodes_once(
+        &mut self,
+        nodes: &[BridgeNode],
+        next_node_ids: &HashMap<(u64, u64, u8), u64>,
+    ) -> io::Result<()> {
         self.next_transaction = self
             .next_transaction
             .checked_add(1)
@@ -1917,19 +2046,14 @@ impl OuterBridge {
             &messages::begin_transaction(begin_request, transaction),
         )?;
 
-        let mut next_node_ids = self.node_ids.clone();
         let mut mutation_requests = Vec::new();
         for node in nodes {
             let stable_key = (node.producer, node.node, node.fragment);
-            let (record_type, node_id) = if let Some(node_id) = next_node_ids.get(&stable_key) {
-                (messages::UPDATE_NODE, *node_id)
+            let node_id = next_node_ids[&stable_key];
+            let record_type = if self.node_ids.contains_key(&stable_key) {
+                messages::UPDATE_NODE
             } else {
-                self.next_node = self
-                    .next_node
-                    .checked_add(1)
-                    .ok_or_else(|| exhausted("node"))?;
-                next_node_ids.insert(stable_key, self.next_node);
-                (messages::CREATE_NODE, self.next_node)
+                messages::CREATE_NODE
             };
             let source_id = *self
                 .source_ids
@@ -1963,17 +2087,13 @@ impl OuterBridge {
             mutation_requests.push((request, node_id));
         }
 
-        let current_keys = nodes
-            .iter()
-            .map(|node| (node.producer, node.node, node.fragment))
-            .collect::<std::collections::HashSet<_>>();
         let removed = self
             .node_ids
             .iter()
-            .filter(|(stable_key, _)| !current_keys.contains(stable_key))
-            .map(|(stable_key, node_id)| (*stable_key, *node_id))
+            .filter(|(stable_key, _)| !next_node_ids.contains_key(stable_key))
+            .map(|(_, node_id)| *node_id)
             .collect::<Vec<_>>();
-        for (stable_key, node_id) in removed {
+        for node_id in removed {
             let request = self.request_id()?;
             self.control.write_record(
                 messages::DELETE_NODE,
@@ -1982,7 +2102,6 @@ impl OuterBridge {
                 &messages::delete_node(request, transaction, node_id),
             )?;
             mutation_requests.push((request, node_id));
-            next_node_ids.remove(&stable_key);
         }
 
         let commit_request = self.request_id()?;
@@ -2001,9 +2120,24 @@ impl OuterBridge {
         for (request, node_id) in mutation_requests {
             self.wait_for(request, messages::OK, node_id)?;
         }
-        self.wait_for(commit_request, messages::PRESENTED, 0)?;
-        self.node_ids = next_node_ids;
-        Ok(())
+        match self.wait_for(commit_request, messages::PRESENTED, 0) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if protocol_error_code(&error)
+                    == Some(messages::ERROR_STALE_DISPLAY_GENERATION) =>
+            {
+                let abort_request = self.request_id()?;
+                self.control.write_record(
+                    messages::ABORT_TXN,
+                    0,
+                    0,
+                    &messages::abort_transaction(abort_request, transaction),
+                )?;
+                self.wait_for(abort_request, messages::OK, 0)?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn play_source(&mut self, source: &BridgeSource) -> io::Result<()> {
@@ -2142,10 +2276,14 @@ impl OuterBridge {
         &self,
         request_id: u64,
         source_id: u64,
+        timeout: Duration,
     ) -> io::Result<messages::SourceReady> {
-        let record = self
-            .control
-            .wait_reply(request_id, messages::SOURCE_READY, source_id)?;
+        let record = self.control.wait_reply_with_timeout(
+            request_id,
+            messages::SOURCE_READY,
+            source_id,
+            timeout,
+        )?;
         let ready = messages::parse_source_ready(&record.body)?;
         if record.object_id != source_id || ready.source_id != source_id {
             return Err(io::Error::new(
@@ -2459,6 +2597,7 @@ fn run_media_writer(
                 delivery_id: write.delivery_id,
                 delivered,
                 record_sequence,
+                object_id: write.object_id,
             })
             .is_err()
         {
@@ -2470,7 +2609,7 @@ fn run_media_writer(
     }
 }
 
-/// Await one correlated outer reply, or fail at [`CONTROL_REPLY_TIMEOUT`].
+/// Await one correlated outer reply, or fail at the supplied operation-specific deadline.
 ///
 /// Free-standing so the deadline can be exercised against control state alone, without standing up
 /// a transport.
@@ -2479,9 +2618,10 @@ fn wait_reply_on(
     request_id: u64,
     expected: u16,
     expected_object_id: u64,
+    timeout: Duration,
 ) -> io::Result<Record> {
     let started = Instant::now();
-    let deadline = started + CONTROL_REPLY_TIMEOUT;
+    let deadline = started + timeout;
     let mut state = shared
         .state
         .lock()
@@ -2548,6 +2688,14 @@ fn wait_reply_on(
     }
 }
 
+fn source_ready_timeout(is_video: bool) -> Duration {
+    if is_video {
+        SOURCE_READY_REPLY_TIMEOUT
+    } else {
+        CONTROL_REPLY_TIMEOUT
+    }
+}
+
 fn reserve_outer_credit(shared: &SharedControl, source_id: u64, bytes: u64) -> io::Result<()> {
     let deadline = Instant::now() + OUTER_CREDIT_TIMEOUT;
     let mut state = shared
@@ -2589,8 +2737,20 @@ fn reserve_outer_credit(shared: &SharedControl, source_id: u64, bytes: u64) -> i
 }
 
 fn protocol_error(body: &[u8]) -> io::Error {
-    let message = messages::parse_error(body).unwrap_or_else(|_| "outer Vivid error".into());
-    io::Error::other(message)
+    match messages::parse_error_reply(body) {
+        Ok(error) => io::Error::other(OuterProtocolError {
+            code: error.code,
+            diagnostic: error.diagnostic,
+        }),
+        Err(_) => io::Error::other("outer Vivid error"),
+    }
+}
+
+fn protocol_error_code(error: &io::Error) -> Option<u64> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<OuterProtocolError>())
+        .map(|error| error.code)
 }
 
 fn with_causation(
@@ -2778,7 +2938,7 @@ mod tests {
             .pending_requests
             .insert(77);
         let started = Instant::now();
-        let outcome = wait_reply_on(&shared, 77, messages::OK, 0);
+        let outcome = wait_reply_on(&shared, 77, messages::OK, 0, CONTROL_REPLY_TIMEOUT);
         let elapsed = started.elapsed();
         stop.store(true, std::sync::atomic::Ordering::Release);
         chatter_thread.join().unwrap();
@@ -2803,6 +2963,14 @@ mod tests {
         assert!(state.abandoned_requests.contains(&77));
         assert_eq!(state.wait_timeouts, 1);
         assert!(state.wait_us > 0);
+    }
+
+    #[test]
+    fn source_creation_allows_bounded_browser_codec_initialization() {
+        assert_eq!(source_ready_timeout(true), SOURCE_READY_REPLY_TIMEOUT);
+        assert_eq!(source_ready_timeout(false), CONTROL_REPLY_TIMEOUT);
+        assert!(SOURCE_READY_REPLY_TIMEOUT > CONTROL_REPLY_TIMEOUT);
+        assert!(SOURCE_READY_REPLY_TIMEOUT < OUTER_CREDIT_TIMEOUT * 10);
     }
 
     #[test]
@@ -3172,6 +3340,147 @@ mod tests {
         server.join().unwrap().unwrap();
     }
 
+    #[test]
+    fn stale_display_commit_aborts_and_retries_on_the_same_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> io::Result<()> {
+            let (mut control, _) = listener.accept()?;
+            control.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut preface = [0; PREFACE_SIZE];
+            control.read_exact(&mut preface)?;
+            let hello = read_client_record(&mut control)?;
+            let mut sequence = 0;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::WELCOME,
+                0,
+                &messages::welcome(
+                    messages::request_id(&hello.body)?,
+                    1,
+                    &[1; 16],
+                    1,
+                    messages::DisplayChanged {
+                        display_generation: 1,
+                        viewport_width: 800,
+                        viewport_height: 600,
+                        grid_columns: 80,
+                        grid_rows: 24,
+                        cell_width: 10,
+                        cell_height: 25,
+                        settled: true,
+                    },
+                    REQUIRED_FEATURES,
+                ),
+            )?;
+
+            let begin = read_client_record(&mut control)?;
+            let commit = read_client_record(&mut control)?;
+            assert_eq!(begin.record_type, messages::BEGIN_TXN);
+            assert_eq!(commit.record_type, messages::COMMIT_TXN);
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                0,
+                &messages::ok(messages::request_id(&begin.body)?),
+            )?;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::DISPLAY_CHANGED,
+                0,
+                &messages::display_changed(
+                    0,
+                    messages::DisplayChanged {
+                        display_generation: 2,
+                        viewport_width: 810,
+                        viewport_height: 600,
+                        grid_columns: 81,
+                        grid_rows: 24,
+                        cell_width: 10,
+                        cell_height: 25,
+                        settled: true,
+                    },
+                ),
+            )?;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::ERROR,
+                0,
+                &messages::error(
+                    messages::request_id(&commit.body)?,
+                    messages::ERROR_STALE_DISPLAY_GENERATION,
+                    "display generation is stale",
+                ),
+            )?;
+
+            let abort = read_client_record(&mut control)?;
+            assert_eq!(abort.record_type, messages::ABORT_TXN);
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                0,
+                &messages::ok(messages::request_id(&abort.body)?),
+            )?;
+
+            let retried_begin = read_client_record(&mut control)?;
+            let retried_commit = read_client_record(&mut control)?;
+            assert_eq!(retried_begin.record_type, messages::BEGIN_TXN);
+            assert_eq!(retried_commit.record_type, messages::COMMIT_TXN);
+            assert_eq!(
+                messages::decode_control(&retried_commit.body)?.expected_generation,
+                Some(2),
+                "the retry must use the DISPLAY_CHANGED generation sent before the stale error"
+            );
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                0,
+                &messages::ok(messages::request_id(&retried_begin.body)?),
+            )?;
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::PRESENTED,
+                0,
+                &messages::presented(
+                    messages::request_id(&retried_commit.body)?,
+                    SceneRevision::new(1),
+                ),
+            )?;
+
+            let goodbye = read_client_record(&mut control)?;
+            assert_eq!(goodbye.record_type, messages::GOODBYE);
+            write_server_record(
+                &mut control,
+                &mut sequence,
+                messages::OK,
+                0,
+                &messages::ok(messages::request_id(&goodbye.body)?),
+            )
+        });
+
+        let mut bridge = OuterBridge::connect(
+            format!("tcp:{address}"),
+            Zeroizing::new("11".repeat(32)),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        bridge.update_nodes(&[]).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a stale display generation must not incur session-replacement latency"
+        );
+        drop(bridge);
+        server.join().unwrap().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn outer_negotiation_emits_and_retains_preserved_fields() {
@@ -3407,7 +3716,10 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert_eq!(bridge.take_media_completions(), vec![(77, true, 0)]);
+        let completions = bridge.take_media_completions();
+        assert_eq!(completions.len(), 1);
+        let (delivery_id, delivered, record_sequence, _object_id) = completions[0];
+        assert_eq!((delivery_id, delivered, record_sequence), (77, true, 0));
         assert!(
             server.join().unwrap().unwrap(),
             "cache hit must not open or attach an outer blob connection"
@@ -3892,7 +4204,9 @@ mod tests {
         let mut completed = HashMap::new();
         while completed.len() < 3 && Instant::now() < deadline {
             completed.extend(bridge.take_media_completions().into_iter().filter_map(
-                |(delivery, delivered, sequence)| delivered.then_some((delivery, sequence)),
+                |(delivery, delivered, sequence, _object)| {
+                    delivered.then_some((delivery, sequence))
+                },
             ));
             thread::sleep(Duration::from_millis(2));
         }
@@ -4014,6 +4328,31 @@ mod tests {
             snapshot.sources[0].play_request.start_pts_us, 30_000_000,
             "a playback-only update must re-base the outer PLAY without a rebuild"
         );
+
+        // A presenter-reported source loss removes that source automatically. Recreate only the
+        // lost source on the existing control session; attempting to destroy its stale object ID
+        // would fail with NOT_FOUND and previously triggered a whole-session replacement.
+        let instance_generation = bridge.diagnostic_instance_generation();
+        drop(bridge.media.remove(&key));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let losses = loop {
+            let losses = bridge.take_source_losses();
+            if !losses.is_empty() || Instant::now() >= deadline {
+                break losses;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(losses, vec![key]);
+        let recreated = bridge.rebuild(std::slice::from_ref(&rebased), &[]).unwrap();
+        assert_eq!(recreated, HashSet::from([key]));
+        assert_eq!(
+            bridge.diagnostic_instance_generation(),
+            instance_generation,
+            "source-scoped recovery must not replace the outer presenter session"
+        );
+        let recovered = presenter.projection_snapshot(&HashSet::from([7]));
+        assert_eq!(recovered.sources.len(), 1);
+        assert!(recovered.sources[0].playing);
 
         // Inner ingress ends. The outer epoch has to be closed explicitly: a presenter only
         // reaches its playback-ended milestone after EOS, so without this the inner producer

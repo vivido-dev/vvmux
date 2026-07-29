@@ -1,9 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
-#[cfg(windows)]
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -61,7 +59,6 @@ pub fn attach(
     let vivid = outer_endpoint.is_some() && outer_token.is_some();
     let terminal = ClientTerminal::enter()?;
     let display = terminal.display_metrics()?;
-    #[cfg(windows)]
     let presenter_cell_size = Arc::new(AtomicU32::new(pack_cell_size(display)));
     send_client(
         &writer,
@@ -83,7 +80,6 @@ pub fn attach(
     let output = Arc::new(Mutex::new(output));
     let output_thread = TerminalOutput::spawn(output, writer.clone())?;
     let bridge_display = display;
-    #[cfg(windows)]
     let bridge_cell_size = presenter_cell_size.clone();
     let bridge_queue_records =
         (client_config.media.ipc_queue_bytes / BRIDGE_MEDIA_CHUNK).clamp(1, 1024);
@@ -100,7 +96,6 @@ pub fn attach(
                     ) {
                         Ok(bridge) => {
                             let presenter_display = bridge.display_metrics();
-                            #[cfg(windows)]
                             bridge_cell_size
                                 .store(pack_cell_size(presenter_display), Ordering::Release);
                             if presenter_display != bridge_display {
@@ -387,11 +382,17 @@ pub fn attach(
             }
             #[cfg(not(windows))]
             {
-                if let Ok(display) = terminal.display_metrics()
-                    && display != last_display
-                {
-                    send_client(&writer, &ClientMessage::Resize(display))?;
-                    last_display = display;
+                if let Ok(mut display) = terminal.display_metrics() {
+                    // The TTY remains authoritative for its live grid, but its pixel metrics are
+                    // not the geometry the outer Vivid presenter actually renders. In particular,
+                    // Linux TIOCGWINSZ values can differ from Vivido's WELCOME metrics. Publishing
+                    // those values makes nested raster producers size their source differently
+                    // from the projected node and forces the outer renderer to resample it.
+                    apply_cell_size(&mut display, presenter_cell_size.load(Ordering::Acquire));
+                    if display != last_display {
+                        send_client(&writer, &ClientMessage::Resize(display))?;
+                        last_display = display;
+                    }
                 }
             }
         }
@@ -618,12 +619,10 @@ fn send_bridge_trace(
     });
 }
 
-#[cfg(windows)]
 fn pack_cell_size(display: crate::ipc::DisplayMetrics) -> u32 {
     u32::from(display.cell_width) | (u32::from(display.cell_height) << 16)
 }
 
-#[cfg(windows)]
 fn apply_cell_size(display: &mut crate::ipc::DisplayMetrics, packed: u32) {
     display.cell_width = packed as u16;
     display.cell_height = (packed >> 16) as u16;
@@ -692,9 +691,19 @@ fn run_bridge_worker(
             let _ = client_writer.send(ClientMessage::BridgeMetrics(metrics));
             metrics_reported_at = Instant::now();
         }
-        for (delivery_id, delivered, _outer_record_sequence) in bridge.take_media_completions() {
+        for (delivery_id, delivered, _outer_record_sequence, object_id) in
+            bridge.take_media_completions()
+        {
             if delivery_id != 0 {
                 acknowledge_bridge_delivery(&client_writer, delivery_id, delivered);
+            } else if delivered {
+                // Retained hydration carries no delivery ID, so its success would otherwise be
+                // invisible to the server. Report it: a retained image reaching the outer
+                // presenter is the moment it is genuinely presented, and a producer waiting on
+                // first visible presentation must not be released before then.
+                if let Some(source) = bridge.source_for_outer_object(object_id) {
+                    let _ = client_writer.send(ClientMessage::BridgeRetainedHydrated { source });
+                }
             }
         }
         let outer_keyframes = bridge.take_keyframe_requests();
@@ -731,7 +740,9 @@ fn run_bridge_worker(
             }
             desynchronized_sources.extend(source_losses);
             force_sources = true;
-            let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
+            let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+                reset_outer_session: false,
+            });
         }
         for changed in bridge.take_capability_changes() {
             let _ = client_writer.send(ClientMessage::BridgeCapabilitiesChanged {
@@ -761,6 +772,7 @@ fn run_bridge_worker(
                 )
             };
             let mut recreated = HashSet::new();
+            let source_scoped_recovery = !desynchronized_sources.is_empty();
             if change == ProjectionChange::Sources && force_replacement {
                 metrics.session_replacements = metrics.session_replacements.saturating_add(1);
             }
@@ -784,10 +796,18 @@ fn run_bridge_worker(
                     result.map(|sources| recreated = sources)
                 }
             };
-            if applied.is_err() {
-                force_sources = true;
-                force_replacement = true;
-                let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
+            if let Err(error) = applied {
+                // A display generation can change between BEGIN_TXN and COMMIT_TXN. The bridge
+                // retries that transaction in place; if the display remains unsettled through its
+                // bounded retry window, request a fresh authoritative projection without tearing
+                // down healthy sources or replacing the presenter session.
+                let same_session_retry =
+                    error.kind() == io::ErrorKind::WouldBlock || source_scoped_recovery;
+                force_sources = source_scoped_recovery || !same_session_retry;
+                force_replacement = !same_session_retry;
+                let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+                    reset_outer_session: !same_session_retry,
+                });
                 continue;
             }
             let next_generation = bridge.diagnostic_instance_generation();
@@ -864,15 +884,22 @@ fn run_bridge_worker(
                     )
                 })
                 .collect::<HashMap<_, _>>();
-            keyframes.extend(desynchronized_sources.drain().map(|source| {
-                (
-                    source,
-                    BridgeKeyframeRequest {
+            keyframes.extend(desynchronized_sources.drain().filter_map(|source| {
+                pending
+                    .sources
+                    .iter()
+                    .any(|candidate| {
+                        candidate.key == source
+                            && matches!(&candidate.kind, BridgeSourceKind::Video { .. })
+                    })
+                    .then_some((
                         source,
-                        minimum_epoch: None,
-                        reason: vivid_protocol::messages::KEYFRAME_REASON_DECODER_ERROR,
-                    },
-                )
+                        BridgeKeyframeRequest {
+                            source,
+                            minimum_epoch: None,
+                            reason: vivid_protocol::messages::KEYFRAME_REASON_DECODER_ERROR,
+                        },
+                    ))
             }));
             if change == ProjectionChange::Sources {
                 keyframes.extend(pending.sources.iter().filter_map(|source| {
@@ -1273,7 +1300,9 @@ fn complete_dropped_deliveries(
         }
     }
     if retry_snapshot {
-        let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry);
+        let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+            reset_outer_session: true,
+        });
     }
     retry_snapshot
 }
@@ -1516,6 +1545,31 @@ mod tests {
     use image::ImageEncoder;
     #[cfg(unix)]
     use vivid_protocol::media::{self, AudioPacket, VideoPacket};
+
+    #[test]
+    fn presenter_cell_size_survives_terminal_grid_polling() {
+        let presenter = crate::ipc::DisplayMetrics {
+            columns: 120,
+            rows: 42,
+            cell_width: 10,
+            cell_height: 25,
+        };
+        let mut terminal_resize = crate::ipc::DisplayMetrics {
+            columns: 121,
+            rows: 43,
+            cell_width: 9,
+            cell_height: 24,
+        };
+
+        apply_cell_size(&mut terminal_resize, pack_cell_size(presenter));
+
+        assert_eq!((terminal_resize.columns, terminal_resize.rows), (121, 43));
+        assert_eq!(
+            (terminal_resize.cell_width, terminal_resize.cell_height),
+            (10, 25),
+            "the TTY supplies the live grid, but nested raster pixels must use presenter cells"
+        );
+    }
 
     #[cfg(unix)]
     fn test_transport(stream: UnixStream) -> crate::platform::Transport {

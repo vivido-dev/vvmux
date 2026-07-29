@@ -219,19 +219,30 @@ impl DaemonLauncher {
     }
 }
 
-/// Keep the outer presenter's state out of a process that outlives the shell that started it.
+/// Keep outer terminal ownership out of a process that outlives the shell that started it.
 ///
 /// The whole `VIVID_*` namespace goes, not just the credential pair, which is also what the Windows
 /// launcher does. A session server inherits its environment to every pane it spawns, so a surviving
 /// `VIVID_ANCHOR_TRANSPORT` from a remote `vvssh` login would make pane producers frame anchor
 /// markers for the *outer* platform's pseudoconsole while they are talking to this hop's virtual
 /// presenter, whose scanner does not recognize that envelope.
+///
+/// An outer tmux or screen identity is stale for the same reason: the daemon creates and owns a new
+/// PTY boundary. If `TMUX` or `STY` reaches that PTY, Vivid producers deliberately decline text
+/// anchors because an ordinary multiplexer may consume their APC marker. Under vvmux the marker is
+/// instead authenticated and consumed by the virtual presenter, so inheriting the outer identity
+/// turns an anchored node into an absolute cursor placement that scrolls away when the producer
+/// reserves its rows. A real nested tmux or screen launched inside the pane will establish fresh
+/// values itself.
 fn scrub_daemon_environment(
     command: &mut Command,
     environment: impl IntoIterator<Item = (OsString, OsString)>,
 ) {
     for (key, _) in environment {
-        if key.to_string_lossy().starts_with("VIVID_") {
+        let key_text = key.to_string_lossy();
+        if key_text.starts_with("VIVID_")
+            || matches!(key_text.as_ref(), "TMUX" | "TMUX_PANE" | "STY")
+        {
             command.env_remove(&key);
         }
     }
@@ -612,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn a_daemon_inherits_no_vivid_state_from_the_shell_that_started_it() {
+    fn a_daemon_inherits_no_outer_presenter_or_multiplexer_state() {
         let mut command = Command::new("true");
         scrub_daemon_environment(
             &mut command,
@@ -624,6 +635,11 @@ mod tests {
                 // panes must not keep it.
                 ("VIVID_ANCHOR_TRANSPORT", "conpty"),
                 ("VIVID_REMOTE", "1"),
+                // These identify the shell that launched vvmux, not the PTYs owned by the new
+                // session daemon. Keeping them disables Vivid text anchors inside every pane.
+                ("TMUX", "/tmp/tmux-1000/default,1,0"),
+                ("TMUX_PANE", "%1"),
+                ("STY", "1234.outer"),
                 ("PATH", "/usr/bin"),
                 ("TERM", "xterm-256color"),
             ]
@@ -643,6 +659,9 @@ mod tests {
         assert_eq!(
             removed,
             [
+                "STY",
+                "TMUX",
+                "TMUX_PANE",
                 "VIVID_ANCHOR_TRANSPORT",
                 "VIVID_ENDPOINT",
                 "VIVID_ENDPOINT_BULK",

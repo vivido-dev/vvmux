@@ -508,7 +508,17 @@ pub enum ClientMessage {
         delivery_id: u64,
         delivered: bool,
     },
-    BridgeSnapshotRetry,
+    BridgeSnapshotRetry {
+        /// The bridge control session is uncertain and its hop-local identities will be replaced.
+        ///
+        /// Source-scoped recovery and display-generation churn retry on the existing session and
+        /// must preserve unrelated attachment and fragment mappings.
+        reset_outer_session: bool,
+    },
+    /// A retained body for one source reached the outer presenter.
+    BridgeRetainedHydrated {
+        source: BridgeSourceKey,
+    },
     BridgeApplied {
         bridge_instance_id: u64,
         virtual_revision: u64,

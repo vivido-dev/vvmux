@@ -121,6 +121,7 @@ pub struct SnapshotSource {
     pub key: SourceKey,
     pub descriptor: SourceDescriptor,
     pub retained: Option<Arc<[u8]>>,
+    pub first_visible_presented: bool,
     pub playing: bool,
     pub play_request: messages::PlayRequest,
     pub eos_epoch: Option<u32>,
@@ -655,16 +656,43 @@ impl VirtualVivid {
             .iter()
             .map(|node| (node.producer, node.config.node.source_id))
             .collect::<HashSet<_>>();
+        let live_referenced_sources = state
+            .nodes
+            .values()
+            .map(|node| (node.producer, node.config.node.source_id))
+            .collect::<HashSet<_>>();
         let mut sources = Vec::new();
+        let mut projected_sources = HashSet::new();
         let mut videos_needing_keyframes = Vec::new();
         for (key, source) in &mut state.sources {
-            if !active_producers.contains(&source.owner) && !referenced_sources.contains(key) {
+            let projected =
+                active_producers.contains(&source.owner) || referenced_sources.contains(key);
+            // An immutable image that has already reached the outer presenter is cheap and safe
+            // to keep resident while its tab is hidden. Keeping the decoded source alive turns a
+            // later tab switch into a node-only transaction instead of DELETE_SOURCE followed by
+            // CREATE_IMAGE, cache lookup, attachment setup, and retained-body replay.
+            //
+            // Do not preload never-presented hidden images: projected_sources remains the
+            // authoritative visibility set, and first-visible waits must still be driven by an
+            // actual outer presentation.
+            let resident_image = !projected
+                && matches!(source.descriptor, SourceDescriptor::Image(_))
+                && source.retained.is_some()
+                && source.milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION != 0
+                && live_referenced_sources.contains(key);
+            if !projected && !resident_image {
                 continue;
+            }
+            if projected {
+                projected_sources.insert(*key);
             }
             sources.push(SnapshotSource {
                 key: *key,
                 descriptor: source.descriptor.clone(),
                 retained: source.retained.clone(),
+                first_visible_presented: source.milestones
+                    & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION
+                    != 0,
                 playing: source.playing,
                 play_request: source.play_request,
                 eos_epoch: source.eos_epoch,
@@ -685,10 +713,6 @@ impl VirtualVivid {
                 videos_needing_keyframes.push(*key);
             }
         }
-        let projected_sources = sources
-            .iter()
-            .map(|source| source.key)
-            .collect::<HashSet<_>>();
         let hidden_deliveries = state
             .deliveries
             .iter()
@@ -888,6 +912,27 @@ impl VirtualVivid {
             self.delivery_changed.notify_all();
         }
         return_delivery_credits(released);
+    }
+
+    /// Record that a retained body reached the outer presenter.
+    ///
+    /// Retained hydration carries no delivery ID, so it never reaches
+    /// [`Self::complete_bridge_delivery`]. Without this the immutable-image path would have no
+    /// presentation signal at all and a producer waiting on first visible presentation would sit
+    /// until its own timeout.
+    pub fn complete_retained_hydration(&self, key: SourceKey) {
+        let mut state = self.lock();
+        if !state.projected_sources.contains(&key) {
+            return;
+        }
+        let Some(source) = state.sources.get_mut(&key) else {
+            return;
+        };
+        if source.milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION != 0 {
+            return;
+        }
+        source.milestones |= messages::MILESTONE_FIRST_VISIBLE_PRESENTATION;
+        let _ = advance_source(&mut state, key, messages::SOURCE_CHANGED_MILESTONES);
     }
 
     pub fn complete_bridge_delivery(&self, delivery_id: u64, delivered: bool) -> bool {
@@ -1236,6 +1281,12 @@ fn advance_source(
         let satisfied = producer
             .waits
             .iter()
+            // A producer's waits are keyed by request ID across all of its sources, so evaluate
+            // only those registered against the source that actually changed. Without this a
+            // linked audio transition satisfies a wait registered on its video source and the
+            // reply carries the wrong object ID, which the producer rejects as a mismatched
+            // reply while the wait it was actually holding is silently dropped.
+            .filter(|(_, wait)| wait.source_id == key.1)
             .filter_map(|(&request_id, wait)| {
                 evaluate_wait(source, visible, *wait).map(|observed_value| {
                     (
@@ -1793,6 +1844,16 @@ fn accept_loop(
             Err(_) => break,
         }
     }
+}
+
+fn media_channel_close_loses_source(source: &Source, media_failed: bool) -> bool {
+    if media_failed {
+        return true;
+    }
+    if source.descriptor.is_static() {
+        return source.retained.is_none();
+    }
+    !source.ended
 }
 
 fn handle_connection(
@@ -2358,7 +2419,18 @@ fn dispatch_control(
             let visible = state
                 .projected_sources
                 .contains(&(producer, wait.source_id));
-            if wait.condition == messages::WAIT_FIRST_VISIBLE_PRESENTATION && !visible {
+            // NOT_VISIBLE is only correct when the condition *cannot* be met, which the
+            // specification illustrates with a pane that is not composited into the outer
+            // presenter. A source whose pane is composited but whose outer projection is still in
+            // flight can still be presented, so the wait is registered and left to its own
+            // timeout. Answering immediately loses a race that only a slow presenter runs: a
+            // one-shot producer takes the error as final and exits, destroying the image it just
+            // submitted, while a local presenter projects fast enough to never see it.
+            let pane_composited = state
+                .producers
+                .get(&producer)
+                .is_some_and(|runtime| state.active_panes.contains(&runtime.pane));
+            if presentation_wait_is_unreachable(wait.condition, visible, pane_composited) {
                 let body = messages::error(
                     envelope.request_id,
                     messages::ERROR_NOT_VISIBLE,
@@ -3482,13 +3554,67 @@ fn handle_media(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Static attachments complete when their single image/frame has been accepted, so their
+        // normal channel close must retain the source. Timed media still needs EOS before close;
+        // any media-processing failure loses the source regardless of its kind.
+        let lost = state
+            .sources
+            .get(&ticket.source)
+            .is_some_and(|source| media_channel_close_loses_source(source, result.is_err()));
         if let Some(source) = state.sources.get_mut(&ticket.source) {
             source.attachment_state = messages::ATTACHMENT_CLOSED;
+            if lost {
+                source.milestones |= messages::MILESTONE_SOURCE_LOST;
+            }
             let _ = advance_source(
                 &mut state,
                 ticket.source,
-                messages::SOURCE_CHANGED_ATTACHMENT,
+                messages::SOURCE_CHANGED_ATTACHMENT
+                    | if lost {
+                        messages::SOURCE_CHANGED_LIFECYCLE
+                    } else {
+                        0
+                    },
             );
+        }
+        if lost {
+            let revision = state
+                .sources
+                .get(&ticket.source)
+                .map_or(SourceRevision::ZERO, |source| source.revision);
+            let writer = state
+                .producers
+                .get(&ticket.source.0)
+                .and_then(|producer| producer.writer.upgrade());
+            let retained = state
+                .sources
+                .remove(&ticket.source)
+                .map_or(0, |source| source.retained_bytes);
+            state.retained_bytes = state.retained_bytes.saturating_sub(retained);
+            state
+                .nodes
+                .retain(|_, node| node.config.node.source_id != ticket.source.1);
+            state.projected_sources.remove(&ticket.source);
+            advance_projection(&mut state);
+            let delivery_ids = state
+                .deliveries
+                .iter()
+                .filter_map(|(id, pending)| (pending.source == ticket.source).then_some(*id))
+                .collect::<Vec<_>>();
+            let released = take_deliveries(&mut state, &delivery_ids);
+            drop(state);
+            return_delivery_credits(released);
+            if let Some(writer) = writer
+                && let Ok(body) = messages::source_lost_with_observability(
+                    ticket.source.1,
+                    messages::ERROR_BAD_STATE,
+                    "media connection closed before EOS",
+                    revision,
+                    &messages::ErrorDetail::new(),
+                )
+            {
+                let _ = writer.write_record(messages::SOURCE_LOST, ticket.source.1, &body);
+            }
         }
     }
     delivery_changed.notify_all();
@@ -3959,14 +4085,12 @@ fn ingest_record(
             .map_or(source.last_pts_us, |prepared| Some(prepared.pts_us));
         (old, new_retained, new, pts, forward, forward_body)
     };
-    let forward_timed = candidate_forward
-        && match &state.sources.get(&key).expect("source exists").descriptor {
-            SourceDescriptor::Audio(config) => config
-                .linked_video_source_id
-                .and_then(|source_id| state.sources.get(&(key.0, source_id)))
-                .is_none_or(|video| !video.bridge_desynchronized),
-            _ => true,
-        };
+    // Audio is forwarded while its linked video awaits keyframe recovery. Every audio access
+    // unit is independently decodable, so discarding one recovers nothing: it deletes content
+    // outright, and a presenter that labels decoded output by sample accumulation rather than by
+    // access unit will carry the resulting gap as a permanent audio/video offset. Video recovers
+    // through NEED_KEYFRAME; audio has no equivalent, so the samples must survive the window.
+    let forward_timed = candidate_forward;
     let projected = state
         .retained_bytes
         .saturating_sub(old_retained)
@@ -3994,16 +4118,21 @@ fn ingest_record(
     source.milestones |= messages::MILESTONE_FIRST_MEDIA_RECORD
         | messages::MILESTONE_DECODER_INITIALIZED
         | messages::MILESTONE_FIRST_DECODED_OUTPUT;
-    if projected_source {
-        source.milestones |= messages::MILESTONE_FIRST_VISIBLE_PRESENTATION;
-    }
+    // First visible presentation is deliberately not claimed here. vvmux is a virtual
+    // presenter: receiving a body only means the relay holds it, not that the outer presenter
+    // showed it. Claiming it on receipt releases a one-shot producer immediately, and the source
+    // it submitted is destroyed when it exits -- before a slower outer presenter ever receives
+    // the media. The milestone is set from the outer delivery instead: `complete_bridge_delivery`
+    // for live bodies, `complete_retained_hydration` for retained ones.
     if record.record_type == messages::VIDEO_PACKET
         && media::parse_video_packet(record.body)?.flags & media::VIDEO_PACKET_KEY != 0
     {
         source.milestones |= messages::MILESTONE_RANDOM_ACCESS_ACCEPTED;
     }
     state.retained_bytes = projected;
-    if retained_requires_revision && new_retained > 0 && old_retained == 0 {
+    let retained_projection_changed =
+        retained_requires_revision && new_retained > 0 && old_retained == 0;
+    if retained_projection_changed {
         // Immutable images have no live MediaEvent, so their first retained body must trigger
         // hydration. Raster bodies are exclusively live while projected and are picked up from
         // retained state only on an independently required source/layout rebuild.
@@ -4119,6 +4248,12 @@ fn ingest_record(
     }
     if let Some(credit) = immediate_credit {
         write_delivery_credit(credit)?;
+    }
+    if retained_projection_changed && let Some(wakeup) = media_wakeup {
+        // Immutable images deliberately have no live MediaEvent. Wake the session actor anyway:
+        // otherwise it notices the new retained projection only on its one-second idle tick,
+        // delaying both the first image and WAIT_FIRST_VISIBLE_PRESENTATION by a full second.
+        wakeup();
     }
     if request_keyframe {
         request_keyframe_recoveries(
@@ -4317,6 +4452,16 @@ fn prune_orphaned_sources(state: &mut State) {
     }
 }
 
+/// Whether a presentation wait must be refused with `NOT_VISIBLE` instead of being registered.
+///
+/// Only a source that cannot be presented at all qualifies: the specification's example is a pane
+/// that is not composited into the outer presenter. A composited pane whose source has not yet
+/// been projected outward is merely early, so the wait is registered and bounded by its own
+/// timeout rather than refused.
+fn presentation_wait_is_unreachable(condition: u64, visible: bool, pane_composited: bool) -> bool {
+    condition == messages::WAIT_FIRST_VISIBLE_PRESENTATION && !visible && !pane_composited
+}
+
 fn supported_feature(feature: u64) -> bool {
     matches!(
         feature,
@@ -4391,6 +4536,7 @@ fn diagnostic_trace_guard() -> io::Result<Option<TraceGuard>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
     use vivid_protocol::wire::{Connection, Endpoint};
 
     #[test]
@@ -4457,6 +4603,27 @@ mod tests {
 
     fn service_endpoint(service: &VirtualVivid) -> Endpoint {
         Endpoint::parse(&service.endpoint()).unwrap()
+    }
+
+    fn wait_for_retained_static_attachment_close(service: &VirtualVivid, key: SourceKey) {
+        for _ in 0..100 {
+            {
+                let state = service.lock();
+                let source = state
+                    .sources
+                    .get(&key)
+                    .expect("a completed static media attachment must not lose its source");
+                if source.attachment_state == messages::ATTACHMENT_CLOSED {
+                    assert!(
+                        source.retained.is_some(),
+                        "a completed static source must retain its media"
+                    );
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("static media attachment did not close");
     }
 
     fn state() -> State {
@@ -4783,6 +4950,75 @@ mod tests {
             raster_damage_window_started: Instant::now(),
             raster_damage_pixels: 0,
         }
+    }
+
+    #[test]
+    fn media_close_loses_only_failed_or_unfinished_timed_sources() {
+        let raster = raster_source();
+        assert!(!media_channel_close_loses_source(&raster, false));
+        assert!(media_channel_close_loses_source(&raster, true));
+        let mut empty_raster = raster;
+        empty_raster.retained = None;
+        assert!(media_channel_close_loses_source(&empty_raster, false));
+
+        let mut video = barrier_source(1);
+        assert!(media_channel_close_loses_source(&video, false));
+        video.ended = true;
+        assert!(!media_channel_close_loses_source(&video, false));
+    }
+
+    #[test]
+    fn a_source_change_only_satisfies_waits_registered_against_that_source() {
+        let mut state = state();
+        let (observation_sender, _observation_receiver) = mpsc::sync_channel(8);
+        state.producers.insert(
+            1,
+            Producer {
+                pane: 7,
+                tag: [0; 16],
+                anchor_key: anchor::derive_key(&[0; 32], &[0; 16]),
+                writer: Weak::new(),
+                observation_sender,
+                features: HashSet::from([messages::FEATURE_OBSERVABILITY_CORE_V1]),
+                anchors: HashMap::new(),
+                seen_anchors: HashSet::new(),
+                scene_revision: SceneRevision::ZERO,
+                observation_mask: messages::OBSERVE_SOURCE_TRANSITIONS,
+                observation_sequence: ObservationSequence::ZERO,
+                first_lost_source_sequence: None,
+                first_lost_scene_sequence: None,
+                waits: HashMap::new(),
+            },
+        );
+        // A video source and its linked audio, as a linked playback group arrives.
+        state.sources.insert((1, 1), barrier_source(1));
+        state.sources.insert((1, 3), barrier_source(1));
+        state.projected_sources.insert((1, 1));
+        state.projected_sources.insert((1, 3));
+        // The producer waits on the video source only, exactly as vivi does for playback end.
+        state.producers.get_mut(&1).unwrap().waits.insert(
+            14,
+            PendingSourceWait {
+                source_id: 1,
+                condition: messages::WAIT_SOURCE_REVISION,
+                value: Some(1),
+            },
+        );
+
+        // The linked audio changes first. Its revision also satisfies the condition, so an
+        // unscoped evaluation would answer request 14 while naming the audio source.
+        advance_source(&mut state, (1, 3), messages::SOURCE_CHANGED_LIFECYCLE).unwrap();
+        assert!(
+            state.producers[&1].waits.contains_key(&14),
+            "a linked audio transition consumed a wait registered against its video source"
+        );
+
+        // The source the wait names still resolves it.
+        advance_source(&mut state, (1, 1), messages::SOURCE_CHANGED_LIFECYCLE).unwrap();
+        assert!(
+            !state.producers[&1].waits.contains_key(&14),
+            "the wait was not satisfied by a change to the source it names"
+        );
     }
 
     #[test]
@@ -5693,6 +5929,74 @@ mod tests {
     }
 
     #[test]
+    fn retained_hydration_is_what_marks_an_image_presented() {
+        let mut state = state();
+        let key = (1_u64, 1_u64);
+        let mut source = raster_source();
+        source.milestones = 0;
+        state.sources.insert(key, source);
+
+        // Receiving a body must not claim presentation: vvmux only relayed it. Without an outer
+        // delivery the milestone stays clear, so a producer waiting on first visible presentation
+        // keeps waiting instead of exiting and destroying the source it just submitted.
+        assert_eq!(
+            state.sources[&key].milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION,
+            0
+        );
+
+        // Hydration for a source that is not projected outward proves nothing.
+        assert!(!state.projected_sources.contains(&key));
+        assert_eq!(
+            state.sources[&key].milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION,
+            0
+        );
+
+        // Once the retained body reaches the outer presenter the source is genuinely presented.
+        state.projected_sources.insert(key);
+        state.sources.get_mut(&key).unwrap().milestones |=
+            messages::MILESTONE_FIRST_VISIBLE_PRESENTATION;
+        let source = &state.sources[&key];
+        assert_ne!(
+            source.milestones & messages::MILESTONE_FIRST_VISIBLE_PRESENTATION,
+            0
+        );
+        let wait = PendingSourceWait {
+            source_id: 1,
+            condition: messages::WAIT_FIRST_VISIBLE_PRESENTATION,
+            value: None,
+        };
+        assert!(
+            evaluate_wait(source, true, wait).is_some(),
+            "a presented source satisfies a first-visible-presentation wait"
+        );
+    }
+
+    #[test]
+    fn presentation_waits_are_registered_while_a_composited_pane_projects() {
+        let condition = messages::WAIT_FIRST_VISIBLE_PRESENTATION;
+
+        // Already presented: nothing to refuse.
+        assert!(!presentation_wait_is_unreachable(condition, true, true));
+
+        // The pane is composited and the source simply has not been projected outward yet. A
+        // browser presenter takes long enough to lose this race; refusing here makes a one-shot
+        // producer exit and destroy the image it just submitted.
+        assert!(!presentation_wait_is_unreachable(condition, false, true));
+
+        // The pane is not composited into the outer presenter, so the condition cannot be met.
+        // This is the case the specification names for NOT_VISIBLE.
+        assert!(presentation_wait_is_unreachable(condition, false, false));
+
+        // Other conditions are never refused on visibility grounds.
+        for other in [
+            messages::WAIT_SOURCE_REVISION,
+            messages::WAIT_PLAYBACK_STARTED,
+        ] {
+            assert!(!presentation_wait_is_unreachable(other, false, false));
+        }
+    }
+
+    #[test]
     fn projected_video_credit_waits_for_bridge_and_hidden_audio_is_discarded() {
         let directory = tempfile::tempdir().unwrap();
         let socket = test_virtual_endpoint(&directory, "vivid-paced.sock");
@@ -5987,6 +6291,11 @@ mod tests {
             }
             Err(error) => panic!("virtual presenter start failed: {error}"),
         };
+        let projection_wakeups = Arc::new(AtomicU64::new(0));
+        let counted_wakeups = projection_wakeups.clone();
+        service.set_media_wakeup(Arc::new(move || {
+            counted_wakeups.fetch_add(1, Ordering::Relaxed);
+        }));
         let token = service.issue_pane_capability(7).unwrap();
         service.update_metrics(7, 80, 22, (10, 20));
 
@@ -6107,6 +6416,10 @@ mod tests {
         assert_eq!(credit.bytes, encoded.len() as u64);
         assert_eq!(credit.packets, 1);
         assert_eq!(credit.fragments, 0);
+        // Vivi closes its one-record image channel before it waits for first visibility.
+        drop(image_connection);
+        wait_for_retained_static_attachment_close(&service, (welcome.session_id, 1));
+        assert!(service.wait_for_retained_media(7, Duration::from_secs(1)));
 
         control
             .write_record(
@@ -6136,6 +6449,8 @@ mod tests {
         let raster_credit = control.read_record().unwrap();
         assert_eq!(raster_credit.record_type, messages::CREDIT);
         assert_eq!(raster_credit.object_id, 2);
+        drop(media_connection);
+        wait_for_retained_static_attachment_close(&service, (welcome.session_id, 2));
 
         let mut retained = false;
         for _ in 0..50 {
@@ -6158,12 +6473,27 @@ mod tests {
                     8_i64 << 32,
                     "copy-mode scrollback must move text-anchored media with its semantic line"
                 );
+                service.scroll_anchors(7, 2);
+                let grid_scrolled = service.projection_snapshot(&HashSet::from([7]));
+                assert_eq!(
+                    grid_scrolled.nodes[0].config.node.y,
+                    1_i64 << 32,
+                    "PTY grid scroll must move the anchor instead of leaving an absolute node \
+                     below the viewport"
+                );
+                service.complete_retained_hydration((welcome.session_id, 1));
                 retained = true;
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
         assert!(retained, "virtual presenter did not retain static media");
+        assert_eq!(
+            projection_wakeups.load(Ordering::Relaxed),
+            1,
+            "the immutable image must wake projection immediately instead of waiting for the \
+             session actor's one-second idle tick"
+        );
 
         control
             .write_record(messages::GOODBYE, 0, 0, &messages::goodbye(7))
@@ -6185,10 +6515,26 @@ mod tests {
                 assert_eq!(snapshot.nodes[0].config.node.source_id, 1);
                 assert_eq!(snapshot.nodes[0].config.node.anchor_id, None);
                 assert_eq!(snapshot.nodes[0].config.node.x, 4_i64 << 32);
-                assert_eq!(snapshot.nodes[0].config.node.y, 3_i64 << 32);
+                assert_eq!(
+                    snapshot.nodes[0].config.node.y,
+                    1_i64 << 32,
+                    "an anchored image must retain its scrolled position after the producer exits"
+                );
                 let other_tab = service.projection_snapshot(&HashSet::from([8]));
                 assert!(other_tab.nodes.is_empty());
-                assert!(other_tab.sources.is_empty());
+                assert_eq!(
+                    other_tab.sources.len(),
+                    1,
+                    "an already-presented immutable image stays decoded while its tab is hidden"
+                );
+                assert_eq!(other_tab.sources[0].key, (welcome.session_id, 1));
+                assert!(
+                    !service
+                        .lock()
+                        .projected_sources
+                        .contains(&(welcome.session_id, 1)),
+                    "outer residency must not be reported as visible projection"
+                );
                 assert_eq!(
                     other_tab.live_nodes.len(),
                     1,

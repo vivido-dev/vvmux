@@ -714,7 +714,14 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
             .send(Message::Text(r#"{"type":"detach"}"#.into()))
             .await
             .unwrap();
-        let recovery_detached = tokio::time::timeout(Duration::from_secs(3), async {
+        // The session actor takes terminal output and client control on one ordered event
+        // channel, so a detach is serviced only after the output already queued ahead of it.
+        // This pane just ran an unthrottled echo loop, and draining that backlog measured
+        // ~3.5 s here even though only ~5 KB reached this socket: the wait is the actor
+        // parsing and rendering pending output, not transfer. The attached terminal client
+        // accommodates the same latency with its own DETACH_ACK_TIMEOUT. Bound this well
+        // above the observed cost so it still catches a detach that never lands.
+        let recovery_detached = tokio::time::timeout(Duration::from_secs(20), async {
             while let Some(message) = recovery.next().await {
                 if matches!(message.unwrap(), Message::Text(ref text) if text.contains("detached"))
                 {
