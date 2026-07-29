@@ -3586,16 +3586,10 @@ fn handle_media(
                 .producers
                 .get(&ticket.source.0)
                 .and_then(|producer| producer.writer.upgrade());
-            let retained = state
-                .sources
-                .remove(&ticket.source)
-                .map_or(0, |source| source.retained_bytes);
-            state.retained_bytes = state.retained_bytes.saturating_sub(retained);
-            state
-                .nodes
-                .retain(|_, node| node.config.node.source_id != ticket.source.1);
+            // Source IDs are scoped to their producer. Use the common removal path so losing
+            // producer B's source 1 cannot delete producer A's node for its own source 1.
+            let _ = remove_source(&mut state, ticket.source);
             state.projected_sources.remove(&ticket.source);
-            advance_projection(&mut state);
             let delivery_ids = state
                 .deliveries
                 .iter()
@@ -4965,6 +4959,236 @@ mod tests {
         assert!(media_channel_close_loses_source(&video, false));
         video.ended = true;
         assert!(!media_channel_close_loses_source(&video, false));
+    }
+
+    #[test]
+    fn timed_media_close_preserves_other_producers_node_with_same_source_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = test_virtual_endpoint(&directory, "vivid-source-scope.sock");
+        let service = match VirtualVivid::start(socket, MediaConfig::default()) {
+            Ok(service) => service,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping virtual presenter socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("virtual presenter start failed: {error}"),
+        };
+        let owner_token = service.issue_pane_capability(7).unwrap();
+        let video_token = service.issue_pane_capability(8).unwrap();
+        service.update_metrics(7, 80, 22, (10, 20));
+        service.update_metrics(8, 80, 22, (10, 20));
+        let endpoint = service_endpoint(&service);
+
+        let mut owner = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        owner
+            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &owner_token))
+            .unwrap();
+        let owner_welcome = messages::parse_welcome(&owner.read_record().unwrap().body).unwrap();
+        owner
+            .write_record(
+                messages::CREATE_RASTER,
+                0,
+                1,
+                &messages::create_raster(2, 1, 1, 1),
+            )
+            .unwrap();
+        assert_eq!(
+            owner.read_record().unwrap().record_type,
+            messages::SOURCE_READY
+        );
+        let owner_node = || messages::NodeConfig {
+            node_id: 2,
+            source_id: 1,
+            context_id: owner_welcome.root_context_id,
+            columns: 1,
+            rows: 1,
+            anchor_id: None,
+        };
+        owner
+            .write_record(
+                messages::BEGIN_TXN,
+                0,
+                0,
+                &messages::begin_transaction(3, 1),
+            )
+            .unwrap();
+        owner
+            .write_record(
+                messages::CREATE_NODE,
+                0,
+                2,
+                &messages::create_node(4, 1, owner_node()),
+            )
+            .unwrap();
+        owner
+            .write_record(
+                messages::COMMIT_TXN,
+                0,
+                0,
+                &messages::commit_transaction(5, 1, owner_welcome.display_generation),
+            )
+            .unwrap();
+        assert_eq!(owner.read_record().unwrap().record_type, messages::OK);
+        assert_eq!(owner.read_record().unwrap().record_type, messages::OK);
+        assert_eq!(
+            owner.read_record().unwrap().record_type,
+            messages::PRESENTED
+        );
+
+        let mut video = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
+        video
+            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &video_token))
+            .unwrap();
+        let video_welcome = messages::parse_welcome(&video.read_record().unwrap().body).unwrap();
+        let video_config = messages::VideoSourceConfig {
+            codec_string: None,
+            decoder_config: None,
+            source_id: 1,
+            codec: "h264",
+            packetization: "h264-annexb-au-v1",
+            extradata: &[],
+            width: 16,
+            height: 16,
+            profile: 100,
+            level: 40,
+            bitrate: 1_000_000,
+            color_primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            range: 1,
+            sar_num: 1,
+            sar_den: 1,
+            max_access_unit_bytes: 1024,
+        };
+        video
+            .write_record(
+                messages::CREATE_VIDEO,
+                0,
+                1,
+                &messages::create_video(2, &video_config),
+            )
+            .unwrap();
+        let video_ready = messages::parse_source_ready(&video.read_record().unwrap().body).unwrap();
+        video
+            .write_record(
+                messages::BEGIN_TXN,
+                0,
+                0,
+                &messages::begin_transaction(3, 1),
+            )
+            .unwrap();
+        video
+            .write_record(
+                messages::CREATE_NODE,
+                0,
+                2,
+                &messages::create_node(
+                    4,
+                    1,
+                    messages::NodeConfig {
+                        node_id: 2,
+                        source_id: 1,
+                        context_id: video_welcome.root_context_id,
+                        columns: 1,
+                        rows: 1,
+                        anchor_id: None,
+                    },
+                ),
+            )
+            .unwrap();
+        video
+            .write_record(
+                messages::COMMIT_TXN,
+                0,
+                0,
+                &messages::commit_transaction(5, 1, video_welcome.display_generation),
+            )
+            .unwrap();
+        assert_eq!(video.read_record().unwrap().record_type, messages::OK);
+        assert_eq!(video.read_record().unwrap().record_type, messages::OK);
+        assert_eq!(
+            video.read_record().unwrap().record_type,
+            messages::PRESENTED
+        );
+        let mut video_media = Connection::open(&endpoint, ConnectionKind::Video).unwrap();
+        video_media
+            .write_record(
+                messages::ATTACH_CHANNEL,
+                0,
+                1,
+                &messages::attach_channel(&video_ready.media_ticket),
+            )
+            .unwrap();
+        let packet = media::video_packet_body(media::VideoPacket {
+            epoch: 1,
+            packet_id: 1,
+            pts_us: 0,
+            dts_us: 0,
+            duration_us: 33_000,
+            key: true,
+            data: &[0, 0, 0, 1, 0x65, 0x88],
+        })
+        .unwrap();
+        video_media
+            .write_record(messages::VIDEO_PACKET, 0, 1, &packet)
+            .unwrap();
+        assert_eq!(video.read_record().unwrap().record_type, messages::CREDIT);
+        drop(video_media);
+        assert_eq!(
+            video.read_record().unwrap().record_type,
+            messages::SOURCE_LOST
+        );
+
+        let snapshot = service.projection_snapshot(&HashSet::from([7, 8]));
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .map(|node| (node.producer, node.config.node.source_id))
+                .collect::<Vec<_>>(),
+            [(owner_welcome.session_id, 1)],
+            "closing producer B's source 1 must preserve producer A's node for source 1"
+        );
+        assert_eq!(
+            snapshot
+                .sources
+                .iter()
+                .map(|source| source.key)
+                .collect::<Vec<_>>(),
+            [(owner_welcome.session_id, 1)]
+        );
+
+        owner
+            .write_record(
+                messages::BEGIN_TXN,
+                0,
+                0,
+                &messages::begin_transaction(6, 2),
+            )
+            .unwrap();
+        owner
+            .write_record(
+                messages::UPDATE_NODE,
+                0,
+                2,
+                &messages::create_node(7, 2, owner_node()),
+            )
+            .unwrap();
+        owner
+            .write_record(
+                messages::COMMIT_TXN,
+                0,
+                0,
+                &messages::commit_transaction(8, 2, owner_welcome.display_generation),
+            )
+            .unwrap();
+        assert_eq!(owner.read_record().unwrap().record_type, messages::OK);
+        assert_eq!(owner.read_record().unwrap().record_type, messages::OK);
+        assert_eq!(
+            owner.read_record().unwrap().record_type,
+            messages::PRESENTED,
+            "the surviving producer must still be able to update its node"
+        );
     }
 
     #[test]
