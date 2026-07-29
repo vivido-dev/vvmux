@@ -1846,6 +1846,16 @@ fn accept_loop(
     }
 }
 
+fn media_channel_close_loses_source(source: &Source, media_failed: bool) -> bool {
+    if media_failed {
+        return true;
+    }
+    if source.descriptor.is_static() {
+        return source.retained.is_none();
+    }
+    !source.ended
+}
+
 fn handle_connection(
     stream: Transport,
     connection_id: u64,
@@ -3544,14 +3554,13 @@ fn handle_media(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A media channel that closes before EOS ends the source: no further access units can
-        // arrive, so the producer is told rather than left holding a source that will never
-        // advance again. After EOS the producer is expected to close the channel, and the
-        // source stays alive so its buffered media can still be presented.
+        // Static attachments complete when their single image/frame has been accepted, so their
+        // normal channel close must retain the source. Timed media still needs EOS before close;
+        // any media-processing failure loses the source regardless of its kind.
         let lost = state
             .sources
             .get(&ticket.source)
-            .is_some_and(|source| !source.ended);
+            .is_some_and(|source| media_channel_close_loses_source(source, result.is_err()));
         if let Some(source) = state.sources.get_mut(&ticket.source) {
             source.attachment_state = messages::ATTACHMENT_CLOSED;
             if lost {
@@ -4596,6 +4605,27 @@ mod tests {
         Endpoint::parse(&service.endpoint()).unwrap()
     }
 
+    fn wait_for_retained_static_attachment_close(service: &VirtualVivid, key: SourceKey) {
+        for _ in 0..100 {
+            {
+                let state = service.lock();
+                let source = state
+                    .sources
+                    .get(&key)
+                    .expect("a completed static media attachment must not lose its source");
+                if source.attachment_state == messages::ATTACHMENT_CLOSED {
+                    assert!(
+                        source.retained.is_some(),
+                        "a completed static source must retain its media"
+                    );
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("static media attachment did not close");
+    }
+
     fn state() -> State {
         State {
             config: MediaConfig::default(),
@@ -4920,6 +4950,21 @@ mod tests {
             raster_damage_window_started: Instant::now(),
             raster_damage_pixels: 0,
         }
+    }
+
+    #[test]
+    fn media_close_loses_only_failed_or_unfinished_timed_sources() {
+        let raster = raster_source();
+        assert!(!media_channel_close_loses_source(&raster, false));
+        assert!(media_channel_close_loses_source(&raster, true));
+        let mut empty_raster = raster;
+        empty_raster.retained = None;
+        assert!(media_channel_close_loses_source(&empty_raster, false));
+
+        let mut video = barrier_source(1);
+        assert!(media_channel_close_loses_source(&video, false));
+        video.ended = true;
+        assert!(!media_channel_close_loses_source(&video, false));
     }
 
     #[test]
@@ -6371,6 +6416,10 @@ mod tests {
         assert_eq!(credit.bytes, encoded.len() as u64);
         assert_eq!(credit.packets, 1);
         assert_eq!(credit.fragments, 0);
+        // Vivi closes its one-record image channel before it waits for first visibility.
+        drop(image_connection);
+        wait_for_retained_static_attachment_close(&service, (welcome.session_id, 1));
+        assert!(service.wait_for_retained_media(7, Duration::from_secs(1)));
 
         control
             .write_record(
@@ -6400,6 +6449,8 @@ mod tests {
         let raster_credit = control.read_record().unwrap();
         assert_eq!(raster_credit.record_type, messages::CREDIT);
         assert_eq!(raster_credit.object_id, 2);
+        drop(media_connection);
+        wait_for_retained_static_attachment_close(&service, (welcome.session_id, 2));
 
         let mut retained = false;
         for _ in 0..50 {
