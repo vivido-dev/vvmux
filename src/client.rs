@@ -768,6 +768,10 @@ fn run_bridge_worker(
                 }
             }
         }
+        // The outer control connection is serviced here so the bridge keeps naming the target the
+        // outer terminal actually has. A resize the bridge never read would make every scene
+        // commit stale.
+        bridge.poll_outer_session();
         let outer_keyframes = bridge.take_keyframe_requests();
         if !outer_keyframes.is_empty() {
             for request in &outer_keyframes {
@@ -2078,6 +2082,113 @@ mod tests {
         );
         // The drop is counted for `inspect-media` without changing the drop behavior itself.
         assert_eq!(queue_drops.load(Ordering::Relaxed), 1);
+    }
+
+    /// The outer terminal resizes while the nested session is live. The bridge names the target
+    /// generation on every scene commit, so it has to follow the outer target: a bridge that never
+    /// reads the announcement has every later commit rejected, and the recovery for that is
+    /// replacing the whole outer session instead of moving one node.
+    ///
+    /// The commit here deliberately runs before the announcement is read, which is what a resize
+    /// landing mid-transaction looks like, so the recovery is the one under test.
+    #[test]
+    #[cfg(unix)]
+    fn a_scene_commit_that_crosses_an_outer_resize_stays_in_the_same_outer_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("outer-resize.sock");
+        let presenter = match VirtualVivid::start(socket.clone(), MediaConfig::default()) {
+            Ok(presenter) => presenter,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping outer resize bridge socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("virtual outer presenter start failed: {error}"),
+        };
+        let token = presenter.issue_pane_capability(7).unwrap();
+        presenter.update_metrics(7, 80, 22, (10, 20));
+        let mut bridge = crate::bridge::OuterBridge::connect(
+            format!("unix:{}", socket.display()),
+            Zeroizing::new(token),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+
+        let key = BridgeSourceKey {
+            producer: 3,
+            context: 1,
+            surface: 7,
+            track: 7,
+        };
+        let surface = test_surface(key);
+        let node = |width: i64| BridgeNode {
+            producer: key.producer,
+            node: 1,
+            fragment: 0,
+            surface: surface.key,
+            x: 0,
+            y: 0,
+            width,
+            height: 1_i64 << 32,
+            z_index: 0,
+            visible: true,
+            clip: crate::ipc::BridgeClipRect {
+                x: 0,
+                y: 0,
+                width,
+                height: 1_i64 << 32,
+            },
+        };
+        bridge
+            .rebuild(std::slice::from_ref(&surface), &[], &[node(2_i64 << 32)])
+            .expect("initial projection");
+
+        for (index, (columns, rows)) in [(100_u16, 30_u16), (64, 18)].into_iter().enumerate() {
+            presenter.update_metrics(7, columns, rows, (10, 20));
+
+            let width = (4 + index as i64) << 32;
+            bridge.update_nodes(&[node(width)]).unwrap_or_else(|error| {
+                panic!("a node move across outer resize {index} left the outer session: {error}")
+            });
+        }
+    }
+
+    /// A target announcement a nested producer cannot apply is worse than none: it is discarded,
+    /// and the producer keeps naming the target it read at `WELCOME` for the rest of the session.
+    #[test]
+    #[cfg(unix)]
+    fn an_outer_target_announcement_is_one_a_nested_producer_can_apply() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("outer-announce.sock");
+        let presenter = match VirtualVivid::start(socket.clone(), MediaConfig::default()) {
+            Ok(presenter) => presenter,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping outer announcement socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("virtual outer presenter start failed: {error}"),
+        };
+        let token = presenter.issue_pane_capability(7).unwrap();
+        presenter.update_metrics(7, 80, 22, (10, 20));
+        let mut bridge = crate::bridge::OuterBridge::connect(
+            format!("unix:{}", socket.display()),
+            Zeroizing::new(token),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+
+        presenter.update_metrics(7, 100, 30, (10, 20));
+
+        let followed = (0..200).any(|_| {
+            let moved = bridge.poll_outer_session();
+            if !moved {
+                thread::sleep(Duration::from_millis(5));
+            }
+            moved
+        });
+        assert!(
+            followed,
+            "the bridge could not apply the outer target announcement"
+        );
     }
 
     #[test]

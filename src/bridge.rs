@@ -2,19 +2,22 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use vivid_protocol::auth::Secret32;
 use vivid_protocol::cbor::Value;
 use vivid_protocol::media::{self, AudioPacket, RasterDeltaOperation, VideoPacket};
 use vivid_protocol::messages::{self, LaneClass};
+use vivid_protocol::registry;
 use vivid_protocol::track::{
     AudioConfiguration, ImageConfiguration, KindConfiguration, RasterConfiguration,
     TrackConfiguration, TrackMode, VideoConfiguration,
 };
 use vivid_sdk::{
     ChannelEvent, CoordinateModel, Fit, ProducerAuthentication, ProducerConfig, RequestMetadata,
-    SceneNode, SlotBinding, Surface, SurfaceDefinition, SurfaceDescriptor, SurfaceRole, Track,
-    TrackChannel,
+    SceneNode, SessionEvent, SlotBinding, Surface, SurfaceDefinition, SurfaceDescriptor,
+    SurfaceRole, Track, TrackChannel,
 };
 use zeroize::Zeroizing;
 
@@ -32,6 +35,19 @@ const SLOT_POSTER: u64 = 4;
 pub(crate) const KEYFRAME_REASON_INITIAL: u64 = 1;
 pub(crate) const KEYFRAME_REASON_DECODER_ERROR: u64 = 2;
 pub(crate) const KEYFRAME_REASON_TRANSPORT_LOSS: u64 = 5;
+/// How long a scene commit keeps following a moving outer target before it asks for a fresh
+/// projection instead.
+const TARGET_FOLLOW_TIMEOUT: Duration = Duration::from_millis(500);
+/// Pause between attempts while the announcement that explains a stale reply is still in flight.
+const TARGET_FOLLOW_POLL: Duration = Duration::from_millis(5);
+
+/// One scene mutation, named so a stale reply can be retried against the target that caused it.
+#[derive(Debug, Clone, Copy)]
+enum NodeCommit<'a> {
+    Create(&'a SceneNode),
+    Update(&'a SceneNode),
+    Delete { context_id: u64, node_id: u64 },
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PlaybackSnapshot {
@@ -610,6 +626,90 @@ impl OuterBridge {
         Ok(())
     }
 
+    /// Read the outer control connection and apply what the bridge owns on it.
+    ///
+    /// Nothing else drains this connection, so the target generation the SDK names on every scene
+    /// commit only follows the outer terminal from here. Returns whether the target moved.
+    pub fn poll_outer_session(&mut self) -> bool {
+        let mut moved = false;
+        loop {
+            match self.session.take_event() {
+                Ok(Some(SessionEvent::TargetChanged(payload))) => {
+                    match self.session.apply_target_changed(&payload) {
+                        Ok(_) => moved = true,
+                        Err(error) => {
+                            log::debug!("ignored unusable outer TARGET_CHANGED: {error}")
+                        }
+                    }
+                }
+                Ok(Some(SessionEvent::TrackLost { payload, .. })) => {
+                    // Matched on the complete context/surface/track identity: another context on
+                    // this session may legitimately reuse the numeric track ID.
+                    let field = |key: u64| payload_u64(&payload, key);
+                    if let Some(key) = self.tracks.iter().find_map(|(key, track)| {
+                        let configuration = track.track.configuration().ok()?;
+                        (field(0) == Some(configuration.context_id)
+                            && field(1) == Some(configuration.surface_id)
+                            && field(2) == Some(configuration.track_id))
+                        .then_some(*key)
+                    }) {
+                        self.losses.insert(key);
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) => {
+                    log::debug!("outer control connection is unreadable: {error}");
+                    break;
+                }
+            }
+        }
+        moved
+    }
+
+    /// Run one scene commit, following the outer presentation target while it moves.
+    ///
+    /// A commit names the target generation it was planned against, so an outer resize that lands
+    /// between planning and committing is answered with `STALE_TARGET_GENERATION`. The presenter
+    /// announces every change that causes one, so apply what has arrived and commit again against
+    /// the target the outer terminal has now. A target that is still moving when the window closes
+    /// is reported as `WouldBlock`, which asks for a fresh projection in this same outer session
+    /// rather than tearing down healthy sources.
+    fn commit_node_following_target(&mut self, commit: NodeCommit<'_>) -> io::Result<()> {
+        let deadline = Instant::now() + TARGET_FOLLOW_TIMEOUT;
+        loop {
+            let metadata = RequestMetadata::default();
+            let attempt = match commit {
+                NodeCommit::Create(node) => self.session.create_node(node, &metadata).map(|_| ()),
+                NodeCommit::Update(node) => self.session.update_node(node, &metadata).map(|_| ()),
+                NodeCommit::Delete {
+                    context_id,
+                    node_id,
+                } => self
+                    .session
+                    .delete_node(context_id, node_id, &metadata)
+                    .map(|_| ()),
+            };
+            match attempt {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if presenter_code(&error) == Some(registry::error::STALE_TARGET_GENERATION) =>
+                {
+                    if !self.poll_outer_session() {
+                        if Instant::now() >= deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                format!("outer target is still moving: {error}"),
+                            ));
+                        }
+                        thread::sleep(TARGET_FOLLOW_POLL);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn reconcile_nodes(&mut self, nodes: &[BridgeNode]) -> io::Result<()> {
         let desired = nodes
             .iter()
@@ -625,11 +725,10 @@ impl OuterBridge {
             let Some((node_id, old)) = self.nodes.remove(&key) else {
                 continue;
             };
-            self.session.delete_node(
-                old.owning_context_id,
+            self.commit_node_following_target(NodeCommit::Delete {
+                context_id: old.owning_context_id,
                 node_id,
-                &RequestMetadata::default(),
-            )?;
+            })?;
         }
         for (stable, node) in desired {
             let surface = self
@@ -646,13 +745,11 @@ impl OuterBridge {
             match self.nodes.get(&stable) {
                 Some((_, old)) if old == &replacement => {}
                 Some(_) => {
-                    self.session
-                        .update_node(&replacement, &RequestMetadata::default())?;
+                    self.commit_node_following_target(NodeCommit::Update(&replacement))?;
                     self.nodes.insert(stable, (node_id, replacement));
                 }
                 None => {
-                    self.session
-                        .create_node(&replacement, &RequestMetadata::default())?;
+                    self.commit_node_following_target(NodeCommit::Create(&replacement))?;
                     self.nodes.insert(stable, (node_id, replacement));
                 }
             }
@@ -1379,6 +1476,14 @@ fn parsed_delta_operation<'a>(
             source_y: *source_y,
         },
     }
+}
+
+/// The registered error code behind a presenter rejection, if the failure came from the presenter.
+fn presenter_code(error: &io::Error) -> Option<u64> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<vivid_sdk::PresenterError>())
+        .map(|error| error.code)
 }
 
 fn payload_u64(payload: &[(u64, Value)], key: u64) -> Option<u64> {

@@ -457,15 +457,14 @@ impl VirtualVivid {
             .filter(|session| session.pane == pane && !session.closed)
         {
             session.target_generation = TargetGeneration::new(generation);
-            let body = Envelope::new(
-                0,
-                vec![
-                    (0, Value::Unsigned(generation)),
-                    (1, Value::Map(target_descriptor(metrics))),
-                    (2, Value::Unsigned(1)),
-                ],
-            )
-            .encode();
+            // The descriptor is inline: keys 0..=8 are the target itself, 9 its generation, and
+            // 10 the reason mask. A nested producer validates that shape exactly, so a wrapped
+            // descriptor leaves it stuck on the generation it read at WELCOME and every scene
+            // commit it makes afterwards is rejected as stale.
+            let mut payload = target_descriptor(metrics);
+            payload.push((9, Value::Unsigned(generation)));
+            payload.push((10, Value::Unsigned(0x1f)));
+            let body = Envelope::new(0, payload).encode();
             if let Ok(body) = body {
                 let _ = session
                     .writer
@@ -1820,16 +1819,25 @@ fn dispatch_control(
                 .sessions
                 .get(&session_id)
                 .ok_or_else(|| ControlError::missing("session does not exist"))?;
-            if envelope.expected_target_generation != Some(session.target_generation.get())
-                || envelope
-                    .preconditions
-                    .iter()
-                    .find_map(|(key, value)| (*key == 0).then(|| value.as_u64()).flatten())
-                    != Some(session.scene_revision.get())
-            {
+            // The two preconditions carry different registered codes and different producer
+            // recoveries: a moved target is re-planned against the announcement that caused it,
+            // while a failed revision precondition needs the scene re-read. Reporting both as one
+            // makes a producer retry a commit that can never succeed.
+            if envelope.expected_target_generation != Some(session.target_generation.get()) {
                 return Err(ControlError {
                     code: messages::ERROR_STALE_TARGET_GENERATION,
-                    message: "scene commit target or revision is stale",
+                    message: "scene commit names a stale target generation",
+                });
+            }
+            if envelope
+                .preconditions
+                .iter()
+                .find_map(|(key, value)| (*key == 0).then(|| value.as_u64()).flatten())
+                != Some(session.scene_revision.get())
+            {
+                return Err(ControlError {
+                    code: messages::ERROR_PRECONDITION_FAILED,
+                    message: "scene commit names a stale scene revision",
                 });
             }
             let transaction_key = state
