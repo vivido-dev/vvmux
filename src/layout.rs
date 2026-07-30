@@ -520,51 +520,44 @@ impl TiledNode {
                 second,
                 first_weight,
                 second_weight,
-            } => {
-                let total_weight = first_weight.saturating_add(*second_weight).max(1);
-                match axis {
-                    Axis::Vertical => {
-                        let first_width = ((u32::from(area.width) * *first_weight) / total_weight)
-                            .clamp(1, u32::from(area.width.saturating_sub(1)))
-                            as u16;
-                        first.place(
-                            Rect {
-                                width: first_width,
-                                ..area
-                            },
-                            output,
-                        );
-                        second.place(
-                            Rect {
-                                x: area.x.saturating_add(first_width),
-                                width: area.width.saturating_sub(first_width),
-                                ..area
-                            },
-                            output,
-                        );
-                    }
-                    Axis::Horizontal => {
-                        let first_height = ((u32::from(area.height) * *first_weight) / total_weight)
-                            .clamp(1, u32::from(area.height.saturating_sub(1)))
-                            as u16;
-                        first.place(
-                            Rect {
-                                height: first_height,
-                                ..area
-                            },
-                            output,
-                        );
-                        second.place(
-                            Rect {
-                                y: area.y.saturating_add(first_height),
-                                height: area.height.saturating_sub(first_height),
-                                ..area
-                            },
-                            output,
-                        );
-                    }
+            } => match axis {
+                Axis::Vertical => {
+                    let first_width = divide_span(area.width, *first_weight, *second_weight);
+                    first.place(
+                        Rect {
+                            width: first_width,
+                            ..area
+                        },
+                        output,
+                    );
+                    second.place(
+                        Rect {
+                            x: area.x.saturating_add(first_width),
+                            width: area.width.saturating_sub(first_width),
+                            ..area
+                        },
+                        output,
+                    );
                 }
-            }
+                Axis::Horizontal => {
+                    let first_height = divide_span(area.height, *first_weight, *second_weight);
+                    first.place(
+                        Rect {
+                            height: first_height,
+                            ..area
+                        },
+                        output,
+                    );
+                    second.place(
+                        Rect {
+                            y: area.y.saturating_add(first_height),
+                            height: area.height.saturating_sub(first_height),
+                            ..area
+                        },
+                        output,
+                    );
+                }
+            },
         }
     }
 
@@ -647,38 +640,46 @@ impl TiledNode {
     }
 }
 
-fn split_areas(area: Rect, axis: Axis, first_weight: u32, second_weight: u32) -> (Rect, Rect, u16) {
+/// Weighted division of one split axis that stays defined for every area a window can shrink to.
+///
+/// Both children normally keep at least one cell. An area with a single cell cannot honor that,
+/// so the first child takes it and the second is placed empty: the pane survives the squeeze and
+/// reappears when the window grows, which a division that refused to divide could not do.
+fn divide_span(total: u16, first_weight: u32, second_weight: u32) -> u16 {
+    if total <= 1 {
+        return total;
+    }
     let total_weight = first_weight.saturating_add(second_weight).max(1);
+    ((u32::from(total) * first_weight) / total_weight).clamp(1, u32::from(total - 1)) as u16
+}
+
+fn split_areas(area: Rect, axis: Axis, first_weight: u32, second_weight: u32) -> (Rect, Rect, u16) {
     match axis {
         Axis::Vertical => {
-            let first_size = ((u32::from(area.width) * first_weight) / total_weight)
-                .clamp(1, u32::from(area.width.saturating_sub(1)))
-                as u16;
+            let first_size = divide_span(area.width, first_weight, second_weight);
             (
                 Rect {
                     width: first_size,
                     ..area
                 },
                 Rect {
-                    x: area.x + first_size,
-                    width: area.width - first_size,
+                    x: area.x.saturating_add(first_size),
+                    width: area.width.saturating_sub(first_size),
                     ..area
                 },
                 area.width,
             )
         }
         Axis::Horizontal => {
-            let first_size = ((u32::from(area.height) * first_weight) / total_weight)
-                .clamp(1, u32::from(area.height.saturating_sub(1)))
-                as u16;
+            let first_size = divide_span(area.height, first_weight, second_weight);
             (
                 Rect {
                     height: first_size,
                     ..area
                 },
                 Rect {
-                    y: area.y + first_size,
-                    height: area.height - first_size,
+                    y: area.y.saturating_add(first_size),
+                    height: area.height.saturating_sub(first_size),
                     ..area
                 },
                 area.height,
@@ -800,6 +801,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A window can shrink below any layout's minimum, and the panes have to still be there when
+    /// it grows back. Placement therefore stays defined all the way down to an empty area: a
+    /// split with a single cell to give hands it to the first child and places the second empty.
+    #[test]
+    fn every_pane_keeps_a_placement_in_an_area_too_small_to_divide() {
+        let mut tree = TiledNode::leaf(1);
+        tree.split(1, 2, Axis::Vertical, area()).unwrap();
+        tree.split(2, 3, Axis::Horizontal, area()).unwrap();
+        for (width, height) in [(10, 4), (4, 2), (3, 1), (1, 1), (1, 0), (0, 0)] {
+            let host = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let geometry = tree.geometry(host);
+            assert_eq!(
+                geometry.keys().copied().collect::<Vec<_>>(),
+                vec![1, 2, 3],
+                "a {width}x{height} area dropped a pane from the layout"
+            );
+            for (pane, rect) in geometry {
+                assert!(
+                    rect.x.saturating_add(rect.width) <= width
+                        && rect.y.saturating_add(rect.height) <= height,
+                    "pane {pane} was placed at {rect:?}, outside a {width}x{height} area"
+                );
+            }
+        }
     }
 
     #[test]
