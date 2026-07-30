@@ -625,7 +625,11 @@ impl OuterBridge {
             let Some((node_id, old)) = self.nodes.remove(&key) else {
                 continue;
             };
-            self.session.destroy_node(old.owning_context_id, node_id)?;
+            self.session.delete_node(
+                old.owning_context_id,
+                node_id,
+                &RequestMetadata::default(),
+            )?;
         }
         for (stable, node) in desired {
             let surface = self
@@ -642,7 +646,8 @@ impl OuterBridge {
             match self.nodes.get(&stable) {
                 Some((_, old)) if old == &replacement => {}
                 Some(_) => {
-                    self.session.update_node(&replacement)?;
+                    self.session
+                        .update_node(&replacement, &RequestMetadata::default())?;
                     self.nodes.insert(stable, (node_id, replacement));
                 }
                 None => {
