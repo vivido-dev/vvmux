@@ -3258,11 +3258,16 @@ impl SessionActor {
             for projection in visible_projections(tab, area) {
                 if let Some(pane) = self.panes.get_mut(&projection.pane_id) {
                     let content = projection.content;
-                    if pane.terminal.rows() != content.height as usize
-                        || pane.terminal.cols() != content.width as usize
+                    // A pane squeezed to nothing still has a live program behind it, and neither
+                    // a terminal grid nor a PTY has a zero dimension. Such a pane keeps a single
+                    // cell so the window can shrink past its frame and grow back with the pane
+                    // and its program intact.
+                    let columns = content.width.max(1);
+                    let rows = content.height.max(1);
+                    if pane.terminal.rows() != rows as usize
+                        || pane.terminal.cols() != columns as usize
                     {
-                        pane.terminal
-                            .resize(content.height as usize, content.width as usize);
+                        pane.terminal.resize(rows as usize, columns as usize);
                         pane.screen_sequence = pane.screen_sequence.wrapping_add(1);
                         pane.last_screen_change = Instant::now();
                         pane.screen_changes.push_back(ScreenChange {
@@ -3273,7 +3278,7 @@ impl SessionActor {
                             pane.screen_changes.pop_front();
                         }
                         resized_panes = resized_panes.wrapping_add(1);
-                        if pane.control.resize(content.width, content.height).is_err() {
+                        if pane.control.resize(columns, rows).is_err() {
                             resize_failures.push(projection.pane_id);
                         }
                     }
@@ -3299,8 +3304,10 @@ impl SessionActor {
         resize_failures.sort_unstable();
         resize_failures.dedup();
         for pane in resize_failures {
+            // A resize the PTY refused leaves the pane at its previous size; it is not evidence
+            // that the program behind it died. Only its exit closes a pane, so a window the user
+            // can drag back open never costs them a shell.
             self.status(&format!("pane {pane} PTY resize failed"));
-            self.close_pane(pane);
         }
     }
 
