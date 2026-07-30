@@ -13,8 +13,8 @@ use vivid_protocol::track::{
 };
 use vivid_sdk::{
     ChannelEvent, CoordinateModel, Fit, ProducerAuthentication, ProducerConfig, RequestMetadata,
-    SceneNode, SlotBinding, Surface, SurfaceDefinition, SurfaceDescriptor, SurfaceRole, Track,
-    TrackChannel,
+    SceneNode, SessionEvent, SlotBinding, Surface, SurfaceDefinition, SurfaceDescriptor,
+    SurfaceRole, Track, TrackChannel,
 };
 use zeroize::Zeroizing;
 
@@ -503,6 +503,47 @@ impl OuterBridge {
         let mut values = self.losses.drain().collect::<Vec<_>>();
         values.sort_by_key(|key| (key.producer, key.context, key.surface, key.track));
         values
+    }
+
+    /// Apply actionable outer-session events before issuing another scene transaction.
+    ///
+    /// The SDK intentionally exposes `TARGET_CHANGED` as an event plus an explicit cache update.
+    /// If the bridge leaves it queued, every later node commit names the stale target generation
+    /// and the relayed grid remains at its old height.
+    pub fn service_session_events(&mut self) -> io::Result<Option<DisplayMetrics>> {
+        let mut changed_display = None;
+        while let Some(event) = self.session.take_event()? {
+            match event {
+                SessionEvent::TargetChanged(payload) => {
+                    self.session.apply_target_changed(&payload)?;
+                    self.display = display_from_target(&self.session, self.display)?;
+                    changed_display = Some(self.display);
+                }
+                SessionEvent::TrackLost { object_id, payload } => {
+                    let context_id = payload_u64(&payload, 0);
+                    let surface_id = payload_u64(&payload, 1);
+                    let track_id = payload_u64(&payload, 2);
+                    if let Some(key) = self.tracks.iter().find_map(|(key, outer)| {
+                        let configuration = outer.track.configuration().ok()?;
+                        (object_id == configuration.track_id
+                            && context_id == Some(configuration.context_id)
+                            && surface_id == Some(configuration.surface_id)
+                            && track_id == Some(configuration.track_id))
+                        .then_some(*key)
+                    }) {
+                        self.losses.insert(key);
+                    }
+                }
+                SessionEvent::ConnectionClosed { diagnostic } => {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, diagnostic));
+                }
+                SessionEvent::AnchorReady { .. }
+                | SessionEvent::AnchorGone { .. }
+                | SessionEvent::ContextChanged { .. }
+                | SessionEvent::Other { .. } => {}
+            }
+        }
+        Ok(changed_display)
     }
 
     pub fn take_playback_states(&mut self) -> Vec<(BridgeSourceKey, PlaybackSnapshot)> {

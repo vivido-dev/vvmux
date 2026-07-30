@@ -457,15 +457,7 @@ impl VirtualVivid {
             .filter(|session| session.pane == pane && !session.closed)
         {
             session.target_generation = TargetGeneration::new(generation);
-            let body = Envelope::new(
-                0,
-                vec![
-                    (0, Value::Unsigned(generation)),
-                    (1, Value::Map(target_descriptor(metrics))),
-                    (2, Value::Unsigned(1)),
-                ],
-            )
-            .encode();
+            let body = Envelope::new(0, target_changed_payload(metrics, 0x07)).encode();
             if let Ok(body) = body {
                 let _ = session
                     .writer
@@ -3300,6 +3292,13 @@ fn target_descriptor(metrics: Metrics) -> Vec<(u64, Value)> {
     ]
 }
 
+fn target_changed_payload(metrics: Metrics, reason_mask: u64) -> Vec<(u64, Value)> {
+    let mut payload = target_descriptor(metrics);
+    payload.push((9, Value::Unsigned(metrics.generation)));
+    payload.push((10, Value::Unsigned(reason_mask)));
+    payload
+}
+
 fn protocol_error(
     request_id: u64,
     code: u64,
@@ -3624,6 +3623,44 @@ mod tests {
         assert_eq!(snapshot.sources[0].key.surface, 9);
         assert_eq!(snapshot.sources[0].key.track, 11);
         second.close().unwrap();
+    }
+
+    #[test]
+    fn pane_resize_emits_an_sdk_compatible_flat_target_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let presenter =
+            VirtualVivid::start(directory.path().join("vivid.sock"), MediaConfig::default())
+                .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+
+        presenter.update_metrics(7, 100, 40, (9, 18));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let payload = loop {
+            if let Some(vivid_sdk::SessionEvent::TargetChanged(payload)) =
+                client.take_event().unwrap()
+            {
+                break payload;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "virtual presenter did not deliver TARGET_CHANGED"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(
+            payload.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            (0..=10).collect::<Vec<_>>(),
+            "the target descriptor must be flat in the event payload"
+        );
+        assert_eq!(
+            client.apply_target_changed(&payload).unwrap(),
+            TargetGeneration::new(2)
+        );
+        assert_eq!(client.info().target_descriptor[3].1.as_u64(), Some(40));
+        client.close().unwrap();
     }
 
     #[test]

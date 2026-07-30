@@ -110,6 +110,7 @@ pub fn attach(
                                 bridge,
                                 read_writer.clone(),
                                 bridge_queue_records,
+                                bridge_cell_size.clone(),
                             ) {
                                 Ok(worker) => Some(worker),
                                 Err(error) => {
@@ -538,11 +539,13 @@ impl BridgeWorker {
         bridge: crate::bridge::OuterBridge,
         client_writer: SharedWriter,
         queue_records: usize,
+        presenter_cell_size: Arc<AtomicU32>,
     ) -> io::Result<Self> {
-        Self::spawn_with_sender(
+        Self::spawn_inner(
             bridge,
             BridgeClientSender::new(move |message| send_client(&client_writer, &message)),
             queue_records,
+            Some(presenter_cell_size),
         )
     }
 
@@ -550,6 +553,15 @@ impl BridgeWorker {
         bridge: crate::bridge::OuterBridge,
         client_writer: BridgeClientSender,
         queue_records: usize,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(bridge, client_writer, queue_records, None)
+    }
+
+    fn spawn_inner(
+        bridge: crate::bridge::OuterBridge,
+        client_writer: BridgeClientSender,
+        queue_records: usize,
+        presenter_cell_size: Option<Arc<AtomicU32>>,
     ) -> io::Result<Self> {
         let bridge_instance_id = new_bridge_instance_id()?;
         let media = Arc::new(Mutex::new(TrackMediaQueues::default()));
@@ -576,6 +588,7 @@ impl BridgeWorker {
                     worker_drops,
                     worker_stopped,
                     bridge_instance_id,
+                    presenter_cell_size,
                 )
             })?;
         Ok(Self {
@@ -688,6 +701,7 @@ fn run_bridge_worker(
     queue_drops: Arc<AtomicU64>,
     stopped: Arc<AtomicBool>,
     mut bridge_instance_id: u64,
+    presenter_cell_size: Option<Arc<AtomicU32>>,
 ) {
     let trace_started = Instant::now();
     let mut diagnostic_generation = bridge.diagnostic_instance_generation();
@@ -717,6 +731,22 @@ fn run_bridge_worker(
     loop {
         if stopped.load(Ordering::Acquire) {
             break;
+        }
+        match bridge.service_session_events() {
+            Ok(Some(display)) => {
+                if let Some(cell_size) = &presenter_cell_size {
+                    cell_size.store(pack_cell_size(display), Ordering::Release);
+                }
+                let _ = client_writer.send(ClientMessage::Resize(display));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                force_sources = true;
+                force_replacement = true;
+                let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+                    reset_outer_session: true,
+                });
+            }
         }
         if bridge
             .retry_pending_activation()
@@ -2082,6 +2112,47 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn bridge_applies_outer_target_changes_before_the_next_scene_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("outer-resize.sock");
+        let presenter = VirtualVivid::start(socket.clone(), MediaConfig::default()).unwrap();
+        presenter.update_metrics(7, 80, 22, (10, 20));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut bridge = crate::bridge::OuterBridge::connect(
+            format!("unix:{}", socket.display()),
+            Zeroizing::new(secret),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+
+        presenter.update_metrics(7, 120, 40, (9, 18));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let resized = loop {
+            match bridge.service_session_events().unwrap() {
+                Some(display) => break display,
+                None => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "outer TARGET_CHANGED was not applied"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        assert_eq!(
+            resized,
+            DisplayMetrics {
+                columns: 120,
+                rows: 40,
+                cell_width: 9,
+                cell_height: 18,
+            }
+        );
+        assert_eq!(bridge.display_metrics(), resized);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn bridge_delivers_consecutive_raster_frames_to_one_outer_source() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("outer-raster.sock");
@@ -2109,7 +2180,10 @@ mod tests {
         let (mut server_reader, _server_writer) =
             establish(test_transport(server), ChannelKind::Control).unwrap();
         let (_client_reader, client_writer) = client_establish.join().unwrap().unwrap();
-        let mut worker = BridgeWorker::spawn(bridge, client_writer, 8).unwrap();
+        let presenter_cell_size =
+            Arc::new(AtomicU32::new(pack_cell_size(bridge.display_metrics())));
+        let mut worker =
+            BridgeWorker::spawn(bridge, client_writer, 8, presenter_cell_size).unwrap();
         let (ack_sender, ack_receiver) = mpsc::channel();
         thread::spawn(move || {
             while let Ok(message) = server_reader.recv::<ClientMessage>() {
@@ -2249,7 +2323,10 @@ mod tests {
         let (mut server_reader, _server_writer) =
             establish(test_transport(server), ChannelKind::Control).unwrap();
         let (_client_reader, client_writer) = client_establish.join().unwrap().unwrap();
-        let mut worker = BridgeWorker::spawn(bridge, client_writer, 8).unwrap();
+        let presenter_cell_size =
+            Arc::new(AtomicU32::new(pack_cell_size(bridge.display_metrics())));
+        let mut worker =
+            BridgeWorker::spawn(bridge, client_writer, 8, presenter_cell_size).unwrap();
 
         let key = BridgeSourceKey {
             producer: 3,
@@ -2461,7 +2538,10 @@ mod tests {
             let (mut server_reader, _server_writer) =
                 establish(test_transport(server), ChannelKind::Control).unwrap();
             let (_client_reader, client_writer) = client_establish.join().unwrap().unwrap();
-            let mut worker = BridgeWorker::spawn(bridge, client_writer, 8).unwrap();
+            let presenter_cell_size =
+                Arc::new(AtomicU32::new(pack_cell_size(bridge.display_metrics())));
+            let mut worker =
+                BridgeWorker::spawn(bridge, client_writer, 8, presenter_cell_size).unwrap();
 
             let (message_sender, message_receiver) = mpsc::channel();
             thread::spawn(move || {
