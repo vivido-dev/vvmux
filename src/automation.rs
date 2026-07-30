@@ -59,7 +59,11 @@ pub enum MsgCommand {
         #[arg(long)]
         producer_id: Option<u64>,
         #[arg(long, requires = "producer_id")]
-        source_id: Option<u64>,
+        context_id: Option<u64>,
+        #[arg(long, requires = "context_id")]
+        surface_id: Option<u64>,
+        #[arg(long, requires = "surface_id")]
+        track_id: Option<u64>,
         #[arg(long, value_enum)]
         category: Option<MediaTraceCategory>,
         #[arg(long)]
@@ -346,7 +350,9 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             timeout,
             follow,
             producer_id,
-            source_id,
+            context_id,
+            surface_id,
+            track_id,
             category,
             recovery_only,
             pane_id,
@@ -357,7 +363,9 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 timeout_ms: if follow { millis(timeout) } else { 0 },
                 filter: MediaTraceFilter {
                     producer_id,
-                    source_id,
+                    context_id,
+                    surface_id,
+                    track_id,
                     category,
                     recovery_only,
                 },
@@ -649,7 +657,9 @@ mod tests {
             timeout: Duration::from_secs(2),
             follow,
             producer_id: Some(3),
-            source_id: Some(7),
+            context_id: Some(5),
+            surface_id: Some(7),
+            track_id: None,
             category: Some(MediaTraceCategory::Recovery),
             recovery_only: true,
             pane_id: Some(2),

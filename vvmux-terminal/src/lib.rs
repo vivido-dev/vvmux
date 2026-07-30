@@ -906,14 +906,14 @@ struct MarkerEnvelope {
 }
 
 const APC_ENVELOPE: MarkerEnvelope = MarkerEnvelope {
-    prefix: b"\x1b_VIVID;2;A;",
+    prefix: b"\x1b_VIVID;3;A;",
     terminator: b"\x1b\\",
     payload_skip: 2,
 };
 
 #[cfg(windows)]
 const CONPTY_ENVELOPE: MarkerEnvelope = MarkerEnvelope {
-    prefix: b"VIVID;2;A;",
+    prefix: b"VIVID;3;A;",
     terminator: b";VIVID-END",
     payload_skip: 0,
 };
@@ -1013,11 +1013,16 @@ fn valid_marker_shape(marker: &str) -> bool {
     }
     let mut fields = marker.split(';');
     let valid = fields.next() == Some("VIVID")
-        && fields.next() == Some("2")
+        && fields.next() == Some("3")
         && fields.next() == Some("A")
         && fields
             .next()
             .is_some_and(|tag| tag.len() == 22 && tag.bytes().all(is_base64url))
+        && fields.next().is_some_and(|id| {
+            id.len() == 16
+                && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && id.bytes().any(|byte| byte != b'0')
+        })
         && fields.next().is_some_and(|id| {
             id.len() == 16
                 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -1080,7 +1085,7 @@ mod tests {
     #[test]
     fn marker_is_consumed_across_boundaries() {
         let marker =
-            b"\x1b_VIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\";
+            b"\x1b_VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\";
         for split in 0..=marker.len() {
             let mut terminal = Terminal::new(2, 20, 0);
             let mut events = terminal.feed(&marker[..split]);
@@ -1088,7 +1093,7 @@ mod tests {
             assert!(
                 events.contains(&TerminalEvent::VividMarker {
                     marker:
-                        "VIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA"
+                        "VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA"
                             .into(),
                     row: 0,
                     column: 0,
@@ -1102,7 +1107,7 @@ mod tests {
     #[test]
     fn conpty_marker_is_consumed_across_boundaries() {
         let marker =
-            b"VIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA;VIVID-END";
+            b"VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA;VIVID-END";
         for split in 0..=marker.len() {
             let mut terminal = Terminal::new(2, 20, 0);
             let mut events = terminal.feed(&marker[..split]);
@@ -1120,7 +1125,7 @@ mod tests {
 
     #[test]
     fn malformed_and_oversized_markers_are_byte_exact_text() {
-        let malformed = b"\x1b_VIVID;2;A;short;0000000000000007;bad\x1b\\";
+        let malformed = b"\x1b_VIVID;3;A;short;0000000000000003;0000000000000007;bad\x1b\\";
         let mut scanner = VividMarkerScanner::default();
         let bytes = scanner
             .push(malformed)
@@ -1149,7 +1154,7 @@ mod tests {
     #[test]
     fn adjacent_markers_are_zero_width_and_surrounding_utf8_is_byte_exact() {
         let marker =
-            b"\x1b_VIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\";
+            b"\x1b_VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\";
         let mut input = "before-界".as_bytes().to_vec();
         input.extend_from_slice(marker);
         input.extend_from_slice(marker);
@@ -1171,7 +1176,7 @@ mod tests {
 
     #[test]
     fn partial_marker_candidate_is_preserved_when_disproved() {
-        let candidate = b"prefix\x1b_VIVID;2;A;partial!suffix";
+        let candidate = b"prefix\x1b_VIVID;3;A;partial!suffix";
         let mut scanner = VividMarkerScanner::default();
         let mut chunks = Vec::new();
         for byte in candidate {
@@ -1191,7 +1196,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn malformed_conpty_candidate_is_byte_exact_text() {
-        let malformed = b"VIVID;2;A;short;0000000000000007;bad;VIVID-END";
+        let malformed = b"VIVID;3;A;short;0000000000000003;0000000000000007;bad;VIVID-END";
         let mut scanner = VividMarkerScanner::default();
         let bytes = scanner
             .push(malformed)
@@ -1209,7 +1214,7 @@ mod tests {
         let mut terminal = Terminal::new(4, 40, 10);
         let mut input = b"\x1b[2;3H".to_vec();
         input.extend_from_slice(
-            b"\x1b_VIVID;2;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\",
+            b"\x1b_VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\",
         );
         // ConPTY batches follow-up repositioning with the marker; the event must keep the
         // marker cell, not the final cursor position.

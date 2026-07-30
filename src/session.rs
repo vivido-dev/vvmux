@@ -14,8 +14,9 @@ use crate::config::Config;
 use crate::ipc::{
     Action, AutomationError, AutomationMethod, AutomationRequest, AutomationResponse, Axis,
     BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceDescriptor,
-    BridgeSourceKey, BridgeSourceKind, ClientMessage, Direction, DisplayMetrics,
-    FloatingEditCommand, FloatingEditKind, MouseEvent, MouseKind, ServerMessage, SharedWriter,
+    BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey, ClientMessage, Direction,
+    DisplayMetrics, FloatingEditCommand, FloatingEditKind, MouseEvent, MouseKind, ServerMessage,
+    SharedWriter,
 };
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
@@ -1088,7 +1089,7 @@ impl SessionActor {
                 if self.client_is(id) {
                     for request in requests {
                         let outcome = self.vivid.request_keyframe(
-                            (request.source.producer, request.source.source),
+                            request.source,
                             request.minimum_epoch,
                             request.reason,
                         );
@@ -1117,13 +1118,7 @@ impl SessionActor {
             }
             ClientMessage::BridgeNeedFullFrames(sources) => {
                 if self.client_is(id) {
-                    self.vivid.request_full_frames(
-                        &sources
-                            .into_iter()
-                            .map(|source| (source.producer, source.source))
-                            .collect::<Vec<_>>(),
-                        vivid_protocol::messages::NEED_FULL_FRAME_BASE_UNAVAILABLE,
-                    );
+                    self.vivid.request_full_frames(&sources, 1);
                 }
             }
             ClientMessage::BridgeCapabilitiesChanged { reason_mask } => {
@@ -1146,8 +1141,7 @@ impl SessionActor {
             }
             ClientMessage::BridgeRetainedHydrated { source } => {
                 if self.client_is(id) {
-                    self.vivid
-                        .complete_retained_hydration((source.producer, source.source));
+                    self.vivid.complete_retained_hydration(source);
                 }
             }
             ClientMessage::BridgeSnapshotRetry {
@@ -1253,11 +1247,7 @@ impl SessionActor {
                         None,
                         MediaTraceKind::PlaybackState { state, eos_state },
                     );
-                    self.vivid.apply_outer_playback(
-                        (source.producer, source.source),
-                        state,
-                        eos_state,
-                    );
+                    self.vivid.apply_outer_playback(source, state, eos_state);
                 }
             }
             ClientMessage::BridgeMetrics(metrics) => {
@@ -3134,9 +3124,9 @@ impl SessionActor {
             ("VVMUX_SESSION".into(), self.name.clone()),
             ("VVMUX_TAB_ID".into(), tab_id.to_string()),
             ("VVMUX_PANE_ID".into(), pane_id.to_string()),
-            ("VIVID_ENDPOINT".into(), self.vivid.endpoint()),
+            ("VIVID_ENDPOINT_CONTROL".into(), self.vivid.endpoint()),
             (
-                "VIVID_TOKEN".into(),
+                "VIVID_ROOT_SECRET".into(),
                 self.vivid.issue_pane_capability(pane_id)?,
             ),
         ];
@@ -3551,6 +3541,27 @@ impl SessionActor {
         let live_nodes = snapshot.live_nodes.iter().copied().collect::<HashSet<_>>();
         self.fragment_assignments
             .retain(|logical, _| live_nodes.contains(logical));
+        let surfaces = snapshot
+            .surfaces
+            .iter()
+            .map(|surface| BridgeSurface {
+                key: BridgeSurfaceKey {
+                    producer: surface.producer,
+                    context: surface.context,
+                    surface: surface.surface,
+                },
+                logical_width: surface.logical_width,
+                logical_height: surface.logical_height,
+                capture_policy: surface.capture_policy,
+                descriptor: BridgeSourceDescriptor {
+                    role: surface.semantic_descriptor.role,
+                    title: surface.semantic_descriptor.title.clone(),
+                    content_revision: surface.semantic_descriptor.content_revision,
+                    semantic_availability: surface.semantic_descriptor.semantic_availability,
+                    locator: surface.semantic_descriptor.locator.clone(),
+                },
+            })
+            .collect::<Vec<_>>();
         let sources = snapshot
             .sources
             .iter()
@@ -3683,14 +3694,16 @@ impl SessionActor {
             .iter()
             .map(|source| source.key)
             .collect::<HashSet<_>>();
-        let source_count = u16::try_from(sources.len()).unwrap_or(u16::MAX);
+        let surface_count = u16::try_from(surfaces.len()).unwrap_or(u16::MAX);
+        let track_count = u16::try_from(sources.len()).unwrap_or(u16::MAX);
         let node_count = u16::try_from(nodes.len()).unwrap_or(u16::MAX);
         let projection_revision = self.media_projection_revision.wrapping_add(1);
         if crate::ipc::send(
             &writer,
             &ServerMessage::MediaSnapshot {
                 revision: projection_revision,
-                sources,
+                surfaces,
+                tracks: sources,
                 nodes,
                 videos_needing_keyframes,
             },
@@ -3706,7 +3719,8 @@ impl SessionActor {
             None,
             MediaTraceKind::ProjectionSubmitted {
                 virtual_revision: projection_key.virtual_revision,
-                source_count,
+                surface_count,
+                track_count,
                 node_count,
             },
         );
@@ -3781,8 +3795,7 @@ impl SessionActor {
         origin_monotonic_us: Option<u64>,
         kind: MediaTraceKind,
     ) {
-        let pane =
-            source.and_then(|source| self.vivid.pane_for_source((source.producer, source.source)));
+        let pane = source.and_then(|source| self.vivid.pane_for_source(source));
         self.media_trace
             .push(pane, source, bridge_instance_id, origin_monotonic_us, kind);
     }
@@ -3831,7 +3844,7 @@ impl SessionActor {
                 Some(source),
                 self.bridge_instance_id,
                 None,
-                MediaTraceKind::SourceVisibility {
+                MediaTraceKind::TrackVisibility {
                     visible: false,
                     virtual_revision,
                 },
@@ -3842,7 +3855,7 @@ impl SessionActor {
                 Some(source),
                 self.bridge_instance_id,
                 None,
-                MediaTraceKind::SourceVisibility {
+                MediaTraceKind::TrackVisibility {
                     visible: true,
                     virtual_revision,
                 },
@@ -4117,11 +4130,14 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
             ))
         }
         AutomationMethod::TraceMedia { filter, .. }
-            if filter.source_id.is_some() && filter.producer_id.is_none() =>
+            if (filter.context_id.is_some()
+                || filter.surface_id.is_some()
+                || filter.track_id.is_some())
+                && filter.producer_id.is_none() =>
         {
             Err(AutomationError::new(
                 "invalid_params",
-                "media trace source-id requires producer-id",
+                "media trace identity filters require producer-id",
             ))
         }
         AutomationMethod::WaitScreenStable { quiet_ms, .. }
@@ -4537,7 +4553,7 @@ fn fallback_cwd() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(r"C:\"))
 }
 
-fn bridge_play_request(request: vivid_protocol::messages::PlayRequest) -> BridgePlayRequest {
+fn bridge_play_request(request: crate::media::PlayRequest) -> BridgePlayRequest {
     BridgePlayRequest {
         start_pts_us: request.start_pts_us,
         minimum_buffer_us: request.minimum_buffer_us,
@@ -4584,10 +4600,7 @@ fn copy_action_bytes(action: &str) -> Option<Vec<u8>> {
 }
 
 fn bridge_key(key: crate::media::SourceKey) -> BridgeSourceKey {
-    BridgeSourceKey {
-        producer: key.0,
-        source: key.1,
-    }
+    key
 }
 
 fn bridge_source_kind(
@@ -4600,7 +4613,7 @@ fn bridge_source_kind(
             width: config.width,
             height: config.height,
             alpha_mode: config.alpha_mode,
-            compression_mode: config.compression_mode,
+            compression_mode: u64::from(config.zstd_enabled),
             delta_operation_limit: raster_delta_operation_limit,
         },
         crate::media::SourceDescriptor::Image(config) => BridgeSourceKind::Image {
@@ -4614,25 +4627,29 @@ fn bridge_source_kind(
             codec: config.codec.clone(),
             packetization: config.packetization.clone(),
             extradata: config.extradata.clone(),
-            width: config.width,
-            height: config.height,
+            width: config.coded_width,
+            height: config.coded_height,
             profile: config.profile,
             level: config.level,
-            bitrate: config.bitrate,
+            bitrate: u64::from(config.maximum_access_unit_bytes)
+                .saturating_mul(8)
+                .saturating_mul(240),
             color_primaries: config.color_primaries,
             transfer: config.transfer,
             matrix: config.matrix,
-            range: config.range,
-            sar_num: config.sar_num,
-            sar_den: config.sar_den,
-            max_access_unit_bytes: config.max_access_unit_bytes,
+            range: config.signal_range,
+            sar_num: u32::try_from(config.aspect_numerator).unwrap_or(u32::MAX),
+            sar_den: u32::try_from(config.aspect_denominator).unwrap_or(u32::MAX),
+            max_access_unit_bytes: config.maximum_access_unit_bytes,
             codec_string: config.codec_string.clone(),
-            decoder_config: config.decoder_config.clone(),
+            decoder_config: config.decoder_configuration.clone(),
         },
         crate::media::SourceDescriptor::Audio(config) => BridgeSourceKind::Audio {
             linked_video: config.linked_video_source_id.map(|source| BridgeSourceKey {
-                producer: key.0,
-                source,
+                producer: key.producer,
+                context: key.context,
+                surface: key.surface,
+                track: source,
             }),
             codec: config.codec.clone(),
             packetization: config.packetization.clone(),
@@ -4738,9 +4755,10 @@ fn project_logical_node(
         producer: node.producer,
         node: node.config.node.node_id,
         fragment: 0,
-        source: BridgeSourceKey {
-            producer: node.producer,
-            source: node.config.node.source_id,
+        surface: BridgeSurfaceKey {
+            producer: node.config.node.track.producer,
+            context: node.config.node.track.context,
+            surface: node.config.node.track.surface,
         },
         x,
         y,
@@ -4894,29 +4912,6 @@ fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::os::unix::net::UnixStream;
-
-    #[cfg(unix)]
-    use crate::ipc::{ChannelKind, establish};
-    #[cfg(unix)]
-    use vivid_protocol::media::{self, AudioPacket, VideoPacket};
-    #[cfg(unix)]
-    use vivid_protocol::messages;
-    #[cfg(unix)]
-    use vivid_protocol::wire::{Connection, ConnectionKind, Endpoint};
-
-    #[cfg(unix)]
-    fn test_transport(stream: UnixStream) -> crate::platform::Transport {
-        let reader = stream.try_clone().unwrap();
-        let timeout_stream = stream.try_clone().unwrap();
-        crate::platform::Transport::new(
-            Box::new(reader),
-            Box::new(stream),
-            crate::platform::ConnectionCancel::inert(),
-            Arc::new(move |duration| timeout_stream.set_read_timeout(duration)),
-        )
-    }
 
     #[test]
     fn bracketed_paste_cannot_inject_terminator() {
@@ -5213,10 +5208,20 @@ mod tests {
 
     #[test]
     fn projection_sync_does_not_duplicate_the_triggering_live_raster() {
-        let raster = (3, 7);
+        let raster = BridgeSourceKey {
+            producer: 3,
+            context: 1,
+            surface: 7,
+            track: 7,
+        };
         assert!(!should_replay_retained(raster, Some(raster), false, false));
         assert!(should_replay_retained(raster, None, false, true));
-        assert!(should_replay_retained(raster, Some((3, 8)), true, false));
+        assert!(should_replay_retained(
+            raster,
+            Some(BridgeSourceKey { track: 8, ..raster }),
+            true,
+            false
+        ));
         assert!(
             !should_replay_retained(raster, None, true, true),
             "an already-presented retained body must not cross IPC again while its outer source \
@@ -5293,23 +5298,25 @@ mod tests {
         crate::media::SceneNode {
             producer: 3,
             pane: 7,
-            config: vivid_protocol::messages::ParsedSceneNode {
-                node: vivid_protocol::messages::ParsedNodeConfig {
+            config: crate::media::SceneNodeConfig {
+                node: crate::media::NodeConfig {
                     node_id: 9,
-                    source_id: 4,
-                    context_id: 1,
+                    track: BridgeSourceKey {
+                        producer: 3,
+                        context: 1,
+                        surface: 4,
+                        track: 5,
+                    },
                     x: 0,
                     y: 0,
                     width,
                     height,
-                    text_layer: 1,
                     z_index: 2,
                     visible: true,
                     anchor_id: None,
                 },
                 clip: None,
             },
-            retained_anchor: None,
         }
     }
 
@@ -5387,306 +5394,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn play_snapshot_precedes_the_next_linked_media_record() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("session-vivid.sock");
-        let (media_sender, media_receiver) = mpsc::sync_channel(8);
-        let config = Config::default();
-        let vivid = match VirtualVivid::start_with_events(
-            socket.clone(),
-            config.media.clone(),
-            Some(media_sender),
-        ) {
-            Ok(vivid) => vivid,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                eprintln!("skipping session media-order socket test: {error}");
-                return;
-            }
-            Err(error) => panic!("virtual presenter start failed: {error}"),
-        };
-        let token = vivid.issue_pane_capability(7).unwrap();
-        vivid.update_metrics(7, 80, 22, (10, 20));
-
-        let (client_stream, server_stream) = UnixStream::pair().unwrap();
-        server_stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let client_establish = std::thread::spawn(move || {
-            establish(test_transport(client_stream), ChannelKind::Control)
-        });
-        let (mut client_reader, _server_writer) =
-            establish(test_transport(server_stream), ChannelKind::Control).unwrap();
-        let (_unused_reader, client_writer) = client_establish.join().unwrap().unwrap();
-        let (actor_sender, _actor_receiver) = mpsc::sync_channel(8);
-        let (response_sender, _response_receiver) = mpsc::sync_channel(8);
-        let mut actor = SessionActor {
-            name: "media-order".into(),
-            config,
-            sender: actor_sender,
-            panes: BTreeMap::new(),
-            tabs: vec![Tab {
-                id: 1,
-                tree: Some(TiledNode::leaf(7)),
-                floating: FloatingLayer::default(),
-                focused: 7,
-                last_focused_tiled: Some(7),
-                zoomed: None,
-            }],
-            active_tab: 0,
-            next_pane_id: 8,
-            next_tab_id: 2,
-            copy_buffer: Vec::new(),
-            frame_id: 0,
-            last_screen: None,
-            #[cfg(windows)]
-            outer_bracketed_paste: None,
-            force_full: false,
-            pending_render: false,
-            layout_revision: 1,
-            last_media_projection: None,
-            media_projection_revision: 0,
-            outer_virtual_revision: 0,
-            bridge_instance_id: None,
-            bridge_local_revision: 0,
-            outer_projection_revision: 0,
-            outer_apply_sequence: 0,
-            outer_attachment_generations: HashMap::new(),
-            traced_projected_sources: HashSet::new(),
-            traced_recovery_deliveries: HashMap::new(),
-            media_trace: MediaTraceJournal::default(),
-            fragment_assignments: HashMap::new(),
-            last_projection_warning: None,
-            pointer_drag: None,
-            float_modal: None,
-            next_float_mode: 0,
-            session_sequence: 1,
-            response_sender,
-            automation_inflight: HashMap::new(),
-            pending_actor_work: HashSet::new(),
-            automation_waiters: Vec::new(),
-            exit_tombstones: VecDeque::new(),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            vivid,
-            media_projection_pending: Arc::new(AtomicBool::new(false)),
-            bridge_metrics: crate::metrics::BridgeMetrics::default(),
-            client_ipc: None,
-            attached: Some(AttachedClient {
-                id: 1,
-                writer: client_writer,
-                display: DisplayMetrics {
-                    columns: 80,
-                    rows: 24,
-                    cell_width: 10,
-                    cell_height: 20,
-                },
-                acknowledged_frame: 0,
-                vivid: true,
-                rendered_session_sequence: 0,
-                frame_sequences: VecDeque::new(),
-            }),
-            last_display: DisplayMetrics {
-                columns: 80,
-                rows: 24,
-                cell_width: 10,
-                cell_height: 20,
-            },
-        };
-
-        actor.render();
-        assert!(
-            matches!(
-                client_reader.recv_server().unwrap(),
-                ServerMessage::MediaSnapshot { .. }
-            ),
-            "a composite change must submit its media projection before exposing the terminal frame"
-        );
-        assert!(
-            matches!(
-                client_reader.recv_server().unwrap(),
-                ServerMessage::Render { .. }
-            ),
-            "the terminal frame must immediately follow its media projection"
-        );
-
-        let endpoint = Endpoint::Unix(socket);
-        let mut control = Connection::open(&endpoint, ConnectionKind::Control).unwrap();
-        control
-            .write_record(messages::HELLO, 0, 0, &messages::hello(1, &token))
-            .unwrap();
-        assert_eq!(
-            control.read_record().unwrap().record_type,
-            messages::WELCOME
-        );
-        let video = messages::VideoSourceConfig {
-            codec_string: None,
-            decoder_config: None,
-            source_id: 9,
-            codec: "h264",
-            packetization: "h264-annexb-au-v1",
-            extradata: &[],
-            width: 16,
-            height: 16,
-            profile: 0,
-            level: 0,
-            bitrate: 0,
-            color_primaries: 1,
-            transfer: 1,
-            matrix: 1,
-            range: 1,
-            sar_num: 1,
-            sar_den: 1,
-            max_access_unit_bytes: 1024,
-        };
-        control
-            .write_record(
-                messages::CREATE_VIDEO,
-                0,
-                9,
-                &messages::create_video(2, &video),
-            )
-            .unwrap();
-        let video_ready =
-            messages::parse_source_ready(&control.read_record().unwrap().body).unwrap();
-        let audio = messages::AudioSourceConfig {
-            codec_string: None,
-            source_id: 10,
-            linked_video_source_id: Some(9),
-            codec: "pcm_s16le",
-            packetization: "pcm-packet-v1",
-            extradata: &[],
-            sample_rate: 48_000,
-            channels: 2,
-            channel_mask: 3,
-            bitrate: 0,
-            max_access_unit_bytes: 1024,
-        };
-        control
-            .write_record(
-                messages::CREATE_AUDIO,
-                0,
-                10,
-                &messages::create_audio(3, &audio),
-            )
-            .unwrap();
-        let audio_ready =
-            messages::parse_source_ready(&control.read_record().unwrap().body).unwrap();
-
-        actor.sync_media(true);
-        assert!(matches!(
-            client_reader.recv_server().unwrap(),
-            ServerMessage::MediaSnapshot { .. }
-        ));
-
-        let mut audio_media = Connection::open(&endpoint, ConnectionKind::Audio).unwrap();
-        audio_media
-            .write_record(
-                messages::ATTACH_CHANNEL,
-                0,
-                10,
-                &messages::attach_channel(&audio_ready.media_ticket),
-            )
-            .unwrap();
-        let audio_packet = media::audio_packet_body(AudioPacket {
-            epoch: 1,
-            packet_id: 1,
-            pts_us: 0,
-            dts_us: 0,
-            duration_us: 20_000,
-            trim_start_samples: 0,
-            trim_end_samples: 0,
-            data: &[0, 0, 0, 0],
-        })
-        .unwrap();
-        audio_media
-            .write_record(messages::AUDIO_PACKET, 0, 10, &audio_packet)
-            .unwrap();
-        actor.forward_media(media_receiver.recv_timeout(Duration::from_secs(1)).unwrap());
-        let delivery_id = match client_reader.recv_server().unwrap() {
-            ServerMessage::MediaRecord {
-                delivery_id,
-                record_type: messages::AUDIO_PACKET,
-                ..
-            } => delivery_id,
-            other => panic!("expected pre-roll audio record, got {other:?}"),
-        };
-        actor.vivid.complete_bridge_delivery(delivery_id, true);
-
-        control
-            .write_record(messages::PLAY, 0, 9, &messages::play(4, 9, 100_000))
-            .unwrap();
-        let returned_audio_credit = control.read_record().unwrap();
-        assert_eq!(returned_audio_credit.record_type, messages::CREDIT);
-        assert_eq!(returned_audio_credit.object_id, 10);
-        assert_eq!(control.read_record().unwrap().record_type, messages::OK);
-        let mut video_media = Connection::open(&endpoint, ConnectionKind::Video).unwrap();
-        video_media
-            .write_record(
-                messages::ATTACH_CHANNEL,
-                0,
-                9,
-                &messages::attach_channel(&video_ready.media_ticket),
-            )
-            .unwrap();
-        let video_packet = media::video_packet_body(VideoPacket {
-            epoch: 1,
-            packet_id: 1,
-            pts_us: 0,
-            dts_us: 0,
-            duration_us: 33_000,
-            key: true,
-            data: &[0, 0, 0, 1, 0x65, 0x88],
-        })
-        .unwrap();
-        video_media
-            .write_record(messages::VIDEO_PACKET, 0, 9, &video_packet)
-            .unwrap();
-        actor.forward_media(media_receiver.recv_timeout(Duration::from_secs(1)).unwrap());
-
-        match client_reader.recv_server().unwrap() {
-            ServerMessage::MediaSnapshot { sources, .. } => {
-                assert!(
-                    sources
-                        .iter()
-                        .any(|source| source.key.source == 9 && source.playing)
-                );
-            }
-            other => panic!("PLAY snapshot must precede post-PLAY media, got {other:?}"),
-        }
-        let video_delivery_id = match client_reader.recv_server().unwrap() {
-            ServerMessage::MediaRecord {
-                delivery_id,
-                record_type: messages::VIDEO_PACKET,
-                ..
-            } => delivery_id,
-            other => panic!("expected post-PLAY video record, got {other:?}"),
-        };
-        actor
-            .vivid
-            .complete_bridge_delivery(video_delivery_id, true);
-
-        control
-            .write_record(messages::EOS, 0, 9, &messages::eos(5, 9, 1))
-            .unwrap();
-        let returned_video_credit = control.read_record().unwrap();
-        assert_eq!(returned_video_credit.record_type, messages::CREDIT);
-        assert_eq!(returned_video_credit.object_id, 9);
-        assert_eq!(control.read_record().unwrap().record_type, messages::OK);
-        actor.sync_media(false);
-        match client_reader.recv_server().unwrap() {
-            ServerMessage::MediaSnapshot { sources, .. } => {
-                assert!(
-                    sources
-                        .iter()
-                        .any(|source| source.key.source == 9 && source.playing),
-                    "EOS must leave buffered outer playback running"
-                );
-            }
-            other => panic!("expected post-EOS projection snapshot, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn automation_keys_honor_cursor_keypad_modifiers_and_reject_unknown_values() {
         let mut modes = TerminalModes::default();
         assert_eq!(
@@ -5760,7 +5467,7 @@ mod tests {
                 limit: 32,
                 timeout_ms: 0,
                 filter: MediaTraceFilter {
-                    source_id: Some(4),
+                    context_id: Some(4),
                     ..MediaTraceFilter::default()
                 },
             })

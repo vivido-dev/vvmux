@@ -124,15 +124,16 @@ acknowledged a composite terminal frame covering the requested session sequence;
 that Vivido presented a GPU frame. Use `vivido msg wait frame` when GPU presentation matters.
 
 `inspect-media` reports only pane-scoped, sanitized metadata: virtual scene/projection revisions,
-the independently acknowledged outer projection revision, source kind/lifecycle/revision/epoch,
-separate inner and outer attachment generations, visibility and milestones, bounded queue/credit utilization, and
-node geometry. It never includes capability tokens, media tickets, payload bytes, hashes, or
-derived keys. `wait media` waits for either requested revision domain to advance; when both
+the independently acknowledged outer projection revision, separate `surfaces` and `tracks`,
+complete inner identity, independent inner/outer channel generations, milestones, bounded
+queue/flow utilization, and node geometry. It never includes root secrets, channel keys,
+authenticators, payload bytes, or hashes. `wait media` waits for either requested revision domain
+to advance; when both
 `--after-virtual` and `--after-outer` are supplied, both predicates must become true.
 
 Requests and input are limited to 1 MiB, decoded replies to 16 MiB, row requests and key repeats to
 1,000, and regular expressions to 8 KiB. The server bounds connections, in-flight requests,
-waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 9 is a hard
+waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 10 is a hard
 private-protocol cutover, so sessions created by older binaries must be restarted after upgrading.
 
 ## Network session gateway
@@ -156,8 +157,9 @@ record.
 
 The gateway lists, creates, and exclusively attaches to sessions. It serves no HTML or JavaScript
 and does not expose session kill operations. Plain xterm.js clients can attach text-only;
-Vivido.js's built-in `connectVvmux` coordinator also routes Vivid 1.1 over authenticated binary
-WebSockets, so images and timed media remain synchronized with the session. See
+The byte-transparent Vivid route accepts only Vivid 1.5 Control and Track connections, uses the
+route's ephemeral 32-byte secret as its Vivid root secret, and advertises `wire_version: "1.5"`.
+Vivido.js is not yet a 1.5 coordinator and fails clearly instead of receiving downgraded traffic. See
 [VVWS-1.md](VVWS-1.md) for the normative wire contract and client integration shape.
 
 ## Default keys
@@ -202,42 +204,37 @@ at 60% by 60% by default, with a minimum 4-by-2 content area plus frame.
 
 ## Vivid behavior
 
-Every pane receives a distinct 256-bit `VIVID_TOKEN` and the session-wide virtual presenter
-endpoint. The server validates producer handshakes, single-use media tickets, request/object scope,
-source and scene quotas, monotonic packet/frame sequences, images, rasters, transactions, and
-authenticated anchor markers.
+Every pane receives a distinct zeroizing 256-bit `VIVID_ROOT_SECRET` and
+`VIVID_ENDPOINT_CONTROL`. Realtime and bulk Track discovery fall back to that endpoint. The shared
+listener accepts Vivid 1.5 Control and Track connections, rejects Lane connections, authenticates
+each root proof with exactly one pane secret, and derives independent session, channel, and
+marker-v3 keys. No Vivid 1.1 parser, alias, or downgrade path is retained.
 
 Static encoded images and the latest raster are retained within the configured aggregate budget.
-Timed audio/video continues to receive credits while detached but payloads are discarded. On a new
-projection, live video gets `NEED_KEYFRAME`; relay-only loss accepts the next keyframe in the
-current epoch, while decoder loss can demand a greater epoch. Only the requested keyframe and later
-packets are eligible for forwarding. Audio resumes with newly arriving packets. EOS video does not
-acquire a reconstructed poster.
+Stable surfaces own immutable tracks and authenticated channel generations. Media is admitted only
+after `CHANNEL_ACCEPTED`; flow uses cumulative `MAX_CHANNEL_DATA`, with one priming record initially
+and a higher maximum only after the corresponding outer delivery becomes reusable. Bridge
+replacement resends images and complete raster content, requests a fresh video key unit, and
+resumes audio from new packets. Ordered `CHANNEL_EOS` never becomes an implicit pause.
 
-The foreground client reconciles stable source and `(producer, node, fragment)` identities into the
-current Vivido session, reuses unchanged sources/media channels, resolves virtual anchors, and
-applies an exact negotiated clip rectangle for every pane. Higher pane outer rectangles are opaque
-media occluders, including their frames. A logical media node is split into at most eight exact
-signed-32.32 fragments that share one source; a projection contains at most 256 upstream nodes and
-omits lower-priority background media when that budget is exhausted. Source creation and scene
-control are pipelined and correlated; uncertain partial reconciliation reconnects once from the
-newest authoritative snapshot.
+The foreground client reconciles complete inner `(session, context, surface, track)` identities
+into fresh outer Vivid identities. The hops never share requests, revisions, generations, epochs,
+media IDs, sequences, flow maxima, credentials, or recovery authority. Stable outer surfaces and
+nodes survive affected-track replacement. Virtual marker-v3 anchors are consumed inside vvmux;
+their marker and authenticator are never forwarded.
 
-Each outer media connection has a bounded source-specific writer and credit ledger. A blocked video
-socket cannot stop linked audio, another pane, terminal rendering, or control. The virtual
-presenter's one-packet grant is returned after the outer record write succeeds, so linked audio
-pre-roll reaches Vivido before `PLAY` without inheriting an outer RTT stop-and-wait. The playing
-snapshot is ordered before the first post-PLAY keyframe. EOS marks the end of submission but leaves
-already-buffered outer video and linked audio playing until explicit stop or source teardown.
+Bridge queues are bounded per track and scheduled round-robin, so a blocked video track cannot
+consume audio or another track's queue. Linked audio/video is pre-rolled, activated atomically, and
+uses active audio as clock when present. Exact play timing and policy are preserved. Outer EOS uses
+its own sequence and epoch, and accepted/buffered-end progress is returned to inner waits.
 
 vvmux validates and forwards the Vivid portable profiles without transcoding, including canonical
-Opus, Vorbis, and FLAC initialization. Outer `NEED_KEYFRAME` and source loss are routed back to the
-matching inner source without replacing unrelated topology.
+Opus, Vorbis, and FLAC initialization. Outer `NEED_KEYFRAME`, `NEED_FULL_FRAME`, and track loss are
+routed to the matching inner track without replacing unrelated surfaces, nodes, or sibling tracks.
 
-Control uses inherited `VIVID_ENDPOINT`. If inherited `VIVID_ENDPOINT_BULK` is present, only the
-foreground bridge uses it for non-control outer connections; the hidden server and pane processes
-never receive the outer endpoint or token. A bulk connection may fall back to the primary endpoint
-only before `ATTACH_CHANNEL` consumes its ticket.
+The outer bridge reads `VIVID_ENDPOINT_CONTROL`, optional `VIVID_ENDPOINT_REALTIME` and
+`VIVID_ENDPOINT_BULK`, and `VIVID_ROOT_SECRET` from the foreground client environment. Panes receive
+only their inner endpoint and root secret; outer credentials never enter the session server or PTY.
 
 If the outer terminal has no Vivid capability, or its presenter rejects `node-clip-rect-v1`,
 terminal use continues without media and the client emits a single status/title warning.

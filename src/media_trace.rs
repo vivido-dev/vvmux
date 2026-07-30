@@ -46,7 +46,8 @@ pub enum MediaTraceKind {
     BridgeClientDetached,
     ProjectionSubmitted {
         virtual_revision: u64,
-        source_count: u16,
+        surface_count: u16,
+        track_count: u16,
         node_count: u16,
     },
     ProjectionApplied {
@@ -54,15 +55,15 @@ pub enum MediaTraceKind {
         bridge_local_revision: u64,
         attachment_count: u16,
     },
-    SourceVisibility {
+    TrackVisibility {
         visible: bool,
         virtual_revision: u64,
     },
-    OuterSourceRecreated {
+    OuterTrackRecreated {
         attachment_generation: u64,
         playing: bool,
     },
-    OuterSourceRemoved,
+    OuterTrackRemoved,
     PlaybackControl {
         control: MediaPlaybackControl,
         request: Option<BridgePlayRequest>,
@@ -87,7 +88,7 @@ pub enum MediaTraceKind {
         pts_us: i64,
     },
     SnapshotRetry,
-    SourceLost,
+    TrackLost,
     DeliveryFailed {
         delivery_id: u64,
     },
@@ -105,17 +106,17 @@ impl MediaTraceKind {
             }
             Self::ProjectionSubmitted { .. }
             | Self::ProjectionApplied { .. }
-            | Self::SourceVisibility { .. } => MediaTraceCategory::Projection,
+            | Self::TrackVisibility { .. } => MediaTraceCategory::Projection,
             Self::PlaybackControl { .. } | Self::PlaybackState { .. } => {
                 MediaTraceCategory::Playback
             }
-            Self::OuterSourceRecreated { .. }
+            Self::OuterTrackRecreated { .. }
             | Self::KeyframeRequest { .. }
             | Self::KeyframeRecovered { .. }
             | Self::KeyframeDelivery { .. }
             | Self::SnapshotRetry
-            | Self::SourceLost => MediaTraceCategory::Recovery,
-            Self::OuterSourceRemoved | Self::DeliveryFailed { .. } | Self::QueueDrops { .. } => {
+            | Self::TrackLost => MediaTraceCategory::Recovery,
+            Self::OuterTrackRemoved | Self::DeliveryFailed { .. } | Self::QueueDrops { .. } => {
                 MediaTraceCategory::Delivery
             }
         }
@@ -124,12 +125,12 @@ impl MediaTraceKind {
     pub fn is_recovery(&self) -> bool {
         matches!(
             self,
-            Self::OuterSourceRecreated { .. }
+            Self::OuterTrackRecreated { .. }
                 | Self::KeyframeRequest { .. }
                 | Self::KeyframeRecovered { .. }
                 | Self::KeyframeDelivery { .. }
                 | Self::SnapshotRetry
-                | Self::SourceLost
+                | Self::TrackLost
                 | Self::DeliveryFailed { .. }
         )
     }
@@ -138,6 +139,7 @@ impl MediaTraceKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BridgeMediaTraceEvent {
     pub origin_monotonic_us: u64,
+    #[serde(rename = "track")]
     pub source: Option<BridgeSourceKey>,
     pub kind: MediaTraceKind,
 }
@@ -151,6 +153,7 @@ pub struct MediaTraceEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "virtual_track")]
     pub virtual_source: Option<BridgeSourceKey>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_instance_id: Option<u64>,
@@ -160,7 +163,9 @@ pub struct MediaTraceEvent {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MediaTraceFilter {
     pub producer_id: Option<u64>,
-    pub source_id: Option<u64>,
+    pub context_id: Option<u64>,
+    pub surface_id: Option<u64>,
+    pub track_id: Option<u64>,
     pub category: Option<MediaTraceCategory>,
     pub recovery_only: bool,
 }
@@ -181,8 +186,18 @@ impl MediaTraceFilter {
         {
             return false;
         }
-        if let Some(source_id) = self.source_id
-            && event.virtual_source.map(|source| source.source) != Some(source_id)
+        if let Some(context_id) = self.context_id
+            && event.virtual_source.map(|source| source.context) != Some(context_id)
+        {
+            return false;
+        }
+        if let Some(surface_id) = self.surface_id
+            && event.virtual_source.map(|source| source.surface) != Some(surface_id)
+        {
+            return false;
+        }
+        if let Some(track_id) = self.track_id
+            && event.virtual_source.map(|source| source.track) != Some(track_id)
         {
             return false;
         }
@@ -320,7 +335,9 @@ mod tests {
     fn source(id: u64) -> BridgeSourceKey {
         BridgeSourceKey {
             producer: 7,
-            source: id,
+            context: 1,
+            surface: 2,
+            track: id,
         }
     }
 
@@ -333,7 +350,7 @@ mod tests {
                 Some(source(id)),
                 Some(9),
                 None,
-                MediaTraceKind::SourceVisibility {
+                MediaTraceKind::TrackVisibility {
                     visible: true,
                     virtual_revision: id,
                 },
@@ -391,7 +408,9 @@ mod tests {
             Some(2),
             MediaTraceFilter {
                 producer_id: Some(7),
-                source_id: Some(1),
+                context_id: Some(1),
+                surface_id: Some(2),
+                track_id: Some(1),
                 category: Some(MediaTraceCategory::Recovery),
                 recovery_only: true,
             },

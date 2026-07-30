@@ -21,13 +21,18 @@ fn detach_then_immediate_reattach_repaints_the_session() {
             .as_nanos()
     );
     let marker = format!("VVMUX_REATTACH_{}", std::process::id());
-    let vivid_environment = ["VIVID_ENDPOINT", "VIVID_ENDPOINT_BULK", "VIVID_TOKEN"]
-        .into_iter()
-        .filter_map(|name| std::env::var(name).ok().map(|value| (name.into(), value)))
-        .collect::<Vec<_>>();
+    let vivid_environment = [
+        "VIVID_ENDPOINT_CONTROL",
+        "VIVID_ENDPOINT_REALTIME",
+        "VIVID_ENDPOINT_BULK",
+        "VIVID_ROOT_SECRET",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var(name).ok().map(|value| (name.into(), value)))
+    .collect::<Vec<_>>();
     let vivid_enabled = vivid_environment
         .iter()
-        .any(|(name, _)| name == "VIVID_ENDPOINT");
+        .any(|(name, _)| name == "VIVID_ENDPOINT_CONTROL");
 
     let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
     let parts = PtyProcess::spawn(&shell, cwd, 100, 30, &vivid_environment).unwrap();

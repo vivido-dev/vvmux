@@ -2,8 +2,8 @@
 
 VVWS/1 is the public, renderer-neutral protocol for attaching a browser terminal to sessions owned
 by vvmux. It is distinct from the private, same-user VVMX IPC protocol. VVWS/1 carries terminal
-text and session control; its `vivid-bridge-v1` capability also brokers the existing Vivid 1.1 wire
-protocol over separate binary WebSockets. Vivid records are not translated into VVWS JSON.
+text and session control; its `vivid-bridge-v1` capability brokers Vivid 1.5 Control and Track
+connections over separate binary WebSockets. Vivid records are not translated into VVWS JSON.
 
 ## Transport and authentication
 
@@ -45,6 +45,7 @@ On success, the server replies:
   "vivid": {
     "endpoint":"/v1/vivid",
     "subprotocol":"vvmux.vivid.v1",
+    "wire_version":"1.5",
     "connection":"EPHEMERAL_CONNECTION_ID",
     "token":"EPHEMERAL_BASE64URL_TOKEN"
   }
@@ -52,10 +53,12 @@ On success, the server replies:
 ```
 
 The Vivid access values are scoped to this authenticated VVWS connection, disappear when it
-closes, and must not be logged or placed in a URL. A browser opens the advertised endpoint with
+closes, and must not be logged or placed in a URL. The decoded ephemeral 32-byte route token is
+also the Vivid 1.5 root secret. A browser opens the advertised endpoint with
 four WebSocket subprotocol values: `vvmux.vivid.v1`, `vvmux.connection.<connection>`,
-`vvmux.auth.<token>`, and `vvmux.kind.<kind>`. Kind is the decimal Vivid connection kind (0–5).
-The gateway selects only `vvmux.vivid.v1` in the upgrade response. Each resulting WebSocket is one
+`vvmux.auth.<token>`, and `vvmux.kind.<kind>`. Kind is Control (`0`) or Track (`2`); Lane (`1`) and
+all other values are rejected. The gateway selects only `vvmux.vivid.v1` in the upgrade response.
+Each resulting WebSocket is one
 ordinary binary Vivid connection; the producer-side preface is the first bytes sent by vvmux.
 
 VVWS/1 has no direct-network TLS mode. `vvmux serve` binds only an IPv4 or IPv6 loopback address;
@@ -63,24 +66,24 @@ remote deployments use an SSH tunnel or a trusted TLS reverse proxy.
 
 ### Private IPC compatibility
 
-VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 9,
+VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 10,
 which is a hard cutover from every earlier VVMX version. VVMX 7 moved render and media byte
 payloads out of JSON into bounded binary records. VVMX 8 added transport-loss recovery without
-inventing a new producer epoch. VVMX 9 adds bridge-instance correlation and bounded,
-metadata-only media recovery traces.
+inventing a new producer epoch. VVMX 9 added bridge-instance correlation and bounded,
+metadata-only media recovery traces. VVMX 10 is the hard Vivid 1.5 surface/track/channel cutover.
 
 Pane media inspection reports separate `virtual_projection_revision`,
 `virtual_scene_revision`, `outer_projection_revision` (the monotonic compatibility sequence),
-`outer_apply_sequence`, `bridge_instance_id`, and `bridge_local_revision`. Per-source fields include
-kind/lifecycle, source revision, epoch, inner and outer attachment generations, outer-mapping
-freshness, visibility, capture policy, sanitized descriptor, retained-static/keyframe state,
-milestones, queued packets/bytes, and available packet/byte credit. Relay/bridge counters are
-diagnostic only. No inner revision, generation, sequence, raster base, or ticket is an outer
-identity.
+`outer_apply_sequence`, `bridge_instance_id`, and `bridge_local_revision`. `surfaces` and `tracks`
+are reported separately. Track entries include complete session/context/surface/track identity,
+kind/lifecycle, revision, epoch, explicitly independent inner/outer channel generations,
+milestones, queue utilization, and cumulative flow availability. Relay/bridge counters are
+diagnostic only; no inner identity or counter is outer-hop authority.
 
 The binary forms carry terminal frame bytes and Vivid media bodies only. They never enter VVWS
-JSON control messages and never contain Vivid tokens, media tickets, hashes, or derived capability
-material. Gateway/session processes from different VVMX versions must reject one another and the
+JSON control messages and never contain root secrets, channel keys, authenticators, payload
+hashes, or derived capability material. Gateway/session processes from different VVMX versions
+must reject one another and the
 older session must be restarted.
 
 ## Connection states and terminal data

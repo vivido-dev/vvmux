@@ -208,8 +208,15 @@ fn message_size(message: &ServerMessage) -> usize {
             | ServerMessage::Status(value)
             | ServerMessage::Error(value) => value.len(),
             ServerMessage::Detached { reason } => reason.len(),
-            ServerMessage::MediaSnapshot { sources, nodes, .. } => {
-                sources.len().saturating_mul(1024) + nodes.len().saturating_mul(256)
+            ServerMessage::MediaSnapshot {
+                surfaces,
+                tracks,
+                nodes,
+                ..
+            } => {
+                surfaces.len().saturating_mul(512)
+                    + tracks.len().saturating_mul(1024)
+                    + nodes.len().saturating_mul(256)
             }
             _ => 0,
         }

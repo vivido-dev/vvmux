@@ -10,6 +10,8 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
+use vivid_protocol::auth::Secret32;
+use vivid_protocol::messages::LaneClass;
 use vivid_protocol::wire::{Connection, ConnectionKind};
 use zeroize::Zeroizing;
 
@@ -91,6 +93,13 @@ impl VividBroker {
 
     pub(crate) fn encoded_token(&self) -> Zeroizing<String> {
         Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(*self.token))
+    }
+
+    /// The route secret is also the Vivid 1.5 root secret for this ephemeral broker session.
+    ///
+    /// Returning the non-debuggable protocol type avoids creating a printable credential.
+    pub(crate) fn root_secret(&self) -> Secret32 {
+        Secret32::new(*self.token)
     }
 
     pub(crate) fn authenticate(&self, submitted: &str) -> bool {
@@ -191,7 +200,13 @@ impl VividBroker {
 }
 
 impl ConnectionFactory for VividBroker {
-    fn open(&self, kind: ConnectionKind) -> io::Result<Connection> {
+    fn open(&self, kind: ConnectionKind, _lane: Option<LaneClass>) -> io::Result<Connection> {
+        if kind == ConnectionKind::Lane {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the vvmux Vivid broker carries Control and Track connections only",
+            ));
+        }
         let io = self.wait_for_transport(kind)?;
         Connection::from_streams(Box::new(io.reader), Box::new(io.writer), kind)
     }
@@ -351,8 +366,6 @@ pub(crate) async fn serve_socket(
 mod tests {
     use super::*;
     use std::thread;
-    use vivid_protocol::cbor::PreservedField;
-    use vivid_protocol::messages;
 
     #[test]
     fn route_tokens_are_exact_and_constant_time_compared() {
@@ -365,27 +378,17 @@ mod tests {
 
     #[test]
     fn gateway_transport_preserves_negotiation_bytes_exactly() {
-        let preserved = [PreservedField {
-            key: 42,
-            encoded_value: vec![0x82, 0x01, 0xf5],
-        }];
-        let hello = messages::encode_hello(
-            1,
-            &messages::HelloConfig {
-                minimum_major: 1,
-                minimum_minor: 1,
-                maximum_major: 1,
-                maximum_minor: 1,
-                token: "0000000000000000000000000000000000000000000000000000000000000000",
-                producer: "gateway-test",
-                producer_version: "1",
-                required_features: &[],
-                optional_features: &[],
-                maximum_record_body: 4096,
-                authentication_kind: messages::AUTHENTICATION_WINDOW_ROOT,
-                preserved_fields: &preserved,
-            },
-        );
+        // Includes the exact 1.5 preface followed by opaque control bytes. The broker must not
+        // parse, normalize, or otherwise learn anything from an authenticated Vivid transcript.
+        let mut hello = vivid_protocol::wire::encode_preface(
+            ConnectionKind::Control,
+            vivid_protocol::CONTROL_MAX_RECORD_BODY,
+        )
+        .to_vec();
+        hello.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xa2, 0x00, 0x01, 0x2a, 0x82, 0x01, 0xf5,
+        ]);
 
         let (incoming_sender, incoming_receiver) = mpsc::channel(hello.len().div_ceil(7));
         for chunk in hello.chunks(7) {

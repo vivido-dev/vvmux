@@ -224,8 +224,19 @@ async fn vivid_upgrade(
     let Some(kind) = protocol_parameter(&headers, vivid::KIND_PROTOCOL_PREFIX)
         .and_then(|value| value.parse::<u8>().ok())
         .and_then(|value| vivid_protocol::wire::ConnectionKind::try_from(value).ok())
+        .filter(|kind| {
+            matches!(
+                kind,
+                vivid_protocol::wire::ConnectionKind::Control
+                    | vivid_protocol::wire::ConnectionKind::Track
+            )
+        })
     else {
-        return (StatusCode::BAD_REQUEST, "invalid Vivid connection kind").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Vivid broker accepts control and track connections only",
+        )
+            .into_response();
     };
     let broker = state
         .vivid_sessions
@@ -303,6 +314,7 @@ async fn handle_connection(
             vivid: VividAccess {
                 endpoint: "/v1/vivid",
                 subprotocol: vivid::SUBPROTOCOL,
+                wire_version: "1.5",
                 connection: broker.id(),
                 token: &vivid_token,
             },
@@ -629,13 +641,14 @@ async fn handle_socket_message(
                         {
                             Ok((adapter, attached_name, text_only)) => {
                                 let browser_bridge = if vivid {
+                                    let root_secret = broker.root_secret();
                                     let connection_factory: Arc<
                                         dyn crate::bridge::ConnectionFactory,
                                     > = broker.clone();
                                     match tokio::task::spawn_blocking(move || {
-                                        crate::bridge::OuterBridge::connect_with_factory(
+                                        crate::bridge::OuterBridge::connect_with_factory_secret(
                                             connection_factory,
-                                            Zeroizing::new("0".repeat(64)),
+                                            root_secret,
                                             display,
                                         )
                                     })
@@ -885,7 +898,8 @@ async fn handle_session_message(
         ServerMessage::Pong => {}
         ServerMessage::MediaSnapshot {
             revision,
-            sources,
+            surfaces,
+            tracks,
             nodes,
             videos_needing_keyframes,
         } => {
@@ -898,7 +912,8 @@ async fn handle_session_message(
             bridge.replace_snapshot(BridgeSnapshot {
                 generation: 0,
                 virtual_revision: revision,
-                sources,
+                surfaces,
+                tracks,
                 nodes,
                 videos_needing_keyframes,
             });

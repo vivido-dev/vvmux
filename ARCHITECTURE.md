@@ -21,15 +21,27 @@ the actor continues servicing media delivery, rendering, client events, and unre
 Vivid queries, waits, device operations, and status work use the same pattern.
 Workers must never mutate `SessionActor` state directly or write session replies themselves.
 
-## Vivid 1.1 and revision domains
+## Vivid 1.5 nested presenter and revision domains
 
 The pane-facing virtual presenter and the outer presenter are different Vivid sessions. Virtual
-scene/source revisions, observation sequences, attachment generations, record sequences, raster
-frame bases, and EOS barriers never cross the boundary as identities. The session actor separately
+scene/surface/track revisions, observation sequences, channel generations, record sequences,
+raster bases, media IDs, epochs, flow maxima, and EOS state never cross the boundary as authority.
+Every relay key contains the complete inner session, context, surface, and track identity. The
+session actor separately
 tracks a monotonic outer compatibility revision and apply sequence; the current foreground bridge
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 9 is a hard cutover. It carries bounded binary render/media records,
+Private VVMX version 10 is a hard cutover. Its binary media header carries complete track identity
+and bounded binary render/media records,
 pane-scoped sanitized media status and waits, bridge-instance correlation, and metadata-only media
 traces. Mixed VVMX versions are rejected with restart guidance.
+
+```text
+Vivi → inner vvmux presenter → VVMX 10 → outer vvmux producer → Vivido
+```
+
+The inner presenter accepts Control and Track only, verifies root and channel authentication,
+consumes marker-v3 anchors, and grants cumulative flow per track. The outer producer allocates all
+of its own identities and re-encodes portable media headers. Per-track bridge queues are
+independently bounded and scheduled fairly; no media writer runs on the session actor.

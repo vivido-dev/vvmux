@@ -18,7 +18,7 @@ use crate::ipc::DisplayMetrics;
 use crate::ipc::{Action, Axis, Direction, MouseEvent, MouseKind};
 use crate::ipc::{
     BridgeKeyframeRequest, BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind,
-    ClientMessage, FloatingEditCommand, ServerMessage, SharedWriter,
+    BridgeSurface, ClientMessage, FloatingEditCommand, ServerMessage, SharedWriter,
 };
 use crate::media_trace::{
     BridgeMediaTraceEvent, MediaKeyframeStage, MediaPlaybackControl, MediaTraceKind,
@@ -51,12 +51,13 @@ pub fn attach(
         Err(error) => return Err(error),
     };
 
-    // Keep outer credentials exclusively in the foreground process. Zeroizing guarantees token
-    // bytes are overwritten when the Vivid bridge or this text-only client closes.
-    let outer_endpoint = std::env::var("VIVID_ENDPOINT").ok();
+    // Keep outer credentials exclusively in the foreground process. Zeroizing guarantees root
+    // secret bytes are overwritten when the Vivid bridge or this text-only client closes.
+    let outer_endpoint = std::env::var("VIVID_ENDPOINT_CONTROL").ok();
+    let outer_realtime_endpoint = std::env::var("VIVID_ENDPOINT_REALTIME").ok();
     let outer_bulk_endpoint = std::env::var("VIVID_ENDPOINT_BULK").ok();
-    let outer_token = std::env::var("VIVID_TOKEN").ok().map(Zeroizing::new);
-    let vivid = outer_endpoint.is_some() && outer_token.is_some();
+    let outer_root_secret = std::env::var("VIVID_ROOT_SECRET").ok().map(Zeroizing::new);
+    let vivid = outer_endpoint.is_some() && outer_root_secret.is_some();
     let terminal = ClientTerminal::enter()?;
     let display = terminal.display_metrics()?;
     let presenter_cell_size = Arc::new(AtomicU32::new(pack_cell_size(display)));
@@ -86,12 +87,13 @@ pub fn attach(
     let reader_thread = thread::Builder::new()
         .name("vvmux-render".into())
         .spawn(move || {
-            let mut bridge = match (outer_endpoint, outer_token) {
-                (Some(endpoint), Some(token)) => {
-                    match crate::bridge::OuterBridge::connect_with_bulk(
+            let mut bridge = match (outer_endpoint, outer_root_secret) {
+                (Some(endpoint), Some(root_secret)) => {
+                    match crate::bridge::OuterBridge::connect_native(
                         endpoint,
+                        outer_realtime_endpoint,
                         outer_bulk_endpoint,
-                        token,
+                        root_secret,
                         bridge_display,
                     ) {
                         Ok(bridge) => {
@@ -165,7 +167,8 @@ pub fn attach(
                     }
                     ServerMessage::MediaSnapshot {
                         revision,
-                        sources,
+                        surfaces,
+                        tracks,
                         nodes,
                         videos_needing_keyframes,
                     } => {
@@ -173,7 +176,8 @@ pub fn attach(
                             bridge.replace_snapshot(BridgeSnapshot {
                                 generation: 0,
                                 virtual_revision: revision,
-                                sources,
+                                surfaces,
+                                tracks,
                                 nodes,
                                 videos_needing_keyframes,
                             });
@@ -445,7 +449,8 @@ impl Drop for ClientWorkers {
 pub(crate) struct BridgeSnapshot {
     pub(crate) generation: u64,
     pub(crate) virtual_revision: u64,
-    pub(crate) sources: Vec<BridgeSource>,
+    pub(crate) surfaces: Vec<BridgeSurface>,
+    pub(crate) tracks: Vec<BridgeSource>,
     pub(crate) nodes: Vec<BridgeNode>,
     pub(crate) videos_needing_keyframes: Vec<BridgeSourceKey>,
 }
@@ -479,7 +484,9 @@ impl BridgeClientSender {
 }
 
 pub(crate) struct BridgeWorker {
-    media: Option<mpsc::SyncSender<BridgeMedia>>,
+    media: Arc<Mutex<TrackMediaQueues>>,
+    media_wakeup: Option<mpsc::SyncSender<()>>,
+    queue_records_per_track: usize,
     snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     dropped: Arc<Mutex<HashSet<u64>>>,
     generation: u64,
@@ -488,6 +495,42 @@ pub(crate) struct BridgeWorker {
     queue_drops: Arc<AtomicU64>,
     stopped: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct TrackMediaQueues {
+    tracks: HashMap<BridgeSourceKey, VecDeque<BridgeMedia>>,
+    ready: VecDeque<BridgeSourceKey>,
+    ready_set: HashSet<BridgeSourceKey>,
+}
+
+impl TrackMediaQueues {
+    fn push(&mut self, media: BridgeMedia, capacity: usize) -> Result<(), BridgeMedia> {
+        let key = media.source;
+        let queue = self.tracks.entry(key).or_default();
+        if queue.len() >= capacity {
+            return Err(media);
+        }
+        queue.push_back(media);
+        if self.ready_set.insert(key) {
+            self.ready.push_back(key);
+        }
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<BridgeMedia> {
+        let key = self.ready.pop_front()?;
+        self.ready_set.remove(&key);
+        let queue = self.tracks.get_mut(&key)?;
+        let media = queue.pop_front();
+        if queue.is_empty() {
+            self.tracks.remove(&key);
+        } else {
+            self.ready.push_back(key);
+            self.ready_set.insert(key);
+        }
+        media
+    }
 }
 
 impl BridgeWorker {
@@ -509,13 +552,15 @@ impl BridgeWorker {
         queue_records: usize,
     ) -> io::Result<Self> {
         let bridge_instance_id = new_bridge_instance_id()?;
-        let (media, receiver) = mpsc::sync_channel(queue_records);
+        let media = Arc::new(Mutex::new(TrackMediaQueues::default()));
+        let (media_wakeup, receiver) = mpsc::sync_channel(1);
         let snapshot = Arc::new(Mutex::new(None));
         let dropped = Arc::new(Mutex::new(HashSet::new()));
         let queue_drops = Arc::new(AtomicU64::new(0));
         let worker_snapshot = snapshot.clone();
         let worker_dropped = dropped.clone();
         let worker_drops = queue_drops.clone();
+        let worker_media = media.clone();
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = stopped.clone();
         let thread = thread::Builder::new()
@@ -525,6 +570,7 @@ impl BridgeWorker {
                     bridge,
                     client_writer,
                     receiver,
+                    worker_media,
                     worker_snapshot,
                     worker_dropped,
                     worker_drops,
@@ -533,7 +579,9 @@ impl BridgeWorker {
                 )
             })?;
         Ok(Self {
-            media: Some(media),
+            media,
+            media_wakeup: Some(media_wakeup),
+            queue_records_per_track: queue_records,
             snapshot,
             dropped,
             generation: 0,
@@ -555,21 +603,22 @@ impl BridgeWorker {
     pub(crate) fn queue_media(&mut self, mut media: BridgeMedia) -> bool {
         media.generation = self.generation;
         let delivery_id = media.delivery_id;
-        let Some(sender) = &self.media else {
+        let Some(wakeup) = &self.media_wakeup else {
             self.mark_dropped(delivery_id);
             return false;
         };
-        match sender.try_send(media) {
-            Ok(()) => true,
-            Err(mpsc::TrySendError::Full(_)) => {
-                self.mark_dropped(delivery_id);
-                false
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.mark_dropped(delivery_id);
-                false
-            }
+        let queued = self
+            .media
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(media, self.queue_records_per_track)
+            .is_ok();
+        if !queued {
+            self.mark_dropped(delivery_id);
+            return false;
         }
+        let _ = wakeup.try_send(());
+        true
     }
 
     fn mark_dropped(&self, delivery_id: u64) {
@@ -588,7 +637,7 @@ impl Drop for BridgeWorker {
         // process teardown can then reset the Windows socket before OuterBridge sends GOODBYE.
         // Stop and join so detach does not complete until the protocol session is closed cleanly.
         self.stopped.store(true, Ordering::Release);
-        self.media.take();
+        self.media_wakeup.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -632,7 +681,8 @@ fn apply_cell_size(display: &mut crate::ipc::DisplayMetrics, packed: u32) {
 fn run_bridge_worker(
     mut bridge: crate::bridge::OuterBridge,
     client_writer: BridgeClientSender,
-    receiver: mpsc::Receiver<BridgeMedia>,
+    receiver: mpsc::Receiver<()>,
+    media_queues: Arc<Mutex<TrackMediaQueues>>,
     snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     dropped: Arc<Mutex<HashSet<u64>>>,
     queue_drops: Arc<AtomicU64>,
@@ -656,6 +706,7 @@ fn run_bridge_worker(
     let mut active_generation = 0;
     let mut minimum_media_generation = HashMap::<BridgeSourceKey, u64>::new();
     let mut retained_rehydration = HashSet::<BridgeSourceKey>::new();
+    let mut active_surfaces = Vec::new();
     let mut active_sources = Vec::new();
     let mut active_nodes = Vec::new();
     let mut started_sources = HashSet::new();
@@ -666,6 +717,17 @@ fn run_bridge_worker(
     loop {
         if stopped.load(Ordering::Acquire) {
             break;
+        }
+        if bridge
+            .retry_pending_activation()
+            .and_then(|()| bridge.retry_pending_playback())
+            .is_err()
+        {
+            force_sources = true;
+            force_replacement = true;
+            let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+                reset_outer_session: true,
+            });
         }
         // Report on a coarse interval rather than per record: this is diagnostic traffic and must
         // never compete with media for the client connection.
@@ -735,7 +797,7 @@ fn run_bridge_worker(
                     bridge_instance_id,
                     trace_started,
                     Some(*source),
-                    MediaTraceKind::SourceLost,
+                    MediaTraceKind::TrackLost,
                 );
             }
             desynchronized_sources.extend(source_losses);
@@ -765,9 +827,11 @@ fn run_bridge_worker(
                 ProjectionChange::Sources
             } else {
                 compare_projection(
+                    &active_surfaces,
                     &active_sources,
                     &active_nodes,
-                    &pending.sources,
+                    &pending.surfaces,
+                    &pending.tracks,
                     &pending.nodes,
                 )
             };
@@ -778,7 +842,7 @@ fn run_bridge_worker(
             }
             let applied = match change {
                 ProjectionChange::PlaybackOnly => {
-                    bridge.update_playback(&active_sources, &pending.sources)
+                    bridge.update_playback(&active_sources, &pending.tracks)
                 }
                 // Scene-only changes (occlusion fragments, node moves) reconcile nodes in the
                 // current outer session: no pause, no source work, no retained-body replay,
@@ -786,12 +850,12 @@ fn run_bridge_worker(
                 // nothing re-issues PLAY for sources that were not recreated.
                 ProjectionChange::SceneOnly => bridge
                     .update_nodes(&pending.nodes)
-                    .and_then(|()| bridge.update_playback(&active_sources, &pending.sources)),
+                    .and_then(|()| bridge.update_playback(&active_sources, &pending.tracks)),
                 ProjectionChange::Sources => {
                     let result = if force_replacement {
-                        bridge.replace_session(&pending.sources, &pending.nodes)
+                        bridge.replace_session(&pending.surfaces, &pending.tracks, &pending.nodes)
                     } else {
-                        bridge.rebuild(&pending.sources, &pending.nodes)
+                        bridge.rebuild(&pending.surfaces, &pending.tracks, &pending.nodes)
                     };
                     result.map(|sources| recreated = sources)
                 }
@@ -828,7 +892,7 @@ fn run_bridge_worker(
                 trace_started,
                 change,
                 &active_sources,
-                &pending.sources,
+                &pending.tracks,
                 &recreated,
                 &bridge.attachment_generations(),
             );
@@ -843,14 +907,14 @@ fn run_bridge_worker(
 
             if change == ProjectionChange::Sources {
                 let current = pending
-                    .sources
+                    .tracks
                     .iter()
                     .map(|source| source.key)
                     .collect::<HashSet<_>>();
                 minimum_media_generation.retain(|source, _| current.contains(source));
                 retained_rehydration.retain(|source| current.contains(source));
                 for source in pending
-                    .sources
+                    .tracks
                     .iter()
                     .filter(|source| recreated.contains(&source.key))
                 {
@@ -879,14 +943,14 @@ fn run_bridge_worker(
                         BridgeKeyframeRequest {
                             source,
                             minimum_epoch: None,
-                            reason: vivid_protocol::messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+                            reason: crate::bridge::KEYFRAME_REASON_TRANSPORT_LOSS,
                         },
                     )
                 })
                 .collect::<HashMap<_, _>>();
             keyframes.extend(desynchronized_sources.drain().filter_map(|source| {
                 pending
-                    .sources
+                    .tracks
                     .iter()
                     .any(|candidate| {
                         candidate.key == source
@@ -897,12 +961,12 @@ fn run_bridge_worker(
                         BridgeKeyframeRequest {
                             source,
                             minimum_epoch: None,
-                            reason: vivid_protocol::messages::KEYFRAME_REASON_DECODER_ERROR,
+                            reason: crate::bridge::KEYFRAME_REASON_DECODER_ERROR,
                         },
                     ))
             }));
             if change == ProjectionChange::Sources {
-                keyframes.extend(pending.sources.iter().filter_map(|source| {
+                keyframes.extend(pending.tracks.iter().filter_map(|source| {
                     (recreated.contains(&source.key)
                         && source.playing
                         && matches!(source.kind, BridgeSourceKind::Video { .. }))
@@ -911,12 +975,13 @@ fn run_bridge_worker(
                         BridgeKeyframeRequest {
                             source: source.key,
                             minimum_epoch: None,
-                            reason: vivid_protocol::messages::KEYFRAME_REASON_INITIAL,
+                            reason: crate::bridge::KEYFRAME_REASON_INITIAL,
                         },
                     ))
                 }));
             }
-            active_sources = pending.sources;
+            active_surfaces = pending.surfaces;
+            active_sources = pending.tracks;
             active_nodes = pending.nodes;
             started_sources.extend(
                 active_sources
@@ -926,7 +991,14 @@ fn run_bridge_worker(
             );
             if !keyframes.is_empty() {
                 let mut keyframes = keyframes.into_values().collect::<Vec<_>>();
-                keyframes.sort_by_key(|request| (request.source.producer, request.source.source));
+                keyframes.sort_by_key(|request| {
+                    (
+                        request.source.producer,
+                        request.source.context,
+                        request.source.surface,
+                        request.source.track,
+                    )
+                });
                 let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(keyframes));
             }
             continue;
@@ -936,11 +1008,15 @@ fn run_bridge_worker(
             force_sources = true;
             force_replacement = true;
         }
-        let media = match deferred.take() {
+        let media = match deferred.take().or_else(|| {
+            media_queues
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop()
+        }) {
             Some(media) => media,
             None => match receiver.recv_timeout(Duration::from_millis(10)) {
-                Ok(media) => media,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             },
         };
@@ -1106,18 +1182,24 @@ fn recreated_source_keys(
 }
 
 fn compare_projection(
+    previous_surfaces: &[BridgeSurface],
     previous_sources: &[BridgeSource],
     previous_nodes: &[BridgeNode],
+    current_surfaces: &[BridgeSurface],
     current_sources: &[BridgeSource],
     current_nodes: &[BridgeNode],
 ) -> ProjectionChange {
+    let surfaces_unchanged = previous_surfaces.len() == current_surfaces.len()
+        && previous_surfaces
+            .iter()
+            .all(|previous| current_surfaces.contains(previous));
     let sources_unchanged = previous_sources.len() == current_sources.len()
         && previous_sources.iter().all(|previous| {
             current_sources
                 .iter()
                 .any(|current| previous.key == current.key && previous.kind == current.kind)
         });
-    if !sources_unchanged {
+    if !surfaces_unchanged || !sources_unchanged {
         return ProjectionChange::Sources;
     }
     let nodes_unchanged = previous_nodes.len() == current_nodes.len()
@@ -1148,20 +1230,34 @@ fn trace_projection_change(
             .filter(|source| !current.iter().any(|next| next.key == source.key))
             .map(|source| source.key)
             .collect::<Vec<_>>();
-        removed.sort_by_key(|source| (source.producer, source.source));
+        removed.sort_by_key(|source| {
+            (
+                source.producer,
+                source.context,
+                source.surface,
+                source.track,
+            )
+        });
         for source in removed {
             send_bridge_trace(
                 client_writer,
                 bridge_instance_id,
                 trace_started,
                 Some(source),
-                MediaTraceKind::OuterSourceRemoved,
+                MediaTraceKind::OuterTrackRemoved,
             );
         }
     }
 
     let mut ordered = current.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|source| (source.key.producer, source.key.source));
+    ordered.sort_by_key(|source| {
+        (
+            source.key.producer,
+            source.key.context,
+            source.key.surface,
+            source.key.track,
+        )
+    });
     for source in ordered {
         if recreated.contains(&source.key) {
             let attachment_generation = attachment_generations
@@ -1173,7 +1269,7 @@ fn trace_projection_change(
                 bridge_instance_id,
                 trace_started,
                 Some(source.key),
-                MediaTraceKind::OuterSourceRecreated {
+                MediaTraceKind::OuterTrackRecreated {
                     attachment_generation,
                     playing: source.playing,
                 },
@@ -1546,6 +1642,26 @@ mod tests {
     #[cfg(unix)]
     use vivid_protocol::media::{self, AudioPacket, VideoPacket};
 
+    fn test_surface(key: BridgeSourceKey) -> BridgeSurface {
+        BridgeSurface {
+            key: crate::ipc::BridgeSurfaceKey {
+                producer: key.producer,
+                context: key.context,
+                surface: key.surface,
+            },
+            logical_width: 16,
+            logical_height: 16,
+            capture_policy: 0,
+            descriptor: crate::ipc::BridgeSourceDescriptor {
+                role: 1,
+                title: "test surface".into(),
+                content_revision: 1,
+                semantic_availability: 0,
+                locator: String::new(),
+            },
+        }
+    }
+
     #[test]
     fn presenter_cell_size_survives_terminal_grid_polling() {
         let presenter = crate::ipc::DisplayMetrics {
@@ -1640,7 +1756,9 @@ mod tests {
         });
         let key = BridgeSourceKey {
             producer: 3,
-            source: 7,
+            context: 1,
+            surface: 7,
+            track: 7,
         };
         let source = BridgeSource {
             key,
@@ -1673,9 +1791,9 @@ mod tests {
                 minimum_buffer_us: 33_000,
                 maximum_latency_us: 500_000,
                 rate_32_32: 1_i64 << 32,
-                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                late_policy: 1,
                 loop_count: 0,
-                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+                start_policy: 1,
             },
         };
 
@@ -1697,7 +1815,7 @@ mod tests {
                 bridge_instance_id: 19,
                 event: BridgeMediaTraceEvent {
                     source: Some(source),
-                    kind: MediaTraceKind::OuterSourceRecreated {
+                    kind: MediaTraceKind::OuterTrackRecreated {
                         attachment_generation: 2,
                         playing: true,
                     },
@@ -1894,11 +2012,13 @@ mod tests {
 
     #[test]
     fn full_bridge_media_queue_drops_instead_of_blocking_input() {
-        let (media, receiver) = mpsc::sync_channel(1);
+        let (media_wakeup, receiver) = mpsc::sync_channel(1);
         let dropped = Arc::new(Mutex::new(HashSet::new()));
         let queue_drops = Arc::new(AtomicU64::new(0));
         let mut worker = BridgeWorker {
-            media: Some(media),
+            media: Arc::new(Mutex::new(TrackMediaQueues::default())),
+            media_wakeup: Some(media_wakeup),
+            queue_records_per_track: 1,
             snapshot: Arc::new(Mutex::new(None)),
             dropped: dropped.clone(),
             generation: 1,
@@ -1908,7 +2028,9 @@ mod tests {
         };
         let key = BridgeSourceKey {
             producer: 3,
-            source: 7,
+            context: 1,
+            surface: 7,
+            track: 7,
         };
         let record = || BridgeMedia {
             generation: 0,
@@ -1923,13 +2045,37 @@ mod tests {
 
         assert!(worker.queue_media(record()));
         assert!(!worker.queue_media(record()));
+        let audio_key = BridgeSourceKey { track: 8, ..key };
+        assert!(
+            worker.queue_media(BridgeMedia {
+                generation: 0,
+                delivery_id: 12,
+                source: audio_key,
+                record_type: vivid_protocol::messages::AUDIO_PACKET,
+                offset: 0,
+                total: 1,
+                last: true,
+                bytes: vec![0],
+            }),
+            "a full video-track queue must not consume the audio track's bounded queue"
+        );
         assert!(
             dropped
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .contains(&11)
         );
-        assert_eq!(receiver.try_recv().unwrap().generation, 1);
+        receiver.try_recv().unwrap();
+        assert_eq!(
+            worker
+                .media
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop()
+                .unwrap()
+                .generation,
+            1
+        );
         // The drop is counted for `inspect-media` without changing the drop behavior itself.
         assert_eq!(queue_drops.load(Ordering::Relaxed), 1);
     }
@@ -1979,15 +2125,17 @@ mod tests {
 
         let key = BridgeSourceKey {
             producer: 3,
-            source: 7,
+            context: 1,
+            surface: 7,
+            track: 7,
         };
         let source = BridgeSource {
             key,
             kind: BridgeSourceKind::Raster {
                 width: 2,
                 height: 1,
-                alpha_mode: vivid_protocol::messages::ALPHA_STRAIGHT,
-                compression_mode: vivid_protocol::messages::COMPRESSION_NONE,
+                alpha_mode: 1,
+                compression_mode: 1,
                 delta_operation_limit: None,
             },
             capture_policy: 0,
@@ -2000,16 +2148,16 @@ mod tests {
                 minimum_buffer_us: 0,
                 maximum_latency_us: 500_000,
                 rate_32_32: 1_i64 << 32,
-                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                late_policy: 1,
                 loop_count: 0,
-                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+                start_policy: 1,
             },
         };
         let node = BridgeNode {
             producer: key.producer,
             node: 1,
             fragment: 0,
-            source: key,
+            surface: test_surface(key).key,
             x: 0,
             y: 0,
             width: 2_i64 << 32,
@@ -2026,7 +2174,8 @@ mod tests {
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
             virtual_revision: 1,
-            sources: vec![source],
+            surfaces: vec![test_surface(key)],
+            tracks: vec![source],
             nodes: vec![node],
             videos_needing_keyframes: Vec::new(),
         });
@@ -2104,11 +2253,15 @@ mod tests {
 
         let key = BridgeSourceKey {
             producer: 3,
-            source: 7,
+            context: 1,
+            surface: 7,
+            track: 7,
         };
         let video_key = BridgeSourceKey {
             producer: 3,
-            source: 8,
+            context: 1,
+            surface: 7,
+            track: 8,
         };
         let video_source = BridgeSource {
             key: video_key,
@@ -2141,9 +2294,9 @@ mod tests {
                 minimum_buffer_us: 100_000,
                 maximum_latency_us: 500_000,
                 rate_32_32: 1_i64 << 32,
-                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                late_policy: 1,
                 loop_count: 0,
-                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+                start_policy: 1,
             },
         };
         let audio_source = BridgeSource {
@@ -2170,15 +2323,16 @@ mod tests {
                 minimum_buffer_us: 0,
                 maximum_latency_us: 500_000,
                 rate_32_32: 1_i64 << 32,
-                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                late_policy: 1,
                 loop_count: 0,
-                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+                start_policy: 1,
             },
         };
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
             virtual_revision: 1,
-            sources: vec![video_source.clone(), audio_source.clone()],
+            surfaces: vec![test_surface(video_key)],
+            tracks: vec![video_source.clone(), audio_source.clone()],
             nodes: Vec::new(),
             videos_needing_keyframes: Vec::new(),
         });
@@ -2227,7 +2381,8 @@ mod tests {
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
             virtual_revision: 2,
-            sources: vec![playing_video, audio_source],
+            surfaces: vec![test_surface(video_key)],
+            tracks: vec![playing_video, audio_source],
             nodes: Vec::new(),
             videos_needing_keyframes: Vec::new(),
         });
@@ -2260,7 +2415,7 @@ mod tests {
         loop {
             let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
             if snapshot.sources.iter().any(|source| {
-                source.key.1 != 0
+                source.key.track != 0
                     && matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
                     && source.playing
             }) {
@@ -2341,20 +2496,24 @@ mod tests {
             let image_rect = image_tab.geometry(tab_area)[&image_pane].content();
             let video_key = BridgeSourceKey {
                 producer: video_pane,
-                source: 7,
+                context: 1,
+                surface: 7,
+                track: 7,
             };
             let audio_key = BridgeSourceKey {
                 producer: video_pane,
-                source: 8,
+                context: 1,
+                surface: 7,
+                track: 8,
             };
             let play_request = crate::ipc::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 33_000,
                 maximum_latency_us: 500_000,
                 rate_32_32: 1_i64 << 32,
-                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                late_policy: 1,
                 loop_count: 0,
-                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+                start_policy: 1,
             };
             let video_source = |playing, play_request| BridgeSource {
                 key: video_key,
@@ -2412,7 +2571,7 @@ mod tests {
                 producer: video_key.producer,
                 node: 1,
                 fragment: 0,
-                source: video_key,
+                surface: test_surface(video_key).key,
                 x: i64::from(video_rect.x) << 32,
                 y: i64::from(video_rect.y) << 32,
                 width: i64::from(video_rect.width) << 32,
@@ -2472,7 +2631,8 @@ mod tests {
             worker.replace_snapshot(BridgeSnapshot {
                 generation: 0,
                 virtual_revision: 1,
-                sources: vec![video_source(false, play_request), audio_source.clone()],
+                surfaces: vec![test_surface(video_key)],
+                tracks: vec![video_source(false, play_request), audio_source.clone()],
                 nodes: vec![video_node.clone()],
                 videos_needing_keyframes: Vec::new(),
             });
@@ -2536,7 +2696,8 @@ mod tests {
             worker.replace_snapshot(BridgeSnapshot {
                 generation: 0,
                 virtual_revision: 2,
-                sources: vec![video_source(true, play_request), audio_source.clone()],
+                surfaces: vec![test_surface(video_key)],
+                tracks: vec![video_source(true, play_request), audio_source.clone()],
                 nodes: vec![video_node.clone()],
                 videos_needing_keyframes: Vec::new(),
             });
@@ -2613,12 +2774,14 @@ mod tests {
                 .unwrap();
             let image_key = BridgeSourceKey {
                 producer: image_pane,
-                source: 9,
+                context: 1,
+                surface: 9,
+                track: 9,
             };
             let image_source = BridgeSource {
                 key: image_key,
                 kind: BridgeSourceKind::Image {
-                    encoding: vivid_protocol::messages::IMAGE_PNG,
+                    encoding: 1,
                     width: 1,
                     height: 1,
                     encoded_length: u32::try_from(encoded.len()).unwrap(),
@@ -2634,16 +2797,16 @@ mod tests {
                     minimum_buffer_us: 0,
                     maximum_latency_us: 500_000,
                     rate_32_32: 1_i64 << 32,
-                    late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                    late_policy: 1,
                     loop_count: 0,
-                    start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+                    start_policy: 1,
                 },
             };
             let image_node = BridgeNode {
                 producer: image_key.producer,
                 node: 2,
                 fragment: 0,
-                source: image_key,
+                surface: test_surface(image_key).key,
                 x: i64::from(image_rect.x) << 32,
                 y: i64::from(image_rect.y) << 32,
                 width: i64::from(image_rect.width) << 32,
@@ -2663,7 +2826,8 @@ mod tests {
             worker.replace_snapshot(BridgeSnapshot {
                 generation: 0,
                 virtual_revision: 3,
-                sources: vec![image_source.clone()],
+                surfaces: vec![test_surface(image_key)],
+                tracks: vec![image_source.clone()],
                 nodes: vec![image_node.clone()],
                 videos_needing_keyframes: Vec::new(),
             });
@@ -2720,7 +2884,8 @@ mod tests {
             worker.replace_snapshot(BridgeSnapshot {
                 generation: 0,
                 virtual_revision: 4,
-                sources: vec![video_source(true, play_request), audio_source.clone()],
+                surfaces: vec![test_surface(video_key)],
+                tracks: vec![video_source(true, play_request), audio_source.clone()],
                 nodes: vec![video_node.clone()],
                 videos_needing_keyframes: Vec::new(),
             });
@@ -2759,9 +2924,13 @@ mod tests {
                 return_bridge_instance, bridge_instance_id,
                 "a tab switch reconciles sources without replacing the outer bridge session"
             );
-            assert!(
-                return_attachment_generation > initial_attachment_generation,
-                "the video decoder attachment must be a new generation"
+            assert_eq!(
+                initial_attachment_generation, 1,
+                "the first independently allocated outer channel starts at generation one"
+            );
+            assert_eq!(
+                return_attachment_generation, 1,
+                "a replacement outer track owns a fresh identity and an independent generation"
             );
             let return_messages = &seen[return_start..=return_applied];
             let recreated = return_messages
@@ -2772,7 +2941,7 @@ mod tests {
                         ClientMessage::BridgeTrace {
                             event: BridgeMediaTraceEvent {
                                 source: Some(source),
-                                kind: MediaTraceKind::OuterSourceRecreated {
+                                kind: MediaTraceKind::OuterTrackRecreated {
                                     playing: true,
                                     ..
                                 },
@@ -2809,7 +2978,7 @@ mod tests {
             let expected_initial = BridgeKeyframeRequest {
                 source: video_key,
                 minimum_epoch: None,
-                reason: vivid_protocol::messages::KEYFRAME_REASON_INITIAL,
+                reason: crate::bridge::KEYFRAME_REASON_INITIAL,
             };
             receive_bridge_message_until(
                 &message_receiver,
@@ -2835,7 +3004,8 @@ mod tests {
             worker.replace_snapshot(BridgeSnapshot {
                 generation: 0,
                 virtual_revision: 5,
-                sources: vec![video_source(true, recovery_play), audio_source.clone()],
+                surfaces: vec![test_surface(video_key)],
+                tracks: vec![video_source(true, recovery_play), audio_source.clone()],
                 nodes: vec![video_node],
                 videos_needing_keyframes: Vec::new(),
             });
@@ -2969,11 +3139,15 @@ mod tests {
     fn playback_only_snapshot_preserves_projection_and_linked_audio_state() {
         let video_key = BridgeSourceKey {
             producer: 3,
-            source: 7,
+            context: 1,
+            surface: 7,
+            track: 7,
         };
         let audio_key = BridgeSourceKey {
             producer: 3,
-            source: 8,
+            context: 1,
+            surface: 7,
+            track: 8,
         };
         let video = |playing| BridgeSource {
             key: video_key,
@@ -3006,9 +3180,9 @@ mod tests {
                 minimum_buffer_us: 100_000,
                 maximum_latency_us: 500_000,
                 rate_32_32: 1_i64 << 32,
-                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                late_policy: 1,
                 loop_count: 0,
-                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+                start_policy: 1,
             },
         };
         let audio = BridgeSource {
@@ -3035,16 +3209,17 @@ mod tests {
                 minimum_buffer_us: 0,
                 maximum_latency_us: 500_000,
                 rate_32_32: 1_i64 << 32,
-                late_policy: vivid_protocol::messages::LATE_DROP_PRESENTATION,
+                late_policy: 1,
                 loop_count: 0,
-                start_policy: vivid_protocol::messages::START_AFTER_MINIMUM_BUFFER,
+                start_policy: 1,
             },
         };
         let before = vec![video(false), audio.clone()];
         let after = vec![audio, video(true)];
+        let surfaces = vec![test_surface(video_key)];
 
         assert_eq!(
-            compare_projection(&before, &[], &after, &[]),
+            compare_projection(&surfaces, &before, &[], &surfaces, &after, &[]),
             ProjectionChange::PlaybackOnly
         );
         assert!(recreated_playing_video_sources(&before, &after).is_empty());
@@ -3059,7 +3234,7 @@ mod tests {
             producer: 3,
             node: 1,
             fragment: 0,
-            source: video_key,
+            surface: test_surface(video_key).key,
             x: x << 32,
             y: 0,
             width: 4_i64 << 32,
@@ -3074,21 +3249,35 @@ mod tests {
             },
         };
         assert_eq!(
-            compare_projection(&before, &[node(0)], &after, &[node(0)]),
+            compare_projection(
+                &surfaces,
+                &before,
+                &[node(0)],
+                &surfaces,
+                &after,
+                &[node(0)],
+            ),
             ProjectionChange::PlaybackOnly
         );
         assert_eq!(
-            compare_projection(&before, &[node(0)], &after, &[node(5)]),
+            compare_projection(
+                &surfaces,
+                &before,
+                &[node(0)],
+                &surfaces,
+                &after,
+                &[node(5)],
+            ),
             ProjectionChange::SceneOnly,
             "a moved node must reconcile the scene without touching sources"
         );
         assert_eq!(
-            compare_projection(&before, &[node(0)], &after, &[]),
+            compare_projection(&surfaces, &before, &[node(0)], &surfaces, &after, &[]),
             ProjectionChange::SceneOnly,
             "a removed node must reconcile the scene without touching sources"
         );
         assert_eq!(
-            compare_projection(&[], &[], &after, &[node(0)]),
+            compare_projection(&[], &[], &[], &surfaces, &after, &[node(0)]),
             ProjectionChange::Sources
         );
         assert!(
@@ -3108,13 +3297,15 @@ mod tests {
 
         let image_key = BridgeSourceKey {
             producer: 3,
-            source: 12,
+            context: 1,
+            surface: 12,
+            track: 12,
         };
         let mut with_image = after.clone();
         with_image.push(BridgeSource {
             key: image_key,
             kind: BridgeSourceKind::Image {
-                encoding: vivid_protocol::messages::IMAGE_PNG,
+                encoding: 1,
                 width: 4,
                 height: 4,
                 encoded_length: 32,

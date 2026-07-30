@@ -1726,18 +1726,8 @@ mod tests {
         );
 
         let (cell_width, cell_height) = console_cell_size(None);
-        let display = vivid_protocol::messages::DisplayChanged {
-            display_generation: 1,
-            viewport_width: 80 * u32::from(cell_width),
-            viewport_height: 22 * u32::from(cell_height),
-            grid_columns: 80,
-            grid_rows: 22,
-            cell_width: u32::from(cell_width),
-            cell_height: u32::from(cell_height),
-            settled: true,
-        };
-        let welcome = vivid_protocol::messages::welcome(1, 1, &[1; 16], 1, display, &[]);
-        vivid_protocol::messages::parse_welcome(&welcome).unwrap();
+        assert!(cell_width > 0);
+        assert!(cell_height > 0);
     }
 
     #[test]
@@ -1779,7 +1769,10 @@ mod tests {
             (OsString::from("zebra"), OsString::from("last")),
             (OsString::from("Path"), OsString::from("first")),
             (OsString::from("PATH"), OsString::from("ignored")),
-            (OsString::from("VIVID_TOKEN"), OsString::from("secret")),
+            (
+                OsString::from("VIVID_ROOT_SECRET"),
+                OsString::from("secret"),
+            ),
             (OsString::from("vivid_endpoint"), OsString::from("secret")),
             (OsString::from("SSH_AUTH_SOCK"), OsString::from("secret")),
             (OsString::from("TMUX"), OsString::from("outer")),

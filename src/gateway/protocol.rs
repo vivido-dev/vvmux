@@ -166,6 +166,8 @@ impl From<WireDirection> for Direction {
 pub(crate) struct VividAccess<'a> {
     pub endpoint: &'a str,
     pub subprotocol: &'static str,
+    /// Vivid wire protocol carried by this otherwise byte-transparent route.
+    pub wire_version: &'static str,
     pub connection: &'a str,
     pub token: &'a str,
 }

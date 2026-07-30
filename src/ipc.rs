@@ -9,11 +9,11 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Bumped to 9 when bridge-instance correlation and bounded media tracing were added.
+/// Bumped to 10 for the Vivid 1.5 surface/track/channel cutover.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 9;
+pub const VERSION: u16 = 10;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -33,7 +33,7 @@ const RENDER_RECORD: u16 = 3;
 /// decimal number per byte, which measured at 3.57x for media and 3.29x for terminal frames, paid
 /// twice — once formatting on the session actor, once parsing on the client's reader thread. Both
 /// are single-threaded, so that cost is latency on the two hops least able to absorb it.
-const MEDIA_RECORD_HEADER: usize = 40;
+const MEDIA_RECORD_HEADER: usize = 56;
 const RENDER_RECORD_HEADER: usize = 24;
 const MEDIA_FLAG_LAST: u16 = 0x0001;
 const RENDER_FLAG_FULL: u16 = 0x0001;
@@ -144,7 +144,8 @@ pub struct PaneMediaStatus {
     pub bridge_instance_id: Option<u64>,
     /// Projection revision local to the current foreground bridge.
     pub bridge_local_revision: u64,
-    pub sources: Vec<PaneMediaSourceStatus>,
+    pub surfaces: Vec<PaneMediaSurfaceStatus>,
+    pub tracks: Vec<PaneMediaTrackStatus>,
     pub nodes: Vec<PaneMediaNodeStatus>,
     /// Session-scoped relay counters. Every pane shares one client connection and one foreground
     /// bridge, so this describes the whole relay rather than this pane's slice of it.
@@ -152,20 +153,34 @@ pub struct PaneMediaStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PaneMediaSourceStatus {
+pub struct PaneMediaSurfaceStatus {
     pub producer_id: u64,
-    pub source_id: u64,
-    pub kind: String,
+    pub context_id: u64,
+    pub surface_id: u64,
     pub lifecycle: String,
-    pub source_revision: u64,
-    pub epoch: u32,
-    pub attachment_state: u64,
-    pub attachment_generation: u64,
-    pub outer_attachment_generation: Option<u64>,
-    pub outer_mapping_fresh: bool,
+    pub surface_revision: u64,
+    pub surface_generation: u64,
     pub visible: bool,
     pub capture_policy: u64,
-    pub descriptor: Option<PaneMediaSourceDescriptor>,
+    pub descriptor: Option<PaneMediaSurfaceDescriptor>,
+    pub active_slots: Vec<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneMediaTrackStatus {
+    pub producer_id: u64,
+    pub context_id: u64,
+    pub surface_id: u64,
+    pub track_id: u64,
+    pub kind: String,
+    pub lifecycle: String,
+    pub track_revision: u64,
+    pub epoch: u32,
+    pub channel_state: u64,
+    pub inner_channel_generation: u64,
+    pub outer_channel_generation: Option<u64>,
+    pub outer_mapping_fresh: bool,
+    pub visible: bool,
     pub retained_static: bool,
     pub keyframe_needed: bool,
     pub milestones: u64,
@@ -176,7 +191,7 @@ pub struct PaneMediaSourceStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PaneMediaSourceDescriptor {
+pub struct PaneMediaSurfaceDescriptor {
     pub role: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -191,8 +206,10 @@ pub struct PaneMediaSourceDescriptor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaneMediaNodeStatus {
     pub producer_id: u64,
+    pub context_id: u64,
     pub node_id: u64,
-    pub source_id: u64,
+    pub surface_context_id: u64,
+    pub surface_id: u64,
     pub visible: bool,
     pub x: i64,
     pub y: i64,
@@ -347,9 +364,29 @@ pub struct MouseEvent {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct BridgeSourceKey {
+pub struct BridgeSurfaceKey {
+    /// Inner Vivid session identity allocated by the virtual presenter.
     pub producer: u64,
-    pub source: u64,
+    pub context: u64,
+    pub surface: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeSurface {
+    pub key: BridgeSurfaceKey,
+    pub logical_width: u64,
+    pub logical_height: u64,
+    pub capture_policy: u64,
+    pub descriptor: BridgeSourceDescriptor,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct BridgeSourceKey {
+    /// Inner Vivid session identity allocated by the virtual presenter.
+    pub producer: u64,
+    pub context: u64,
+    pub surface: u64,
+    pub track: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -469,7 +506,7 @@ pub struct BridgeNode {
     pub node: u64,
     /// Stable fragment identity within one logical `(producer, node)`.
     pub fragment: u8,
-    pub source: BridgeSourceKey,
+    pub surface: BridgeSurfaceKey,
     pub x: i64,
     pub y: i64,
     pub width: i64,
@@ -570,7 +607,8 @@ pub enum ServerMessage {
     Status(String),
     MediaSnapshot {
         revision: u64,
-        sources: Vec<BridgeSource>,
+        surfaces: Vec<BridgeSurface>,
+        tracks: Vec<BridgeSource>,
         nodes: Vec<BridgeNode>,
         videos_needing_keyframes: Vec<BridgeSourceKey>,
     },
@@ -769,11 +807,13 @@ impl RecordWriter {
         let mut header = [0_u8; MEDIA_RECORD_HEADER];
         header[0..8].copy_from_slice(&chunk.delivery_id.to_be_bytes());
         header[8..16].copy_from_slice(&chunk.source.producer.to_be_bytes());
-        header[16..24].copy_from_slice(&chunk.source.source.to_be_bytes());
-        header[24..26].copy_from_slice(&chunk.record_type.to_be_bytes());
-        header[26..28].copy_from_slice(&if chunk.last { MEDIA_FLAG_LAST } else { 0 }.to_be_bytes());
-        header[28..32].copy_from_slice(&chunk.offset.to_be_bytes());
-        header[32..36].copy_from_slice(&chunk.total.to_be_bytes());
+        header[16..24].copy_from_slice(&chunk.source.context.to_be_bytes());
+        header[24..32].copy_from_slice(&chunk.source.surface.to_be_bytes());
+        header[32..40].copy_from_slice(&chunk.source.track.to_be_bytes());
+        header[40..42].copy_from_slice(&chunk.record_type.to_be_bytes());
+        header[42..44].copy_from_slice(&if chunk.last { MEDIA_FLAG_LAST } else { 0 }.to_be_bytes());
+        header[44..48].copy_from_slice(&chunk.offset.to_be_bytes());
+        header[48..52].copy_from_slice(&chunk.total.to_be_bytes());
         self.write_raw_parts(MEDIA_RECORD, 0, &[&header, bytes])
     }
 
@@ -942,12 +982,14 @@ fn decode_media_record(mut body: Vec<u8>) -> io::Result<ServerMessage> {
     }
     let delivery_id = u64::from_be_bytes(body[0..8].try_into().unwrap());
     let producer = u64::from_be_bytes(body[8..16].try_into().unwrap());
-    let source = u64::from_be_bytes(body[16..24].try_into().unwrap());
-    let record_type = u16::from_be_bytes(body[24..26].try_into().unwrap());
-    let flags = u16::from_be_bytes(body[26..28].try_into().unwrap());
-    let offset = u32::from_be_bytes(body[28..32].try_into().unwrap());
-    let total = u32::from_be_bytes(body[32..36].try_into().unwrap());
-    if u32::from_be_bytes(body[36..40].try_into().unwrap()) != 0 {
+    let context = u64::from_be_bytes(body[16..24].try_into().unwrap());
+    let surface = u64::from_be_bytes(body[24..32].try_into().unwrap());
+    let track = u64::from_be_bytes(body[32..40].try_into().unwrap());
+    let record_type = u16::from_be_bytes(body[40..42].try_into().unwrap());
+    let flags = u16::from_be_bytes(body[42..44].try_into().unwrap());
+    let offset = u32::from_be_bytes(body[44..48].try_into().unwrap());
+    let total = u32::from_be_bytes(body[48..52].try_into().unwrap());
+    if u32::from_be_bytes(body[52..56].try_into().unwrap()) != 0 {
         return Err(invalid("VVMX media record reserved field is nonzero"));
     }
     if flags & !MEDIA_FLAG_LAST != 0 {
@@ -968,7 +1010,12 @@ fn decode_media_record(mut body: Vec<u8>) -> io::Result<ServerMessage> {
     }
     Ok(ServerMessage::MediaRecord {
         delivery_id,
-        source: BridgeSourceKey { producer, source },
+        source: BridgeSourceKey {
+            producer,
+            context,
+            surface,
+            track,
+        },
         record_type,
         offset,
         total,
@@ -1099,10 +1146,12 @@ mod tests {
         let recovery = ClientMessage::BridgeNeedKeyframes(vec![BridgeKeyframeRequest {
             source: BridgeSourceKey {
                 producer: 7,
-                source: 11,
+                context: 3,
+                surface: 5,
+                track: 11,
             },
             minimum_epoch: Some(3),
-            reason: vivid_protocol::messages::KEYFRAME_REASON_TRANSPORT_LOSS,
+            reason: crate::bridge::KEYFRAME_REASON_TRANSPORT_LOSS,
         }]);
         client_writer.lock().unwrap().send(&recovery).unwrap();
         assert_eq!(server_reader.recv::<ClientMessage>().unwrap(), recovery);
@@ -1146,7 +1195,9 @@ mod tests {
     fn binary_media_records_cost_their_payload_instead_of_a_json_number_array() {
         let source = BridgeSourceKey {
             producer: 3,
-            source: 9,
+            context: 1,
+            surface: 4,
+            track: 9,
         };
         let payload = scrambled(64 * 1024);
 
@@ -1199,7 +1250,9 @@ mod tests {
     fn media_and_render_records_round_trip_byte_for_byte() {
         let source = BridgeSourceKey {
             producer: 7,
-            source: 11,
+            context: 3,
+            surface: 5,
+            track: 11,
         };
         // Larger than one chunk so reassembly across records is covered.
         let media = scrambled(300 * 1024);
@@ -1281,7 +1334,9 @@ mod tests {
             1,
             BridgeSourceKey {
                 producer: 1,
-                source: 1,
+                context: 1,
+                surface: 1,
+                track: 1,
             },
             0x8001,
             &high_bytes,
@@ -1312,7 +1367,9 @@ mod tests {
             1,
             BridgeSourceKey {
                 producer: 1,
-                source: 1,
+                context: 1,
+                surface: 1,
+                track: 1,
             },
             0x8001,
             &[1, 2, 3, 4],
@@ -1322,17 +1379,17 @@ mod tests {
 
         // Reserved word set.
         let mut reserved = good.clone();
-        reserved[16 + 36] = 1;
+        reserved[16 + 52] = 1;
         assert!(test_reader(reserved).recv_server().is_err());
 
         // Unknown flag bit set.
         let mut flags = good.clone();
-        flags[16 + 27] = 0xff;
+        flags[16 + 43] = 0xff;
         assert!(test_reader(flags).recv_server().is_err());
 
         // `last` set while the chunk stops short of the declared total.
         let mut short = good.clone();
-        short[16 + 35] = 8;
+        short[16 + 51] = 8;
         assert!(test_reader(short).recv_server().is_err());
 
         // Body shorter than the fixed header.

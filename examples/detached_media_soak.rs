@@ -1,14 +1,20 @@
+//! Long-running Vivid 1.5 raster producer for detach/reattach soak testing.
+
 use std::env;
 use std::io;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use vivid_protocol::cbor::Value;
 use vivid_protocol::media;
-use vivid_protocol::messages;
-use vivid_protocol::wire::{Connection, ConnectionKind, Endpoint, Record};
-use zeroize::Zeroizing;
+use vivid_protocol::track::{
+    KindConfiguration, RasterConfiguration, TrackConfiguration, TrackMode,
+};
+use vivid_sdk::{
+    CoordinateModel, Fit, LaneClass, MILESTONE_OUTPUT_READY, ProducerConfig, RequestMetadata,
+    SceneNode, SlotBinding, SurfaceDefinition, SurfaceDescriptor, SurfaceRole, TrackWaitCondition,
+};
 
-const SOURCE_ID: u64 = 1;
 const DEFAULT_DURATION_SECONDS: u64 = 60 * 60;
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -20,12 +26,6 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
-    let endpoint = env::var("VIVID_ENDPOINT")
-        .map_err(|_| invalid("VIVID_ENDPOINT is not present in the pane environment"))?;
-    let token = Zeroizing::new(
-        env::var("VIVID_TOKEN")
-            .map_err(|_| invalid("VIVID_TOKEN is not present in the pane environment"))?,
-    );
     let duration = env::var("VVMUX_MEDIA_SOAK_SECONDS")
         .ok()
         .map(|value| {
@@ -41,93 +41,136 @@ fn run() -> io::Result<()> {
         ));
     }
 
-    let endpoint = Endpoint::parse(&endpoint)?;
-    let mut control = Connection::open(&endpoint, ConnectionKind::Control)?;
-    control.write_record(messages::HELLO, 0, 0, &messages::hello(1, &token))?;
-    let welcome = read_until(&mut control, messages::WELCOME, 0)?;
-    let welcome = messages::parse_welcome(&welcome.body)?;
-    control.set_send_body_limit(welcome.maximum_control_body)?;
-
-    control.write_record(
-        messages::CREATE_RASTER,
-        0,
-        SOURCE_ID,
-        &messages::create_raster(2, SOURCE_ID, 1, 1),
+    // ProducerConfig reads VIVID_ENDPOINT_CONTROL and VIVID_ROOT_SECRET. Realtime and bulk
+    // discovery intentionally fall back to the control endpoint in a vvmux pane.
+    let mut client = vivid_sdk::Session::connect(ProducerConfig::default())?;
+    let context = client.info().root_context_id;
+    let surface_id = client.allocate_id()?;
+    let track_id = client.allocate_id()?;
+    let node_id = client.allocate_id()?;
+    let surface = client.create_surface(
+        SurfaceDefinition {
+            context_id: context,
+            surface_id,
+            semantic_profile: vivid_sdk::GENERIC_CONTENT.into(),
+            coordinate_model: CoordinateModel::DesktopLogicalPixels,
+            logical_width: 1,
+            logical_height: 1,
+            scale_numerator: 1,
+            scale_denominator: 1,
+            rotation: 0,
+            descriptor: SurfaceDescriptor {
+                role: SurfaceRole::Figure,
+                title: "vvmux detached raster soak".into(),
+                semantic_content_revision: 1,
+                semantic_availability: 0,
+                locator_hint: String::new(),
+            },
+            policy: 0,
+            profile_parameters: vec![],
+        },
+        &RequestMetadata::default(),
     )?;
-    let source_ready = read_until(&mut control, messages::SOURCE_READY, SOURCE_ID)?;
-    let source_ready = messages::parse_source_ready(&source_ready.body)?;
+    client.create_node(
+        &SceneNode {
+            owning_context_id: context,
+            node_id,
+            surface_context_id: context,
+            surface_id,
+            geometry: vec![
+                (0, Value::Unsigned(1)),
+                (1, signed(0)),
+                (2, signed(0)),
+                (3, signed(1_i64 << 32)),
+                (4, signed(1_i64 << 32)),
+                (5, Value::Unsigned(1)),
+            ],
+            fit: Fit::Contain,
+            linear_sampling: true,
+            z_index: 0,
+            visible: true,
+            opacity: u16::MAX,
+            clip: None,
+        },
+        &RequestMetadata::default(),
+    )?;
+    let maximum_record_body = media::rgba8_raw_frame_body_len(1, 1).map_err(io::Error::other)?;
+    let track = client.create_track(
+        TrackConfiguration {
+            context_id: context,
+            surface_id,
+            track_id,
+            slot: 3,
+            mode: TrackMode::Live,
+            lane: LaneClass::Bulk,
+            maximum_record_body,
+            maximum_rate_millihertz: 10_000,
+            maximum_encoded_bits_per_second: u64::from(maximum_record_body) * 8 * 10,
+            maximum_records_per_second: 10,
+            maximum_inflight_body_bytes: u64::from(maximum_record_body) * 2,
+            kind: KindConfiguration::Raster(RasterConfiguration {
+                width: 1,
+                height: 1,
+                alpha_mode: 1,
+                delta_enabled: false,
+                maximum_delta_operations: 1,
+                zstd_enabled: false,
+            }),
+            target_latency_us: 100_000,
+            maximum_latency_us: 1_000_000,
+            retained_pixel_charge: 1,
+        },
+        &RequestMetadata::default(),
+    )?;
+    let channel = client.open_track_channel(&track)?;
 
-    let mut raster = Connection::open(&endpoint, ConnectionKind::Raster)?;
-    raster.write_record(
-        messages::ATTACH_CHANNEL,
-        0,
-        SOURCE_ID,
-        &messages::attach_channel(&source_ready.media_ticket),
+    channel.send_raster(0, 1, &[0, 0, 0, 255], false)?;
+    client.wait_track(
+        &track,
+        TrackWaitCondition::MilestoneSet,
+        Some(MILESTONE_OUTPUT_READY),
+        5_000_000,
+    )?;
+    client.activate_tracks(
+        &surface,
+        &[SlotBinding {
+            slot: 3,
+            track_id,
+            expected_channel_generation: track.channel_generation(),
+            required_milestone: MILESTONE_OUTPUT_READY,
+        }],
+        &RequestMetadata::default(),
     )?;
 
-    let started = Instant::now();
-    let deadline = started
+    let deadline = Instant::now()
         .checked_add(Duration::from_secs(duration))
         .ok_or_else(|| invalid("media soak deadline overflowed"))?;
-    let mut frame_id = 0_u64;
+    let mut frame_id = 1_u64;
     while Instant::now() < deadline {
         frame_id = frame_id
             .checked_add(1)
-            .ok_or_else(|| invalid("media soak frame ID exhausted"))?;
+            .ok_or_else(|| invalid("raster frame ID exhausted"))?;
         let phase = frame_id as u8;
-        let pixels = [phase, phase.wrapping_mul(3), phase.wrapping_mul(7), 255];
-        let body = media::raster_frame_body(0, frame_id, 1, 1, &pixels)?;
-        raster.write_record(messages::RASTER_FRAME, 0, SOURCE_ID, &body)?;
-
-        let credit = read_until(&mut control, messages::CREDIT, SOURCE_ID)?;
-        let credit = messages::parse_credit(&credit.body)?;
-        if credit.packets != 1 || credit.bytes != body.len() as u64 {
-            return Err(invalid("presenter returned an invalid raster credit"));
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        thread::sleep(FRAME_INTERVAL.min(remaining));
+        channel.send_raster(
+            0,
+            frame_id,
+            &[phase, phase.wrapping_mul(3), phase.wrapping_mul(7), 255],
+            false,
+        )?;
+        thread::sleep(FRAME_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
     }
-
-    control.write_record(messages::GOODBYE, 0, 0, &messages::goodbye(3))?;
-    let goodbye = read_until(&mut control, messages::OK, 0)?;
-    if messages::request_id(&goodbye.body)? != 3 {
-        return Err(invalid("presenter returned an uncorrelated GOODBYE reply"));
-    }
-    Ok(())
+    channel.eos()?;
+    client.close()
 }
 
-fn read_until(
-    connection: &mut Connection,
-    expected_type: u16,
-    expected_object: u64,
-) -> io::Result<Record> {
-    loop {
-        let record = connection.read_record()?;
-        if record.record_type == messages::PING {
-            let envelope = messages::decode_control(&record.body)?;
-            if record.object_id != 0 || envelope.request_id == 0 {
-                return Err(invalid("presenter sent an invalid PING"));
-            }
-            connection.write_record(messages::PONG, 0, 0, &messages::ok(envelope.request_id))?;
-            continue;
-        }
-        if record.record_type == messages::ERROR {
-            return Err(invalid(messages::parse_error(&record.body)?));
-        }
-        if record.record_type == expected_type && record.object_id == expected_object {
-            return Ok(record);
-        }
-        if record.flags & vivid_protocol::wire::RECORD_OPTIONAL != 0 {
-            continue;
-        }
-        return Err(invalid(format!(
-            "unexpected Vivid record type {:#06x} for object {}",
-            record.record_type, record.object_id
-        )));
+fn signed(value: i64) -> Value {
+    if value >= 0 {
+        Value::Unsigned(value as u64)
+    } else {
+        Value::Negative(value)
     }
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }

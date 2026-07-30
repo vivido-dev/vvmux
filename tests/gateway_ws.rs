@@ -7,11 +7,15 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use vivid_protocol::messages::{self, DisplayChanged, WelcomeConfig};
+use vivid_protocol::auth::{self, Secret32};
+use vivid_protocol::cbor::Value;
+use vivid_protocol::messages::{self, Hello, HelloAuthentication, Welcome, WelcomeAuthentication};
+use vivid_protocol::resource::{Resource, ResourceContract};
 use vivid_protocol::wire::{ConnectionKind, HEADER_SIZE, PREFACE_SIZE, Preface, RecordHeader};
 
 struct ChildGuard(Child);
@@ -34,8 +38,11 @@ fn command(executable: &Path, runtime: &Path, config: &Path) -> Command {
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", config)
         .env_remove("VIVID_ENDPOINT")
+        .env_remove("VIVID_ENDPOINT_CONTROL")
+        .env_remove("VIVID_ENDPOINT_REALTIME")
         .env_remove("VIVID_ENDPOINT_BULK")
         .env_remove("VIVID_TOKEN")
+        .env_remove("VIVID_ROOT_SECRET")
         .env_remove("VIVID_SSH_ENDPOINT")
         .env_remove("VIVID_SSH_TOKEN");
     command
@@ -247,6 +254,7 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
             .iter()
             .any(|value| value == "vivid-bridge-v1"));
         let vivid_access = &hello["vivid"];
+        assert_eq!(vivid_access["wire_version"], "1.5");
         let vivid_url = format!("ws://{address}{}", vivid_access["endpoint"].as_str().unwrap());
         assert!(
             tokio_tungstenite::connect_async(vivid_request(
@@ -360,8 +368,8 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
                 if vivid_bytes.len() < PREFACE_SIZE + HEADER_SIZE {
                     continue;
                 }
-                let preface = Preface::decode(vivid_bytes[..PREFACE_SIZE].try_into().unwrap())
-                    .unwrap();
+                let preface =
+                    Preface::decode(vivid_bytes[..PREFACE_SIZE].try_into().unwrap()).unwrap();
                 assert_eq!(preface.kind, ConnectionKind::Control);
                 let header = RecordHeader::decode(
                     vivid_bytes[PREFACE_SIZE..PREFACE_SIZE + HEADER_SIZE]
@@ -380,34 +388,103 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
         .await
         .expect("Vivid HELLO timed out");
         assert_eq!(hello_header.record_type, messages::HELLO);
-        let (hello_request, vivid_hello) = messages::parse_hello(&hello_body).unwrap();
-        assert_eq!(vivid_hello.token, "0".repeat(64));
-        let welcome_body = messages::encode_welcome(
-            hello_request,
-            &WelcomeConfig {
-                session_id: 1,
-                session_tag: &[1; 16],
-                root_context_id: 2,
-                capability_generation: 1,
-                display: DisplayChanged {
-                    display_generation: 1,
-                    viewport_width: 640,
-                    viewport_height: 384,
-                    grid_columns: 80,
-                    grid_rows: 24,
-                    cell_width: 8,
-                    cell_height: 16,
-                    settled: true,
-                },
-                maximum_control_body: vivid_protocol::CONTROL_MAX_RECORD_BODY,
-                accepted_profiles: &[],
-                selected_major: 1,
-                selected_minor: 1,
-                accepted_features: &vivid_hello.required_features,
-                initial_scene_revision: 0,
-                preserved_fields: &[],
-            },
+        let (hello_request, vivid_hello) = Hello::decode(&hello_body).unwrap();
+        let route_secret = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(vivid_access["token"].as_str().unwrap())
+            .unwrap();
+        let root_secret = Secret32::new(route_secret.try_into().unwrap());
+        let authless = vivid_hello.authless_payload().unwrap();
+        let HelloAuthentication::Root { proof } = &vivid_hello.authentication else {
+            panic!("gateway bridge did not use Vivid root authentication")
+        };
+        assert!(auth::verify_root_hello_proof(
+            &root_secret,
+            vivid_bytes[..PREFACE_SIZE].try_into().unwrap(),
+            &authless,
+            proof,
+        ));
+        let server_nonce = [2; auth::NONCE_BYTES];
+        let session_tag = [1; messages::SESSION_TAG_BYTES];
+        let prk = auth::extract_handshake_prk(
+            &root_secret,
+            &vivid_hello.client_nonce,
+            &server_nonce,
+            &[0; 32],
         );
+        let mut contract = ResourceContract::denied();
+        for resource in [
+            Resource::Surfaces,
+            Resource::Tracks,
+            Resource::Nodes,
+            Resource::VideoTracks,
+            Resource::AudioTracks,
+            Resource::RasterTracks,
+            Resource::ImageTracks,
+            Resource::DecoderInstances,
+            Resource::TrackConnections,
+            Resource::PendingRequests,
+            Resource::RegisteredWaits,
+            Resource::IdempotencyEntries,
+            Resource::ObservationQueueEntries,
+            Resource::OpenSceneTransactions,
+            Resource::PendingChannelOpenAttempts,
+            Resource::ActiveTerminalAnchors,
+            Resource::SeenTerminalAnchorIds,
+        ] {
+            contract.set(resource, 64);
+        }
+        contract.set(Resource::CodedPixelsPerTrack, 8192 * 8192);
+        contract.set(Resource::DecodedPixelsPerSecond, 8192 * 8192 * 60);
+        contract.set(Resource::EncodedBitsPerSecond, 1_000_000_000);
+        contract.set(Resource::MediaRecordsPerSecond, 4_000);
+        contract.set(Resource::AudioSampleRate, 192_000);
+        contract.set(Resource::AudioChannelsPerTrack, 8);
+        contract.set(Resource::InflightMediaBytes, 256 * 1024 * 1024);
+        contract.set(Resource::RetainedPixels, 8192 * 8192);
+        contract.set(
+            Resource::MediaRecordBody,
+            u64::from(vivid_protocol::HARD_MAX_RECORD_BODY),
+        );
+        contract.set(
+            Resource::ControlRecordBody,
+            u64::from(vivid_protocol::CONTROL_MAX_RECORD_BODY),
+        );
+        contract.set(Resource::ImageCacheBytes, 64 * 1024 * 1024);
+        let mut welcome = Welcome {
+            session_id: 1,
+            session_tag,
+            root_context_id: 2,
+            target_generation: 1,
+            target_profile: vivid_protocol::registry::TERMINAL_SURFACE.into(),
+            target_descriptor: vec![
+                (0, Value::Unsigned(640)),
+                (1, Value::Unsigned(384)),
+                (2, Value::Unsigned(80)),
+                (3, Value::Unsigned(24)),
+                (4, Value::Unsigned(8)),
+                (5, Value::Unsigned(16)),
+                (6, Value::Bool(true)),
+                (7, Value::Unsigned(3)),
+                (8, Value::Unsigned(64)),
+            ],
+            accepted_profiles: vivid_hello.required_profiles.clone(),
+            maximum_control_body: vivid_hello.maximum_control_body,
+            server_nonce,
+            authentication: WelcomeAuthentication {
+                kind: messages::AUTHENTICATION_ROOT,
+                confirmation: [0; 32],
+                lease_state: 0,
+                activation_attempt_status: 0,
+            },
+            session_revision: 1,
+            scene_revision: 0,
+            resource_contract: contract,
+            establishment_state: 0,
+            resume_generation: 0,
+            extensions: vec![],
+        };
+        welcome.confirm(&prk).unwrap();
+        let welcome_body = welcome.encode(hello_request).unwrap();
         let welcome_header = RecordHeader {
             body_length: welcome_body.len().try_into().unwrap(),
             record_type: messages::WELCOME,

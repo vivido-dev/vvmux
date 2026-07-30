@@ -8,7 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{ConnectionCancel, Transport};
@@ -481,21 +481,72 @@ impl Drop for VirtualPresenterListener {
 
 fn split_unix(stream: UnixStream) -> io::Result<Transport> {
     let reader = stream.try_clone()?;
-    let timeout_stream = stream.try_clone()?;
     let cancel_reader = reader.try_clone()?;
     let cancel_writer = stream.try_clone()?;
     let cancel = ConnectionCancel::new(move || {
         let _ = cancel_reader.shutdown(Shutdown::Both);
         let _ = cancel_writer.shutdown(Shutdown::Both);
     });
-    let timeout =
-        Arc::new(move |duration: Option<Duration>| timeout_stream.set_read_timeout(duration));
+    // Darwin rejects SO_RCVTIMEO on local-domain sockets with EINVAL. Keep the timeout in
+    // userspace and poll before each read so handshake deadlines work identically on every Unix
+    // platform without changing the socket into nonblocking mode.
+    let read_timeout = Arc::new(Mutex::new(None));
+    let timeout_value = read_timeout.clone();
+    let timeout = Arc::new(move |duration: Option<Duration>| {
+        *timeout_value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = duration;
+        Ok(())
+    });
     Ok(Transport::new(
-        Box::new(reader),
+        Box::new(PollTimeoutReader {
+            stream: reader,
+            timeout: read_timeout,
+        }),
         Box::new(stream),
         cancel,
         timeout,
     ))
+}
+
+struct PollTimeoutReader {
+    stream: UnixStream,
+    timeout: Arc<Mutex<Option<Duration>>>,
+}
+
+impl Read for PollTimeoutReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let timeout = *self
+            .timeout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(timeout) = timeout {
+            let milliseconds = i32::try_from(timeout.as_millis().max(1)).unwrap_or(i32::MAX);
+            let mut descriptor = libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            loop {
+                match unsafe { libc::poll(&mut descriptor, 1, milliseconds) } {
+                    -1 => {
+                        let error = io::Error::last_os_error();
+                        if error.kind() != io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                    0 => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "local transport read timed out",
+                        ));
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.stream.read(buffer)
+    }
 }
 
 pub fn require_peer_owner(stream: &UnixStream) -> io::Result<()> {
@@ -628,8 +679,8 @@ mod tests {
         scrub_daemon_environment(
             &mut command,
             [
-                ("VIVID_ENDPOINT", "unix:/tmp/outer.sock"),
-                ("VIVID_TOKEN", "secret"),
+                ("VIVID_ENDPOINT_CONTROL", "unix:/tmp/outer.sock"),
+                ("VIVID_ROOT_SECRET", "secret"),
                 ("VIVID_ENDPOINT_BULK", "unix:/tmp/outer-bulk.sock"),
                 // A Windows presenter exports this through `vvssh`; a Unix session server and its
                 // panes must not keep it.
@@ -663,10 +714,10 @@ mod tests {
                 "TMUX",
                 "TMUX_PANE",
                 "VIVID_ANCHOR_TRANSPORT",
-                "VIVID_ENDPOINT",
                 "VIVID_ENDPOINT_BULK",
+                "VIVID_ENDPOINT_CONTROL",
                 "VIVID_REMOTE",
-                "VIVID_TOKEN",
+                "VIVID_ROOT_SECRET",
             ]
         );
     }
