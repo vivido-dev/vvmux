@@ -311,13 +311,18 @@ impl OuterBridge {
             Some(factory) => vivid_sdk::Session::connect_with_factory(config, factory.clone())?,
             None => vivid_sdk::Session::connect(config)?,
         };
-        self.session = session;
+        let replaced = std::mem::replace(&mut self.session, session);
         self.display = display_from_target(&self.session, self.display)?;
         self.surfaces.clear();
         self.tracks.clear();
         self.nodes.clear();
         self.pending.clear();
         self.active_sources.clear();
+        // Say goodbye to the session being abandoned. Dropping it leaves its control connection
+        // open - the reader thread still holds the socket - so the presenter goes on counting it
+        // against its session capacity. Each replacement would consume one more slot until every
+        // later replacement is refused, which no amount of retrying can recover from.
+        let _ = replaced.close();
         self.diagnostic_generation = self.diagnostic_generation.saturating_add(1);
         self.rebuild(surfaces, sources, nodes)
     }

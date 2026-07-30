@@ -711,6 +711,9 @@ impl VirtualVivid {
             }
         }
         let deliveries = std::mem::take(&mut state.deliveries);
+        for delivery in deliveries.values() {
+            release_delivery_allowance(&mut state, delivery);
+        }
         drop(state);
         if !deliveries.is_empty() {
             self.delivery_changed.notify_all();
@@ -723,18 +726,11 @@ impl VirtualVivid {
             return false;
         };
         let mut resync = !delivered;
+        release_delivery_allowance(&mut state, &delivery);
         if let Some(track) = state.tracks.get_mut(&delivery.track) {
             if delivered {
                 track.outer_presented = true;
                 track.state.milestones |= MILESTONE_PRESENTED;
-                let maxima_bytes = track
-                    .state
-                    .flow
-                    .maximum_body_bytes
-                    .saturating_add(delivery.bytes);
-                let maxima_records = track.state.flow.maximum_media_records.saturating_add(1);
-                track.state.flow.raise_maxima(maxima_bytes, maxima_records);
-                send_flow_update(delivery.track, track);
             } else {
                 track.recovery_pending = true;
                 resync = true;
@@ -3178,6 +3174,28 @@ fn node_uses_live_anchor(
             .is_some_and(|anchor| anchors.contains_key(&anchor))
 }
 
+/// Return the flow allowance a finished delivery was holding.
+///
+/// A pane producer spends allowance when it writes a record and only gets it back when the
+/// record leaves the bridge. Whether the outer presenter displayed the record decides milestones
+/// and recovery, not flow: a delivery the bridge failed or abandoned - which every outer resize
+/// can cause, since it rebuilds the outer session under in-flight media - has stopped occupying
+/// the bridge either way. Withholding the allowance from those would shrink the producer's window
+/// by one record each time until it reaches zero and the producer blocks in a credit wait forever.
+fn release_delivery_allowance(state: &mut State, delivery: &PendingDelivery) {
+    let Some(track) = state.tracks.get_mut(&delivery.track) else {
+        return;
+    };
+    let bytes = track
+        .state
+        .flow
+        .maximum_body_bytes
+        .saturating_add(delivery.bytes);
+    let records = track.state.flow.maximum_media_records.saturating_add(1);
+    track.state.flow.raise_maxima(bytes, records);
+    send_flow_update(delivery.track, track);
+}
+
 fn send_flow_update(key: TrackKey, track: &TrackEntry) {
     let Some(writer) = &track.channel_writer else {
         return;
@@ -3526,6 +3544,61 @@ mod tests {
         );
         assert_eq!(event.record_type, messages::RASTER_FRAME);
         assert!(!presenter.complete_bridge_delivery(event.delivery_id, true));
+        client.close().unwrap();
+    }
+
+    /// A freshly accepted channel carries one record of allowance, so a producer can only write
+    /// its next frame once the previous delivery has returned what it held. An outer resize fails
+    /// deliveries in bulk - it rebuilds the outer session under whatever is in flight - and if a
+    /// failed one kept its allowance the producer would run out and block in a credit wait with
+    /// no event able to release it: the pane would freeze mid-frame and stop reading its input.
+    #[test]
+    fn a_delivery_the_bridge_failed_returns_the_allowance_it_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(4);
+        let presenter = VirtualVivid::start_with_events(
+            directory.path().join("vivid.sock"),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let context = client.info().root_context_id;
+        client
+            .create_surface(surface(context, 9), &RequestMetadata::default())
+            .unwrap();
+        let track = client
+            .create_track(raster(context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let channel = client.open_track_channel(&track).unwrap();
+
+        let frames = 4;
+        let (written, writes) = mpsc::sync_channel(0);
+        let writer = thread::spawn(move || {
+            for frame in 1..=frames {
+                if channel
+                    .send_raster(0, frame, &[0, 0, 0, 255].repeat(4), false)
+                    .is_err()
+                    || written.send(frame).is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        for frame in 1..=frames {
+            assert_eq!(
+                writes.recv_timeout(Duration::from_secs(10)).ok(),
+                Some(frame),
+                "frame {frame} never left the producer, so a failed delivery kept its allowance"
+            );
+            let event = received.recv_timeout(Duration::from_secs(10)).unwrap();
+            presenter.complete_bridge_delivery(event.delivery_id, false);
+        }
+        writer.join().unwrap();
         client.close().unwrap();
     }
 

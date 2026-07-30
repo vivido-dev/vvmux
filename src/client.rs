@@ -1005,12 +1005,20 @@ fn run_bridge_worker(
                 });
                 let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(keyframes));
             }
-            continue;
+            // Fall through to the media queue rather than restarting the loop. The projection is
+            // current as of here, so the queued records can be applied against it, and a session
+            // that keeps publishing snapshots - an outer resize does, once per relayout - must not
+            // be able to postpone them indefinitely. A queue that never drains stays full, and a
+            // full queue drops records, and every dropped record asks for another snapshot: the
+            // starvation would sustain itself and strand the record whose delivery a nested
+            // producer is waiting on.
         }
 
         if complete_dropped_deliveries(&client_writer, &dropped) {
+            // Reconcile sources on the existing outer session. A record this client could not
+            // queue says nothing about the outer session's identities, and replacing it would
+            // re-arm the retained replay for every source at once.
             force_sources = true;
-            force_replacement = true;
         }
         let media = match deferred.take().or_else(|| {
             media_queues
@@ -1400,8 +1408,13 @@ fn complete_dropped_deliveries(
         }
     }
     if retry_snapshot {
+        // A retained body the local queue could not hold has to be replayed, but the outer
+        // session that would have received it is still valid. Resetting it would discard every
+        // attachment, and an unattached source is replayed on every projection sync: the drop
+        // that asked for the reset would produce the replay that overflows the queue again. Ask
+        // for the snapshot on the session already in place.
         let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
-            reset_outer_session: true,
+            reset_outer_session: false,
         });
     }
     retry_snapshot

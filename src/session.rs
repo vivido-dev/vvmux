@@ -3735,8 +3735,7 @@ impl SessionActor {
             if !should_replay_retained(
                 source.key,
                 live_delivery_source,
-                matches!(&source.descriptor, crate::media::SourceDescriptor::Image(_))
-                    && source.first_visible_presented,
+                source.first_visible_presented,
                 self.outer_attachment_generations
                     .contains_key(&bridge_key(source.key)),
             ) {
@@ -4518,14 +4517,20 @@ fn encode_automation_key(
     ))
 }
 
+/// Whether one source's retained body has to be replayed with this projection.
+///
+/// A retained body that has already been presented and whose outer attachment is still resident
+/// is where it needs to be, whatever kind it is. Replaying it anyway costs a full body per
+/// projection change - megabytes per relayout for a page raster - which an outer resize produces
+/// dozens of times a second; the client's bounded media queue overflows, and the records it drops
+/// to stay bounded include the live ones a nested producer is waiting on.
 fn should_replay_retained(
     source: crate::media::SourceKey,
     live_delivery_source: Option<crate::media::SourceKey>,
-    reusable_presented_image: bool,
+    presented: bool,
     outer_attachment_resident: bool,
 ) -> bool {
-    Some(source) != live_delivery_source
-        && (!reusable_presented_image || !outer_attachment_resident)
+    Some(source) != live_delivery_source && (!presented || !outer_attachment_resident)
 }
 
 #[cfg(unix)]
