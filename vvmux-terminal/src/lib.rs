@@ -128,6 +128,7 @@ pub struct Terminal {
     cursor_row: usize,
     cursor_col: usize,
     saved_cursor: (usize, usize),
+    primary_cursor_before_alternate: Option<(usize, usize)>,
     scroll_top: usize,
     scroll_bottom: usize,
     template: Cell,
@@ -158,6 +159,7 @@ impl Terminal {
             cursor_row: 0,
             cursor_col: 0,
             saved_cursor: (0, 0),
+            primary_cursor_before_alternate: None,
             scroll_top: 0,
             scroll_bottom: rows,
             template: Cell::default(),
@@ -235,6 +237,10 @@ impl Terminal {
         self.cols = cols;
         self.cursor_row = self.cursor_row.min(rows - 1);
         self.cursor_col = self.cursor_col.min(cols - 1);
+        if let Some((row, column)) = &mut self.primary_cursor_before_alternate {
+            *row = (*row).min(rows - 1);
+            *column = (*column).min(cols - 1);
+        }
         self.scroll_top = 0;
         self.scroll_bottom = rows;
         self.events.push(TerminalEvent::Damage);
@@ -699,6 +705,7 @@ impl Handler for Terminal {
         self.history_wrapped.clear();
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.primary_cursor_before_alternate = None;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows;
         self.template = Cell::default();
@@ -815,11 +822,19 @@ impl Terminal {
             1004 => self.modes.focus_reporting = enabled,
             25 => self.modes.cursor_visible = enabled,
             1049 if enabled != self.alternate_screen => {
+                let next_cursor = if enabled {
+                    self.primary_cursor_before_alternate = Some((self.cursor_row, self.cursor_col));
+                    (0, 0)
+                } else {
+                    self.primary_cursor_before_alternate
+                        .take()
+                        .unwrap_or((0, 0))
+                };
                 mem::swap(&mut self.grid, &mut self.alternate_grid);
                 mem::swap(&mut self.grid_wrapped, &mut self.alternate_grid_wrapped);
                 self.alternate_screen = enabled;
-                self.cursor_row = 0;
-                self.cursor_col = 0;
+                self.cursor_row = next_cursor.0;
+                self.cursor_col = next_cursor.1;
                 self.damage();
             }
             _ => {}
@@ -1258,6 +1273,23 @@ mod tests {
                 .collect::<String>(),
             "main"
         );
+    }
+
+    #[test]
+    fn alternate_screen_restores_primary_cursor_before_shell_redraw() {
+        let mut terminal = Terminal::new(4, 12, 10);
+        terminal.feed(b"one\r\ntwo\r\nshell> ");
+        let primary_cursor = terminal.cursor();
+
+        // Full-screen applications can save the cursor for their own use. That must not replace
+        // the primary-screen cursor captured by DECSET 1049.
+        terminal.feed(b"\x1b[?1049h\x1b[4;10H\x1b7editor\x1b8\x1b[?1049l");
+        assert_eq!(terminal.cursor(), primary_cursor);
+
+        // Shell line editors commonly erase below while repainting the prompt. With the cursor
+        // incorrectly restored to the top-left, this clears all of the primary-screen content.
+        terminal.feed(b"\rprompt> \x1b[J");
+        assert_eq!(terminal.extract_rows(0, 3), "one\ntwo\nprompt>");
     }
 
     #[test]
