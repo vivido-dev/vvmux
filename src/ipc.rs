@@ -9,11 +9,11 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Bumped to 10 for the Vivid 1.5 surface/track/channel cutover.
+/// Bumped to 11 for host focus reporting; 10 was the Vivid 1.5 surface/track/channel cutover.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 10;
+pub const VERSION: u16 = 11;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -525,6 +525,11 @@ pub enum ClientMessage {
     },
     Input(Vec<u8>),
     Mouse(MouseEvent),
+    /// The client's host terminal gained or lost focus.
+    ///
+    /// This is terminal state rather than typed input: the session decides which pane, if any,
+    /// asked to be told about it.
+    Focus(bool),
     Resize(DisplayMetrics),
     Action(Action),
     RenderAck(u64),

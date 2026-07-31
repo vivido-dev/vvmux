@@ -66,11 +66,12 @@ remote deployments use an SSH tunnel or a trusted TLS reverse proxy.
 
 ### Private IPC compatibility
 
-VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 10,
+VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 11,
 which is a hard cutover from every earlier VVMX version. VVMX 7 moved render and media byte
 payloads out of JSON into bounded binary records. VVMX 8 added transport-loss recovery without
 inventing a new producer epoch. VVMX 9 added bridge-instance correlation and bounded,
 metadata-only media recovery traces. VVMX 10 is the hard Vivid 1.5 surface/track/channel cutover.
+VVMX 11 reports host terminal focus as its own client message instead of pane input.
 
 Pane media inspection reports separate `virtual_projection_revision`,
 `virtual_scene_revision`, `outer_projection_revision` (the monotonic compatibility sequence),
