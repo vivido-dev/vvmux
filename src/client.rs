@@ -3493,6 +3493,16 @@ mod tests {
             let restored = presenter.projection_snapshot(&HashSet::from([7]));
             assert_eq!(restored.nodes.len(), 1);
             assert!(outer_video(&restored).is_some_and(|(_, playing)| playing));
+            for source in restored
+                .sources
+                .iter()
+                .filter(|source| source.key.surface == video_key.surface && source.playing)
+            {
+                assert_eq!(
+                    source.play_request.start_pts_us, recovery_pts_us,
+                    "the outer audio/video clock must be re-based to the recovery keyframe"
+                );
+            }
             assert!(
                 restored.sources.iter().all(|source| {
                     !matches!(source.descriptor, crate::media::SourceDescriptor::Image(_))

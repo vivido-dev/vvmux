@@ -284,6 +284,7 @@ struct TrackEntry {
     last_pts_us: i64,
     outer_presented: bool,
     recovery_pending: bool,
+    recovery_requested: bool,
     causation_id: Option<[u8; messages::CAUSATION_ID_BYTES]>,
 }
 
@@ -711,6 +712,10 @@ impl VirtualVivid {
         for track in state.tracks.values_mut() {
             if matches!(track.configuration.kind, KindConfiguration::Video(_)) && track.playing {
                 track.recovery_pending = true;
+                // A later foreground presenter owns a fresh decoder. Re-arm producer recovery for
+                // that handoff instead of damping its first NEED_KEYFRAME against the request
+                // state owned by the presenter that just detached.
+                track.recovery_requested = false;
             }
         }
         let deliveries = std::mem::take(&mut state.deliveries);
@@ -741,9 +746,15 @@ impl VirtualVivid {
                     // lets a delayed recovery request overtake the delivery acknowledgement and
                     // incorrectly send Vivi back into recovery after its good keyframe.
                     track.recovery_pending = false;
+                    track.recovery_requested = false;
                     recovery_completed = true;
                 }
             } else {
+                if !track.recovery_pending || delivery.random_access {
+                    // The failed packet starts a new recovery episode, while a failed random-access
+                    // packet means the previously requested recovery was not usable.
+                    track.recovery_requested = false;
+                }
                 track.recovery_pending = true;
                 resync = true;
             }
@@ -780,22 +791,29 @@ impl VirtualVivid {
     ) -> KeyframeRequestOutcome {
         let mut state = lock(&self.state);
         let key = inner_track_key(source);
+        let recovery_inflight = state
+            .deliveries
+            .values()
+            .any(|delivery| delivery.track == key && delivery.random_access);
         let Some(track) = state.tracks.get_mut(&key) else {
             return KeyframeRequestOutcome::Ignored;
         };
         if !matches!(track.configuration.kind, KindConfiguration::Video(_)) {
             return KeyframeRequestOutcome::Ignored;
         }
-        if track.recovery_pending {
+        if track.recovery_pending && (track.recovery_requested || recovery_inflight) {
             return KeyframeRequestOutcome::Damped;
         }
         track.recovery_pending = true;
-        send_need_keyframe(
+        if !send_need_keyframe(
             key,
             track,
             minimum_epoch.unwrap_or(track.state.media_epoch),
             reason,
-        );
+        ) {
+            return KeyframeRequestOutcome::Ignored;
+        }
+        track.recovery_requested = true;
         KeyframeRequestOutcome::Forwarded
     }
 
@@ -1639,6 +1657,7 @@ fn dispatch_control(
                     last_pts_us: 0,
                     outer_presented: false,
                     recovery_pending: true,
+                    recovery_requested: false,
                     causation_id: envelope.causation_id,
                 },
             );
@@ -1684,6 +1703,7 @@ fn dispatch_control(
                 .map_err(|_| ControlError::state("channel advance is stale"))?;
             track.channel_writer = None;
             track.recovery_pending = true;
+            track.recovery_requested = false;
             (
                 messages::CHANNEL_ADVANCED,
                 record.object_id,
@@ -2040,6 +2060,7 @@ fn dispatch_control(
                     track.state.media_epoch = epoch;
                     track.state.last_media_id = 0;
                     track.recovery_pending = true;
+                    track.recovery_requested = false;
                     track.retained = None;
                 }
                 messages::DRAIN => {
@@ -2251,6 +2272,7 @@ fn handle_track(
         if result.is_err() || track.eos_epoch.is_none() {
             let _ = track.state.lose();
             track.recovery_pending = true;
+            track.recovery_requested = false;
         }
         changed_payload = Envelope::new(0, track_status_payload(key, track))
             .encode()
@@ -2341,6 +2363,12 @@ fn track_loop(
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "track disappeared"))?;
         let (epoch, media_id, random_access, pts, retained) =
             validate_media_record(&configuration, &record)?;
+        let discard_for_recovery = matches!(configuration.kind, KindConfiguration::Video(_))
+            && !random_access
+            && state
+                .tracks
+                .get(&key)
+                .is_some_and(|track| track.recovery_pending);
         {
             let track = state.tracks.get_mut(&key).unwrap();
             track
@@ -2354,17 +2382,38 @@ fn track_loop(
                     random_access,
                 )
                 .map_err(io::Error::other)?;
-            track.state.milestones |= MILESTONE_DECODER_INITIALIZED | MILESTONE_OUTPUT_READY;
+            if !discard_for_recovery {
+                track.state.milestones |= MILESTONE_DECODER_INITIALIZED | MILESTONE_OUTPUT_READY;
+            }
             track.last_record_sequence = record.sequence;
             track.last_pts_us = pts;
             if random_access && events.is_none() {
                 // Focused eventless tests terminate delivery locally. A live bridge keeps
                 // recovery pending until complete_bridge_delivery confirms outer acceptance.
                 track.recovery_pending = false;
+                track.recovery_requested = false;
             }
             if retained {
                 track.retained = Some(Arc::from(record.body.clone()));
             }
+        }
+        if discard_for_recovery {
+            // A fresh outer decoder cannot consume inter-frame video until recovery reaches it.
+            // Consume and credit these inner packets locally so the producer can advance to the
+            // requested random-access point without poisoning the replacement bridge writer.
+            let track = state.tracks.get_mut(&key).unwrap();
+            track.state.flow.raise_maxima(
+                track
+                    .state
+                    .flow
+                    .maximum_body_bytes
+                    .saturating_add(record.body.len() as u64),
+                track.state.flow.maximum_media_records.saturating_add(1),
+            );
+            send_flow_update(key, track);
+            drop(state);
+            changed.notify_all();
+            continue;
         }
         if events.is_none() {
             // The eventless constructor is used by focused presenter/bridge tests. It terminates
@@ -2417,6 +2466,7 @@ fn track_loop(
             state.deliveries.remove(&delivery_id);
             let track = state.tracks.get_mut(&key).unwrap();
             track.recovery_pending = true;
+            track.recovery_requested = false;
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "bounded bridge media queue is full",
@@ -3279,9 +3329,9 @@ fn send_flow_update(key: TrackKey, track: &TrackEntry) {
     }
 }
 
-fn send_need_keyframe(key: TrackKey, track: &TrackEntry, minimum_epoch: u32, reason: u64) {
+fn send_need_keyframe(key: TrackKey, track: &TrackEntry, minimum_epoch: u32, reason: u64) -> bool {
     let Some(writer) = &track.channel_writer else {
-        return;
+        return false;
     };
     if let Ok(body) = Envelope::new(
         0,
@@ -3296,8 +3346,11 @@ fn send_need_keyframe(key: TrackKey, track: &TrackEntry, minimum_epoch: u32, rea
     )
     .encode()
     {
-        let _ = writer.write_record(messages::NEED_KEYFRAME, key.track, &body);
+        return writer
+            .write_record(messages::NEED_KEYFRAME, key.track, &body)
+            .is_ok();
     }
+    false
 }
 
 fn send_need_full_frame(key: TrackKey, track: &TrackEntry) {
@@ -3756,7 +3809,240 @@ mod tests {
                 None => panic!("the later recovery request never reached the producer"),
             }
         }
+
+        channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 2,
+                pts_us: 41_667,
+                dts_us: 41_667,
+                duration_us: 41_667,
+                key: true,
+                data: &[0, 0, 0, 1, 0x65, 0x99],
+            })
+            .unwrap();
+        let recovered = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!presenter.complete_bridge_delivery(recovered.delivery_id, true));
+        {
+            let mut state = lock(&presenter.state);
+            state
+                .tracks
+                .get_mut(&inner_track_key(source))
+                .unwrap()
+                .playing = true;
+        }
+
+        presenter.deactivate_bridge();
+        let detached = presenter.projection_snapshot(&HashSet::from([7]));
+        assert_eq!(
+            detached.videos_needing_keyframes,
+            [source],
+            "a playing video must require decoder recovery after its presenter detaches"
+        );
+        channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 3,
+                pts_us: 83_334,
+                dts_us: 83_334,
+                duration_us: 41_667,
+                key: false,
+                data: &[0, 0, 0, 1, 0x41, 0x77],
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            received.try_recv().is_err(),
+            "inter-frame video must not poison the fresh decoder while recovery is pending"
+        );
+        assert_eq!(
+            presenter.request_keyframe(source, None, 5),
+            KeyframeRequestOutcome::Forwarded,
+            "a fresh presenter must re-arm recovery instead of inheriting the detached bridge's \
+             damped request state"
+        );
+        assert_eq!(
+            presenter.request_keyframe(source, None, 5),
+            KeyframeRequestOutcome::Damped,
+            "only one producer request should be issued for the reattached recovery episode"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match channel.take_event().unwrap() {
+                Some(vivid_sdk::ChannelEvent::NeedKeyframe(_)) => break,
+                Some(other) => panic!("unexpected video channel event: {other:?}"),
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+                None => panic!("reattached presenter recovery never reached the producer"),
+            }
+        }
+        channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 4,
+                pts_us: 125_001,
+                dts_us: 125_001,
+                duration_us: 41_667,
+                key: true,
+                data: &[0, 0, 0, 1, 0x65, 0xaa],
+            })
+            .unwrap();
+        let reattached_keyframe = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(reattached_keyframe.recovered_keyframe, Some((1, 125_001)));
+        assert!(!presenter.complete_bridge_delivery(reattached_keyframe.delivery_id, true));
+        assert!(
+            presenter
+                .projection_snapshot(&HashSet::from([7]))
+                .videos_needing_keyframes
+                .is_empty(),
+            "successful reattached keyframe delivery must complete the recovery episode"
+        );
         client.close().unwrap();
+    }
+
+    #[test]
+    fn failed_video_recovery_is_scoped_when_owners_reuse_numeric_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(8);
+        let presenter = VirtualVivid::start_with_events(
+            directory.path().join("vivid.sock"),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        presenter.update_metrics(8, 80, 24, (8, 16));
+        let first_secret = presenter.issue_pane_capability(7).unwrap();
+        let second_secret = presenter.issue_pane_capability(8).unwrap();
+        let mut first =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &first_secret)).unwrap();
+        let mut second =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &second_secret)).unwrap();
+        let first_context = first.info().root_context_id;
+        let second_context = second.info().root_context_id;
+        for (client, context) in [(&mut first, first_context), (&mut second, second_context)] {
+            client
+                .create_surface(surface(context, 9), &RequestMetadata::default())
+                .unwrap();
+        }
+        let first_track = first
+            .create_track(video(first_context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let second_track = second
+            .create_track(video(second_context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let first_channel = first.open_track_channel(&first_track).unwrap();
+        let second_channel = second.open_track_channel(&second_track).unwrap();
+        let first_source = BridgeSourceKey {
+            producer: first.info().session_id,
+            context: first_context,
+            surface: 9,
+            track: 11,
+        };
+        let second_source = BridgeSourceKey {
+            producer: second.info().session_id,
+            context: second_context,
+            surface: 9,
+            track: 11,
+        };
+
+        for channel in [&first_channel, &second_channel] {
+            channel
+                .send_video(media::VideoPacket {
+                    epoch: 1,
+                    packet_id: 1,
+                    pts_us: 0,
+                    dts_us: 0,
+                    duration_us: 41_667,
+                    key: true,
+                    data: &[0, 0, 0, 1, 0x65, 0x88],
+                })
+                .unwrap();
+        }
+        let initial = [
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ];
+        assert_eq!(
+            initial
+                .iter()
+                .map(|event| event.source)
+                .collect::<HashSet<_>>(),
+            HashSet::from([first_source, second_source])
+        );
+        for event in initial {
+            assert!(!presenter.complete_bridge_delivery(event.delivery_id, true));
+        }
+
+        first_channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 2,
+                pts_us: 41_667,
+                dts_us: 41_667,
+                duration_us: 41_667,
+                key: false,
+                data: &[0, 0, 0, 1, 0x41, 0x77],
+            })
+            .unwrap();
+        let failed = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(failed.source, first_source);
+        assert!(presenter.complete_bridge_delivery(failed.delivery_id, false));
+
+        let recovering = presenter.projection_snapshot(&HashSet::from([7, 8]));
+        assert_eq!(recovering.sources.len(), 2);
+        assert_eq!(
+            recovering
+                .videos_needing_keyframes
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([first_source])
+        );
+        let unaffected = recovering
+            .sources
+            .iter()
+            .find(|source| source.key == second_source)
+            .unwrap();
+        assert!(
+            unaffected.first_visible_presented,
+            "the unrelated owner's presented state was changed by another owner's failure"
+        );
+
+        second_channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 2,
+                pts_us: 41_667,
+                dts_us: 41_667,
+                duration_us: 41_667,
+                key: false,
+                data: &[0, 0, 0, 1, 0x41, 0x99],
+            })
+            .unwrap();
+        let next = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(next.source, second_source);
+        assert!(!presenter.complete_bridge_delivery(next.delivery_id, true));
+        let after = presenter.projection_snapshot(&HashSet::from([7, 8]));
+        assert_eq!(
+            after
+                .sources
+                .iter()
+                .find(|source| source.key == second_source)
+                .unwrap()
+                .last_inner_record_sequence,
+            3,
+            "the unrelated owner could not deliver its next valid media update"
+        );
+        assert_eq!(
+            after
+                .videos_needing_keyframes
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([first_source])
+        );
+        first.close().unwrap();
+        second.close().unwrap();
     }
 
     #[test]
