@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 
 #[cfg(test)]
 use crate::client_input::parse_configured_action;
-use crate::client_input::{FloatEditScanner, ParsedInput, PrefixParser};
+use crate::client_input::{self, FloatEditScanner, ParsedInput, PrefixParser};
 #[cfg(all(test, unix))]
 use crate::ipc::DisplayMetrics;
 #[cfg(test)]
@@ -34,6 +34,8 @@ const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const DISPLAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DETACH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Idle wait for host terminal input when nothing time-sensitive is buffered.
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub fn attach(
     name: &str,
@@ -333,7 +335,14 @@ pub fn attach(
                 }
             }
             let mut bytes = [0_u8; 4096];
-            if let Some(read) = terminal.read_input(&mut bytes, Duration::from_millis(100))? {
+            // A held bare Escape has to reach the pane on its own timescale, not on the idle poll
+            // interval, or a modal editor appears to swallow the first press.
+            let poll = if parser.holds_bare_escape() || float_scanner.holds_bare_escape() {
+                client_input::ESCAPE_DELAY
+            } else {
+                INPUT_POLL_INTERVAL
+            };
+            if let Some(read) = terminal.read_input(&mut bytes, poll)? {
                 if read == 0 {
                     let _ = send_client(&writer, &ClientMessage::Detach);
                     detach_requested_at = Some(Instant::now());
@@ -382,11 +391,17 @@ pub fn attach(
                         }
                     }
                 }
-            } else if let Some(mode_id) = float_mode
-                && let Some(command) = float_scanner.expire(Instant::now())
-            {
-                send_client(&writer, &ClientMessage::FloatingEdit { mode_id, command })?;
-                float_mode = None;
+            } else {
+                let now = Instant::now();
+                if let Some(mode_id) = float_mode
+                    && let Some(command) = float_scanner.expire(now)
+                {
+                    send_client(&writer, &ClientMessage::FloatingEdit { mode_id, command })?;
+                    float_mode = None;
+                }
+                if let Some(escape) = parser.expire(now) {
+                    send_client(&writer, &ClientMessage::Input(escape))?;
+                }
             }
             #[cfg(not(windows))]
             {
@@ -2046,7 +2061,7 @@ mod tests {
         let mut scanner = FloatEditScanner::default();
         assert!(scanner.scan(b"\x1b").0.is_empty());
         assert_eq!(
-            scanner.expire(Instant::now() + FloatEditScanner::ESCAPE_DELAY),
+            scanner.expire(Instant::now() + client_input::ESCAPE_DELAY),
             Some(FloatingEditCommand::Cancel)
         );
 
