@@ -120,6 +120,9 @@ struct Pane {
     control: PtyControl,
     copy: Option<CopyState>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
+    /// Whether this pane was last told it holds the host terminal's focus. A pane that has not
+    /// enabled focus reporting still tracks it, so enabling the mode later reports no stale event.
+    focus_reported: bool,
     last_input_warning: Option<Instant>,
     screen_sequence: u64,
     last_screen_change: Instant,
@@ -513,6 +516,9 @@ struct SessionActor {
     tabs: Vec<Tab>,
     active_tab: usize,
     attached: Option<AttachedClient>,
+    /// Whether the attached client's host terminal currently holds focus. Assumed true until the
+    /// client reports otherwise, because a client attaches into a focused window.
+    client_focused: bool,
     last_display: DisplayMetrics,
     next_pane_id: PaneId,
     next_tab_id: u64,
@@ -620,6 +626,7 @@ pub fn start(
         tabs: Vec::new(),
         active_tab: 0,
         attached: None,
+        client_focused: true,
         last_display,
         next_pane_id: 1,
         next_tab_id: 1,
@@ -928,6 +935,9 @@ impl SessionActor {
             // The payload or retained-projection dirty bit is drained by the run loop.
             ActorEvent::MediaReady => {}
         }
+        // Attachment, pane focus, tab switching, pane teardown, and a program enabling the mode
+        // all move focus, so reconcile once here rather than at each of those call sites.
+        self.sync_pane_focus();
         Ok(())
     }
 
@@ -968,6 +978,9 @@ impl SessionActor {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .counters(),
                 );
+                // A client attaches into a focused window, and the previous client's last
+                // reported blur says nothing about this one's.
+                self.client_focused = true;
                 self.bridge_metrics = crate::metrics::BridgeMetrics::default();
                 self.bridge_instance_id = None;
                 self.bridge_local_revision = 0;
@@ -1024,6 +1037,11 @@ impl SessionActor {
             ClientMessage::Mouse(mouse) => {
                 if self.client_is(id) {
                     self.mouse(mouse);
+                }
+            }
+            ClientMessage::Focus(focused) => {
+                if self.client_is(id) {
+                    self.client_focused = focused;
                 }
             }
             ClientMessage::Resize(display) => {
@@ -3189,6 +3207,7 @@ impl SessionActor {
                 control: parts.control,
                 copy: None,
                 vivid_metrics: None,
+                focus_reported: false,
                 last_input_warning: None,
                 screen_sequence: 1,
                 last_screen_change: Instant::now(),
@@ -3923,6 +3942,41 @@ impl SessionActor {
             .get_mut(&pane_id)
             .and_then(|pane| queue_pane_input(pane, bytes));
         self.report_input_failure(pane_id, failure);
+    }
+
+    /// Tell each pane whose program enabled focus reporting whether it now holds focus.
+    ///
+    /// The client asks its own terminal for focus reports so the session can answer this, which
+    /// means the reports arrive whether or not any pane wants them. Relaying them as ordinary
+    /// input put `ESC[I`/`ESC[O` in front of every focused pane's program: a shell prompt showed
+    /// it as a stray newline, and a program that never asked for the mode echoed `^[[O`. A pane
+    /// hears about focus only when it asked to and only when its own state changed, so an
+    /// unrelated pane's program sees nothing at all.
+    fn sync_pane_focus(&mut self) {
+        let focused = self
+            .attached
+            .is_some()
+            .then(|| self.active_tab().map(|tab| tab.focused))
+            .flatten()
+            .filter(|_| self.client_focused);
+        let mut failures = Vec::new();
+        for (pane_id, pane) in &mut self.panes {
+            let holds_focus = focused == Some(*pane_id);
+            if pane.focus_reported == holds_focus {
+                continue;
+            }
+            pane.focus_reported = holds_focus;
+            if !pane.terminal.modes().focus_reporting {
+                continue;
+            }
+            let report: &[u8] = if holds_focus { b"\x1b[I" } else { b"\x1b[O" };
+            if let Some(failure) = queue_pane_input(pane, report) {
+                failures.push((*pane_id, failure));
+            }
+        }
+        for (pane_id, failure) in failures {
+            self.report_input_failure(pane_id, Some(failure));
+        }
     }
 
     fn report_input_failure(&mut self, pane_id: PaneId, failure: Option<InputFailure>) {

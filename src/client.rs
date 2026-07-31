@@ -368,6 +368,9 @@ pub fn attach(
                         ParsedInput::Mouse(mouse) => {
                             send_client(&writer, &ClientMessage::Mouse(mouse))?
                         }
+                        ParsedInput::Focus(focused) => {
+                            send_client(&writer, &ClientMessage::Focus(focused))?
+                        }
                         ParsedInput::Detach => {
                             send_client(&writer, &ClientMessage::Detach)?;
                             // Keep the reader alive until the session actor acknowledges Detach.
