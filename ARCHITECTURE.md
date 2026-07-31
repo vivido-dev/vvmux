@@ -7,6 +7,28 @@ state. Events enter through a bounded synchronous channel and are admitted in re
 running on the actor must not perform device I/O, wait for media, join a thread, or wait for a PTY
 write.
 
+Media payloads use a dedicated bounded receiver, but that receiver is serviced in finite batches:
+a live producer can refill a bounded channel while it is being drained, so exhaustion is not a
+fairness boundary. Media/projection wakeups are dirty-bit coalesced, keeping at most one redundant
+wake in the general actor queue until the actor observes the pending work. Detach, pane input,
+delivery acknowledgements, and projection control therefore retain a scheduling turn under
+continuous playback.
+
+Video recovery remains pending from inner keyframe ingest through the foreground bridge's outer
+delivery acknowledgement. The level-triggered recovery bit is edge-coalesced before crossing VVMX,
+so media-only projection revisions cannot queue duplicate requests that arrive after the good
+keyframe and force the producer to skip to the next GOP.
+
+Each media track starts with one record of flow allowance so recovery control can overtake at most
+one stale packet. Its first completed outer delivery expands only that track to the bounded rolling
+window declared by its immutable inflight-byte limit. In particular, linked audio can prebuffer and
+absorb acknowledgement jitter without borrowing capacity from video or another producer.
+
+Ordinary timed audio/video packets update delivery and query status without advancing the virtual
+scene projection. PLAY, PAUSE, EOS, recovery edges, track lifecycle, and retained image/raster
+updates still advance it. This separation prevents a packet burst from placing hundreds of no-op
+projection reconciliations ahead of the media records they describe.
+
 An operation that cannot complete promptly follows the pending-work pattern:
 
 1. Validate and admit the operation on the actor in receive order.
@@ -45,3 +67,11 @@ The inner presenter accepts Control and Track only, verifies root and channel au
 consumes marker-v3 anchors, and grants cumulative flow per track. The outer producer allocates all
 of its own identities and re-encodes portable media headers. Per-track bridge queues are
 independently bounded and scheduled fairly; no media writer runs on the session actor.
+
+Each outer track has its own blocking writer. Before timed PLAY, that writer reports a completed
+pre-roll record only after the outer presenter returns the record's ingress capacity; this keeps
+ACTIVATE_TRACK behind actual outer processing instead of a kernel socket write. Once atomic
+activation and PLAY succeed, the writer stops adding that record-by-record barrier and uses the
+outer channel's normal bounded flow window. Linked audio can then stay buffered at device rate
+without sharing a blocking write, decoder wait, or acknowledgement round trip with video. EOS is
+queued behind all earlier records for the same track.

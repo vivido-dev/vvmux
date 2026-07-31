@@ -519,18 +519,40 @@ impl TrackMediaQueues {
         Ok(())
     }
 
+    #[cfg(test)]
     fn pop(&mut self) -> Option<BridgeMedia> {
-        let key = self.ready.pop_front()?;
-        self.ready_set.remove(&key);
-        let queue = self.tracks.get_mut(&key)?;
-        let media = queue.pop_front();
-        if queue.is_empty() {
-            self.tracks.remove(&key);
-        } else {
-            self.ready.push_back(key);
-            self.ready_set.insert(key);
+        self.pop_where(|_| true)
+    }
+
+    fn pop_where(
+        &mut self,
+        mut accepts: impl FnMut(BridgeSourceKey) -> bool,
+    ) -> Option<BridgeMedia> {
+        let ready = self.ready.len();
+        for _ in 0..ready {
+            let key = self.ready.pop_front()?;
+            if !accepts(key) {
+                self.ready.push_back(key);
+                continue;
+            }
+            self.ready_set.remove(&key);
+            let Some(queue) = self.tracks.get_mut(&key) else {
+                continue;
+            };
+            let media = queue.pop_front();
+            if queue.is_empty() {
+                self.tracks.remove(&key);
+            } else {
+                self.ready.push_back(key);
+                self.ready_set.insert(key);
+            }
+            return media;
         }
-        media
+        None
+    }
+
+    fn source_keys(&self) -> HashSet<BridgeSourceKey> {
+        self.tracks.keys().copied().collect()
     }
 }
 
@@ -724,10 +746,14 @@ fn run_bridge_worker(
     let mut active_sources = Vec::new();
     let mut active_nodes = Vec::new();
     let mut started_sources = HashSet::new();
+    // `videos_needing_keyframes` is level-triggered projection state. Convert it to one request
+    // per recovery episode: media-only revisions can otherwise enqueue hundreds of identical
+    // requests before the first keyframe delivery acknowledgement reaches the session actor.
+    let mut requested_virtual_keyframes = HashSet::<BridgeSourceKey>::new();
     let mut desynchronized_sources = HashSet::new();
     let mut force_sources = false;
     let mut force_replacement = false;
-    let mut deferred = None;
+    let mut deferred: Option<BridgeMedia> = None;
     loop {
         if stopped.load(Ordering::Acquire) {
             break;
@@ -759,6 +785,14 @@ fn run_bridge_worker(
                 reset_outer_session: true,
             });
         }
+        let mut eos_blocked = media_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .source_keys();
+        if let Some(media) = &deferred {
+            eos_blocked.insert(media.source);
+        }
+        bridge.flush_pending_eos(&eos_blocked);
         // Report on a coarse interval rather than per record: this is diagnostic traffic and must
         // never compete with media for the client connection.
         if metrics_reported_at.elapsed() >= METRICS_REPORT_INTERVAL {
@@ -783,9 +817,11 @@ fn run_bridge_worker(
             let _ = client_writer.send(ClientMessage::BridgeMetrics(metrics));
             metrics_reported_at = Instant::now();
         }
-        for (delivery_id, delivered, _outer_record_sequence, object_id) in
-            bridge.take_media_completions()
-        {
+        let media_completions = bridge.take_media_completions();
+        let playback_may_be_ready = media_completions
+            .iter()
+            .any(|(_, delivered, _, _)| *delivered);
+        for (delivery_id, delivered, _outer_record_sequence, object_id) in media_completions {
             if delivery_id != 0 {
                 acknowledge_bridge_delivery(&client_writer, delivery_id, delivered);
             } else if delivered {
@@ -797,6 +833,13 @@ fn run_bridge_worker(
                     let _ = client_writer.send(ClientMessage::BridgeRetainedHydrated { source });
                 }
             }
+        }
+        if playback_may_be_ready && bridge.retry_pending_playback().is_err() {
+            force_sources = true;
+            force_replacement = true;
+            let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+                reset_outer_session: true,
+            });
         }
         // The outer control connection is serviced here so the bridge keeps naming the target the
         // outer terminal actually has. A resize the bridge never read would make every scene
@@ -964,13 +1007,21 @@ fn run_bridge_worker(
                     }
                 }
                 started_sources.retain(|source| current.contains(source));
+                requested_virtual_keyframes.retain(|source| current.contains(source));
             }
             force_sources = false;
             force_replacement = false;
             active_generation = pending.generation;
+            let needing_virtual_keyframes = pending
+                .videos_needing_keyframes
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            requested_virtual_keyframes.retain(|source| needing_virtual_keyframes.contains(source));
             let mut keyframes = pending
                 .videos_needing_keyframes
                 .into_iter()
+                .filter(|source| requested_virtual_keyframes.insert(*source))
                 .map(|source| {
                     (
                         source,
@@ -1054,7 +1105,7 @@ fn run_bridge_worker(
             media_queues
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .pop()
+                .pop_where(|source| bridge.can_accept_media(source))
         }) {
             Some(media) => media,
             None => match receiver.recv_timeout(Duration::from_millis(10)) {
@@ -1095,9 +1146,10 @@ fn run_bridge_worker(
             continue;
         }
         // Timed media for a source that has not started is legitimate pre-roll. OuterBridge
-        // acknowledges it after the outer socket write, replenishing the virtual presenter's
-        // one-packet grant so Vivi can buffer enough linked audio to issue PLAY. Only reject
-        // media for a source that had started and is now stopped.
+        // acknowledges it after the outer presenter returns the corresponding ingress capacity,
+        // replenishing the virtual presenter's initial grant so Vivi can supply enough linked
+        // audio and reordered video to issue PLAY. Only reject media for a source that had
+        // started and is now stopped.
         if matches!(
             media.record_type,
             vivid_protocol::messages::VIDEO_PACKET | vivid_protocol::messages::AUDIO_PACKET
@@ -2423,7 +2475,12 @@ mod tests {
     fn bridge_forwards_linked_preroll_and_applies_play_before_video() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("outer-vivid.sock");
-        let presenter = match VirtualVivid::start(socket.clone(), MediaConfig::default()) {
+        let (outer_media_sender, outer_media_receiver) = mpsc::sync_channel(8);
+        let presenter = match VirtualVivid::start_with_events(
+            socket.clone(),
+            MediaConfig::default(),
+            Some(outer_media_sender),
+        ) {
             Ok(presenter) => presenter,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 eprintln!("skipping bridge pre-roll socket test: {error}");
@@ -2535,7 +2592,7 @@ mod tests {
             surfaces: vec![test_surface(video_key)],
             tracks: vec![video_source.clone(), audio_source.clone()],
             nodes: Vec::new(),
-            videos_needing_keyframes: Vec::new(),
+            videos_needing_keyframes: vec![video_key],
         });
         let packet = media::audio_packet_body(AudioPacket {
             epoch: 1,
@@ -2560,30 +2617,75 @@ mod tests {
         }));
 
         let (ack_sender, ack_receiver) = mpsc::channel();
+        let (keyframe_sender, keyframe_receiver) = mpsc::channel();
         thread::spawn(move || {
             while let Ok(message) = server_reader.recv::<ClientMessage>() {
-                if let ClientMessage::BridgeMediaAck {
-                    delivery_id,
-                    delivered,
-                } = message
-                {
-                    let _ = ack_sender.send((delivery_id, delivered));
+                match message {
+                    ClientMessage::BridgeMediaAck {
+                        delivery_id,
+                        delivered,
+                    } => {
+                        let _ = ack_sender.send((delivery_id, delivered));
+                    }
+                    ClientMessage::BridgeNeedKeyframes(requests) => {
+                        let _ = keyframe_sender.send(requests);
+                    }
+                    _ => {}
                 }
             }
         });
+        let requests = keyframe_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].source, video_key);
+        assert_eq!(
+            requests[0].reason,
+            crate::bridge::KEYFRAME_REASON_TRANSPORT_LOSS
+        );
+        let outer_audio = outer_media_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("outer presenter did not receive linked-audio pre-roll");
+        assert_eq!(
+            outer_audio.record_type,
+            vivid_protocol::messages::AUDIO_PACKET
+        );
+        assert!(
+            ack_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "pre-PLAY delivery was acknowledged before outer ingress became reusable"
+        );
+        assert!(!presenter.complete_bridge_delivery(outer_audio.delivery_id, true));
         assert_eq!(
             ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
             (42, true),
             "pre-PLAY media must replenish the virtual presenter's one-packet grant"
+        );
+        for virtual_revision in 2..=8 {
+            worker.replace_snapshot(BridgeSnapshot {
+                generation: 0,
+                virtual_revision,
+                surfaces: vec![test_surface(video_key)],
+                tracks: vec![video_source.clone(), audio_source.clone()],
+                nodes: Vec::new(),
+                videos_needing_keyframes: vec![video_key],
+            });
+        }
+        assert!(
+            keyframe_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "level-triggered recovery state must emit one request, not one per media projection"
         );
 
         let mut playing_video = video_source;
         playing_video.playing = true;
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
-            virtual_revision: 2,
+            virtual_revision: 9,
             surfaces: vec![test_surface(video_key)],
-            tracks: vec![playing_video, audio_source],
+            tracks: vec![playing_video.clone(), audio_source.clone()],
             nodes: Vec::new(),
             videos_needing_keyframes: Vec::new(),
         });
@@ -2607,6 +2709,20 @@ mod tests {
             last: true,
             bytes: packet,
         }));
+        let outer_video = outer_media_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("outer presenter did not receive the opening video keyframe");
+        assert_eq!(
+            outer_video.record_type,
+            vivid_protocol::messages::VIDEO_PACKET
+        );
+        assert!(
+            ack_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "opening video was acknowledged before outer ingress became reusable"
+        );
+        assert!(!presenter.complete_bridge_delivery(outer_video.delivery_id, true));
         assert_eq!(
             ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
             (43, true),
@@ -2628,6 +2744,53 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
+        let packet = media::audio_packet_body(AudioPacket {
+            epoch: 1,
+            packet_id: 2,
+            pts_us: 20_000,
+            dts_us: 20_000,
+            duration_us: 20_000,
+            trim_start_samples: 0,
+            trim_end_samples: 0,
+            data: &[0, 0, 0, 0],
+        })
+        .unwrap();
+        assert!(worker.queue_media(BridgeMedia {
+            generation: 0,
+            delivery_id: 44,
+            source: key,
+            record_type: vivid_protocol::messages::AUDIO_PACKET,
+            offset: 0,
+            total: packet.len() as u32,
+            last: true,
+            bytes: packet,
+        }));
+        let outer_audio = outer_media_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("outer presenter did not receive post-PLAY audio");
+        assert_eq!(
+            outer_audio.record_type,
+            vivid_protocol::messages::AUDIO_PACKET
+        );
+        assert_eq!(
+            ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (44, true),
+            "post-PLAY audio retained a stop-and-wait hop instead of using outer flow control"
+        );
+        assert!(!presenter.complete_bridge_delivery(outer_audio.delivery_id, true));
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            virtual_revision: 10,
+            surfaces: vec![test_surface(video_key)],
+            tracks: vec![playing_video, audio_source],
+            nodes: Vec::new(),
+            videos_needing_keyframes: vec![video_key],
+        });
+        let requests = keyframe_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].source, video_key);
     }
 
     #[test]

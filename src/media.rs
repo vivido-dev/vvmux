@@ -49,6 +49,11 @@ const MAX_WAITS: usize = 64;
 const CHANNEL_OPEN_DEADLINE_US: u64 = 30_000_000;
 const MAX_WAIT_US: u64 = 24 * 60 * 60 * 1_000_000;
 const INITIAL_FLOW_RECORDS: u64 = 1;
+// Start with one record so a newly projected video observes recovery promptly, then expand after
+// the first completed delivery. Keeping the startup grant forever turns linked audio into a
+// stop-and-wait stream across both bridge hops; one acknowledgement round trip per access unit is
+// enough to underrun 21 ms AAC packets while video is active.
+const ROLLING_FLOW_RECORDS: u64 = 8;
 const MAX_ACTIVE_ANCHORS: usize = 256;
 
 pub type ProducerId = u64;
@@ -297,6 +302,7 @@ struct NodeEntry {
 struct PendingDelivery {
     track: TrackKey,
     bytes: u64,
+    random_access: bool,
 }
 
 #[derive(Clone)]
@@ -723,18 +729,38 @@ impl VirtualVivid {
             return false;
         };
         let mut resync = !delivered;
+        let mut recovery_completed = false;
         release_delivery_allowance(&mut state, &delivery);
         if let Some(track) = state.tracks.get_mut(&delivery.track) {
             if delivered {
                 track.outer_presented = true;
                 track.state.milestones |= MILESTONE_PRESENTED;
+                if delivery.random_access && track.recovery_pending {
+                    // A keyframe has recovered the nested path only after the foreground bridge
+                    // confirms that it reached the outer track. Clearing this at inner ingest
+                    // lets a delayed recovery request overtake the delivery acknowledgement and
+                    // incorrectly send Vivi back into recovery after its good keyframe.
+                    track.recovery_pending = false;
+                    recovery_completed = true;
+                }
             } else {
                 track.recovery_pending = true;
                 resync = true;
             }
         }
+        let wakeup = recovery_completed
+            .then(|| {
+                advance_projection(&mut state);
+                state.media_wakeup.clone()
+            })
+            .flatten();
         drop(state);
         self.delivery_changed.notify_all();
+        if let Some(wakeup) = wakeup {
+            // Publish the falling edge of videos_needing_keyframes so the bridge can arm a later,
+            // genuinely new recovery episode.
+            wakeup();
+        }
         resync
     }
 
@@ -2331,7 +2357,9 @@ fn track_loop(
             track.state.milestones |= MILESTONE_DECODER_INITIALIZED | MILESTONE_OUTPUT_READY;
             track.last_record_sequence = record.sequence;
             track.last_pts_us = pts;
-            if random_access {
+            if random_access && events.is_none() {
+                // Focused eventless tests terminate delivery locally. A live bridge keeps
+                // recovery pending until complete_bridge_delivery confirms outer acceptance.
                 track.recovery_pending = false;
             }
             if retained {
@@ -2369,6 +2397,7 @@ fn track_loop(
             PendingDelivery {
                 track: key,
                 bytes: record.body.len() as u64,
+                random_access,
             },
         );
         let recovered_keyframe = (matches!(configuration.kind, KindConfiguration::Video(_))
@@ -2393,7 +2422,14 @@ fn track_loop(
                 "bounded bridge media queue is full",
             ));
         }
-        advance_projection(&mut state);
+        // Timed packets change delivery state, not the outer scene projection. Advancing the
+        // projection for every audio/video packet makes the attached bridge reconcile a no-op
+        // snapshot before nearly every media record; linked audio then accumulates behind video
+        // and catches up only after video EOS. Retained image/raster bodies do belong to the
+        // authoritative projection and still advance it for rehydration.
+        if retained {
+            advance_projection(&mut state);
+        }
         drop(state);
         changed.notify_all();
         if let Some(wakeup) = wakeup {
@@ -3180,15 +3216,44 @@ fn node_uses_live_anchor(
 /// the bridge either way. Withholding the allowance from those would shrink the producer's window
 /// by one record each time until it reaches zero and the producer blocks in a credit wait forever.
 fn release_delivery_allowance(state: &mut State, delivery: &PendingDelivery) {
+    let projected = state
+        .projected_sources
+        .contains(&bridge_track_key(delivery.track));
     let Some(track) = state.tracks.get_mut(&delivery.track) else {
         return;
     };
-    let bytes = track
+    let returned_bytes = track
         .state
         .flow
         .maximum_body_bytes
         .saturating_add(delivery.bytes);
-    let records = track.state.flow.maximum_media_records.saturating_add(1);
+    let returned_records = track.state.flow.maximum_media_records.saturating_add(1);
+    let maximum_record_body = u64::from(track.configuration.maximum_record_body);
+    let rolling_records = if projected {
+        ROLLING_FLOW_RECORDS.min(
+            track
+                .configuration
+                .maximum_inflight_body_bytes
+                .checked_div(maximum_record_body)
+                .unwrap_or(0)
+                .max(INITIAL_FLOW_RECORDS),
+        )
+    } else {
+        INITIAL_FLOW_RECORDS
+    };
+    let rolling_bytes = if projected {
+        track
+            .configuration
+            .maximum_inflight_body_bytes
+            .min(maximum_record_body.saturating_mul(rolling_records))
+    } else {
+        maximum_record_body
+    };
+    let available_bytes = returned_bytes.saturating_sub(track.state.flow.sent_body_bytes);
+    let available_records = returned_records.saturating_sub(track.state.flow.sent_media_records);
+    let bytes = returned_bytes.saturating_add(rolling_bytes.saturating_sub(available_bytes));
+    let records =
+        returned_records.saturating_add(rolling_records.saturating_sub(available_records));
     track.state.flow.raise_maxima(bytes, records);
     send_flow_update(delivery.track, track);
 }
@@ -3411,7 +3476,9 @@ fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::ipc::BridgeSourceKey;
-    use vivid_protocol::track::{KindConfiguration, RasterConfiguration, TrackMode};
+    use vivid_protocol::track::{
+        AudioConfiguration, KindConfiguration, RasterConfiguration, TrackMode,
+    };
     use vivid_sdk::{
         CoordinateModel, Fit, LaneClass, ProducerAuthentication, ProducerConfig, RequestMetadata,
         SceneNode, SurfaceDefinition, SurfaceDescriptor, SurfaceRole,
@@ -3486,6 +3553,74 @@ mod tests {
         }
     }
 
+    fn video(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
+        TrackConfiguration {
+            context_id,
+            surface_id,
+            track_id,
+            slot: 1,
+            mode: TrackMode::Timed,
+            lane: LaneClass::Realtime,
+            maximum_record_body: media::video_body_len(1024).unwrap(),
+            maximum_rate_millihertz: 60_000,
+            maximum_encoded_bits_per_second: 8_000_000,
+            maximum_records_per_second: 60,
+            maximum_inflight_body_bytes: 16 * 1024,
+            kind: KindConfiguration::Video(VideoConfiguration {
+                codec: "h264".into(),
+                packetization: "h264-annexb-au-v1".into(),
+                extradata: Vec::new(),
+                coded_width: 16,
+                coded_height: 16,
+                profile: 0,
+                level: 0,
+                maximum_reorder_depth: 16,
+                color_primaries: 1,
+                transfer: 1,
+                matrix: 1,
+                signal_range: 1,
+                aspect_numerator: 1,
+                aspect_denominator: 1,
+                maximum_access_unit_bytes: 1024,
+                codec_string: None,
+                decoder_configuration: None,
+            }),
+            target_latency_us: 20_000,
+            maximum_latency_us: 1_000_000,
+            retained_pixel_charge: 256,
+        }
+    }
+
+    fn audio(context_id: u64, surface_id: u64, track_id: u64) -> TrackConfiguration {
+        let maximum_record_body = media::audio_body_len(256).unwrap();
+        TrackConfiguration {
+            context_id,
+            surface_id,
+            track_id,
+            slot: 2,
+            mode: TrackMode::Timed,
+            lane: LaneClass::Realtime,
+            maximum_record_body,
+            maximum_rate_millihertz: 50_000,
+            maximum_encoded_bits_per_second: 512_000,
+            maximum_records_per_second: 50,
+            maximum_inflight_body_bytes: u64::from(maximum_record_body) * ROLLING_FLOW_RECORDS,
+            kind: KindConfiguration::Audio(AudioConfiguration {
+                codec: "pcm_s16le".into(),
+                packetization: "pcm-packet-v1".into(),
+                extradata: Vec::new(),
+                sample_rate: 48_000,
+                channels: 2,
+                channel_mask: 3,
+                maximum_access_unit_bytes: 256,
+                codec_string: None,
+            }),
+            target_latency_us: 0,
+            maximum_latency_us: 1_000_000,
+            retained_pixel_charge: 0,
+        }
+    }
+
     #[test]
     fn idempotency_fingerprint_ignores_only_request_correlation() {
         let mut first = Envelope::new(41, vec![(0, Value::Unsigned(7))]);
@@ -3548,6 +3683,267 @@ mod tests {
         );
         assert_eq!(event.record_type, messages::RASTER_FRAME);
         assert!(!presenter.complete_bridge_delivery(event.delivery_id, true));
+        client.close().unwrap();
+    }
+
+    #[test]
+    fn keyframe_recovery_remains_pending_until_outer_delivery_completes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(4);
+        let presenter = VirtualVivid::start_with_events(
+            directory.path().join("vivid.sock"),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let context = client.info().root_context_id;
+        client
+            .create_surface(surface(context, 9), &RequestMetadata::default())
+            .unwrap();
+        let track = client
+            .create_track(video(context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let channel = client.open_track_channel(&track).unwrap();
+        channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 41_667,
+                key: true,
+                data: &[0, 0, 0, 1, 0x65, 0x88],
+            })
+            .unwrap();
+        let event = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let source = BridgeSourceKey {
+            producer: client.info().session_id,
+            context,
+            surface: 9,
+            track: 11,
+        };
+        assert_eq!(event.source, source);
+        assert_eq!(
+            presenter.request_keyframe(source, None, 5),
+            KeyframeRequestOutcome::Damped,
+            "a recovery request racing a good in-flight keyframe must not make Vivi discard the \
+             rest of the GOP"
+        );
+        let recovering = presenter.projection_snapshot(&HashSet::from([7]));
+        assert_eq!(recovering.videos_needing_keyframes, [source]);
+
+        assert!(!presenter.complete_bridge_delivery(event.delivery_id, true));
+        let recovered = presenter.projection_snapshot(&HashSet::from([7]));
+        assert!(
+            recovered.videos_needing_keyframes.is_empty(),
+            "successful outer delivery must publish the end of the recovery episode"
+        );
+        assert_eq!(
+            presenter.request_keyframe(source, None, 5),
+            KeyframeRequestOutcome::Forwarded,
+            "a later recovery episode must still reach the producer"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match channel.take_event().unwrap() {
+                Some(vivid_sdk::ChannelEvent::NeedKeyframe(_)) => break,
+                Some(other) => panic!("unexpected video channel event: {other:?}"),
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+                None => panic!("the later recovery request never reached the producer"),
+            }
+        }
+        client.close().unwrap();
+    }
+
+    #[test]
+    fn first_audio_delivery_opens_a_source_scoped_rolling_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(32);
+        let presenter = VirtualVivid::start_with_events(
+            directory.path().join("vivid.sock"),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let context = client.info().root_context_id;
+        client
+            .create_surface(surface(context, 9), &RequestMetadata::default())
+            .unwrap();
+        let video = client
+            .create_track(video(context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let audio = client
+            .create_track(audio(context, 9, 12), &RequestMetadata::default())
+            .unwrap();
+        let video_channel = Arc::new(client.open_track_channel(&video).unwrap());
+        let audio_channel = Arc::new(client.open_track_channel(&audio).unwrap());
+        let projection = presenter.projection_snapshot(&HashSet::from([7]));
+        assert_eq!(projection.sources.len(), 2);
+
+        video_channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 41_667,
+                key: true,
+                data: &[0, 0, 0, 1, 0x65, 0x88],
+            })
+            .unwrap();
+        audio_channel
+            .send_audio(media::AudioPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 21_333,
+                trim_start_samples: 0,
+                trim_end_samples: 0,
+                data: &[0; 16],
+            })
+            .unwrap();
+
+        let first = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (audio_delivery, video_delivery) = if first.source.track == 12 {
+            (first.delivery_id, second.delivery_id)
+        } else {
+            (second.delivery_id, first.delivery_id)
+        };
+        assert!(!presenter.complete_bridge_delivery(audio_delivery, true));
+
+        let (audio_written, audio_writes) = mpsc::sync_channel(ROLLING_FLOW_RECORDS as usize);
+        let audio_writer = {
+            let channel = audio_channel.clone();
+            thread::spawn(move || {
+                for packet_id in 2..=ROLLING_FLOW_RECORDS + 1 {
+                    channel
+                        .send_audio(media::AudioPacket {
+                            epoch: 1,
+                            packet_id,
+                            pts_us: i64::try_from(packet_id - 1).unwrap() * 21_333,
+                            dts_us: i64::try_from(packet_id - 1).unwrap() * 21_333,
+                            duration_us: 21_333,
+                            trim_start_samples: 0,
+                            trim_end_samples: 0,
+                            data: &[0; 16],
+                        })
+                        .unwrap();
+                    audio_written.send(packet_id).unwrap();
+                }
+            })
+        };
+        let (video_written, video_writes) = mpsc::sync_channel(1);
+        let video_writer = {
+            let channel = video_channel.clone();
+            thread::spawn(move || {
+                channel
+                    .send_video(media::VideoPacket {
+                        epoch: 1,
+                        packet_id: 2,
+                        pts_us: 41_667,
+                        dts_us: 41_667,
+                        duration_us: 41_667,
+                        key: false,
+                        data: &[0, 0, 0, 1, 0x41, 0x88],
+                    })
+                    .unwrap();
+                video_written.send(()).unwrap();
+            })
+        };
+
+        for packet_id in 2..=ROLLING_FLOW_RECORDS + 1 {
+            assert_eq!(
+                audio_writes.recv_timeout(Duration::from_secs(2)).ok(),
+                Some(packet_id),
+                "audio remained stop-and-wait instead of receiving its bounded rolling window"
+            );
+        }
+        assert!(
+            video_writes
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "returning audio allowance must not enlarge an unrelated video track's window"
+        );
+
+        assert!(!presenter.complete_bridge_delivery(video_delivery, true));
+        video_writes.recv_timeout(Duration::from_secs(2)).unwrap();
+        audio_writer.join().unwrap();
+        video_writer.join().unwrap();
+        client.close().unwrap();
+    }
+
+    #[test]
+    fn timed_packet_ingest_does_not_advance_the_scene_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, received) = mpsc::sync_channel(4);
+        let presenter = VirtualVivid::start_with_events(
+            directory.path().join("vivid.sock"),
+            MediaConfig::default(),
+            Some(events),
+        )
+        .unwrap();
+        presenter.update_metrics(7, 80, 24, (8, 16));
+        let secret = presenter.issue_pane_capability(7).unwrap();
+        let mut client =
+            vivid_sdk::Session::connect(producer(presenter.endpoint(), &secret)).unwrap();
+        let context = client.info().root_context_id;
+        client
+            .create_surface(surface(context, 9), &RequestMetadata::default())
+            .unwrap();
+        let video = client
+            .create_track(video(context, 9, 11), &RequestMetadata::default())
+            .unwrap();
+        let audio = client
+            .create_track(audio(context, 9, 12), &RequestMetadata::default())
+            .unwrap();
+        let video_channel = client.open_track_channel(&video).unwrap();
+        let audio_channel = client.open_track_channel(&audio).unwrap();
+        presenter.projection_snapshot(&HashSet::from([7]));
+        let projection_before_packets = presenter.revision();
+
+        video_channel
+            .send_video(media::VideoPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 41_667,
+                key: true,
+                data: &[0, 0, 0, 1, 0x65, 0x88],
+            })
+            .unwrap();
+        audio_channel
+            .send_audio(media::AudioPacket {
+                epoch: 1,
+                packet_id: 1,
+                pts_us: 0,
+                dts_us: 0,
+                duration_us: 21_333,
+                trim_start_samples: 0,
+                trim_end_samples: 0,
+                data: &[0; 16],
+            })
+            .unwrap();
+        let first = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = received.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        assert_eq!(
+            presenter.revision(),
+            projection_before_packets,
+            "ordinary timed packets must not generate no-op scene snapshots"
+        );
+        presenter.complete_bridge_delivery(first.delivery_id, true);
+        presenter.complete_bridge_delivery(second.delivery_id, true);
         client.close().unwrap();
     }
 

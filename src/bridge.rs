@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,17 @@ pub(crate) const KEYFRAME_REASON_TRANSPORT_LOSS: u64 = 5;
 const TARGET_FOLLOW_TIMEOUT: Duration = Duration::from_millis(500);
 /// Pause between attempts while the announcement that explains a stale reply is still in flight.
 const TARGET_FOLLOW_POLL: Duration = Duration::from_millis(5);
+/// Per-track handoff between the foreground bridge and the SDK's blocking flow/rate admission.
+///
+/// The virtual presenter exposes at most eight unacknowledged records per track, so this remains
+/// bounded above that protocol window without becoming another large media reservoir.
+const OUTER_MEDIA_WRITER_QUEUE: usize = 32;
+/// Bounded linked pre-roll forwarded before outer PLAY.
+///
+/// One H.264 access unit may not produce output until reordered frames arrive. Keep the bounded
+/// round budget above the advertised reorder depth while testing readiness between rounds whose
+/// ingress capacity has actually been returned by the presenter.
+const OUTER_TIMED_PREROLL_RECORDS: usize = 32;
 
 /// One scene mutation, named so a stale reply can be retried against the target that caused it.
 #[derive(Debug, Clone, Copy)]
@@ -60,20 +72,47 @@ pub(crate) struct CapabilityChange {
     pub reason_mask: u64,
 }
 
-#[derive(Clone)]
 struct OuterTrack {
+    writer_id: u64,
     surface_key: BridgeSurfaceKey,
     track: Track,
     channel: Arc<TrackChannel>,
+    media_sender: mpsc::SyncSender<OuterMediaCommand>,
+    playback_started: Arc<AtomicBool>,
+    kind: BridgeSourceKind,
+    activated: bool,
+    media_inflight: usize,
+    media_submitted: usize,
+    media_completed: usize,
+    preplay_queried: usize,
+    preplay_limit: usize,
+    playing: bool,
+    eos_requested: bool,
+    eos: bool,
+    reported_eos_state: u64,
+}
+
+struct OuterMediaWriter {
+    writer_id: u64,
+    key: BridgeSourceKey,
+    object_id: u64,
+    channel: Arc<TrackChannel>,
+    playback_started: Arc<AtomicBool>,
     kind: BridgeSourceKind,
     next_media_id: u64,
     outer_epoch: u32,
     inner_epoch: u32,
     last_raster_id: u64,
-    activated: bool,
-    playing: bool,
-    eos: bool,
-    reported_eos_state: u64,
+    needs_full_frame: bool,
+}
+
+enum OuterMediaCommand {
+    Write {
+        delivery_id: u64,
+        record_type: u16,
+        body: Vec<u8>,
+    },
+    Eos,
 }
 
 struct PendingBody {
@@ -85,10 +124,14 @@ struct PendingBody {
 
 #[derive(Debug, Clone, Copy)]
 struct MediaCompletion {
+    writer_id: u64,
+    source: BridgeSourceKey,
     delivery_id: u64,
     delivered: bool,
     sequence: u64,
     object_id: u64,
+    needs_full_frame: bool,
+    eos: bool,
 }
 
 /// Vivid 1.5 producer side of the nested presenter.
@@ -109,6 +152,9 @@ pub struct OuterBridge {
     nodes: HashMap<(u64, u64, u8), (u64, SceneNode)>,
     pending: HashMap<BridgeSourceKey, PendingBody>,
     completions: Vec<MediaCompletion>,
+    writer_completions_tx: mpsc::Sender<MediaCompletion>,
+    writer_completions_rx: mpsc::Receiver<MediaCompletion>,
+    next_writer_id: u64,
     keyframes: Vec<BridgeKeyframeRequest>,
     full_frames: HashSet<BridgeSourceKey>,
     losses: HashSet<BridgeSourceKey>,
@@ -201,6 +247,7 @@ impl OuterBridge {
         fallback_display: DisplayMetrics,
     ) -> io::Result<Self> {
         let display = display_from_target(&session, fallback_display)?;
+        let (writer_completions_tx, writer_completions_rx) = mpsc::channel();
         Ok(Self {
             session,
             authentication,
@@ -215,6 +262,9 @@ impl OuterBridge {
             nodes: HashMap::new(),
             pending: HashMap::new(),
             completions: Vec::new(),
+            writer_completions_tx,
+            writer_completions_rx,
+            next_writer_id: 0,
             keyframes: Vec::new(),
             full_frames: HashSet::new(),
             losses: HashSet::new(),
@@ -314,6 +364,9 @@ impl OuterBridge {
         let replaced = std::mem::replace(&mut self.session, session);
         self.display = display_from_target(&self.session, self.display)?;
         self.surfaces.clear();
+        for track in self.tracks.values() {
+            let _ = track.channel.close();
+        }
         self.tracks.clear();
         self.nodes.clear();
         self.pending.clear();
@@ -351,15 +404,11 @@ impl OuterBridge {
                 && let Some(track) = self.tracks.get_mut(&source.key)
                 && !track.eos
             {
-                let sequence = track.channel.eos()?;
-                track.eos = true;
-                self.session.drain(&track.track)?;
-                self.completions.push(MediaCompletion {
-                    delivery_id: 0,
-                    delivered: true,
-                    sequence,
-                    object_id: track.track.id(),
-                });
+                // The snapshot can overtake media that was already received on the client IPC
+                // connection but still sits in its per-track queue. Record the intent here; the
+                // bridge worker calls `flush_pending_eos` only after that source queue is empty,
+                // and the per-track writer then serializes EOS behind every accepted packet.
+                track.eos_requested = true;
             }
         }
         self.active_sources = current
@@ -368,6 +417,39 @@ impl OuterBridge {
             .map(|source| (source.key, source))
             .collect();
         Ok(())
+    }
+
+    /// Enqueue requested EOS markers after all earlier client-side media for those tracks.
+    ///
+    /// `blocked` is the set of sources that still have a record waiting in the foreground
+    /// bridge. Each track writer preserves command order, so accepting EOS here establishes the
+    /// complete inner-packets-before-outer-EOS ordering without waiting on another track.
+    pub fn flush_pending_eos(&mut self, blocked: &HashSet<BridgeSourceKey>) {
+        let ready = self
+            .tracks
+            .iter()
+            .filter_map(|(key, track)| {
+                (track.eos_requested
+                    && !track.eos
+                    && !blocked.contains(key)
+                    && !self.pending.contains_key(key))
+                .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        for key in ready {
+            let Some(track) = self.tracks.get_mut(&key) else {
+                continue;
+            };
+            match track.media_sender.try_send(OuterMediaCommand::Eos) {
+                Ok(()) => {
+                    track.eos = true;
+                }
+                Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.losses.insert(key);
+                }
+            }
+        }
     }
 
     /// Recheck output readiness for a previously accepted PLAY intent.
@@ -419,6 +501,29 @@ impl OuterBridge {
         self.reconcile_nodes(nodes)
     }
 
+    /// Whether the foreground worker may hand another media chunk to this source.
+    ///
+    /// Timed tracks forward one bounded pre-roll window before outer PLAY. This avoids filling the
+    /// video socket while still supplying enough reordered video and linked audio to become
+    /// output-ready. A pre-roll round completes only after the outer presenter returns its ingress
+    /// capacity; after PLAY, the per-track writer bound is the source-scoped boundary.
+    pub fn can_accept_media(&self, key: BridgeSourceKey) -> bool {
+        if self.pending.contains_key(&key) {
+            return true;
+        }
+        let Some(track) = self.tracks.get(&key) else {
+            return true;
+        };
+        if track.eos || track.media_inflight >= OUTER_MEDIA_WRITER_QUEUE {
+            return false;
+        }
+        !matches!(
+            track.kind,
+            BridgeSourceKind::Video { .. } | BridgeSourceKind::Audio { .. }
+        ) || track.playing
+            || (track.media_inflight == 0 && track.media_submitted < track.preplay_limit)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn media_chunk(
         &mut self,
@@ -464,27 +569,73 @@ impl OuterBridge {
         if pending.received != pending.total {
             return Err(invalid_data("incomplete media body"));
         }
-        let (sequence, object_id) = self.forward_media(key, pending.record_type, &pending.bytes)?;
-        self.completions.push(MediaCompletion {
-            delivery_id,
-            delivered: true,
-            sequence,
-            object_id,
-        });
-        self.poll_channel_events(key)?;
-        if self
-            .active_sources
-            .get(&key)
-            .is_some_and(|source| source.playing)
-        {
-            let _ = self.try_start_surface(key);
+        let track = self
+            .tracks
+            .get_mut(&key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "outer track is missing"))?;
+        if track.eos {
+            return Err(invalid_data("media arrived after outer channel EOS"));
         }
+        track
+            .media_sender
+            .try_send(OuterMediaCommand::Write {
+                delivery_id,
+                record_type: pending.record_type,
+                body: pending.bytes,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "outer source media writer queue is full",
+                ),
+                mpsc::TrySendError::Disconnected(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "outer source media writer stopped",
+                ),
+            })?;
+        track.media_inflight = track.media_inflight.saturating_add(1);
+        track.media_submitted = track.media_submitted.saturating_add(1);
         Ok(true)
     }
 
     pub fn take_media_completions(&mut self) -> Vec<(u64, bool, u64, u64)> {
         self.completions
+            .extend(self.writer_completions_rx.try_iter());
+        let mut completed_eos = Vec::new();
+        for completion in &mut self.completions {
+            let current = self
+                .tracks
+                .get_mut(&completion.source)
+                .filter(|track| track.writer_id == completion.writer_id);
+            let Some(track) = current else {
+                // A late retained hydration from a replaced writer must not be attributed to a
+                // new track that happens to reuse the same SDK object ID.
+                if completion.delivery_id == 0 {
+                    completion.delivered = false;
+                }
+                continue;
+            };
+            if !completion.eos {
+                track.media_inflight = track.media_inflight.saturating_sub(1);
+                track.media_completed = track.media_completed.saturating_add(1);
+            }
+            if completion.eos && completion.delivered {
+                completed_eos.push(completion.source);
+            }
+            if completion.needs_full_frame {
+                self.full_frames.insert(completion.source);
+            } else if !completion.delivered {
+                self.losses.insert(completion.source);
+            }
+        }
+        for key in completed_eos {
+            if let Some(track) = self.tracks.get(&key) {
+                let _ = self.session.drain(&track.track);
+            }
+        }
+        self.completions
             .drain(..)
+            .filter(|value| !value.eos)
             .map(|value| {
                 (
                     value.delivery_id,
@@ -600,19 +751,48 @@ impl OuterBridge {
             .session
             .create_track(configuration, &RequestMetadata::default())?;
         let channel = Arc::new(self.session.open_track_channel(&track)?);
+        self.next_writer_id = self
+            .next_writer_id
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("outer media writer identity exhausted"))?;
+        let writer_id = self.next_writer_id;
+        let (media_sender, media_receiver) = mpsc::sync_channel(OUTER_MEDIA_WRITER_QUEUE);
+        let playback_started = Arc::new(AtomicBool::new(false));
+        let writer = OuterMediaWriter {
+            writer_id,
+            key: source.key,
+            object_id: track.id(),
+            channel: channel.clone(),
+            playback_started: playback_started.clone(),
+            kind: source.kind.clone(),
+            next_media_id: 0,
+            outer_epoch: 0,
+            inner_epoch: 0,
+            last_raster_id: 0,
+            needs_full_frame: false,
+        };
+        let completions = self.writer_completions_tx.clone();
+        thread::Builder::new()
+            .name(format!("vvmux-outer-media-{}", track.id()))
+            .spawn(move || run_outer_media_writer(writer, media_receiver, completions))?;
         self.tracks.insert(
             source.key,
             OuterTrack {
+                writer_id,
                 surface_key,
                 track,
                 channel,
+                media_sender,
+                playback_started,
                 kind: source.kind.clone(),
-                next_media_id: 0,
-                outer_epoch: 0,
-                inner_epoch: 0,
-                last_raster_id: 0,
                 activated: false,
+                media_inflight: 0,
+                media_submitted: 0,
+                media_completed: 0,
+                preplay_queried: 0,
+                preplay_limit: 1,
                 playing: false,
+                eos_requested: false,
                 eos: false,
                 reported_eos_state: 0,
             },
@@ -803,112 +983,6 @@ impl OuterBridge {
         Ok(())
     }
 
-    fn forward_media(
-        &mut self,
-        key: BridgeSourceKey,
-        record_type: u16,
-        body: &[u8],
-    ) -> io::Result<(u64, u64)> {
-        let track = self
-            .tracks
-            .get_mut(&key)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "outer track is missing"))?;
-        if track.eos {
-            return Err(invalid_data("media arrived after outer channel EOS"));
-        }
-        let object_id = track.track.id();
-        let sequence = match record_type {
-            messages::IMAGE_DATA => track.channel.send_image(body)?,
-            messages::VIDEO_PACKET => {
-                let packet = media::parse_video_packet(body)?;
-                let (epoch, id) = next_outer_identity(track, packet.epoch)?;
-                track.channel.send_video(VideoPacket {
-                    epoch,
-                    packet_id: id,
-                    pts_us: packet.pts_us,
-                    dts_us: packet.dts_us,
-                    duration_us: packet.duration_us,
-                    key: packet.flags & media::VIDEO_PACKET_KEY != 0,
-                    data: packet.data,
-                })?
-            }
-            messages::AUDIO_PACKET => {
-                let packet = media::parse_audio_packet(body)?;
-                let (epoch, id) = next_outer_identity(track, packet.epoch)?;
-                track.channel.send_audio(AudioPacket {
-                    epoch,
-                    packet_id: id,
-                    pts_us: packet.pts_us,
-                    dts_us: packet.dts_us,
-                    duration_us: packet.duration_us,
-                    trim_start_samples: packet.trim_start_samples,
-                    trim_end_samples: packet.trim_end_samples,
-                    data: packet.data,
-                })?
-            }
-            messages::RASTER_FRAME => {
-                let flags = body
-                    .get(4..8)
-                    .and_then(|value| value.try_into().ok())
-                    .map(u32::from_be_bytes)
-                    .ok_or_else(|| invalid_data("raster header is truncated"))?;
-                if flags & media::RASTER_FRAME_DELTA == 0 {
-                    let frame = media::parse_full_raster_frame(body)?;
-                    let pixels = media::decode_raster_pixels(frame)?;
-                    let (epoch, id) = next_outer_identity(track, frame.epoch)?;
-                    track.last_raster_id = id;
-                    track.channel.send_raster(epoch, id, &pixels, false)?
-                } else {
-                    let (width, height, limit) = match &track.kind {
-                        BridgeSourceKind::Raster {
-                            width,
-                            height,
-                            delta_operation_limit: Some(limit),
-                            ..
-                        } => (*width, *height, *limit),
-                        _ => {
-                            self.full_frames.insert(key);
-                            return Err(invalid_data(
-                                "raster delta arrived for a non-delta outer track",
-                            ));
-                        }
-                    };
-                    let frame = media::parse_delta_raster_frame(body, width, height, limit)?;
-                    if track.last_raster_id == 0 {
-                        self.full_frames.insert(key);
-                        return Err(invalid_data("outer raster delta has no reusable base"));
-                    }
-                    let (epoch, id) = next_outer_identity(track, frame.epoch)?;
-                    let operations = frame
-                        .operations
-                        .iter()
-                        .map(parsed_delta_operation)
-                        .collect::<Vec<_>>();
-                    let sequence = track.channel.send_raster_delta(
-                        epoch,
-                        id,
-                        track.last_raster_id,
-                        frame.pts_us,
-                        frame.duration_us,
-                        &operations,
-                        false,
-                    )?;
-                    track.last_raster_id = id;
-                    sequence
-                }
-            }
-            _ => return Err(invalid_data("unsupported relayed media record type")),
-        };
-        let needs_static_activation = matches!(
-            track.kind,
-            BridgeSourceKind::Image { .. } | BridgeSourceKind::Raster { .. }
-        ) && !track.activated;
-        if needs_static_activation {
-            self.try_activate_static(key)?;
-        }
-        Ok((sequence, object_id))
-    }
-
     fn try_activate_static(&mut self, key: BridgeSourceKey) -> io::Result<()> {
         let Some(track) = self.tracks.get(&key) else {
             return Ok(());
@@ -958,50 +1032,69 @@ impl OuterBridge {
                 (track.surface_key == surface_key).then_some(*candidate)
             })
             .collect::<Vec<_>>();
+        let members = member_keys
+            .into_iter()
+            .filter_map(|member| {
+                let track = &self.tracks[&member];
+                if !matches!(
+                    track.kind,
+                    BridgeSourceKind::Video { .. } | BridgeSourceKind::Audio { .. }
+                ) {
+                    return None;
+                }
+                let source_playing = self
+                    .active_sources
+                    .get(&member)
+                    .is_some_and(|source| source.playing)
+                    || matches!(
+                        &track.kind,
+                        BridgeSourceKind::Audio {
+                            linked_video: Some(video),
+                            ..
+                        } if self.active_sources.get(video).is_some_and(|source| source.playing)
+                    );
+                source_playing.then(|| {
+                    (
+                        member,
+                        track.track.clone(),
+                        matches!(track.kind, BridgeSourceKind::Audio { .. }),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            return Ok(());
+        }
+        if members
+            .iter()
+            .any(|(member, _, _)| self.tracks[member].media_completed == 0)
+            || members.iter().all(|(member, _, _)| {
+                let track = &self.tracks[member];
+                track.media_completed <= track.preplay_queried
+            })
+        {
+            // Wait until the presenter has returned capacity for a new pre-roll round on every
+            // member before attempting atomic slot activation.
+            return Ok(());
+        }
         let mut bindings = Vec::new();
         let mut clock = key;
-        for member in member_keys {
-            let track = &self.tracks[&member];
-            if !matches!(
-                track.kind,
-                BridgeSourceKind::Video { .. } | BridgeSourceKind::Audio { .. }
-            ) {
-                continue;
-            }
-            let source_playing = self
-                .active_sources
-                .get(&member)
-                .is_some_and(|source| source.playing)
-                || matches!(
-                    &track.kind,
-                    BridgeSourceKind::Audio {
-                        linked_video: Some(video),
-                        ..
-                    } if self.active_sources.get(video).is_some_and(|source| source.playing)
-                );
-            if !source_playing {
-                continue;
-            }
-            let status = self.session.query_track(&track.track)?;
-            if status.milestones & vivid_sdk::MILESTONE_OUTPUT_READY == 0 {
-                // Readiness is driven by media on an independent connection. Keep the intent and
-                // retry after the next track delivery instead of blocking the bridge worker.
-                return Ok(());
-            }
+        for (member, outer_track, audio) in &members {
             bindings.push(SlotBinding {
-                slot: if matches!(track.kind, BridgeSourceKind::Audio { .. }) {
-                    clock = member;
+                slot: if *audio {
+                    clock = *member;
                     SLOT_AUDIO
                 } else {
-                    slot_for_kind(&track.kind)
+                    SLOT_VIDEO
                 },
-                track_id: track.track.id(),
-                expected_channel_generation: track.track.channel_generation(),
+                track_id: outer_track.id(),
+                expected_channel_generation: outer_track.channel_generation(),
                 required_milestone: vivid_sdk::MILESTONE_OUTPUT_READY,
             });
         }
-        if bindings.is_empty() {
-            return Ok(());
+        for (member, _, _) in &members {
+            let track = self.tracks.get_mut(member).expect("member still exists");
+            track.preplay_queried = track.media_completed;
         }
         let already_playing = self.tracks.get(&clock).is_some_and(|track| track.playing);
         if already_playing {
@@ -1010,9 +1103,30 @@ impl OuterBridge {
         let surface = self
             .surfaces
             .get(&surface_key)
-            .ok_or_else(|| invalid_data("outer playback surface is missing"))?;
-        self.session
-            .activate_tracks(surface, &bindings, &RequestMetadata::default())?;
+            .ok_or_else(|| invalid_data("outer playback surface is missing"))?
+            .clone();
+        match self
+            .session
+            .activate_tracks(&surface, &bindings, &RequestMetadata::default())
+        {
+            Ok(_) => {}
+            Err(error) if presenter_code(&error) == Some(messages::ERROR_BAD_STATE) => {
+                // Media and control use independent connections. If the presenter has not
+                // observed enough pre-roll, admit one more record per member and retry only after
+                // their ingress capacity is reusable. ACTIVATE_TRACK does not reconcile the SDK
+                // media-sequence lock, so it cannot deadlock with a paced TrackChannel write.
+                for (member, _, _) in &members {
+                    let track = self.tracks.get_mut(member).expect("member still exists");
+                    let next = track
+                        .media_submitted
+                        .saturating_add(1)
+                        .min(OUTER_TIMED_PREROLL_RECORDS);
+                    track.preplay_limit = track.preplay_limit.max(next);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         let request = self
             .active_sources
             .get(&key)
@@ -1036,6 +1150,7 @@ impl OuterBridge {
                 .iter_mut()
                 .find(|(_, track)| track.track.id() == binding.track_id)
             {
+                track.playback_started.store(true, Ordering::Release);
                 track.activated = true;
                 track.playing = true;
             }
@@ -1113,6 +1228,136 @@ impl OuterBridge {
                     eos_state,
                 },
             ));
+        }
+    }
+}
+
+impl OuterMediaWriter {
+    fn forward_media(&mut self, record_type: u16, body: &[u8]) -> io::Result<u64> {
+        match record_type {
+            messages::IMAGE_DATA => self.channel.send_image(body),
+            messages::VIDEO_PACKET => {
+                let packet = media::parse_video_packet(body)?;
+                let (epoch, id) = next_outer_identity(self, packet.epoch)?;
+                self.channel.send_video(VideoPacket {
+                    epoch,
+                    packet_id: id,
+                    pts_us: packet.pts_us,
+                    dts_us: packet.dts_us,
+                    duration_us: packet.duration_us,
+                    key: packet.flags & media::VIDEO_PACKET_KEY != 0,
+                    data: packet.data,
+                })
+            }
+            messages::AUDIO_PACKET => {
+                let packet = media::parse_audio_packet(body)?;
+                let (epoch, id) = next_outer_identity(self, packet.epoch)?;
+                self.channel.send_audio(AudioPacket {
+                    epoch,
+                    packet_id: id,
+                    pts_us: packet.pts_us,
+                    dts_us: packet.dts_us,
+                    duration_us: packet.duration_us,
+                    trim_start_samples: packet.trim_start_samples,
+                    trim_end_samples: packet.trim_end_samples,
+                    data: packet.data,
+                })
+            }
+            messages::RASTER_FRAME => {
+                let flags = body
+                    .get(4..8)
+                    .and_then(|value| value.try_into().ok())
+                    .map(u32::from_be_bytes)
+                    .ok_or_else(|| invalid_data("raster header is truncated"))?;
+                if flags & media::RASTER_FRAME_DELTA == 0 {
+                    let frame = media::parse_full_raster_frame(body)?;
+                    let pixels = media::decode_raster_pixels(frame)?;
+                    let (epoch, id) = next_outer_identity(self, frame.epoch)?;
+                    self.last_raster_id = id;
+                    self.channel.send_raster(epoch, id, &pixels, false)
+                } else {
+                    let (width, height, limit) = match &self.kind {
+                        BridgeSourceKind::Raster {
+                            width,
+                            height,
+                            delta_operation_limit: Some(limit),
+                            ..
+                        } => (*width, *height, *limit),
+                        _ => {
+                            self.needs_full_frame = true;
+                            return Err(invalid_data(
+                                "raster delta arrived for a non-delta outer track",
+                            ));
+                        }
+                    };
+                    let frame = media::parse_delta_raster_frame(body, width, height, limit)?;
+                    if self.last_raster_id == 0 {
+                        self.needs_full_frame = true;
+                        return Err(invalid_data("outer raster delta has no reusable base"));
+                    }
+                    let (epoch, id) = next_outer_identity(self, frame.epoch)?;
+                    let operations = frame
+                        .operations
+                        .iter()
+                        .map(parsed_delta_operation)
+                        .collect::<Vec<_>>();
+                    let sequence = self.channel.send_raster_delta(
+                        epoch,
+                        id,
+                        self.last_raster_id,
+                        frame.pts_us,
+                        frame.duration_us,
+                        &operations,
+                        false,
+                    )?;
+                    self.last_raster_id = id;
+                    Ok(sequence)
+                }
+            }
+            _ => Err(invalid_data("unsupported relayed media record type")),
+        }
+    }
+}
+
+fn run_outer_media_writer(
+    mut writer: OuterMediaWriter,
+    receiver: mpsc::Receiver<OuterMediaCommand>,
+    completions: mpsc::Sender<MediaCompletion>,
+) {
+    while let Ok(command) = receiver.recv() {
+        let (delivery_id, eos, result) = match command {
+            OuterMediaCommand::Write {
+                delivery_id,
+                record_type,
+                body,
+            } => {
+                writer.needs_full_frame = false;
+                let result = writer
+                    .forward_media(record_type, &body)
+                    .and_then(|sequence| {
+                        if !writer.playback_started.load(Ordering::Acquire) {
+                            writer.channel.wait_for_reusable_media_capacity()?;
+                        }
+                        Ok(sequence)
+                    });
+                (delivery_id, false, result)
+            }
+            OuterMediaCommand::Eos => (0, true, writer.channel.eos()),
+        };
+        let delivered = result.is_ok();
+        let completion = MediaCompletion {
+            writer_id: writer.writer_id,
+            source: writer.key,
+            delivery_id,
+            delivered,
+            sequence: result.unwrap_or(0),
+            object_id: writer.object_id,
+            needs_full_frame: writer.needs_full_frame,
+            eos,
+        };
+        if completions.send(completion).is_err() || eos || (!delivered && !writer.needs_full_frame)
+        {
+            break;
         }
     }
 }
@@ -1465,7 +1710,7 @@ fn scene_node(
     }
 }
 
-fn next_outer_identity(track: &mut OuterTrack, inner_epoch: u32) -> io::Result<(u32, u64)> {
+fn next_outer_identity(track: &mut OuterMediaWriter, inner_epoch: u32) -> io::Result<(u32, u64)> {
     if track.outer_epoch == 0 {
         track.outer_epoch = 1;
         track.inner_epoch = inner_epoch;

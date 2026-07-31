@@ -34,6 +34,12 @@ const EVENT_QUEUE: usize = 1024;
 /// enough slots that small records — audio access units especially — cannot exhaust it while that
 /// byte budget is far from spent.
 const MEDIA_EVENT_QUEUE: usize = 256;
+/// Maximum media deliveries forwarded before the actor gives its general queue another turn.
+///
+/// The media receiver is bounded, but a live producer can refill it while it is being drained.
+/// Without a per-turn limit, "drain to exhaustion" can therefore starve detach, input, credits,
+/// and projection updates indefinitely.
+const MEDIA_EVENTS_PER_TURN: usize = 32;
 const COPY_BUFFER_LIMIT: usize = 1024 * 1024;
 const MAX_NODE_FRAGMENTS: usize = 8;
 const MAX_PROJECTED_NODES: usize = 256;
@@ -569,8 +575,7 @@ pub fn start(
         let wakeup = sender.clone();
         let pending = media_projection_pending.clone();
         vivid.set_media_wakeup(Arc::new(move || {
-            pending.store(true, Ordering::Release);
-            let _ = wakeup.try_send(ActorEvent::MediaReady);
+            request_media_service(&wakeup, &pending);
         }));
     }
     let (response_sender, response_receiver) =
@@ -676,10 +681,11 @@ impl SessionActor {
                 Duration::from_secs(1)
             };
             timeout = timeout.min(self.next_automation_deadline());
-            // Media first, and to exhaustion: a projected source's frames must not queue behind an
-            // unrelated pane's terminal output. This is cheap when idle because the media receiver
-            // is empty and `try_recv` does not block.
-            self.drain_media(&media_receiver);
+            // Give ready media low-latency service, but force a general-queue turn after a bounded
+            // batch. A bounded channel is not a bounded drain when its producer can refill it.
+            if self.drain_media(&media_receiver) {
+                timeout = Duration::ZERO;
+            }
             match receiver.recv_timeout(timeout) {
                 Ok(event) => {
                     if self.handle_event(event).is_err() {
@@ -717,14 +723,15 @@ impl SessionActor {
         self.shutdown.store(true, Ordering::Release);
     }
 
-    /// Forward every media event currently queued.
+    /// Forward one bounded batch of currently queued media events.
     ///
-    /// Bounded by the media channel's own capacity, so this cannot become an unbounded stall on
-    /// the actor even when a producer is saturating its source.
-    fn drain_media(&mut self, media_receiver: &mpsc::Receiver<crate::media::MediaEvent>) {
-        while let Ok(event) = media_receiver.try_recv() {
+    /// Returns true when the batch limit was reached and more media may remain. The caller then
+    /// polls the general actor queue without waiting, preserving detach, input, and credit
+    /// liveness under a continuously refilled video queue.
+    fn drain_media(&mut self, media_receiver: &mpsc::Receiver<crate::media::MediaEvent>) -> bool {
+        drain_ready_batch(media_receiver, MEDIA_EVENTS_PER_TURN, |event| {
             self.forward_media(event);
-        }
+        })
     }
 
     fn sync_pending_media_projection(&mut self) {
@@ -4806,6 +4813,31 @@ fn send_media_body(
     crate::ipc::send_media_record(writer, delivery_id, source, record_type, body).is_ok()
 }
 
+/// Mark media/projection work pending and enqueue at most one coalesced actor wake.
+///
+/// A wake that loses a race with a full general queue is still safe: the dirty bit remains set,
+/// and the actor checks it after every event and idle timeout.
+fn request_media_service(wakeup: &mpsc::SyncSender<ActorEvent>, pending: &AtomicBool) {
+    if !pending.swap(true, Ordering::AcqRel) {
+        let _ = wakeup.try_send(ActorEvent::MediaReady);
+    }
+}
+
+/// Consume no more than `limit` ready items, returning whether the limit was reached.
+fn drain_ready_batch<T>(
+    receiver: &mpsc::Receiver<T>,
+    limit: usize,
+    mut consume: impl FnMut(T),
+) -> bool {
+    for _ in 0..limit {
+        let Ok(item) = receiver.try_recv() else {
+            return false;
+        };
+        consume(item);
+    }
+    true
+}
+
 fn normalized_display(display: DisplayMetrics, status_visible: bool) -> DisplayMetrics {
     DisplayMetrics {
         columns: display.columns.clamp(10, 1000),
@@ -4924,6 +4956,54 @@ fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_wakeups_coalesce_until_the_actor_clears_pending_work() {
+        let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE);
+        let pending = AtomicBool::new(false);
+
+        for _ in 0..(EVENT_QUEUE * 2) {
+            request_media_service(&sender, &pending);
+        }
+
+        assert!(matches!(receiver.try_recv(), Ok(ActorEvent::MediaReady)));
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "one video frame must not add another redundant actor wake while media work is pending"
+        );
+
+        pending.store(false, Ordering::Release);
+        request_media_service(&sender, &pending);
+        assert!(matches!(receiver.try_recv(), Ok(ActorEvent::MediaReady)));
+    }
+
+    #[test]
+    fn saturated_media_is_batched_so_actor_control_gets_a_turn() {
+        let (media_sender, media_receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE);
+        for item in 0..(MEDIA_EVENTS_PER_TURN * 2) {
+            media_sender.try_send(item).unwrap();
+        }
+        let (control_sender, control_receiver) = mpsc::sync_channel(1);
+        control_sender.try_send("detach").unwrap();
+
+        let mut forwarded = Vec::new();
+        assert!(drain_ready_batch(
+            &media_receiver,
+            MEDIA_EVENTS_PER_TURN,
+            |item| forwarded.push(item)
+        ));
+
+        assert_eq!(forwarded.len(), MEDIA_EVENTS_PER_TURN);
+        assert_eq!(
+            control_receiver.try_recv().unwrap(),
+            "detach",
+            "a saturated or continuously refilled media receiver must yield to actor control"
+        );
+        assert!(
+            media_receiver.try_recv().is_ok(),
+            "the test must leave media queued rather than accidentally exercising exhaustion"
+        );
+    }
 
     #[test]
     fn bracketed_paste_cannot_inject_terminator() {
