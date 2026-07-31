@@ -99,6 +99,11 @@ struct OuterMediaWriter {
     channel: Arc<TrackChannel>,
     playback_started: Arc<AtomicBool>,
     kind: BridgeSourceKind,
+    /// Raster delta operations the outer presenter granted this track, zero when it granted none.
+    ///
+    /// The inner grant says only what the nested producer was allowed to send. Forwarding is
+    /// governed by what the outer track will accept.
+    outer_delta_operations: u32,
     next_media_id: u64,
     outer_epoch: u32,
     inner_epoch: u32,
@@ -765,6 +770,7 @@ impl OuterBridge {
             channel: channel.clone(),
             playback_started: playback_started.clone(),
             kind: source.kind.clone(),
+            outer_delta_operations: track.delta_operation_limit()?,
             next_media_id: 0,
             outer_epoch: 0,
             inner_epoch: 0,
@@ -1294,6 +1300,16 @@ impl OuterMediaWriter {
                     if self.last_raster_id == 0 {
                         self.needs_full_frame = true;
                         return Err(invalid_data("outer raster delta has no reusable base"));
+                    }
+                    // An outer presenter that granted fewer delta operations than this frame uses
+                    // cannot receive it at all. Ask the nested producer for a full frame instead:
+                    // sending the delta anyway fails the record, and a failure that is not a
+                    // full-frame request retires the writer and strands the source for good.
+                    if frame.operations.len() > self.outer_delta_operations as usize {
+                        self.needs_full_frame = true;
+                        return Err(invalid_data(
+                            "outer track granted too few raster delta operations",
+                        ));
                     }
                     let (epoch, id) = next_outer_identity(self, frame.epoch)?;
                     let operations = frame
@@ -1874,5 +1890,172 @@ fn default_play_request() -> crate::ipc::BridgePlayRequest {
         late_policy: 1,
         loop_count: 0,
         start_policy: 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RASTER_WIDTH: u32 = 4;
+    const RASTER_HEIGHT: u32 = 2;
+    const INNER_DELTA_OPERATIONS: u32 = 4;
+
+    /// One raster writer against an offline outer track, granted `outer_delta_operations`.
+    fn raster_writer(outer_delta_operations: u32) -> (vivid_sdk::Session, OuterMediaWriter) {
+        let mut session = vivid_sdk::Session::connect(ProducerConfig::offline()).unwrap();
+        let context_id = session.info().root_context_id;
+        let surface = session
+            .create_surface(
+                SurfaceDefinition {
+                    context_id,
+                    surface_id: 1,
+                    semantic_profile: registry::TERMINAL_CONTENT.into(),
+                    coordinate_model: CoordinateModel::TerminalContentCells,
+                    logical_width: 1,
+                    logical_height: 1,
+                    scale_numerator: 1,
+                    scale_denominator: 1,
+                    rotation: 0,
+                    descriptor: SurfaceDescriptor {
+                        role: SurfaceRole::Figure,
+                        title: "relayed raster".into(),
+                        semantic_content_revision: 1,
+                        semantic_availability: 0,
+                        locator_hint: String::new(),
+                    },
+                    policy: 0,
+                    profile_parameters: vec![],
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let body = media::rgba8_raw_frame_body_len(RASTER_WIDTH, RASTER_HEIGHT).unwrap();
+        let track = session
+            .create_track(
+                TrackConfiguration {
+                    context_id,
+                    surface_id: surface.id(),
+                    track_id: 2,
+                    slot: SLOT_RASTER,
+                    mode: TrackMode::Live,
+                    lane: LaneClass::Bulk,
+                    maximum_record_body: body,
+                    maximum_rate_millihertz: 60_000,
+                    maximum_encoded_bits_per_second: u64::from(body) * 8 * 120,
+                    maximum_records_per_second: 120,
+                    maximum_inflight_body_bytes: u64::from(body) * 2,
+                    kind: KindConfiguration::Raster(RasterConfiguration {
+                        width: RASTER_WIDTH,
+                        height: RASTER_HEIGHT,
+                        alpha_mode: 1,
+                        delta_enabled: true,
+                        maximum_delta_operations: u8::try_from(INNER_DELTA_OPERATIONS).unwrap(),
+                        zstd_enabled: false,
+                    }),
+                    target_latency_us: 0,
+                    maximum_latency_us: 100_000,
+                    retained_pixel_charge: u64::from(RASTER_WIDTH) * u64::from(RASTER_HEIGHT),
+                },
+                &RequestMetadata::default(),
+            )
+            .unwrap();
+        let channel = Arc::new(session.open_track_channel(&track).unwrap());
+        let writer = OuterMediaWriter {
+            writer_id: 1,
+            key: BridgeSourceKey {
+                producer: 1,
+                context: 1,
+                surface: 1,
+                track: 3,
+            },
+            object_id: track.id(),
+            channel,
+            playback_started: Arc::new(AtomicBool::new(true)),
+            kind: BridgeSourceKind::Raster {
+                width: RASTER_WIDTH,
+                height: RASTER_HEIGHT,
+                alpha_mode: 1,
+                compression_mode: 0,
+                delta_operation_limit: Some(INNER_DELTA_OPERATIONS),
+            },
+            outer_delta_operations,
+            next_media_id: 0,
+            outer_epoch: 0,
+            inner_epoch: 0,
+            last_raster_id: 0,
+            needs_full_frame: false,
+        };
+        (session, writer)
+    }
+
+    fn full_frame_body(frame_id: u64) -> Vec<u8> {
+        media::raster_frame_body(
+            1,
+            frame_id,
+            RASTER_WIDTH,
+            RASTER_HEIGHT,
+            &[0x10, 0x20, 0x30, 0xff].repeat((RASTER_WIDTH * RASTER_HEIGHT) as usize),
+        )
+        .unwrap()
+    }
+
+    fn delta_body(frame_id: u64, base_frame_id: u64) -> Vec<u8> {
+        media::raster_delta_frame_body(
+            1,
+            frame_id,
+            base_frame_id,
+            0,
+            0,
+            RASTER_WIDTH,
+            RASTER_HEIGHT,
+            INNER_DELTA_OPERATIONS,
+            &[RasterDeltaOperation::Overwrite {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                rgba: &[0xaa, 0xbb, 0xcc, 0xff],
+            }],
+            false,
+        )
+        .unwrap()
+    }
+
+    /// An outer presenter that grants no delta operations must not be handed a delta.
+    ///
+    /// The inner grant only says what the nested producer was allowed to send. Relaying the delta
+    /// regardless fails the record without asking for anything, which retires the writer and
+    /// leaves the pane frozen on its last full frame for the life of the source.
+    #[test]
+    fn a_delta_the_outer_track_cannot_accept_asks_for_a_full_frame() {
+        let (_session, mut writer) = raster_writer(0);
+        writer
+            .forward_media(messages::RASTER_FRAME, &full_frame_body(1))
+            .expect("a full frame is always relayable");
+        assert!(!writer.needs_full_frame);
+
+        let error = writer
+            .forward_media(messages::RASTER_FRAME, &delta_body(2, 1))
+            .expect_err("an ungranted delta cannot be relayed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            writer.needs_full_frame,
+            "the failure has to ask the nested producer for a full frame"
+        );
+    }
+
+    /// The same relay stays intact when the outer track did grant the operations.
+    #[test]
+    fn a_delta_within_the_outer_grant_is_relayed() {
+        let (_session, mut writer) = raster_writer(INNER_DELTA_OPERATIONS);
+        writer
+            .forward_media(messages::RASTER_FRAME, &full_frame_body(1))
+            .expect("a full frame is always relayable");
+        writer
+            .forward_media(messages::RASTER_FRAME, &delta_body(2, 1))
+            .expect("a granted delta is relayable");
+        assert!(!writer.needs_full_frame);
+        assert_eq!(writer.last_raster_id, 2, "the outer base has to advance");
     }
 }
