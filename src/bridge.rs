@@ -390,6 +390,15 @@ impl OuterBridge {
         previous: &[BridgeSource],
         current: &[BridgeSource],
     ) -> io::Result<()> {
+        // Playback helpers must read the new authoritative request. Keeping this assignment until
+        // the end made a changed PLAY either use the old PTS or disappear entirely because the
+        // outer tracks were already marked playing.
+        self.active_sources = current
+            .iter()
+            .cloned()
+            .map(|source| (source.key, source))
+            .collect();
+        let mut rebased_surfaces = HashSet::new();
         for source in current {
             let old = previous
                 .iter()
@@ -397,7 +406,18 @@ impl OuterBridge {
             if source.playing
                 && old.is_none_or(|old| !old.playing || old.play_request != source.play_request)
             {
-                self.try_start_surface(source.key)?;
+                if old.is_some_and(|old| old.playing && old.play_request != source.play_request) {
+                    let surface = self
+                        .tracks
+                        .get(&source.key)
+                        .map(|track| track.surface_key)
+                        .ok_or_else(|| invalid_data("playback track is missing"))?;
+                    if rebased_surfaces.insert(surface) {
+                        self.rebase_surface_clock(source.key)?;
+                    }
+                } else {
+                    self.try_start_surface(source.key)?;
+                }
             } else if !source.playing
                 && old.is_some_and(|old| old.playing)
                 && let Some(track) = self.tracks.get(&source.key)
@@ -416,11 +436,52 @@ impl OuterBridge {
                 track.eos_requested = true;
             }
         }
-        self.active_sources = current
-            .iter()
-            .cloned()
-            .map(|source| (source.key, source))
-            .collect();
+        Ok(())
+    }
+
+    fn rebase_surface_clock(&mut self, key: BridgeSourceKey) -> io::Result<()> {
+        let surface_key = self
+            .tracks
+            .get(&key)
+            .map(|track| track.surface_key)
+            .ok_or_else(|| invalid_data("playback track is missing"))?;
+        let mut clock = key;
+        for (candidate, track) in &self.tracks {
+            if track.surface_key == surface_key
+                && matches!(track.kind, BridgeSourceKind::Audio { .. })
+                && self
+                    .active_sources
+                    .get(candidate)
+                    .is_some_and(|source| source.playing)
+            {
+                clock = *candidate;
+                break;
+            }
+        }
+        let request = self
+            .active_sources
+            .get(&key)
+            .map(|source| source.play_request)
+            .ok_or_else(|| invalid_data("authoritative playback request is missing"))?;
+        let clock_track = self
+            .tracks
+            .get(&clock)
+            .ok_or_else(|| invalid_data("outer playback clock is missing"))?
+            .track
+            .clone();
+        self.session.play(
+            &clock_track,
+            request.start_pts_us,
+            request.minimum_buffer_us.max(1),
+            request.maximum_latency_us.max(1),
+        )?;
+        self.playback.push((
+            key,
+            PlaybackSnapshot {
+                state: 2,
+                eos_state: 0,
+            },
+        ));
         Ok(())
     }
 
