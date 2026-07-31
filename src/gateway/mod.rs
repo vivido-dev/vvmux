@@ -991,6 +991,7 @@ fn dispatch_parsed(adapter: &SessionAdapter, parsed: Vec<ParsedInput>) -> io::Re
             ParsedInput::Input(bytes) => ClientMessage::Input(bytes),
             ParsedInput::Action(action) => ClientMessage::Action(action),
             ParsedInput::Mouse(mouse) => ClientMessage::Mouse(mouse),
+            ParsedInput::Focus(focused) => ClientMessage::Focus(focused),
             ParsedInput::Detach => ClientMessage::Detach,
         };
         adapter.send(message)?;

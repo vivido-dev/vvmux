@@ -8,8 +8,15 @@ pub(crate) enum ParsedInput {
     Input(Vec<u8>),
     Action(Action),
     Mouse(MouseEvent),
+    /// The host terminal gained or lost focus.
+    Focus(bool),
     Detach,
 }
+
+/// How long a lone ESC may be held while the parser waits to see whether it begins a longer
+/// terminal sequence. Nothing may hold a bare Escape past this: an editor such as vim leaves
+/// insert mode only when the byte itself arrives, so an indefinite hold reads as a lost keypress.
+pub(crate) const ESCAPE_DELAY: Duration = Duration::from_millis(25);
 
 /// Fragment-safe parser for the intentionally tiny floating-edit key language. A leading ESC is
 /// held briefly so an arrow split across terminal reads is not mistaken for a bare Escape. Any
@@ -21,8 +28,6 @@ pub(crate) struct FloatEditScanner {
 }
 
 impl FloatEditScanner {
-    pub(crate) const ESCAPE_DELAY: Duration = Duration::from_millis(25);
-
     pub(crate) fn scan(&mut self, bytes: &[u8]) -> (Vec<FloatingEditCommand>, Vec<u8>) {
         let mut commands = Vec::new();
         let mut forward = Vec::new();
@@ -70,13 +75,18 @@ impl FloatEditScanner {
 
     pub(crate) fn expire(&mut self, now: Instant) -> Option<FloatingEditCommand> {
         let since = self.pending_since?;
-        if self.pending == b"\x1b" && now.saturating_duration_since(since) >= Self::ESCAPE_DELAY {
+        if self.pending == b"\x1b" && now.saturating_duration_since(since) >= ESCAPE_DELAY {
             self.pending.clear();
             self.pending_since = None;
             Some(FloatingEditCommand::Cancel)
         } else {
             None
         }
+    }
+
+    /// Whether a bare Escape is being held and therefore needs an expiry poll.
+    pub(crate) fn holds_bare_escape(&self) -> bool {
+        self.pending == b"\x1b"
     }
 
     /// Clear a no-longer-current mode and return any incomplete bytes for ordinary input.
@@ -122,7 +132,8 @@ pub(crate) struct PrefixParser {
     bindings: HashMap<u8, Action>,
     prefix: bool,
     sequence: Vec<u8>,
-    mouse_sequence: Vec<u8>,
+    escape_sequence: Vec<u8>,
+    escape_since: Option<Instant>,
     confirm_close: bool,
 }
 
@@ -148,9 +159,33 @@ impl PrefixParser {
             bindings,
             prefix: false,
             sequence: Vec::new(),
-            mouse_sequence: Vec::new(),
+            escape_sequence: Vec::new(),
+            escape_since: None,
             confirm_close: false,
         }
+    }
+
+    /// Release a lone Escape once it can no longer be the start of a mouse report or focus event.
+    /// The parser has to hold ESC while that is still possible, but holding it until the next
+    /// keystroke arrives makes vim and other modal programs look like they need Escape twice.
+    pub(crate) fn expire(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let since = self.escape_since?;
+        if self.escape_sequence == b"\x1b" && now.saturating_duration_since(since) >= ESCAPE_DELAY {
+            self.escape_since = None;
+            Some(std::mem::take(&mut self.escape_sequence))
+        } else {
+            None
+        }
+    }
+
+    /// Whether a bare Escape is being held and therefore needs an expiry poll.
+    pub(crate) fn holds_bare_escape(&self) -> bool {
+        self.escape_sequence == b"\x1b"
+    }
+
+    fn clear_escape(&mut self) {
+        self.escape_sequence.clear();
+        self.escape_since = None;
     }
 
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<ParsedInput> {
@@ -166,6 +201,13 @@ impl PrefixParser {
             }
             if !self.sequence.is_empty() {
                 self.sequence.push(byte);
+                if let Some(focused) = focus_event(&self.sequence) {
+                    // A window focus change is not a chord. It must neither be mistaken for one
+                    // of the prefix arrow sequences nor consume the prefix the user just typed.
+                    output.push(ParsedInput::Focus(focused));
+                    self.sequence.clear();
+                    continue;
+                }
                 if let Some(command) = prefix_sequence(&self.sequence) {
                     output.push(ParsedInput::Action(command));
                     self.sequence.clear();
@@ -177,34 +219,43 @@ impl PrefixParser {
                 continue;
             }
             if !self.prefix {
-                if !self.mouse_sequence.is_empty() {
-                    self.mouse_sequence.push(byte);
-                    let valid_prefix = match self.mouse_sequence.len() {
-                        2 => self.mouse_sequence == b"\x1b[",
-                        3 => self.mouse_sequence == b"\x1b[<",
+                if !self.escape_sequence.is_empty() {
+                    self.escape_sequence.push(byte);
+                    if let Some(focused) = focus_event(&self.escape_sequence) {
+                        if !ordinary.is_empty() {
+                            output.push(ParsedInput::Input(std::mem::take(&mut ordinary)));
+                        }
+                        output.push(ParsedInput::Focus(focused));
+                        self.clear_escape();
+                        continue;
+                    }
+                    let valid_prefix = match self.escape_sequence.len() {
+                        2 => self.escape_sequence == b"\x1b[",
+                        3 => self.escape_sequence == b"\x1b[<",
                         _ => true,
                     };
                     if !valid_prefix {
-                        ordinary.extend_from_slice(&self.mouse_sequence);
-                        self.mouse_sequence.clear();
+                        ordinary.extend_from_slice(&self.escape_sequence);
+                        self.clear_escape();
                     } else if matches!(byte, b'M' | b'm') {
                         if !ordinary.is_empty() {
                             output.push(ParsedInput::Input(std::mem::take(&mut ordinary)));
                         }
-                        if let Some(mouse) = parse_sgr_mouse(&self.mouse_sequence) {
+                        if let Some(mouse) = parse_sgr_mouse(&self.escape_sequence) {
                             output.push(ParsedInput::Mouse(mouse));
                         } else {
-                            ordinary.extend_from_slice(&self.mouse_sequence);
+                            ordinary.extend_from_slice(&self.escape_sequence);
                         }
-                        self.mouse_sequence.clear();
-                    } else if self.mouse_sequence.len() >= 64 {
-                        ordinary.extend_from_slice(&self.mouse_sequence);
-                        self.mouse_sequence.clear();
+                        self.clear_escape();
+                    } else if self.escape_sequence.len() >= 64 {
+                        ordinary.extend_from_slice(&self.escape_sequence);
+                        self.clear_escape();
                     }
                     continue;
                 }
                 if byte == 0x1b {
-                    self.mouse_sequence.push(byte);
+                    self.escape_sequence.push(byte);
+                    self.escape_since = Some(Instant::now());
                     continue;
                 }
                 if byte == self.prefix_byte {
@@ -317,6 +368,17 @@ fn parse_sgr_mouse(sequence: &[u8]) -> Option<MouseEvent> {
     })
 }
 
+/// A focus in/out report from the host terminal, which the client asks for with DEC private mode
+/// 1004. These are terminal state, not typed input: forwarding them into a pane wrote `ESC[I` and
+/// `ESC[O` into whatever program was running there.
+fn focus_event(sequence: &[u8]) -> Option<bool> {
+    match sequence {
+        b"\x1b[I" => Some(true),
+        b"\x1b[O" => Some(false),
+        _ => None,
+    }
+}
+
 fn prefix_sequence(sequence: &[u8]) -> Option<Action> {
     let direction = match sequence {
         b"\x1b[A" | b"\x1b[1;5A" => Direction::Up,
@@ -358,6 +420,76 @@ mod tests {
                 shift: false,
             })]
         );
+    }
+
+    #[test]
+    fn focus_reports_are_parsed_instead_of_reaching_a_pane_as_input() {
+        let mut parser = PrefixParser::default();
+        assert_eq!(
+            parser.feed(b"\x1b[O"),
+            [ParsedInput::Focus(false)],
+            "a focus report must never be forwarded as pane input"
+        );
+        assert_eq!(parser.feed(b"\x1b[I"), [ParsedInput::Focus(true)]);
+
+        // Split across reads, and mixed with ordinary bytes on either side.
+        let mut parser = PrefixParser::default();
+        let held = parser.feed(b"a\x1b[");
+        assert_eq!(held.len(), 1);
+        assert!(matches!(&held[0], ParsedInput::Input(bytes) if bytes == b"a"));
+        let completed = parser.feed(b"Ob");
+        assert_eq!(completed[0], ParsedInput::Focus(false));
+        assert!(matches!(&completed[1], ParsedInput::Input(bytes) if bytes == b"b"));
+
+        // Unfocusing the window while a prefix is pending leaves the chord usable.
+        let mut parser = PrefixParser::default();
+        assert!(parser.feed(b"\x02").is_empty());
+        assert_eq!(parser.feed(b"\x1b[O"), [ParsedInput::Focus(false)]);
+        assert_eq!(
+            parser.feed(b"z"),
+            [ParsedInput::Action(Action::ToggleZoom)],
+            "a focus report must not consume the pending prefix"
+        );
+    }
+
+    #[test]
+    fn bare_escape_reaches_the_pane_without_a_second_press() {
+        let mut parser = PrefixParser::default();
+        assert!(
+            parser.feed(b"\x1b").is_empty(),
+            "ESC is held while it may still begin a mouse or focus sequence"
+        );
+        assert!(parser.holds_bare_escape());
+        assert_eq!(
+            parser.expire(Instant::now()),
+            None,
+            "the hold window must not be skipped"
+        );
+        assert_eq!(
+            parser.expire(Instant::now() + ESCAPE_DELAY),
+            Some(b"\x1b".to_vec()),
+            "a lone Escape must be forwarded once no longer sequence is possible"
+        );
+        assert!(!parser.holds_bare_escape());
+        assert_eq!(parser.expire(Instant::now() + ESCAPE_DELAY), None);
+
+        // A sequence still in flight is not a bare Escape and keeps its full parse.
+        let mut parser = PrefixParser::default();
+        assert!(parser.feed(b"\x1b[").is_empty());
+        assert!(!parser.holds_bare_escape());
+        assert_eq!(
+            parser.expire(Instant::now() + Duration::from_secs(1)),
+            None,
+            "a fragmented mouse or focus prefix must not become Escape"
+        );
+        assert_eq!(parser.feed(b"O"), [ParsedInput::Focus(false)]);
+
+        // Escape immediately followed by another key still forwards both, in order, at once.
+        let mut parser = PrefixParser::default();
+        let commands = parser.feed(b"\x1b:");
+        assert!(matches!(&commands[0], ParsedInput::Input(bytes) if bytes == b"\x1b:"));
+        assert!(!parser.holds_bare_escape());
+        assert_eq!(parser.expire(Instant::now() + ESCAPE_DELAY), None);
     }
 
     #[test]
