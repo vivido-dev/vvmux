@@ -79,3 +79,5 @@ windows-sys = { version = "0.61.2", features = [
 [dev-dependencies]
 tempfile = "3"
 tokio-tungstenite = "0.30"
+# The gateway's test-support API (wait_for_retained_media) is gated behind its testing feature.
+vivid_gateway = { path = "../vivid_gateway", features = ["testing"] }
