@@ -16,7 +16,6 @@ mod runtime;
 mod screen;
 mod server;
 mod session;
-mod vivid_transport;
 
 use std::io;
 use std::path::PathBuf;

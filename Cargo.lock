@@ -1540,6 +1540,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vivid_gateway"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "log",
+ "serde",
+ "sha2",
+ "vivid_protocol",
+ "vivid_sdk",
+ "zeroize",
+]
+
+[[package]]
 name = "vivid_protocol"
 version = "1.5.0"
 dependencies = [
@@ -1598,6 +1611,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "toml",
  "unicode-width",
+ "vivid_gateway",
  "vivid_protocol",
  "vivid_sdk",
  "vte",

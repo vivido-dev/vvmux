@@ -4,6 +4,13 @@ use std::sync::{Arc, Mutex};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[allow(unused_imports)]
+pub use vivid_gateway::{
+    BridgeClipRect, BridgeKeyframeRequest, BridgeNode, BridgePlayRequest, BridgeSource,
+    BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey,
+    DisplayMetrics, PaneMediaNodeStatus, PaneMediaStatus, PaneMediaSurfaceDescriptor,
+    PaneMediaSurfaceStatus, PaneMediaTrackStatus,
+};
 
 use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
@@ -131,93 +138,6 @@ pub enum AutomationMethod {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PaneMediaStatus {
-    pub virtual_projection_revision: u64,
-    pub virtual_scene_revision: u64,
-    /// Compatibility sequence for callers of the original `wait media --after-outer` API.
-    ///
-    /// This never moves backwards across foreground bridge replacement.
-    pub outer_projection_revision: u64,
-    /// Number of accepted outer projection applications in this session actor.
-    pub outer_apply_sequence: u64,
-    /// Current foreground bridge identity, or `None` before its first applied projection.
-    pub bridge_instance_id: Option<u64>,
-    /// Projection revision local to the current foreground bridge.
-    pub bridge_local_revision: u64,
-    pub surfaces: Vec<PaneMediaSurfaceStatus>,
-    pub tracks: Vec<PaneMediaTrackStatus>,
-    pub nodes: Vec<PaneMediaNodeStatus>,
-    /// Session-scoped relay counters. Every pane shares one client connection and one foreground
-    /// bridge, so this describes the whole relay rather than this pane's slice of it.
-    pub relay: crate::metrics::RelayMetrics,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PaneMediaSurfaceStatus {
-    pub producer_id: u64,
-    pub context_id: u64,
-    pub surface_id: u64,
-    pub lifecycle: String,
-    pub surface_revision: u64,
-    pub surface_generation: u64,
-    pub visible: bool,
-    pub capture_policy: u64,
-    pub descriptor: Option<PaneMediaSurfaceDescriptor>,
-    pub active_slots: Vec<(u64, u64)>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PaneMediaTrackStatus {
-    pub producer_id: u64,
-    pub context_id: u64,
-    pub surface_id: u64,
-    pub track_id: u64,
-    pub kind: String,
-    pub lifecycle: String,
-    pub track_revision: u64,
-    pub epoch: u32,
-    pub channel_state: u64,
-    pub inner_channel_generation: u64,
-    pub outer_channel_generation: Option<u64>,
-    pub outer_mapping_fresh: bool,
-    pub visible: bool,
-    pub retained_static: bool,
-    pub keyframe_needed: bool,
-    pub milestones: u64,
-    pub queued_packets: u64,
-    pub queued_bytes: u64,
-    pub available_packet_credit: u64,
-    pub available_byte_credit: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PaneMediaSurfaceDescriptor {
-    pub role: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_revision: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic_availability: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub locator: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PaneMediaNodeStatus {
-    pub producer_id: u64,
-    pub context_id: u64,
-    pub node_id: u64,
-    pub surface_context_id: u64,
-    pub surface_id: u64,
-    pub visible: bool,
-    pub x: i64,
-    pub y: i64,
-    pub width: i64,
-    pub height: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutomationError {
     pub code: String,
     pub message: String,
@@ -338,14 +258,6 @@ pub enum FloatingEditCommand {
     Cancel,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct DisplayMetrics {
-    pub columns: u16,
-    pub rows: u16,
-    pub cell_width: u16,
-    pub cell_height: u16,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MouseKind {
     Press,
@@ -361,159 +273,6 @@ pub struct MouseEvent {
     pub y: u16,
     pub kind: MouseKind,
     pub shift: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct BridgeSurfaceKey {
-    /// Inner Vivid session identity allocated by the virtual presenter.
-    pub producer: u64,
-    pub context: u64,
-    pub surface: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BridgeSurface {
-    pub key: BridgeSurfaceKey,
-    pub logical_width: u64,
-    pub logical_height: u64,
-    pub capture_policy: u64,
-    pub descriptor: BridgeSourceDescriptor,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct BridgeSourceKey {
-    /// Inner Vivid session identity allocated by the virtual presenter.
-    pub producer: u64,
-    pub context: u64,
-    pub surface: u64,
-    pub track: u64,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BridgeKeyframeRequest {
-    pub source: BridgeSourceKey,
-    /// `None` asks the virtual presenter to choose the minimum from its current source state.
-    pub minimum_epoch: Option<u32>,
-    pub reason: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum BridgeSourceKind {
-    Raster {
-        width: u32,
-        height: u32,
-        alpha_mode: u64,
-        compression_mode: u64,
-        /// Operation limit of the inner delta-capable source, when it has one.
-        ///
-        /// Present means the inner producer may send deltas, so vvmux can re-originate deltas on
-        /// its own outgoing chain instead of expanding every update to a full frame. The outgoing
-        /// chain's identities are always vvmux's own; the inner base frame never crosses the hop
-        /// (specification 11.4 "Nesting" and 16.3 rule 5).
-        delta_operation_limit: Option<u32>,
-    },
-    Image {
-        encoding: u64,
-        width: u32,
-        height: u32,
-        encoded_length: u32,
-        sha256: Option<[u8; 32]>,
-    },
-    Video {
-        codec: String,
-        packetization: String,
-        extradata: Vec<u8>,
-        width: u32,
-        height: u32,
-        profile: i32,
-        level: i32,
-        bitrate: u64,
-        color_primaries: u64,
-        transfer: u64,
-        matrix: u64,
-        range: u64,
-        sar_num: u32,
-        sar_den: u32,
-        max_access_unit_bytes: u32,
-        codec_string: Option<String>,
-        decoder_config: Option<Vec<u8>>,
-    },
-    Audio {
-        linked_video: Option<BridgeSourceKey>,
-        codec: String,
-        packetization: String,
-        extradata: Vec<u8>,
-        sample_rate: u32,
-        channels: u16,
-        channel_mask: u64,
-        bitrate: u64,
-        max_access_unit_bytes: u32,
-        codec_string: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BridgeSource {
-    pub key: BridgeSourceKey,
-    pub kind: BridgeSourceKind,
-    #[serde(default)]
-    pub capture_policy: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub descriptor: Option<BridgeSourceDescriptor>,
-    pub playing: bool,
-    pub play_request: BridgePlayRequest,
-    /// Epoch of the inner `EOS`, once ingress has closed.
-    ///
-    /// The outer presenter only reaches `MILESTONE_PLAYBACK_ENDED` after it sees `EOS`, so the
-    /// bridge has to close the matching outer epoch rather than let the source simply run dry.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eos_epoch: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub causation_id: Option<[u8; 16]>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BridgeSourceDescriptor {
-    pub role: u64,
-    pub title: String,
-    pub content_revision: u64,
-    pub semantic_availability: u64,
-    pub locator: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BridgePlayRequest {
-    pub start_pts_us: i64,
-    pub minimum_buffer_us: u64,
-    pub maximum_latency_us: u64,
-    pub rate_32_32: i64,
-    pub late_policy: u64,
-    pub loop_count: u64,
-    pub start_policy: u64,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BridgeClipRect {
-    pub x: i64,
-    pub y: i64,
-    pub width: i64,
-    pub height: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BridgeNode {
-    pub producer: u64,
-    pub node: u64,
-    /// Stable fragment identity within one logical `(producer, node)`.
-    pub fragment: u8,
-    pub surface: BridgeSurfaceKey,
-    pub x: i64,
-    pub y: i64,
-    pub width: i64,
-    pub height: i64,
-    pub z_index: i64,
-    pub visible: bool,
-    pub clip: BridgeClipRect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

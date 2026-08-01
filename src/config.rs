@@ -37,15 +37,7 @@ pub struct Appearance {
     pub status_background: u8,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Media {
-    pub aggregate_retained_bytes: u64,
-    pub max_sources: usize,
-    pub max_nodes: usize,
-    pub max_anchors: usize,
-    pub ipc_queue_bytes: usize,
-}
+pub use vivid_gateway::MediaConfig as Media;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -115,18 +107,6 @@ impl Default for Appearance {
             inactive_frame: 8,
             status_foreground: 15,
             status_background: 4,
-        }
-    }
-}
-
-impl Default for Media {
-    fn default() -> Self {
-        Self {
-            aggregate_retained_bytes: 256 * 1024 * 1024,
-            max_sources: 64,
-            max_nodes: 256,
-            max_anchors: 256,
-            ipc_queue_bytes: 32 * 1024 * 1024,
         }
     }
 }
