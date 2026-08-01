@@ -48,8 +48,17 @@ Workers must never mutate `SessionActor` state directly or write session replies
 The pane-facing virtual presenter and the outer presenter are different Vivid sessions. Virtual
 scene/surface/track revisions, observation sequences, channel generations, record sequences,
 raster bases, media IDs, epochs, flow maxima, and EOS state never cross the boundary as authority.
-Every relay key contains the complete inner session, context, surface, and track identity. The
-session actor separately
+Every relay key contains the complete inner session, context, surface, and track identity.
+
+What does cross is the *shape* of the media. The outer raster track mirrors the nested track's
+compression and delta grant, so the relay re-encodes each frame with the outer track's own identity
+and sends it compressed whenever that is the smaller of the two forms. Raster tracks never reach
+PLAY, so their writers pace one record at a time only until the outer slot is activated; after that
+the outer channel's byte and record flow is the sole bound. Both matter only when the outer
+connection is forwarded, where a raw framebuffer per page turn and a presenter round trip per frame
+are what a nested document reader actually pays.
+
+The session actor separately
 tracks a monotonic outer compatibility revision and apply sequence; the current foreground bridge
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.

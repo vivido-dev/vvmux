@@ -2488,6 +2488,242 @@ mod tests {
         }
     }
 
+    /// A page-sized raster relay: geometry, compression, and one page turn's worth of pixels.
+    #[cfg(unix)]
+    const PAGE_WIDTH: u32 = 256;
+    #[cfg(unix)]
+    const PAGE_HEIGHT: u32 = 64;
+    #[cfg(unix)]
+    const PAGE_DELTA_OPERATIONS: u32 = 8;
+
+    /// A document page: a light background with a few dark bands, like rendered text.
+    #[cfg(unix)]
+    fn page_pixels(shade: u8) -> Vec<u8> {
+        let mut pixels = vec![0xf5_u8; (PAGE_WIDTH * PAGE_HEIGHT * 4) as usize];
+        for (index, byte) in pixels.iter_mut().enumerate() {
+            let row = index as u32 / (PAGE_WIDTH * 4);
+            if index % 4 == 3 {
+                *byte = 0xff;
+            } else if row % 8 < 2 {
+                *byte = shade;
+            }
+        }
+        pixels
+    }
+
+    #[cfg(unix)]
+    fn page_frame_body(frame_id: u64, shade: u8) -> Vec<u8> {
+        media::raster_frame_body(1, frame_id, PAGE_WIDTH, PAGE_HEIGHT, &page_pixels(shade)).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn page_source(key: BridgeSourceKey) -> BridgeSource {
+        BridgeSource {
+            key,
+            kind: BridgeSourceKind::Raster {
+                width: PAGE_WIDTH,
+                height: PAGE_HEIGHT,
+                alpha_mode: 1,
+                compression_mode: 1,
+                delta_operation_limit: Some(PAGE_DELTA_OPERATIONS),
+            },
+            capture_policy: 0,
+            descriptor: None,
+            playing: false,
+            eos_epoch: None,
+            causation_id: None,
+            play_request: crate::ipc::BridgePlayRequest {
+                start_pts_us: 0,
+                minimum_buffer_us: 0,
+                maximum_latency_us: 500_000,
+                rate_32_32: 1_i64 << 32,
+                late_policy: 1,
+                loop_count: 0,
+                start_policy: 1,
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn page_node(key: BridgeSourceKey) -> BridgeNode {
+        BridgeNode {
+            producer: key.producer,
+            node: 1,
+            fragment: 0,
+            surface: test_surface(key).key,
+            x: 0,
+            y: 0,
+            width: 8_i64 << 32,
+            height: 4_i64 << 32,
+            z_index: 0,
+            visible: true,
+            clip: crate::ipc::BridgeClipRect {
+                x: 0,
+                y: 0,
+                width: 8_i64 << 32,
+                height: 4_i64 << 32,
+            },
+        }
+    }
+
+    /// The outer track mirrors the nested track's compression, so the relay has to use it.
+    ///
+    /// A nested document reader compresses its page turns, and a rendered page compresses by more
+    /// than an order of magnitude. Relaying the decoded pixels raw put a whole framebuffer on the
+    /// outer connection for every page turn: free over a local socket, and the dominant cost over
+    /// a forwarded one, which is where nested reading actually got slow. Scrolling and panning
+    /// send deltas rather than page turns, so both forms are covered here.
+    #[test]
+    #[cfg(unix)]
+    fn a_relayed_raster_page_keeps_its_compression_on_the_outer_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("outer-page.sock");
+        let (outer_media_sender, outer_media_receiver) = mpsc::sync_channel(8);
+        let presenter = match VirtualVivid::start_with_events(
+            socket.clone(),
+            MediaConfig::default(),
+            Some(outer_media_sender),
+        ) {
+            Ok(presenter) => presenter,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping relayed raster compression socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("virtual outer presenter start failed: {error}"),
+        };
+        let token = presenter.issue_pane_capability(7).unwrap();
+        presenter.update_metrics(7, 80, 22, (10, 20));
+        let bridge = crate::bridge::OuterBridge::connect(
+            format!("unix:{}", socket.display()),
+            Zeroizing::new(token),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let client_establish = thread::spawn(move || {
+            crate::ipc::establish(test_transport(client), ChannelKind::Control)
+        });
+        let (_server_reader, _server_writer) =
+            establish(test_transport(server), ChannelKind::Control).unwrap();
+        let (_client_reader, client_writer) = client_establish.join().unwrap().unwrap();
+        let presenter_cell_size =
+            Arc::new(AtomicU32::new(pack_cell_size(bridge.display_metrics())));
+        let mut worker =
+            BridgeWorker::spawn(bridge, client_writer, 8, presenter_cell_size).unwrap();
+
+        let key = BridgeSourceKey {
+            producer: 3,
+            context: 1,
+            surface: 7,
+            track: 7,
+        };
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            virtual_revision: 1,
+            surfaces: vec![test_surface(key)],
+            tracks: vec![page_source(key)],
+            nodes: vec![page_node(key)],
+            videos_needing_keyframes: Vec::new(),
+        });
+
+        // The nested producer's own frame is uncompressed here on purpose: the outer hop owes the
+        // link its compression regardless of the form the inner hop happened to use.
+        let frame = page_frame_body(1, 0x10);
+        assert!(worker.queue_media(BridgeMedia {
+            generation: 0,
+            delivery_id: 41,
+            source: key,
+            record_type: vivid_protocol::messages::RASTER_FRAME,
+            offset: 0,
+            total: frame.len() as u32,
+            last: true,
+            bytes: frame.clone(),
+        }));
+
+        let page = outer_media_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the outer presenter never received the relayed page");
+        let relayed = page.body;
+        let flags = u32::from_be_bytes(relayed[4..8].try_into().unwrap());
+        assert_ne!(
+            flags & media::RASTER_FRAME_ZSTD,
+            0,
+            "a relayed page must not reach the outer link as raw pixels"
+        );
+        assert!(
+            relayed.len() * 4 < frame.len(),
+            "the relayed page is {} bytes against a {} byte framebuffer, so it was not compressed \
+             in any useful sense",
+            relayed.len(),
+            frame.len()
+        );
+        // The outer presenter validates every raster body it accepts by decoding it, so a body it
+        // took is already legible; check that the compressed relay kept the pixels too.
+        let decoded = media::decode_raster_pixels(
+            media::parse_full_raster_frame(&relayed).expect("relayed page parses"),
+        )
+        .expect("relayed page decodes");
+        assert_eq!(decoded, page_pixels(0x10), "the relayed page lost pixels");
+        presenter.complete_bridge_delivery(page.delivery_id, true);
+
+        // The same obligation on a scroll: a delta large enough to be worth compressing is one the
+        // outer link must not carry raw either.
+        let band = vec![0x40_u8; (PAGE_WIDTH * PAGE_HEIGHT / 2 * 4) as usize];
+        let delta = media::raster_delta_frame_body(
+            1,
+            2,
+            1,
+            0,
+            0,
+            PAGE_WIDTH,
+            PAGE_HEIGHT,
+            PAGE_DELTA_OPERATIONS,
+            &[media::RasterDeltaOperation::Overwrite {
+                x: 0,
+                y: 0,
+                width: PAGE_WIDTH,
+                height: PAGE_HEIGHT / 2,
+                rgba: &band,
+            }],
+            false,
+        )
+        .unwrap();
+        assert!(worker.queue_media(BridgeMedia {
+            generation: 0,
+            delivery_id: 42,
+            source: key,
+            record_type: vivid_protocol::messages::RASTER_FRAME,
+            offset: 0,
+            total: delta.len() as u32,
+            last: true,
+            bytes: delta.clone(),
+        }));
+
+        let relayed = outer_media_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the outer presenter never received the relayed delta")
+            .body;
+        let flags = u32::from_be_bytes(relayed[4..8].try_into().unwrap());
+        assert_ne!(
+            flags & media::RASTER_FRAME_DELTA,
+            0,
+            "the delta became a full frame"
+        );
+        assert_ne!(
+            flags & media::RASTER_FRAME_ZSTD,
+            0,
+            "a relayed delta must not reach the outer link as raw pixels"
+        );
+        assert!(
+            relayed.len() * 4 < delta.len(),
+            "the relayed delta is {} bytes against a {} byte delta, so it was not compressed in \
+             any useful sense",
+            relayed.len(),
+            delta.len()
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn bridge_forwards_linked_preroll_and_applies_play_before_video() {
