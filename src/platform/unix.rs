@@ -307,14 +307,7 @@ pub struct ClientTerminal {
 
 impl ClientTerminal {
     pub fn enter() -> io::Result<Self> {
-        if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1
-            || unsafe { libc::isatty(libc::STDOUT_FILENO) } != 1
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "vvmux attach requires an interactive terminal",
-            ));
-        }
+        require_interactive_terminal()?;
         let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
         if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } == -1 {
             return Err(io::Error::last_os_error());
@@ -344,27 +337,7 @@ impl ClientTerminal {
     }
 
     pub fn display_metrics(&self) -> io::Result<DisplayMetrics> {
-        let mut size = libc::winsize {
-            ws_row: 0,
-            ws_col: 0,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut size) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        if size.ws_col == 0 || size.ws_row == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "terminal has zero dimensions",
-            ));
-        }
-        Ok(DisplayMetrics {
-            columns: size.ws_col,
-            rows: size.ws_row,
-            cell_width: size.ws_xpixel.checked_div(size.ws_col).unwrap_or(0),
-            cell_height: size.ws_ypixel.checked_div(size.ws_row).unwrap_or(0),
-        })
+        current_display_metrics()
     }
 
     pub fn output(&self) -> io::Result<Box<dyn Write + Send>> {
@@ -391,6 +364,48 @@ impl ClientTerminal {
         } else {
             io::stdin().read(buffer).map(Some)
         }
+    }
+}
+
+/// Query and validate the host terminal without changing any of its modes.
+///
+/// Attachment admission uses this before entering the alternate screen so a refusal is invisible
+/// to the terminal other than the diagnostic printed by the command.
+pub fn current_display_metrics() -> io::Result<DisplayMetrics> {
+    require_interactive_terminal()?;
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut size) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if size.ws_col == 0 || size.ws_row == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "terminal has zero dimensions",
+        ));
+    }
+    Ok(DisplayMetrics {
+        columns: size.ws_col,
+        rows: size.ws_row,
+        cell_width: size.ws_xpixel.checked_div(size.ws_col).unwrap_or(0),
+        cell_height: size.ws_ypixel.checked_div(size.ws_row).unwrap_or(0),
+    })
+}
+
+fn require_interactive_terminal() -> io::Result<()> {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1
+        && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vvmux attach requires an interactive terminal",
+        ))
     }
 }
 

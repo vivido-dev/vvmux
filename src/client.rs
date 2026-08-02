@@ -60,17 +60,13 @@ pub fn attach(
     let outer_bulk_endpoint = std::env::var("VIVID_ENDPOINT_BULK").ok();
     let outer_root_secret = std::env::var("VIVID_ROOT_SECRET").ok().map(Zeroizing::new);
     let vivid = outer_endpoint.is_some() && outer_root_secret.is_some();
-    let terminal = ClientTerminal::enter()?;
-    let display = terminal.display_metrics()?;
+    // Negotiate the attachment before entering raw/alternate-screen mode. A rejected attach must
+    // remain an ordinary command error: changing terminal state here would visibly clear the
+    // caller's Vivido window, and the later terminal teardown would hide the server's diagnostic.
+    let display = crate::platform::current_display_metrics()?;
     let presenter_cell_size = Arc::new(AtomicU32::new(pack_cell_size(display)));
-    send_client(
-        &writer,
-        &ClientMessage::Attach {
-            replace,
-            display,
-            vivid,
-        },
-    )?;
+    let text_only = request_attachment(&mut reader, &writer, replace, display, vivid)?;
+    let terminal = ClientTerminal::enter()?;
 
     let stopped = Arc::new(AtomicBool::new(false));
     let ipc_cancel = reader.cancel_handle();
@@ -82,6 +78,9 @@ pub fn attach(
     let output = terminal.output()?;
     let output = Arc::new(Mutex::new(output));
     let output_thread = TerminalOutput::spawn(output, writer.clone())?;
+    if text_only {
+        write_title(&output_thread, "vvmux (text-only media fallback)");
+    }
     let bridge_display = display;
     let bridge_cell_size = presenter_cell_size.clone();
     let bridge_queue_records =
@@ -134,11 +133,7 @@ pub fn attach(
             };
             while let Ok(message) = reader.recv_server() {
                 match message {
-                    ServerMessage::Attached { text_only, .. } => {
-                        if text_only {
-                            write_title(&output_thread, "vvmux (text-only media fallback)");
-                        }
-                    }
+                    ServerMessage::Attached { .. } => break,
                     ServerMessage::Render {
                         frame_id,
                         full,
@@ -424,6 +419,33 @@ pub fn attach(
     workers.stop();
     drop(terminal);
     result
+}
+
+fn request_attachment(
+    reader: &mut crate::ipc::RecordReader,
+    writer: &SharedWriter,
+    replace: bool,
+    display: crate::ipc::DisplayMetrics,
+    vivid: bool,
+) -> io::Result<bool> {
+    send_client(
+        writer,
+        &ClientMessage::Attach {
+            replace,
+            display,
+            vivid,
+        },
+    )?;
+    match reader.recv_server()? {
+        ServerMessage::Attached { text_only, .. } => Ok(text_only),
+        ServerMessage::Error(message) => {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session returned an unexpected attachment reply",
+        )),
+    }
 }
 
 struct ClientWorkers {
@@ -1833,6 +1855,45 @@ mod tests {
             (10, 25),
             "the TTY supplies the live grid, but nested raster pixels must use presenter cells"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_attachment_returns_the_server_diagnostic_before_terminal_entry() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let (mut reader, writer) =
+                establish(test_transport(server_stream), ChannelKind::Control).unwrap();
+            assert!(matches!(
+                reader.recv::<ClientMessage>().unwrap(),
+                ClientMessage::Attach { replace: false, .. }
+            ));
+            crate::ipc::send(
+                &writer,
+                &ServerMessage::Error("session already has an attached client".into()),
+            )
+            .unwrap();
+        });
+        let (mut reader, writer) =
+            establish(test_transport(client_stream), ChannelKind::Control).unwrap();
+
+        let error = request_attachment(
+            &mut reader,
+            &writer,
+            false,
+            crate::ipc::DisplayMetrics {
+                columns: 80,
+                rows: 24,
+                cell_width: 10,
+                cell_height: 20,
+            },
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "session already has an attached client");
+        server.join().unwrap();
     }
 
     #[cfg(unix)]

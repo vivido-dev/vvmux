@@ -975,8 +975,6 @@ impl SessionActor {
                 display,
                 vivid,
             } => {
-                self.cancel_pointer_drag(true);
-                self.end_float_mode(true);
                 if let Some(old) = &self.attached {
                     if !replace {
                         return crate::ipc::send(
@@ -991,6 +989,8 @@ impl SessionActor {
                         },
                     );
                 }
+                self.cancel_pointer_drag(true);
+                self.end_float_mode(true);
                 // Even a clean client replacement owns a different physical presenter and fresh
                 // decoder/audio devices. Park timed ingress until that client applies its first
                 // authoritative projection.

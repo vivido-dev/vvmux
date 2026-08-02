@@ -247,7 +247,20 @@ impl ClientTerminal {
 /// Query the attached console without borrowing `ClientTerminal`, allowing the Windows client to
 /// observe viewport changes on a thread that cannot be stalled by console input semantics.
 pub fn current_display_metrics() -> io::Result<DisplayMetrics> {
+    let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    require_handle(input, "stdin is not an interactive Windows console")?;
+    require_handle(output, "stdout is not an interactive Windows console")?;
+    let mut input_mode = 0;
+    let mut output_mode = 0;
+    if unsafe { GetConsoleMode(input, &mut input_mode) } == 0
+        || unsafe { GetConsoleMode(output, &mut output_mode) } == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vvmux attach requires an interactive Windows console",
+        ));
+    }
     let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
     if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } == 0 {
         return Err(io::Error::last_os_error());
