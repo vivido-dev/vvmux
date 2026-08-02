@@ -3635,6 +3635,10 @@ mod tests {
                     )
                 },
             );
+            // Snapshot state propagates PLAY across every active surface member, so it cannot
+            // reveal whether the bridge actually named video or linked audio as the clock. Clear
+            // the initial playback command and inspect the exact recovery command below.
+            let _ = presenter.take_play_commands();
 
             // Vivi's fixed recovery behavior re-bases PLAY to the same-epoch recovery keyframe before
             // submitting that packet. The worker must apply that playback-only update before media.
@@ -3769,6 +3773,19 @@ mod tests {
             let restored = presenter.projection_snapshot(&HashSet::from([7]));
             assert_eq!(restored.nodes.len(), 1);
             assert!(outer_video(&restored).is_some_and(|(_, playing)| playing));
+            let recovery_clocks = presenter.take_play_commands();
+            assert_eq!(
+                recovery_clocks.len(),
+                1,
+                "recovery must defer PLAY until the replacement slots are active"
+            );
+            assert!(
+                restored.sources.iter().any(|source| {
+                    source.key == recovery_clocks[0]
+                        && matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_))
+                }),
+                "recovery PLAY must name linked audio so the physical output is configured and restarted"
+            );
             for source in restored
                 .sources
                 .iter()
