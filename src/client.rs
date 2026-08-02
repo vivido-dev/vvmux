@@ -917,7 +917,57 @@ fn run_bridge_worker(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let Some(pending) = pending {
+        if let Some(mut pending) = pending {
+            // Ask the producer for the replacement decoder's keyframe before rebuilding that
+            // decoder. The server processes this message before BridgeApplied on the same IPC
+            // stream and keeps timed ingress parked until the latter, so an already-blocked old
+            // packet cannot overtake the recovery request.
+            let needing_virtual_keyframes = pending
+                .videos_needing_keyframes
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            requested_virtual_keyframes.retain(|source| needing_virtual_keyframes.contains(source));
+            let mut early_keyframes = pending
+                .videos_needing_keyframes
+                .iter()
+                .copied()
+                .filter(|source| requested_virtual_keyframes.insert(*source))
+                .map(|source| BridgeKeyframeRequest {
+                    source,
+                    minimum_epoch: None,
+                    // The gateway raises the minimum epoch for this replacement handoff, so no
+                    // same-epoch keyframe queued under the detached presenter can satisfy it.
+                    reason: crate::bridge::KEYFRAME_REASON_TRANSPORT_LOSS,
+                })
+                .collect::<Vec<_>>();
+            early_keyframes.sort_by_key(|request| {
+                (
+                    request.source.producer,
+                    request.source.context,
+                    request.source.surface,
+                    request.source.track,
+                )
+            });
+            if !early_keyframes.is_empty() {
+                let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(early_keyframes));
+            }
+            let recovering_surfaces = needing_virtual_keyframes
+                .iter()
+                .map(|source| (source.producer, source.context, source.surface))
+                .collect::<HashSet<_>>();
+            for source in &mut pending.tracks {
+                if recovering_surfaces.contains(&(
+                    source.key.producer,
+                    source.key.context,
+                    source.key.surface,
+                )) {
+                    // Do not transiently start a replacement surface with the stale pre-handoff
+                    // PLAY. Vivi publishes an exact recovery PLAY before its keyframe; keeping the
+                    // rebuilt tracks paused makes that the only clock the new presenter observes.
+                    source.playing = false;
+                }
+            }
             let change = if force_sources {
                 ProjectionChange::Sources
             } else {
@@ -1030,27 +1080,7 @@ fn run_bridge_worker(
             force_sources = false;
             force_replacement = false;
             active_generation = pending.generation;
-            let needing_virtual_keyframes = pending
-                .videos_needing_keyframes
-                .iter()
-                .copied()
-                .collect::<HashSet<_>>();
-            requested_virtual_keyframes.retain(|source| needing_virtual_keyframes.contains(source));
-            let mut keyframes = pending
-                .videos_needing_keyframes
-                .into_iter()
-                .filter(|source| requested_virtual_keyframes.insert(*source))
-                .map(|source| {
-                    (
-                        source,
-                        BridgeKeyframeRequest {
-                            source,
-                            minimum_epoch: None,
-                            reason: crate::bridge::KEYFRAME_REASON_TRANSPORT_LOSS,
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>();
+            let mut keyframes = HashMap::new();
             keyframes.extend(desynchronized_sources.drain().filter_map(|source| {
                 pending
                     .tracks
@@ -1072,6 +1102,7 @@ fn run_bridge_worker(
                 keyframes.extend(pending.tracks.iter().filter_map(|source| {
                     (recreated.contains(&source.key)
                         && source.playing
+                        && !requested_virtual_keyframes.contains(&source.key)
                         && matches!(source.kind, BridgeSourceKind::Video { .. }))
                     .then_some((
                         source.key,
@@ -3529,7 +3560,7 @@ mod tests {
                 surfaces: vec![test_surface(video_key)],
                 tracks: vec![video_source(true, play_request), audio_source.clone()],
                 nodes: vec![video_node.clone()],
-                videos_needing_keyframes: Vec::new(),
+                videos_needing_keyframes: vec![video_key],
             });
             let return_applied = receive_bridge_message_until(
                 &message_receiver,
@@ -3585,7 +3616,7 @@ mod tests {
                             event: BridgeMediaTraceEvent {
                                 source: Some(source),
                                 kind: MediaTraceKind::OuterTrackRecreated {
-                                    playing: true,
+                                    playing: false,
                                     ..
                                 },
                                 ..
@@ -3595,9 +3626,8 @@ mod tests {
                     )
                 })
                 .expect("video decoder recreation was not traced");
-            let replayed_play = return_messages
-                .iter()
-                .position(|message| {
+            assert!(
+                !return_messages.iter().any(|message| {
                     matches!(
                         message,
                         ClientMessage::BridgeTrace {
@@ -3605,35 +3635,34 @@ mod tests {
                                 source: Some(source),
                                 kind: MediaTraceKind::PlaybackControl {
                                     control: MediaPlaybackControl::Play,
-                                    request: Some(request),
+                                    ..
                                 },
                                 ..
                             },
                             ..
-                        } if *source == video_key && *request == play_request
+                        } if *source == video_key
                     )
-                })
-                .expect("replayed PLAY was not traced");
-            assert!(
-                recreated < replayed_play,
-                "decoder recreation must precede its authoritative PLAY"
+                }),
+                "replacement tracks must remain paused until Vivi publishes recovery PLAY"
             );
-            let expected_initial = BridgeKeyframeRequest {
+            let expected_recovery = BridgeKeyframeRequest {
                 source: video_key,
                 minimum_epoch: None,
-                reason: crate::bridge::KEYFRAME_REASON_INITIAL,
+                reason: crate::bridge::KEYFRAME_REASON_TRANSPORT_LOSS,
             };
-            receive_bridge_message_until(
-                &message_receiver,
-                &mut seen,
-                "recreated video keyframe request",
-                |message| {
+            let recovery_requested = return_messages
+                .iter()
+                .position(|message| {
                     matches!(
                         message,
                         ClientMessage::BridgeNeedKeyframes(requests)
-                            if requests == std::slice::from_ref(&expected_initial)
+                            if requests == std::slice::from_ref(&expected_recovery)
                     )
-                },
+                })
+                .expect("restored video recovery was not requested");
+            assert!(
+                recovery_requested < recreated,
+                "producer recovery must be requested before rebuilding and acknowledging the replacement decoder"
             );
             // Snapshot state propagates PLAY across every active surface member, so it cannot
             // reveal whether the bridge actually named video or linked audio as the clock. Clear

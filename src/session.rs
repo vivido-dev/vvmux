@@ -47,6 +47,7 @@ const INPUT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_AUTOMATION_REQUESTS_PER_CLIENT: usize = 64;
 const MAX_AUTOMATION_WAITERS: usize = 256;
 const MAX_PENDING_ACTOR_WORK: usize = 256;
+const MAX_PENDING_MEDIA_PROJECTIONS: usize = 64;
 /// Frames allowed outstanding before rendering pauses for the client to catch up.
 ///
 /// The acknowledgement arrives after the client writes the frame to its terminal, so this bounds
@@ -483,6 +484,11 @@ struct MediaProjectionKey {
     layout_revision: u64,
 }
 
+struct PendingMediaProjection {
+    sources: HashSet<BridgeSourceKey>,
+    gateway_revision: u64,
+}
+
 fn should_sync_media(
     force: bool,
     last: Option<MediaProjectionKey>,
@@ -532,6 +538,9 @@ struct SessionActor {
     layout_revision: u64,
     last_media_projection: Option<MediaProjectionKey>,
     media_projection_revision: u64,
+    /// Source sets submitted to the foreground bridge but not yet acknowledged as physically
+    /// applied. Timed producer workers remain parked until the matching revision is consumed.
+    pending_media_projections: BTreeMap<u64, PendingMediaProjection>,
     outer_virtual_revision: u64,
     bridge_instance_id: Option<u64>,
     bridge_local_revision: u64,
@@ -640,6 +649,7 @@ pub fn start(
         layout_revision: 0,
         last_media_projection: None,
         media_projection_revision: 0,
+        pending_media_projections: BTreeMap::new(),
         outer_virtual_revision: 0,
         bridge_instance_id: None,
         bridge_local_revision: 0,
@@ -748,6 +758,15 @@ impl SessionActor {
     }
 
     fn forward_media(&mut self, event: crate::media::MediaEvent) {
+        if !self
+            .vivid
+            .bridge_delivery_is_pending(event.delivery_id, event.source)
+        {
+            // Its source crossed a hidden/detached falling edge after admission. The gateway has
+            // already returned its allowance; forwarding this stale event after re-apply would
+            // splice the old epoch into the replacement decoder.
+            return;
+        }
         if let Some((epoch, pts_us)) = event.recovered_keyframe {
             self.traced_recovery_deliveries.insert(
                 event.delivery_id,
@@ -818,6 +837,7 @@ impl SessionActor {
                     self.attached = None;
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
+                    self.pending_media_projections.clear();
                     self.traced_recovery_deliveries.clear();
                     self.record_projection_sources(&HashSet::new(), self.vivid.revision());
                     self.last_screen = None;
@@ -827,6 +847,7 @@ impl SessionActor {
                     }
                     self.force_full = true;
                     self.end_float_mode(true);
+                    self.vivid.deactivate_bridge();
                 }
             }
             ActorEvent::PtyOutput(pane_id, bytes) => {
@@ -970,6 +991,11 @@ impl SessionActor {
                         },
                     );
                 }
+                // Even a clean client replacement owns a different physical presenter and fresh
+                // decoder/audio devices. Park timed ingress until that client applies its first
+                // authoritative projection.
+                self.vivid.deactivate_bridge();
+                self.pending_media_projections.clear();
                 let display = normalized_display(display, self.config.general.status_visible);
                 self.last_display = display;
                 self.client_ipc = Some(
@@ -1233,6 +1259,13 @@ impl SessionActor {
                             attachment_count,
                         },
                     );
+                    if let Some(applied) = self.pending_media_projections.remove(&virtual_revision)
+                    {
+                        self.pending_media_projections
+                            .retain(|revision, _| *revision > virtual_revision);
+                        self.record_projection_sources(&applied.sources, applied.gateway_revision);
+                        self.vivid.activate_bridge_projection(&applied.sources);
+                    }
                     self.check_automation_waiters();
                 }
             }
@@ -1298,6 +1331,7 @@ impl SessionActor {
                     self.attached = None;
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
+                    self.pending_media_projections.clear();
                     self.traced_recovery_deliveries.clear();
                     self.record_projection_sources(&HashSet::new(), self.vivid.revision());
                     self.last_screen = None;
@@ -3520,12 +3554,14 @@ impl SessionActor {
         live_delivery_source: Option<crate::media::SourceKey>,
     ) {
         let Some(client) = &self.attached else {
+            self.pending_media_projections.clear();
             self.record_projection_sources(&HashSet::new(), self.vivid.revision());
             self.traced_recovery_deliveries.clear();
             self.vivid.deactivate_bridge();
             return;
         };
         if !client.vivid {
+            self.pending_media_projections.clear();
             self.record_projection_sources(&HashSet::new(), self.vivid.revision());
             self.traced_recovery_deliveries.clear();
             self.vivid.deactivate_bridge();
@@ -3562,11 +3598,11 @@ impl SessionActor {
         if !should_sync_media(force, self.last_media_projection, projection_key) {
             return;
         }
-        // projection_snapshot marks active video sources as requiring a fresh keyframe. Only call
-        // it after deciding that the client will actually rebuild its outer Vivid session.
+        // Preparing a snapshot parks falling edges immediately but does not wake rising edges.
+        // The matching BridgeApplied acknowledgement publishes those sources below.
         let mut snapshot = self
             .vivid
-            .projection_snapshot_with_viewports(&panes, &viewport_offsets);
+            .prepare_projection_snapshot_with_viewports(&panes, &viewport_offsets);
         let projection_key = MediaProjectionKey {
             virtual_revision: snapshot.revision,
             layout_revision: self.layout_revision,
@@ -3745,7 +3781,22 @@ impl SessionActor {
         {
             return;
         }
-        self.record_projection_sources(&projected_source_keys, projection_key.virtual_revision);
+        let still_applied = self
+            .traced_projected_sources
+            .intersection(&projected_source_keys)
+            .copied()
+            .collect::<HashSet<_>>();
+        self.record_projection_sources(&still_applied, projection_key.virtual_revision);
+        self.pending_media_projections.insert(
+            projection_revision,
+            PendingMediaProjection {
+                sources: projected_source_keys,
+                gateway_revision: projection_key.virtual_revision,
+            },
+        );
+        while self.pending_media_projections.len() > MAX_PENDING_MEDIA_PROJECTIONS {
+            self.pending_media_projections.pop_first();
+        }
         self.record_media_trace(
             None,
             self.bridge_instance_id,
