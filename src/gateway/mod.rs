@@ -1,6 +1,7 @@
 pub(crate) mod auth;
 mod protocol;
 mod session_adapter;
+mod transport;
 mod vivid;
 
 use std::collections::{HashMap, HashSet};
@@ -12,12 +13,11 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::State;
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::http::header::{ORIGIN, SEC_WEBSOCKET_PROTOCOL};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
@@ -30,6 +30,7 @@ use protocol::{
     VERSION, VividAccess, decode_control, encode_control,
 };
 use session_adapter::{QueuedServerMessage, SessionAdapter};
+use transport::{Frame, FrameSink, FrameStream, Payload};
 
 #[cfg(not(windows))]
 const TERMINAL_ENTER: &[u8] =
@@ -186,7 +187,10 @@ async fn websocket_upgrade(
         .max_frame_size(MAX_FRAME_BYTES)
         .max_message_size(MAX_FRAME_BYTES)
         .protocols([SUBPROTOCOL])
-        .on_upgrade(move |socket| handle_connection(socket, state, permit))
+        .on_upgrade(move |socket| {
+            let (sink, stream) = transport::split(socket);
+            handle_connection(sink, stream, state, permit)
+        })
 }
 
 async fn vivid_upgrade(
@@ -266,23 +270,25 @@ async fn vivid_upgrade(
         .protocols([vivid::SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            let _ = vivid::serve_socket(socket, broker, kind).await;
+            let (sink, stream) = transport::split(socket);
+            let _ = vivid::serve_socket(sink, stream, broker, kind).await;
         })
 }
 
-async fn handle_connection(
-    mut socket: WebSocket,
+async fn handle_connection<Si: FrameSink, St: FrameStream>(
+    mut sink: Si,
+    mut stream: St,
     state: GatewayState,
     _permit: OwnedSemaphorePermit,
 ) {
-    if authenticate_connection(&mut socket, &state).await.is_err() {
-        let _ = close_socket(&mut socket, 1008, "authentication failed").await;
+    if authenticate_connection(&mut stream, &state).await.is_err() {
+        let _ = close_socket(&mut sink, 1008, "authentication failed").await;
         return;
     }
     let broker = match vivid::VividBroker::new() {
         Ok(broker) => broker,
         Err(_) => {
-            let _ = close_socket(&mut socket, 1011, "could not initialize Vivid routing").await;
+            let _ = close_socket(&mut sink, 1011, "could not initialize Vivid routing").await;
             return;
         }
     };
@@ -297,7 +303,7 @@ async fn handle_connection(
         }
     });
     if !registered {
-        let _ = close_socket(&mut socket, 1013, "Vivid route capacity reached").await;
+        let _ = close_socket(&mut sink, 1013, "Vivid route capacity reached").await;
         return;
     }
     let _vivid_registration = VividRegistration {
@@ -306,7 +312,7 @@ async fn handle_connection(
     };
     let vivid_token = broker.encoded_token();
     if send_control_socket(
-        &mut socket,
+        &mut sink,
         &ServerControl::Hello {
             protocol: VERSION,
             server_version: env!("CARGO_PKG_VERSION"),
@@ -329,13 +335,11 @@ async fn handle_connection(
     // The queue is sized from the same budget as the session-side queue, so a client that stops
     // reading is bounded by one configured amount rather than two independent ones.
     let outbound_messages = (state.config.server.outbound_queue_bytes / 1024).clamp(8, 4096);
-    let (outbound, mut outbound_receiver) =
-        tokio::sync::mpsc::channel::<Message>(outbound_messages);
+    let (outbound, mut outbound_receiver) = tokio::sync::mpsc::channel::<Frame>(outbound_messages);
     let writer = ClientWriter { outbound };
-    let (mut sink, mut stream) = socket.split();
     let mut writer_task = tokio::spawn(async move {
-        while let Some(message) = outbound_receiver.recv().await {
-            if sink.send(message).await.is_err() {
+        while let Some(frame) = outbound_receiver.recv().await {
+            if sink.send_frame(frame).await.is_err() {
                 break;
             }
         }
@@ -355,12 +359,12 @@ async fn handle_connection(
     loop {
         let incoming = if let Some(adapter) = session.as_mut() {
             tokio::select! {
-                message = stream.next() => Incoming::Socket(message),
+                message = stream.next_frame() => Incoming::Socket(message),
                 event = adapter.recv() => Incoming::Session(event),
                 _ = tick.tick() => Incoming::Tick,
             }
         } else {
-            let message = stream.next().await;
+            let message = stream.next_frame().await;
             Incoming::Socket(message)
         };
 
@@ -380,7 +384,7 @@ async fn handle_connection(
                 )
                 .await
             }
-            Incoming::Socket(Some(Err(error))) => Err(io::Error::other(error)),
+            Incoming::Socket(Some(Err(error))) => Err(error),
             Incoming::Socket(None) => break,
             Incoming::Session(Some(event)) => {
                 handle_session_message(
@@ -396,7 +400,7 @@ async fn handle_connection(
             }
             Incoming::Session(None) => {
                 let overloaded = session.as_ref().is_some_and(SessionAdapter::overloaded);
-                let _ = writer.send(Message::Binary(TERMINAL_LEAVE.into()));
+                let _ = writer.send(Frame::Binary(Payload::from_static(TERMINAL_LEAVE)));
                 if overloaded {
                     let _ = close(&writer, 1013, STALLED_CLIENT);
                     break;
@@ -438,7 +442,7 @@ async fn handle_connection(
         }
     }
     if session.is_some() {
-        let _ = writer.send(Message::Binary(TERMINAL_LEAVE.into()));
+        let _ = writer.send(Frame::Binary(Payload::from_static(TERMINAL_LEAVE)));
     }
     if let Some(adapter) = session.take() {
         let _ = adapter.send(ClientMessage::Detach);
@@ -457,18 +461,20 @@ async fn handle_connection(
 }
 
 enum Incoming {
-    Socket(Option<Result<Message, axum::Error>>),
+    Socket(Option<io::Result<Frame>>),
     Session(Option<QueuedServerMessage>),
     Tick,
 }
 
-async fn authenticate_connection(socket: &mut WebSocket, state: &GatewayState) -> io::Result<()> {
-    let first = tokio::time::timeout(AUTH_TIMEOUT, socket.next())
+async fn authenticate_connection<St: FrameStream>(
+    stream: &mut St,
+    state: &GatewayState,
+) -> io::Result<()> {
+    let first = tokio::time::timeout(AUTH_TIMEOUT, stream.next_frame())
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "authentication timed out"))?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"))?
-        .map_err(io::Error::other)?;
-    let Message::Text(text) = first else {
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"))??;
+    let Frame::Text(text) = first else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "first VVWS/1 message must be hello",
@@ -499,7 +505,7 @@ async fn authenticate_connection(socket: &mut WebSocket, state: &GatewayState) -
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket_message(
     writer: &ClientWriter,
-    message: Message,
+    message: Frame,
     state: &GatewayState,
     broker: &Arc<vivid::VividBroker>,
     session: &mut Option<SessionAdapter>,
@@ -509,7 +515,7 @@ async fn handle_socket_message(
     float_mode: &mut Option<u64>,
 ) -> io::Result<()> {
     match message {
-        Message::Text(text) => {
+        Frame::Text(text) => {
             let control = match decode_control(&text) {
                 Ok(control) => control,
                 Err(error) => {
@@ -706,7 +712,7 @@ async fn handle_socket_message(
                                         text_only,
                                     },
                                 )?;
-                                writer.send(Message::Binary(TERMINAL_ENTER.into()))?;
+                                writer.send(Frame::Binary(Payload::from_static(TERMINAL_ENTER)))?;
                                 *input = PrefixParser::new(
                                     crate::config::parse_control_chord(
                                         &state.config.general.prefix,
@@ -783,7 +789,7 @@ async fn handle_socket_message(
                 },
             }
         }
-        Message::Binary(bytes) => {
+        Frame::Binary(bytes) => {
             if bytes.len() > MAX_INPUT_BYTES {
                 send_error(
                     writer,
@@ -802,11 +808,11 @@ async fn handle_socket_message(
                 )?;
             }
         }
-        Message::Ping(bytes) => {
-            writer.send(Message::Pong(bytes))?;
+        Frame::Ping(bytes) => {
+            writer.send(Frame::Pong(bytes))?;
         }
-        Message::Pong(_) => {}
-        Message::Close(_) => return Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
+        Frame::Pong(_) => {}
+        Frame::Close(_) => return Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
     }
     Ok(())
 }
@@ -828,10 +834,10 @@ async fn handle_session_message(
             ..
         } => {
             if bytes.is_empty() {
-                writer.send(Message::Binary(bytes.into()))?;
+                writer.send(Frame::Binary(bytes.into()))?;
             } else {
                 for chunk in bytes.chunks(MAX_FRAME_BYTES) {
-                    writer.send(Message::Binary(chunk.to_vec().into()))?;
+                    writer.send(Frame::Binary(Payload::copy_from_slice(chunk)))?;
                 }
             }
             if last && let Some(adapter) = session.as_ref() {
@@ -882,7 +888,7 @@ async fn handle_session_message(
             )?;
         }
         ServerMessage::Detached { reason } => {
-            writer.send(Message::Binary(TERMINAL_LEAVE.into()))?;
+            writer.send(Frame::Binary(Payload::from_static(TERMINAL_LEAVE)))?;
             send_control(writer, &ServerControl::Detached { reason })?;
             *session = None;
             release_bridge(bridge);
@@ -890,7 +896,7 @@ async fn handle_session_message(
             *float_scanner = FloatEditScanner::default();
         }
         ServerMessage::Error(message) => {
-            writer.send(Message::Binary(TERMINAL_LEAVE.into()))?;
+            writer.send(Frame::Binary(Payload::from_static(TERMINAL_LEAVE)))?;
             send_error(writer, None, "session_error", message)?;
             *session = None;
             release_bridge(bridge);
@@ -1037,46 +1043,37 @@ fn list_live_sessions() -> io::Result<Vec<SessionInfo>> {
 /// Queueing here keeps the loop free to read no matter how far behind the peer falls, and a queue
 /// that fills anyway is the delivery failure that ends the connection.
 struct ClientWriter {
-    outbound: tokio::sync::mpsc::Sender<Message>,
+    outbound: tokio::sync::mpsc::Sender<Frame>,
 }
 
 impl ClientWriter {
-    fn send(&self, message: Message) -> io::Result<()> {
-        self.outbound
-            .try_send(message)
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    io::Error::new(io::ErrorKind::TimedOut, STALLED_CLIENT)
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "client connection closed")
-                }
-            })
+    fn send(&self, frame: Frame) -> io::Result<()> {
+        self.outbound.try_send(frame).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                io::Error::new(io::ErrorKind::TimedOut, STALLED_CLIENT)
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                io::Error::new(io::ErrorKind::BrokenPipe, "client connection closed")
+            }
+        })
     }
 }
 
-async fn send_socket(socket: &mut WebSocket, message: Message) -> io::Result<()> {
-    socket.send(message).await.map_err(io::Error::other)
-}
-
 /// Send a control frame before the write half has been handed to its own task.
-async fn send_control_socket(
-    socket: &mut WebSocket,
+async fn send_control_socket<Si: FrameSink>(
+    sink: &mut Si,
     message: &ServerControl<'_>,
 ) -> io::Result<()> {
     let encoded = encode_control(message)?;
-    send_socket(socket, Message::Text(encoded.into())).await
+    sink.send_frame(Frame::Text(encoded)).await
 }
 
-async fn close_socket(socket: &mut WebSocket, code: u16, reason: &'static str) -> io::Result<()> {
-    send_socket(
-        socket,
-        Message::Close(Some(CloseFrame {
-            code,
-            reason: reason.into(),
-        })),
-    )
-    .await
+async fn close_socket<Si: FrameSink>(
+    sink: &mut Si,
+    code: u16,
+    reason: &'static str,
+) -> io::Result<()> {
+    sink.send_frame(Frame::Close(Some((code, reason)))).await
 }
 
 /// Give up a bridge worker without blocking the runtime.
@@ -1156,7 +1153,7 @@ fn check_client_liveness(
         return Ok(());
     }
     *last_ping = Instant::now();
-    writer.send(Message::Ping(Vec::new().into()))
+    writer.send(Frame::Ping(Payload::new()))
 }
 
 fn is_stalled_client(error: &io::Error) -> bool {
@@ -1165,7 +1162,7 @@ fn is_stalled_client(error: &io::Error) -> bool {
 
 fn send_control(writer: &ClientWriter, message: &ServerControl<'_>) -> io::Result<()> {
     let encoded = encode_control(message)?;
-    writer.send(Message::Text(encoded.into()))
+    writer.send(Frame::Text(encoded))
 }
 
 fn send_error(
@@ -1185,10 +1182,7 @@ fn send_error(
 }
 
 fn close(writer: &ClientWriter, code: u16, reason: &'static str) -> io::Result<()> {
-    writer.send(Message::Close(Some(CloseFrame {
-        code,
-        reason: reason.into(),
-    })))
+    writer.send(Frame::Close(Some((code, reason))))
 }
 
 fn offered_subprotocol(headers: &HeaderMap) -> bool {

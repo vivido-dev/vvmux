@@ -5,9 +5,8 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::ws::{Message, WebSocket};
+use super::transport::{Frame, FrameSink, FrameStream};
 use base64::Engine;
-use futures_util::{SinkExt, StreamExt};
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use vivid_protocol::auth::Secret32;
@@ -259,8 +258,9 @@ impl Write for SocketWriter {
     }
 }
 
-pub(crate) async fn serve_socket(
-    socket: WebSocket,
+pub(crate) async fn serve_socket<Si: FrameSink, St: FrameStream>(
+    mut socket_writer: Si,
+    mut socket_reader: St,
     broker: Arc<VividBroker>,
     kind: ConnectionKind,
 ) -> io::Result<()> {
@@ -281,12 +281,11 @@ pub(crate) async fn serve_socket(
         },
     )?;
 
-    let (mut socket_writer, mut socket_reader) = socket.split();
     let (pong_sender, mut pong_receiver) = mpsc::channel(CHANNEL_CHUNKS);
     let read_socket = async move {
-        while let Some(incoming) = socket_reader.next().await {
+        while let Some(incoming) = socket_reader.next_frame().await {
             match incoming {
-                Ok(Message::Binary(bytes)) => {
+                Ok(Frame::Binary(bytes)) => {
                     // Waiting for capacity pauses only this WebSocket's input. The independent
                     // writer below remains live, so bounded backpressure cannot deadlock a
                     // correlated reply behind presenter output.
@@ -302,14 +301,14 @@ pub(crate) async fn serve_socket(
                             )
                         })?;
                 }
-                Ok(Message::Ping(bytes)) => {
+                Ok(Frame::Ping(bytes)) => {
                     pong_sender.send(bytes).await.map_err(|_| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "Vivid WebSocket output closed")
                     })?;
                 }
-                Ok(Message::Pong(_)) => {}
-                Ok(Message::Close(_)) => return Ok(()),
-                Ok(Message::Text(_)) => {
+                Ok(Frame::Pong(_)) => {}
+                Ok(Frame::Close(_)) => return Ok(()),
+                Ok(Frame::Text(_)) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "text is forbidden on an established Vivid WebSocket",
@@ -326,9 +325,8 @@ pub(crate) async fn serve_socket(
                 outgoing = outgoing_receiver.recv() => match outgoing {
                     Some(chunk) => {
                         let result = socket_writer
-                            .send(Message::Binary(chunk.bytes.into()))
-                            .await
-                            .map_err(io::Error::other);
+                            .send_frame(Frame::Binary(chunk.bytes.into()))
+                            .await;
                         let report = result.as_ref().map(|_| ()).map_err(|error| {
                             io::Error::new(error.kind(), error.to_string())
                         });
@@ -338,10 +336,7 @@ pub(crate) async fn serve_socket(
                     None => return Ok(()),
                 },
                 pong = pong_receiver.recv() => match pong {
-                    Some(bytes) => socket_writer
-                        .send(Message::Pong(bytes))
-                        .await
-                        .map_err(io::Error::other)?,
+                    Some(bytes) => socket_writer.send_frame(Frame::Pong(bytes)).await?,
                     None => return Ok(()),
                 }
             }
