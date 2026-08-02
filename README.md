@@ -156,11 +156,39 @@ owned by that OS user. The raw token is printed once; only its hash is retained 
 record.
 
 The gateway lists, creates, and exclusively attaches to sessions. It serves no HTML or JavaScript
-and does not expose session kill operations. Plain xterm.js clients can attach text-only;
-The byte-transparent Vivid route accepts only Vivid 1.5 Control and Track connections, uses the
-route's ephemeral 32-byte secret as its Vivid root secret, and advertises `wire_version: "1.5"`.
-Vivido.js is not yet a 1.5 coordinator and fails clearly instead of receiving downgraded traffic. See
-[VVWS-1.md](VVWS-1.md) for the normative wire contract and client integration shape.
+and does not expose session kill operations on the loopback listener. Plain xterm.js clients can
+attach text-only; the byte-transparent Vivid route accepts only Vivid 1.5 Control and Track
+connections, uses the route's ephemeral 32-byte secret as its Vivid root secret, and advertises
+`wire_version: "1.5"`. See [VVWS-1.md](VVWS-1.md) for the normative wire contract and client
+integration shape.
+
+### Connect mode: serve from anywhere, without opening a port
+
+`vvmux serve --connect wss://host/t/v1/control` opens no listener at all. The gateway authenticates
+to a vvmux_server deployment with an enrolled Ed25519 identity and holds one outbound VVTUN/1
+tunnel; the deployment dials one additional leg per browser socket, and the same VVWS/1 and Vivid
+loops run on the legs. This is how a machine behind NAT becomes reachable from a browser anywhere.
+
+```sh
+vvmux cloud enroll <code> --server https://vvmux.example
+vvmux serve --connect wss://vvmux.example/t/v1/control --allow-account 'https://accounts.google.com#1234567890'
+```
+
+`vvmux cloud enroll` generates the identity, submits only the public key under a one-time code from
+the deployment's website, and stores the private key in an owner-only file. The private key never
+leaves the machine and never appears in argv, an environment variable, or a log.
+
+The tunnel gateway uses the tunnel-asserted VVWS authentication of
+[VVWS-1.md](VVWS-1.md) — the browser sends `{"type":"hello","protocol":1,"auth":"tunnel"}` and no
+bearer token is involved. It advertises `tunnel-attached-v1`, and `session-kill-v1` only when
+started with `--allow-kill`, which additionally enables the `kill_session` VVWS control.
+
+`--allow-account` is repeatable and bounds which authenticated accounts the deployment may present
+when opening legs; without it, any account is accepted. `ws://` is accepted for loopback
+development only; `wss://` is required across a host boundary. The tunnel reconnects with
+full-jittered exponential backoff and survives a deployment restart; sessions are untouched by
+tunnel loss, because the hidden session daemon is fully detached from the gateway. See
+[VVTUN-1.md](VVTUN-1.md) for the tunnel protocol.
 
 ## Default keys
 

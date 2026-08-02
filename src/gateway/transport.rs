@@ -108,6 +108,70 @@ impl FrameStream for AxumStream {
     }
 }
 
+/// The stream type an outbound tunnel leg connects with.
+pub(crate) type TunnelStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The outbound-leg write half.
+type TungsteniteSinkInner =
+    futures_util::stream::SplitSink<TunnelStream, tokio_tungstenite::tungstenite::Message>;
+pub(crate) struct TungsteniteSink(pub(crate) TungsteniteSinkInner);
+
+/// The outbound-leg read half.
+type TungsteniteStreamInner = futures_util::stream::SplitStream<TunnelStream>;
+pub(crate) struct TungsteniteStream(pub(crate) TungsteniteStreamInner);
+
+impl FrameSink for TungsteniteSink {
+    async fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
+        let message = match frame {
+            Frame::Text(text) => tokio_tungstenite::tungstenite::Message::text(text),
+            // tungstenite 0.29 carries `bytes::Bytes`, the same type as the axum
+            // payload, so binary frames cross the seam without copying.
+            Frame::Binary(bytes) => tokio_tungstenite::tungstenite::Message::Binary(bytes),
+            Frame::Ping(bytes) => tokio_tungstenite::tungstenite::Message::Ping(bytes),
+            Frame::Pong(bytes) => tokio_tungstenite::tungstenite::Message::Pong(bytes),
+            Frame::Close(None) => tokio_tungstenite::tungstenite::Message::Close(None),
+            Frame::Close(Some((code, reason))) => {
+                let code =
+                    tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(code);
+                tokio_tungstenite::tungstenite::Message::Close(Some(
+                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code,
+                        reason: reason.into(),
+                    },
+                ))
+            }
+        };
+        self.0.send(message).await.map_err(io::Error::other)
+    }
+}
+
+impl FrameStream for TungsteniteStream {
+    // `StreamExt::next` is cancel-safe, which is what the trait requires.
+    async fn next_frame(&mut self) -> Option<io::Result<Frame>> {
+        self.0.next().await.map(|message| {
+            message
+                .map_err(io::Error::other)
+                .and_then(|message| match message {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        Ok(Frame::Text(text.as_str().to_owned()))
+                    }
+                    tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                        Ok(Frame::Binary(bytes))
+                    }
+                    tokio_tungstenite::tungstenite::Message::Ping(bytes) => Ok(Frame::Ping(bytes)),
+                    tokio_tungstenite::tungstenite::Message::Pong(bytes) => Ok(Frame::Pong(bytes)),
+                    // A peer's close text is not retained, matching the axum path.
+                    tokio_tungstenite::tungstenite::Message::Close(_) => Ok(Frame::Close(None)),
+                    tokio_tungstenite::tungstenite::Message::Frame(_) => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "raw frame reached the message layer",
+                    )),
+                })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

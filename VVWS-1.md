@@ -29,6 +29,28 @@ The raw token is printed once. vvmux stores only a domain-separated SHA-256 hash
 record and compares hashes in constant time. A token grants shell access to every vvmux session
 owned by the gateway's OS user.
 
+### Tunnel-asserted authentication
+
+A `vvmux serve --connect` gateway serves its sessions through outbound VVTUN/1 tunnel legs
+([VVTUN-1.md](VVTUN-1.md)) instead of the loopback listener. On such a leg there is no bearer token,
+and inventing one would recreate the "one token equals shell access to everything" property the
+tunnel exists to avoid. The first message on a tunnel leg is therefore:
+
+```json
+{"type":"hello","protocol":1,"auth":"tunnel"}
+```
+
+`auth` is `"tunnel"` and the `token` field must be absent. The loopback listener rejects this form
+and continues to require the bearer token; the two authentication modes are mutually exclusive and
+neither is accepted on the other's transport. The connection identity is asserted by the tunnel
+handshake itself and by the account the server presented in the leg's `open_leg` frame, never by
+anything the browser sends.
+
+A tunnel leg's `hello` reply advertises the additional capability `tunnel-attached-v1`. When the
+gateway was started with `--allow-kill`, it also advertises `session-kill-v1` and accepts the
+`kill_session` control; the default is off, matching the loopback gateway's refusal to expose
+session kill. VVWS/1 remains protocol version 1 for both transports.
+
 On success, the server replies:
 
 ```json
@@ -120,6 +142,13 @@ Create a detached session using the gateway's vvmux configuration:
 {"type":"create_session","request_id":2,"name":"work"}
 ```
 
+Terminate a session and all of its panes (tunnel gateways with `--allow-kill` only, and never the
+loopback listener):
+
+```json
+{"type":"kill_session","request_id":3,"name":"work"}
+```
+
 Attach to an existing session:
 
 ```json
@@ -171,7 +200,8 @@ Successful correlated replies are:
 ```json
 {"type":"sessions","request_id":1,"sessions":[{"name":"work","pid":1234}]}
 {"type":"created","request_id":2,"name":"work"}
-{"type":"attached","request_id":3,"name":"work","text_only":false}
+{"type":"killed","request_id":3,"name":"work"}
+{"type":"attached","request_id":4,"name":"work","text_only":false}
 ```
 
 Uncorrelated terminal events are:

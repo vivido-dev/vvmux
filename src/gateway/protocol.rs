@@ -15,7 +15,10 @@ pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub(crate) enum ClientControl {
     Hello {
         protocol: u16,
-        token: String,
+        #[serde(default)]
+        token: Option<String>,
+        #[serde(default)]
+        auth: Option<HelloAuth>,
     },
     ListSessions {
         request_id: u64,
@@ -39,7 +42,18 @@ pub(crate) enum ClientControl {
     Action {
         action: WireAction,
     },
+    KillSession {
+        request_id: u64,
+        name: String,
+    },
     Detach,
+}
+
+/// How a tunnel leg asserts identity in place of the bearer token (VVWS-1, D7).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HelloAuth {
+    Tunnel,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -186,6 +200,10 @@ pub(crate) enum ServerControl<'a> {
         sessions: Vec<SessionInfo>,
     },
     Created {
+        request_id: u64,
+        name: String,
+    },
+    Killed {
         request_id: u64,
         name: String,
     },

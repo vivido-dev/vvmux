@@ -65,7 +65,8 @@ enum Command {
         #[command(subcommand)]
         command: automation::MsgCommand,
     },
-    /// Run the authenticated loopback VVWS/1 session gateway.
+    /// Run the authenticated loopback VVWS/1 session gateway, or connect mode
+    /// (`--connect`) which opens no listener and serves through a VVTUN/1 tunnel.
     #[cfg(feature = "server-capability")]
     Serve {
         #[arg(long)]
@@ -74,6 +75,24 @@ enum Command {
         allow_origins: Vec<String>,
         #[arg(long)]
         auth_file: Option<PathBuf>,
+        #[arg(long)]
+        connect: Option<String>,
+        #[arg(long = "allow-account")]
+        allow_accounts: Vec<String>,
+        #[arg(long)]
+        allow_kill: bool,
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        tunnel_heartbeat_ms: Option<u64>,
+        #[arg(long, hide = true)]
+        tunnel_miss_limit: Option<u32>,
+    },
+    /// Enroll this machine with a vvmux_server deployment.
+    #[cfg(feature = "server-capability")]
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommand,
     },
     /// Manage the network gateway authentication token.
     #[cfg(feature = "server-capability")]
@@ -91,6 +110,25 @@ enum Command {
     #[cfg(windows)]
     #[command(name = "__console-self-test", hide = true)]
     ConsoleSelfTest,
+}
+
+#[cfg(feature = "server-capability")]
+#[derive(Debug, Subcommand)]
+enum CloudCommand {
+    /// Register this machine with a vvmux_server deployment.
+    ///
+    /// Generates an Ed25519 identity, submits the public key under a one-time
+    /// code from the deployment's website, and stores the private key in an
+    /// owner-only file. The private key never leaves the machine.
+    Enroll {
+        /// The deployment's bare scheme://host[:port] URL.
+        #[arg(long)]
+        server: String,
+        /// The one-time enrollment code shown on the deployment's website.
+        code: String,
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
+    },
 }
 
 #[cfg(feature = "server-capability")]
@@ -151,18 +189,73 @@ fn run(cli: Cli) -> io::Result<()> {
             listen,
             allow_origins,
             auth_file,
+            connect,
+            allow_accounts,
+            allow_kill,
+            identity_file,
+            tunnel_heartbeat_ms,
+            tunnel_miss_limit,
         }) => {
             let config = config::Config::load(cli.config.as_deref())?;
-            gateway::run(
-                config,
-                cli.config,
-                gateway::ServeOverrides {
-                    listen,
-                    allowed_origins: allow_origins,
-                    auth_file,
-                },
-            )
+            if let Some(connect) = connect {
+                if listen.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--connect and --listen are mutually exclusive",
+                    ));
+                }
+                let identity_file =
+                    identity_file.or(gateway::identity::default_identity_path().ok());
+                let identity_file = identity_file.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "no identity file; run `vvmux cloud enroll` first",
+                    )
+                })?;
+                gateway::tunnel::run_connect(
+                    config,
+                    cli.config,
+                    gateway::tunnel::ConnectOptions {
+                        url: connect,
+                        identity_file,
+                        allow_accounts,
+                        allow_kill,
+                        heartbeat: tunnel_heartbeat_ms.map(std::time::Duration::from_millis),
+                        miss_limit: tunnel_miss_limit,
+                    },
+                )
+            } else {
+                gateway::run(
+                    config,
+                    cli.config,
+                    gateway::ServeOverrides {
+                        listen,
+                        allowed_origins: allow_origins,
+                        auth_file,
+                    },
+                )
+            }
         }
+        #[cfg(feature = "server-capability")]
+        Some(Command::Cloud { command }) => match command {
+            CloudCommand::Enroll {
+                server,
+                code,
+                identity_file,
+            } => {
+                let identity = gateway::identity::MachineIdentity::new_random()?;
+                gateway::identity::enroll(&server, &code, &identity.public_key())?;
+                let path = identity_file
+                    .or(gateway::identity::default_identity_path().ok())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "no configuration directory")
+                    })?;
+                identity.store(&path)?;
+                println!("enrolled machine {} with {}", identity.machine_id(), server);
+                println!("start the gateway with `vvmux serve --connect {server}/t/v1/control`");
+                Ok(())
+            }
+        },
         #[cfg(feature = "server-capability")]
         Some(Command::Token { command }) => match command {
             TokenCommand::Create { rotate, auth_file } => {

@@ -1,7 +1,9 @@
 pub(crate) mod auth;
+pub(crate) mod identity;
 mod protocol;
 mod session_adapter;
 mod transport;
+pub(crate) mod tunnel;
 mod vivid;
 
 use std::collections::{HashMap, HashSet};
@@ -62,6 +64,56 @@ const CAPABILITIES: &[&str] = &[
     "session-create-v1",
     "vivid-bridge-v1",
 ];
+/// VVWS capabilities advertised on a tunnel leg (VVWS-1, D7).
+const TUNNEL_CAPABILITIES: &[&str] = &[
+    "terminal-v1",
+    "session-list-v1",
+    "session-create-v1",
+    "vivid-bridge-v1",
+    "tunnel-attached-v1",
+];
+const TUNNEL_CAPABILITIES_KILL: &[&str] = &[
+    "terminal-v1",
+    "session-list-v1",
+    "session-create-v1",
+    "vivid-bridge-v1",
+    "tunnel-attached-v1",
+    "session-kill-v1",
+];
+
+/// Shared gateway state, independent of the transport that carries connections:
+/// the loopback listener builds it in [`run`], and connect mode builds it in
+/// `tunnel::run_connect` with no origins and no bearer record.
+fn build_state(
+    config: Config,
+    config_path: Option<PathBuf>,
+    allowed_origins: HashSet<String>,
+    auth_file: Option<PathBuf>,
+) -> GatewayState {
+    GatewayState {
+        connections: Arc::new(Semaphore::new(config.server.max_connections)),
+        config: Arc::new(config),
+        config_path,
+        auth_file,
+        allowed_origins: Arc::new(allowed_origins),
+        vivid_sessions: Arc::new(Mutex::new(HashMap::new())),
+        contended_sessions: Arc::new(Mutex::new(HashMap::new())),
+    }
+}
+
+/// Identity a tunnel leg carries in place of the loopback bearer token (D7).
+#[derive(Clone)]
+pub(crate) struct TunnelContext {
+    pub allow_kill: bool,
+}
+
+fn tunnel_capabilities(tunnel: &Option<TunnelContext>) -> &'static [&'static str] {
+    match tunnel {
+        None => CAPABILITIES,
+        Some(ctx) if ctx.allow_kill => TUNNEL_CAPABILITIES_KILL,
+        Some(_) => TUNNEL_CAPABILITIES,
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ServeOverrides {
@@ -74,7 +126,8 @@ pub(crate) struct ServeOverrides {
 struct GatewayState {
     config: Arc<Config>,
     config_path: Option<PathBuf>,
-    auth_file: PathBuf,
+    /// The loopback bearer record; absent in connect mode, which never uses it.
+    auth_file: Option<PathBuf>,
     allowed_origins: Arc<HashSet<String>>,
     connections: Arc<Semaphore>,
     vivid_sessions: Arc<Mutex<HashMap<String, Arc<vivid::VividBroker>>>>,
@@ -138,15 +191,7 @@ pub(crate) fn run(
         )
     })?;
 
-    let state = GatewayState {
-        connections: Arc::new(Semaphore::new(config.server.max_connections)),
-        config: Arc::new(config),
-        config_path,
-        auth_file,
-        allowed_origins: Arc::new(allowed_origins),
-        vivid_sessions: Arc::new(Mutex::new(HashMap::new())),
-        contended_sessions: Arc::new(Mutex::new(HashMap::new())),
-    };
+    let state = build_state(config, config_path, allowed_origins, Some(auth_file));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("vvmux-gateway")
@@ -189,8 +234,81 @@ async fn websocket_upgrade(
         .protocols([SUBPROTOCOL])
         .on_upgrade(move |socket| {
             let (sink, stream) = transport::split(socket);
-            handle_connection(sink, stream, state, permit)
+            handle_connection(sink, stream, state, Some(permit), None)
         })
+}
+
+/// The offered subprotocol strings, split and trimmed exactly as
+/// `protocol_parameter` consumed them.
+fn offered_subprotocols_from_headers(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Parse the offered subprotocol strings into a Vivid leg's connection, route
+/// token, and kind, with exactly-once non-empty parameter semantics.
+fn parse_vivid_parameters(
+    offered: &[String],
+) -> Result<(&str, &str, vivid_protocol::wire::ConnectionKind), &'static str> {
+    fn exactly_once<'a>(offered: &'a [String], prefix: &str) -> Option<&'a str> {
+        let mut matches = offered
+            .iter()
+            .filter_map(|value| value.strip_prefix(prefix))
+            .filter(|rest| !rest.is_empty());
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+    if !offered.iter().any(|value| value == vivid::SUBPROTOCOL) {
+        return Err("Vivid WebSocket subprotocol is required");
+    }
+    let connection = exactly_once(offered, vivid::CONNECTION_PROTOCOL_PREFIX)
+        .ok_or("Vivid WebSocket authentication failed")?;
+    let token = exactly_once(offered, vivid::AUTH_PROTOCOL_PREFIX)
+        .ok_or("Vivid WebSocket authentication failed")?;
+    let kind = exactly_once(offered, vivid::KIND_PROTOCOL_PREFIX)
+        .and_then(|value| value.parse::<u8>().ok())
+        .and_then(|value| vivid_protocol::wire::ConnectionKind::try_from(value).ok())
+        .filter(|kind| {
+            matches!(
+                kind,
+                vivid_protocol::wire::ConnectionKind::Control
+                    | vivid_protocol::wire::ConnectionKind::Track
+            )
+        })
+        .ok_or("Vivid broker accepts control and track connections only")?;
+    Ok((connection, token, kind))
+}
+
+/// Resolve a Vivid leg from its offered subprotocol strings and the shared
+/// broker registry. This is the identical validation the loopback upgrade
+/// applies, shared with tunnel legs (VVTUN-1).
+fn resolve_vivid_leg(
+    offered: &[String],
+    state: &GatewayState,
+) -> Result<
+    (
+        Arc<vivid::VividBroker>,
+        vivid_protocol::wire::ConnectionKind,
+    ),
+    &'static str,
+> {
+    let (connection, token, kind) = parse_vivid_parameters(offered)?;
+    let broker = state
+        .vivid_sessions
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(connection).cloned());
+    let broker = broker
+        .filter(|broker| broker.authenticate(token))
+        .ok_or("Vivid WebSocket authentication failed")?;
+    Ok((broker, kind))
 }
 
 async fn vivid_upgrade(
@@ -204,55 +322,20 @@ async fn vivid_upgrade(
     if !state.allowed_origins.contains(origin) {
         return (StatusCode::FORBIDDEN, "WebSocket Origin is not allowed").into_response();
     }
-    if !offered_protocol(&headers, vivid::SUBPROTOCOL) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Vivid WebSocket subprotocol is required",
-        )
-            .into_response();
-    }
-    let Some(connection) = protocol_parameter(&headers, vivid::CONNECTION_PROTOCOL_PREFIX) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "Vivid WebSocket authentication failed",
-        )
-            .into_response();
-    };
-    let Some(token) = protocol_parameter(&headers, vivid::AUTH_PROTOCOL_PREFIX) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "Vivid WebSocket authentication failed",
-        )
-            .into_response();
-    };
-    let Some(kind) = protocol_parameter(&headers, vivid::KIND_PROTOCOL_PREFIX)
-        .and_then(|value| value.parse::<u8>().ok())
-        .and_then(|value| vivid_protocol::wire::ConnectionKind::try_from(value).ok())
-        .filter(|kind| {
-            matches!(
-                kind,
-                vivid_protocol::wire::ConnectionKind::Control
-                    | vivid_protocol::wire::ConnectionKind::Track
-            )
-        })
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Vivid broker accepts control and track connections only",
-        )
-            .into_response();
-    };
-    let broker = state
-        .vivid_sessions
-        .lock()
-        .ok()
-        .and_then(|sessions| sessions.get(connection).cloned());
-    let Some(broker) = broker.filter(|broker| broker.authenticate(token)) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "Vivid WebSocket authentication failed",
-        )
-            .into_response();
+    let offered = offered_subprotocols_from_headers(&headers);
+    let resolved = resolve_vivid_leg(&offered, &state);
+    let (broker, kind) = match resolved {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            let status = if message == "Vivid WebSocket subprotocol is required"
+                || message == "Vivid broker accepts control and track connections only"
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            return (status, message).into_response();
+        }
     };
     let Ok(permit) = state.connections.clone().try_acquire_owned() else {
         return (
@@ -279,9 +362,13 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     mut sink: Si,
     mut stream: St,
     state: GatewayState,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
+    tunnel: Option<TunnelContext>,
 ) {
-    if authenticate_connection(&mut stream, &state).await.is_err() {
+    if authenticate_connection(&mut stream, &state, tunnel.as_ref())
+        .await
+        .is_err()
+    {
         let _ = close_socket(&mut sink, 1008, "authentication failed").await;
         return;
     }
@@ -316,7 +403,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
         &ServerControl::Hello {
             protocol: VERSION,
             server_version: env!("CARGO_PKG_VERSION"),
-            capabilities: CAPABILITIES,
+            capabilities: tunnel_capabilities(&tunnel),
             vivid: VividAccess {
                 endpoint: "/v1/vivid",
                 subprotocol: vivid::SUBPROTOCOL,
@@ -332,6 +419,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
         return;
     }
 
+    drop(permit);
     // The queue is sized from the same budget as the session-side queue, so a client that stops
     // reading is bounded by one configured amount rather than two independent ones.
     let outbound_messages = (state.config.server.outbound_queue_bytes / 1024).clamp(8, 4096);
@@ -381,6 +469,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
                     &mut input,
                     &mut float_scanner,
                     &mut float_mode,
+                    tunnel.as_ref(),
                 )
                 .await
             }
@@ -469,6 +558,7 @@ enum Incoming {
 async fn authenticate_connection<St: FrameStream>(
     stream: &mut St,
     state: &GatewayState,
+    tunnel: Option<&TunnelContext>,
 ) -> io::Result<()> {
     let first = tokio::time::timeout(AUTH_TIMEOUT, stream.next_frame())
         .await
@@ -480,7 +570,12 @@ async fn authenticate_connection<St: FrameStream>(
             "first VVWS/1 message must be hello",
         ));
     };
-    let ClientControl::Hello { protocol, token } = decode_control(&text)? else {
+    let ClientControl::Hello {
+        protocol,
+        token,
+        auth,
+    } = decode_control(&text)?
+    else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "first VVWS/1 message must be hello",
@@ -492,14 +587,37 @@ async fn authenticate_connection<St: FrameStream>(
             "unsupported VVWS protocol version",
         ));
     }
-    let token = Zeroizing::new(token);
-    if !auth::authenticate(&state.auth_file, &token)? {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "authentication failed",
-        ));
+    match (tunnel, auth) {
+        // A tunnel leg asserts identity; the bearer token is never involved.
+        (Some(_), Some(protocol::HelloAuth::Tunnel)) if token.is_none() => Ok(()),
+        (Some(_), _) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tunnel legs require the tunnel hello form",
+        )),
+        // The loopback listener never accepts the tunnel form.
+        (None, Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the tunnel hello form is not accepted on the loopback listener",
+        )),
+        (None, None) => {
+            let token = token.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "hello requires a bearer token")
+            })?;
+            let token = Zeroizing::new(token);
+            if !auth::authenticate(
+                state.auth_file.as_deref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "no bearer record configured")
+                })?,
+                &token,
+            )? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "authentication failed",
+                ));
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -513,6 +631,7 @@ async fn handle_socket_message(
     input: &mut PrefixParser,
     float_scanner: &mut FloatEditScanner,
     float_mode: &mut Option<u64>,
+    tunnel: Option<&TunnelContext>,
 ) -> io::Result<()> {
     match message {
         Frame::Text(text) => {
@@ -776,6 +895,29 @@ async fn handle_socket_message(
                         )?;
                     }
                 },
+                ClientControl::KillSession { request_id, name } => {
+                    match tunnel.filter(|ctx| ctx.allow_kill) {
+                        Some(_) => match crate::client::kill(&name) {
+                            Ok(()) => {
+                                send_control(writer, &ServerControl::Killed { request_id, name })?;
+                            }
+                            Err(error) => {
+                                send_error(
+                                    writer,
+                                    Some(request_id),
+                                    "session_error",
+                                    error.to_string(),
+                                )?;
+                            }
+                        },
+                        None => send_error(
+                            writer,
+                            Some(request_id),
+                            "invalid_state",
+                            "session kill is not enabled on this gateway".to_owned(),
+                        )?,
+                    }
+                }
                 ClientControl::Detach => match session.as_ref() {
                     Some(adapter) => adapter.send(ClientMessage::Detach)?,
                     None => {
@@ -1198,17 +1340,6 @@ fn offered_protocol(headers: &HeaderMap, expected: &str) -> bool {
         .any(|value| value.trim() == expected)
 }
 
-fn protocol_parameter<'a>(headers: &'a HeaderMap, prefix: &str) -> Option<&'a str> {
-    let mut matches = headers
-        .get_all(SEC_WEBSOCKET_PROTOCOL)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|value| value.trim().strip_prefix(prefix));
-    let first = matches.next().filter(|value| !value.is_empty())?;
-    matches.next().is_none().then_some(first)
-}
-
 fn validate_origins(origins: Vec<String>) -> io::Result<HashSet<String>> {
     if origins.is_empty() {
         return Err(io::Error::new(
@@ -1355,28 +1486,38 @@ mod tests {
 
     #[test]
     fn vivid_protocol_parameters_must_be_present_once() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            SEC_WEBSOCKET_PROTOCOL,
-            "vvmux.vivid.v1, vvmux.connection.abc, vvmux.auth.secret, vvmux.kind.2"
-                .parse()
-                .unwrap(),
-        );
-        assert_eq!(
-            protocol_parameter(&headers, vivid::CONNECTION_PROTOCOL_PREFIX),
-            Some("abc")
-        );
-        assert_eq!(
-            protocol_parameter(&headers, vivid::KIND_PROTOCOL_PREFIX),
-            Some("2")
-        );
-        headers.append(
-            SEC_WEBSOCKET_PROTOCOL,
-            "vvmux.connection.duplicate".parse().unwrap(),
-        );
-        assert_eq!(
-            protocol_parameter(&headers, vivid::CONNECTION_PROTOCOL_PREFIX),
-            None
-        );
+        fn offered(values: &[&str]) -> Vec<String> {
+            values.iter().map(|value| value.to_string()).collect()
+        }
+        let base = offered(&[
+            "vvmux.vivid.v1",
+            "vvmux.connection.abc",
+            "vvmux.auth.secret",
+            "vvmux.kind.2",
+        ]);
+        let (connection, token, kind) = parse_vivid_parameters(&base).unwrap();
+        assert_eq!(connection, "abc");
+        assert_eq!(token, "secret");
+        assert_eq!(kind, vivid_protocol::wire::ConnectionKind::Track);
+
+        // A duplicate connection parameter is rejected, as are empty ones.
+        let mut duplicate = base.clone();
+        duplicate.push("vvmux.connection.again".to_owned());
+        assert!(parse_vivid_parameters(&duplicate).is_err());
+
+        let mut empty = base.clone();
+        empty.push("vvmux.kind.".to_owned());
+        // An empty remainder is not a second parameter; the kind is still "2".
+        assert!(parse_vivid_parameters(&empty).is_ok());
+
+        // Lane (1) and unknown kinds are rejected.
+        let mut lane = base.clone();
+        lane[3] = "vvmux.kind.1".to_owned();
+        assert!(parse_vivid_parameters(&lane).is_err());
+
+        // The marker subprotocol is required.
+        let mut missing = base.clone();
+        missing[0] = "vvmux.vivid.v2".to_owned();
+        assert!(parse_vivid_parameters(&missing).is_err());
     }
 }
