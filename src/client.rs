@@ -1837,6 +1837,25 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn project_outer_timed_sources(
+        presenter: &crate::media::VirtualVivid,
+        expected_sources: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+            if snapshot.sources.len() == expected_sources {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "outer test presenter never created {expected_sources} timed sources"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn prefix_parser_sends_literal_and_actions() {
         let mut parser = PrefixParser::default();
@@ -2848,6 +2867,7 @@ mod tests {
             nodes: Vec::new(),
             videos_needing_keyframes: vec![video_key],
         });
+        project_outer_timed_sources(&presenter, 2);
         let packet = media::audio_packet_body(AudioPacket {
             epoch: 1,
             packet_id: 1,
@@ -3287,6 +3307,7 @@ mod tests {
                 ),
                 _ => unreachable!(),
             };
+            project_outer_timed_sources(&presenter, 2);
             let initial_audio = audio_packet(1, 0);
             assert!(worker.queue_media(BridgeMedia {
                 generation: 0,
@@ -3554,6 +3575,7 @@ mod tests {
                 "a replacement outer track owns a fresh identity and an independent generation"
             );
             let return_messages = &seen[return_start..=return_applied];
+            project_outer_timed_sources(&presenter, 2);
             let recreated = return_messages
                 .iter()
                 .position(|message| {
