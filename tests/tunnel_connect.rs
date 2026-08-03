@@ -12,8 +12,11 @@ use std::io::Write as _;
 use std::process::Stdio;
 use std::time::Duration;
 
+use base64::Engine as _;
 use common::{ClientControl, LegSocket, TunnelHarness};
+use ed25519_dalek::Signature;
 use futures_util::{SinkExt, StreamExt};
+use sha2::{Digest as _, Sha256};
 use tokio::time::timeout;
 
 fn private_directory(path: &std::path::Path) {
@@ -466,6 +469,235 @@ async fn a_tunnel_leg_drives_a_real_session() {
 
     gateway.kill().unwrap();
     gateway.wait().unwrap();
+    std::fs::remove_dir_all(&runtime).ok();
+}
+
+async fn wt_send_json(send: &mut wtransport::SendStream, value: serde_json::Value) {
+    let bytes = serde_json::to_vec(&value).unwrap();
+    send.write_all(&(bytes.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    send.write_all(&bytes).await.unwrap();
+}
+
+async fn wt_read_json(recv: &mut wtransport::RecvStream) -> serde_json::Value {
+    let mut length = [0_u8; 4];
+    recv.read_exact(&mut length).await.unwrap();
+    let mut bytes = vec![0_u8; u32::from_be_bytes(length) as usize];
+    recv.read_exact(&mut bytes).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn wt_send_frame(send: &mut wtransport::SendStream, kind: u8, bytes: &[u8]) {
+    let mut header = [0_u8; 5];
+    header[0] = kind;
+    header[1..].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+    send.write_all(&header).await.unwrap();
+    send.write_all(bytes).await.unwrap();
+}
+
+async fn wt_read_frame(recv: &mut wtransport::RecvStream) -> (u8, Vec<u8>) {
+    let mut header = [0_u8; 5];
+    recv.read_exact(&mut header).await.unwrap();
+    let mut bytes = vec![0_u8; u32::from_be_bytes(header[1..].try_into().unwrap()) as usize];
+    recv.read_exact(&mut bytes).await.unwrap();
+    (header[0], bytes)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_webtransport_stream_drives_a_real_session_without_another_machine_connection() {
+    let runtime = std::env::temp_dir().join(format!("vvmux-tun-wt-{}", std::process::id()));
+    private_directory(&runtime);
+    let enrollment = TunnelHarness::start("test-code").await;
+    let (machine_id, identity_file) = enroll_identity(&enrollment, &runtime);
+    let public_key = enrollment.registered_key(&machine_id).unwrap();
+    let created = common::vvmux_command(&runtime)
+        .args(["new", "-s", "wt", "-d"])
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let identity = wtransport::Identity::self_signed(["127.0.0.1"]).unwrap();
+    let certificate_hash = hex::encode(Sha256::digest(
+        identity.certificate_chain().as_slice()[0].der(),
+    ));
+    let config = wtransport::ServerConfig::builder()
+        .with_bind_address(address)
+        .with_identity(identity)
+        .keep_alive_interval(Some(Duration::from_millis(100)))
+        .build();
+    let endpoint = wtransport::Endpoint::server(config).unwrap();
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+    let (open_sender, open_receiver) = tokio::sync::oneshot::channel();
+    let (leg_sender, leg_receiver) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let request = endpoint.accept().await.await.unwrap();
+        assert_eq!(request.path(), "/t/v1/webtransport");
+        let connection = request
+            .accept_with_headers([("Sec-WebTransport-Protocol", "vvtun.v1")])
+            .await
+            .unwrap();
+        let mut exporter = [0_u8; 32];
+        connection
+            .export_keying_material(&mut exporter, b"EXPORTER-VVTUN-1", &[])
+            .unwrap();
+        let (mut control_send, mut control_recv) =
+            connection.open_bi().await.unwrap().await.unwrap();
+        let nonce = [0x5a_u8; 32];
+        wt_send_json(
+            &mut control_send,
+            serde_json::json!({
+                "type":"challenge", "protocol":1,
+                "nonce":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
+                "hostname":"127.0.0.1"
+            }),
+        )
+        .await;
+        let auth = wt_read_json(&mut control_recv).await;
+        assert_eq!(auth["machine_id"], machine_id);
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(auth["signature"].as_str().unwrap())
+            .unwrap();
+        let signature = Signature::from_slice(&signature).unwrap();
+        let mut signed = Vec::new();
+        signed.extend_from_slice(common::AUTH_DOMAIN);
+        signed.extend_from_slice(&nonce);
+        signed.extend_from_slice(b"127.0.0.1");
+        signed.extend_from_slice(&exporter);
+        signed.extend_from_slice(machine_id.as_bytes());
+        public_key.verify_strict(&signed, &signature).unwrap();
+        wt_send_json(
+            &mut control_send,
+            serde_json::json!({
+                "type":"authed", "protocol":1, "server_version":"test-wt",
+                "reconnect_after_seconds":0
+            }),
+        )
+        .await;
+        let status = wt_read_json(&mut control_recv).await;
+        assert_eq!(status["type"], "machine_status");
+        assert!(
+            status["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "webtransport-streams-v1")
+        );
+        ready_sender.send(()).unwrap();
+        open_receiver.await.unwrap();
+        let ticket = [0x6b_u8; 32];
+        wt_send_json(
+            &mut control_send,
+            serde_json::json!({
+                "type":"open_leg", "leg_id":1, "kind":"vvws", "route":"test-route",
+                "account":"issuer#subject",
+                "ticket":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ticket),
+                "subprotocols":[]
+            }),
+        )
+        .await;
+        let (leg_send, leg_recv) = connection.open_bi().await.unwrap().await.unwrap();
+        let mut preface = [0_u8; 64];
+        preface[..8].copy_from_slice(b"VVTLEG1\0");
+        preface[8..16].copy_from_slice(&17_u64.to_be_bytes());
+        preface[16..24].copy_from_slice(&1_u64.to_be_bytes());
+        preface[24] = 1;
+        preface[25..29].copy_from_slice(&100_i32.to_be_bytes());
+        preface[32..].copy_from_slice(&ticket);
+        let mut leg_send = leg_send;
+        leg_send.write_all(&preface).await.unwrap();
+        leg_sender.send((leg_send, leg_recv)).unwrap();
+        connection.closed().await;
+    });
+
+    let mut gateway = common::vvmux_command(&runtime)
+        .args(["serve", "--connect"])
+        .arg(format!("https://{address}"))
+        .arg("--identity-file")
+        .arg(&identity_file)
+        .args(["--tunnel-carrier", "webtransport"])
+        .arg("--tunnel-certificate-sha256")
+        .arg(&certificate_hash)
+        .arg("--acknowledge-content-visible-gateway")
+        .spawn()
+        .unwrap();
+    timeout(Duration::from_secs(10), ready_receiver)
+        .await
+        .expect("gateway did not authenticate WebTransport")
+        .unwrap();
+    open_sender.send(()).unwrap();
+    let (mut leg_send, mut leg_recv) = timeout(Duration::from_secs(10), leg_receiver)
+        .await
+        .expect("gateway did not accept WebTransport leg")
+        .unwrap();
+
+    wt_send_frame(
+        &mut leg_send,
+        1,
+        br#"{"type":"hello","protocol":1,"auth":"tunnel"}"#,
+    )
+    .await;
+    let (kind, hello) = timeout(Duration::from_secs(10), wt_read_frame(&mut leg_recv))
+        .await
+        .expect("no hello reply");
+    assert_eq!(kind, 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&hello).unwrap()["type"],
+        "hello"
+    );
+
+    wt_send_frame(
+        &mut leg_send,
+        1,
+        serde_json::json!({
+            "type":"attach", "request_id":1, "name":"wt",
+            "display":{"columns":80,"rows":24,"cell_width":9,"cell_height":18},
+            "takeover":true, "vivid":false
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .await;
+    let mut attached = false;
+    let mut rendered = false;
+    timeout(Duration::from_secs(10), async {
+        while !(attached && rendered) {
+            let (kind, bytes) = wt_read_frame(&mut leg_recv).await;
+            match kind {
+                1 => {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_ne!(value["type"], "error", "attach error: {value}");
+                    attached |= value["type"] == "attached";
+                }
+                2 => rendered = true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("no attached/render over WebTransport");
+
+    wt_send_frame(&mut leg_send, 2, b"printf 'wt-ok\\n'\r").await;
+    let echoed = timeout(Duration::from_secs(10), async {
+        loop {
+            let (kind, bytes) = wt_read_frame(&mut leg_recv).await;
+            if kind == 2 && bytes.windows(5).any(|window| window == b"wt-ok") {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        echoed.is_ok(),
+        "terminal input did not reach the real session"
+    );
+
+    gateway.kill().unwrap();
+    gateway.wait().unwrap();
+    server.abort();
     std::fs::remove_dir_all(&runtime).ok();
 }
 

@@ -6,24 +6,33 @@ on the machine. The gateway dials out; the server never dials in.
 
 ## Transport and authentication
 
-The control tunnel is `GET /t/v1/control` over WebSocket with the `vvtun.v1` subprotocol. A data
-leg is `GET /t/v1/leg` with the subprotocols `vvtun.leg.v1` and `vvtun.ticket.<BASE64URL_TICKET>`.
+VVTUN/1 has two behavior-identical reliable carrier mappings. The preferred mapping is one
+WebTransport session at `CONNECT /t/v1/webtransport`, protocol `vvtun.v1`, containing one
+server-opened bidirectional control stream and one server-opened independent bidirectional stream
+per data leg. The fallback is a control WebSocket at `GET /t/v1/control`, subprotocol `vvtun.v1`,
+plus one data-leg WebSocket at `GET /t/v1/leg` offering `vvtun.leg.v1` and
+`vvtun.ticket.<BASE64URL_TICKET>`.
+
+`--tunnel-carrier auto` tries WebTransport first and may fall back only before authentication;
+`webtransport` and `websocket` force a mapping. An explicit `wss://.../t/v1/control` URL forces
+WebSocket. A tunnel must never mix a WebSocket control with WebTransport legs or the reverse.
 
 TLS is mandatory across a host boundary. The canonical CLI input is a bare `https://host[:port]`
-deployment base, from which the gateway derives the W3 `wss://` endpoints. An exact
+deployment base, from which the gateway derives the HTTP/3 and `wss://` endpoints. An exact
 `wss://host[:port]/t/v1/control` URL explicitly forces this mapping. Plain `http://` or `ws://` is
 accepted for loopback addresses only, for development and testing. Connect URLs reject credentials,
 queries, fragments, and unexpected paths. A public connect also requires the explicit
 `--acknowledge-content-visible-gateway` flag because the relay can observe terminal and media bytes.
 A loopback plaintext tunnel has no TLS exporter and its handshake signature covers an empty
-exporter.
+exporter. WebTransport always has TLS and a 32-byte exporter.
 
 The gateway connects with its enrolled identity: an Ed25519 key pair stored in an owner-only file
 (`cloud-identity.json`). Only the public key leaves the machine.
 
 ### Challenge and proof
 
-After the WebSocket upgrade, the server sends the first message, a strict JSON text frame:
+After carrier establishment, the server sends the first strict JSON object (a WebSocket text frame
+or a length-prefixed object on the WebTransport control stream):
 
 ```json
 {"type":"challenge","protocol":1,"nonce":"BASE64URL_32_BYTES","hostname":"vvmux.example"}
@@ -69,6 +78,14 @@ On success the server replies:
 Both the initial `challenge` wait and the subsequent `authed` wait have a 10-second deadline. A peer
 cannot retain an unauthenticated gateway task by completing the upgrade and then remaining silent.
 
+### WebTransport control framing
+
+Every control object is a `u32` big-endian byte length followed by exactly that many UTF-8 JSON
+bytes. The 64 KiB ceiling is checked before allocation. The control stream has the highest
+transport priority. EOF inside a prefix or object, invalid UTF-8/JSON, an unknown field, or an
+oversized object closes the tunnel. A WebTransport gateway advertises
+`webtransport-streams-v1` and `stream-priority-v1` in `machine_status`.
+
 The gateway then sends `machine_status`:
 
 ```json
@@ -88,9 +105,9 @@ most 16 entries. The server must treat every value as untrusted.
 
 Both layers of D2 apply on the control tunnel.
 
-The **socket layer**: the server sends WebSocket ping frames every 30 seconds. The gateway answers
+The **socket layer** on the fallback: the server sends WebSocket ping frames every 30 seconds. The gateway answers
 pong frames with the same payload. This keeps NAT and proxy mappings warm and proves the socket
-lives.
+lives. On WebTransport, QUIC keepalive and connection-close events provide this layer.
 
 The **protocol layer**: the gateway sends
 
@@ -146,11 +163,32 @@ Vivid bytes are never interpreted by the server.
 `authentication_failed`, `capacity`, `ticket_rejected`, `upgrade_rejected`, `transport_error`, and
 `closed`.
 
-To dial a leg, the gateway connects `GET /t/v1/leg` offering exactly `vvtun.leg.v1` and
+On the fallback mapping, the gateway connects `GET /t/v1/leg` offering exactly `vvtun.leg.v1` and
 `vvtun.ticket.<ticket>`, both non-empty and each occurring once. The server consumes the ticket
 atomically before any Vivid or VVWS byte is accepted. Binary frames only after the upgrade; text
 frames on a leg are a protocol error. Byte zero after admission is the first byte of the browser
 socket's stream.
+
+On WebTransport, the server sends `open_leg` and opens one reliable bidirectional stream. The
+stream starts with this fixed 64-byte network-order preface, stripped before endpoint bytes:
+
+```text
+0..8    "VVTLEG1\0"
+8..16   authenticated tunnel generation, u64
+16..24  leg_id, u64
+24      kind: 1 VVWS, 2 Vivid
+25..29  stream priority, i32
+29..32  zero reserved bytes
+32..64  raw 32-byte one-use leg ticket
+```
+
+The preface and `open_leg` must agree. Mismatch, duplicate, unknown kind, nonzero reserved bytes,
+mixed mapping, or an unpaired stream is reset. Pairing is bounded and expires within 30 seconds.
+
+After the preface, Vivid is raw bytes. VVWS uses
+`kind:u8 || length:u32be || payload`, with kinds text=1, binary=2, ping=3, pong=4, close=5. Payload
+is at most 64 KiB, text is UTF-8, and close has zero length. Unknown kinds or malformed frames close
+the leg. Priorities are control/VVWS, realtime/audio, then bulk. Datagrams are forbidden.
 
 A gateway bounds its legs: at most 32 open legs per tunnel. A leg beyond the bound is answered
 with `leg_failed{code:"capacity"}`. A `leg_id` is unique for the lifetime of one authenticated tunnel

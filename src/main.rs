@@ -84,6 +84,12 @@ enum Command {
         allow_accounts: Vec<String>,
         #[arg(long)]
         allow_kill: bool,
+        /// Machine tunnel carrier. Auto prefers WebTransport and falls back before authentication.
+        #[arg(long, value_enum, default_value = "auto")]
+        tunnel_carrier: gateway::tunnel::TunnelCarrier,
+        /// Pin an ephemeral/self-hosted WebTransport certificate by SHA-256 (64 hex digits).
+        #[arg(long = "tunnel-certificate-sha256", hide = true)]
+        tunnel_certificate_sha256: Vec<String>,
         #[arg(long)]
         identity_file: Option<PathBuf>,
         #[arg(long, hide = true)]
@@ -200,6 +206,8 @@ fn run(cli: Cli) -> io::Result<()> {
             acknowledge_content_visible_gateway,
             allow_accounts,
             allow_kill,
+            tunnel_carrier,
+            tunnel_certificate_sha256,
             identity_file,
             tunnel_heartbeat_ms,
             tunnel_miss_limit,
@@ -230,6 +238,8 @@ fn run(cli: Cli) -> io::Result<()> {
                         acknowledge_content_visible_gateway,
                         allow_accounts,
                         allow_kill,
+                        carrier: tunnel_carrier,
+                        certificate_sha256: tunnel_certificate_sha256,
                         heartbeat: tunnel_heartbeat_ms.map(std::time::Duration::from_millis),
                         miss_limit: tunnel_miss_limit,
                         handshake_timeout: tunnel_handshake_timeout_ms

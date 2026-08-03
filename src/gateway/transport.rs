@@ -172,6 +172,123 @@ impl FrameStream for TungsteniteStream {
     }
 }
 
+/// VVTUN WebTransport leg representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuicMapping {
+    Framed,
+    RawBinary,
+}
+
+pub(crate) struct QuicSink {
+    send: wtransport::SendStream,
+    mapping: QuicMapping,
+}
+
+pub(crate) struct QuicStream {
+    recv: wtransport::RecvStream,
+    mapping: QuicMapping,
+    buffer: Vec<u8>,
+}
+
+pub(crate) fn quic(
+    send: wtransport::SendStream,
+    recv: wtransport::RecvStream,
+    mapping: QuicMapping,
+) -> (QuicSink, QuicStream) {
+    (
+        QuicSink { send, mapping },
+        QuicStream {
+            recv,
+            mapping,
+            buffer: vec![0_u8; 64 * 1024],
+        },
+    )
+}
+
+impl FrameSink for QuicSink {
+    async fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
+        if self.mapping == QuicMapping::RawBinary {
+            return match frame {
+                Frame::Binary(bytes) => self.send.write_all(&bytes).await.map_err(io::Error::other),
+                Frame::Close(_) => self.send.finish().await.map_err(io::Error::other),
+                Frame::Ping(_) | Frame::Pong(_) => Ok(()),
+                Frame::Text(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "text frame on raw Vivid WebTransport leg",
+                )),
+            };
+        }
+        let (kind, bytes): (u8, Payload) = match frame {
+            Frame::Text(text) => (1, Payload::copy_from_slice(text.as_bytes())),
+            Frame::Binary(bytes) => (2, bytes),
+            Frame::Ping(bytes) => (3, bytes),
+            Frame::Pong(bytes) => (4, bytes),
+            Frame::Close(_) => (5, Payload::new()),
+        };
+        if bytes.len() > super::protocol::MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VVTUN leg frame too large",
+            ));
+        }
+        let length = u32::try_from(bytes.len()).map_err(io::Error::other)?;
+        let mut header = [0_u8; 5];
+        header[0] = kind;
+        header[1..].copy_from_slice(&length.to_be_bytes());
+        self.send
+            .write_all(&header)
+            .await
+            .map_err(io::Error::other)?;
+        self.send.write_all(&bytes).await.map_err(io::Error::other)
+    }
+}
+
+impl FrameStream for QuicStream {
+    async fn next_frame(&mut self) -> Option<io::Result<Frame>> {
+        if self.mapping == QuicMapping::RawBinary {
+            return match self.recv.read(&mut self.buffer).await {
+                Ok(Some(0)) => Some(Ok(Frame::Binary(Payload::new()))),
+                Ok(Some(count)) => Some(Ok(Frame::Binary(Payload::copy_from_slice(
+                    &self.buffer[..count],
+                )))),
+                Ok(None) => None,
+                Err(error) => Some(Err(io::Error::other(error))),
+            };
+        }
+        let mut header = [0_u8; 5];
+        if let Err(error) = self.recv.read_exact(&mut header).await {
+            return Some(Err(io::Error::other(error)));
+        }
+        let length = u32::from_be_bytes(header[1..].try_into().expect("four-byte length")) as usize;
+        if length > super::protocol::MAX_FRAME_BYTES || (header[0] == 5 && length != 0) {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid VVTUN leg frame length",
+            )));
+        }
+        let mut bytes = vec![0_u8; length];
+        if let Err(error) = self.recv.read_exact(&mut bytes).await {
+            return Some(Err(io::Error::other(error)));
+        }
+        let bytes = Payload::from(bytes);
+        Some(match header[0] {
+            1 => String::from_utf8(bytes.to_vec())
+                .map(Frame::Text)
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8 text frame")
+                }),
+            2 => Ok(Frame::Binary(bytes)),
+            3 => Ok(Frame::Ping(bytes)),
+            4 => Ok(Frame::Pong(bytes)),
+            5 => Ok(Frame::Close(None)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown VVTUN leg frame kind",
+            )),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
