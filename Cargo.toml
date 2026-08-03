@@ -32,7 +32,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 subtle = { version = "2.6", optional = true }
-ed25519-dalek = { version = "2", features = ["signature", "digest", "std"], optional = true }
+ed25519-dalek = { version = "2", features = ["signature", "digest", "std", "zeroize"], optional = true }
+httpdate = { version = "1", optional = true }
+rpassword = { version = "7", optional = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"], optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
@@ -57,6 +59,8 @@ server-capability = [
   "dep:axum",
   "dep:ed25519-dalek",
   "dep:futures-util",
+  "dep:httpdate",
+  "dep:rpassword",
   "dep:subtle",
   "dep:rustls",
   "dep:rustls-native-certs",
@@ -91,7 +95,9 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3"
+tokio-rustls = "0.26"
 tokio-tungstenite = "0.30"
 # The gateway's test-support API (wait_for_retained_media) is gated behind its testing feature.
 vivid_gateway = { path = "../vivid_gateway", features = ["testing"] }

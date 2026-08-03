@@ -77,6 +77,9 @@ enum Command {
         auth_file: Option<PathBuf>,
         #[arg(long)]
         connect: Option<String>,
+        /// Confirm that the public gateway can observe terminal and media content.
+        #[arg(long)]
+        acknowledge_content_visible_gateway: bool,
         #[arg(long = "allow-account")]
         allow_accounts: Vec<String>,
         #[arg(long)]
@@ -87,6 +90,8 @@ enum Command {
         tunnel_heartbeat_ms: Option<u64>,
         #[arg(long, hide = true)]
         tunnel_miss_limit: Option<u32>,
+        #[arg(long, hide = true)]
+        tunnel_handshake_timeout_ms: Option<u64>,
     },
     /// Enroll this machine with a vvmux_server deployment.
     #[cfg(feature = "server-capability")]
@@ -124,8 +129,10 @@ enum CloudCommand {
         /// The deployment's bare scheme://host[:port] URL.
         #[arg(long)]
         server: String,
-        /// The one-time enrollment code shown on the deployment's website.
-        code: String,
+        /// Read the enrollment code from this file, or from stdin when PATH is `-`.
+        /// Without this option, read it from a no-echo terminal prompt.
+        #[arg(long, value_name = "PATH")]
+        code_file: Option<PathBuf>,
         #[arg(long)]
         identity_file: Option<PathBuf>,
     },
@@ -190,11 +197,13 @@ fn run(cli: Cli) -> io::Result<()> {
             allow_origins,
             auth_file,
             connect,
+            acknowledge_content_visible_gateway,
             allow_accounts,
             allow_kill,
             identity_file,
             tunnel_heartbeat_ms,
             tunnel_miss_limit,
+            tunnel_handshake_timeout_ms,
         }) => {
             let config = config::Config::load(cli.config.as_deref())?;
             if let Some(connect) = connect {
@@ -218,10 +227,13 @@ fn run(cli: Cli) -> io::Result<()> {
                     gateway::tunnel::ConnectOptions {
                         url: connect,
                         identity_file,
+                        acknowledge_content_visible_gateway,
                         allow_accounts,
                         allow_kill,
                         heartbeat: tunnel_heartbeat_ms.map(std::time::Duration::from_millis),
                         miss_limit: tunnel_miss_limit,
+                        handshake_timeout: tunnel_handshake_timeout_ms
+                            .map(std::time::Duration::from_millis),
                     },
                 )
             } else {
@@ -240,19 +252,23 @@ fn run(cli: Cli) -> io::Result<()> {
         Some(Command::Cloud { command }) => match command {
             CloudCommand::Enroll {
                 server,
-                code,
+                code_file,
                 identity_file,
             } => {
-                let identity = gateway::identity::MachineIdentity::new_random()?;
-                gateway::identity::enroll(&server, &code, &identity.public_key())?;
                 let path = identity_file
                     .or(gateway::identity::default_identity_path().ok())
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::NotFound, "no configuration directory")
                     })?;
-                identity.store(&path)?;
+                let reservation = gateway::identity::IdentityReservation::new(&path)?;
+                let code = gateway::identity::read_enrollment_code(code_file.as_deref())?;
+                let identity = gateway::identity::MachineIdentity::new_random()?;
+                gateway::identity::enroll(&server, &code, &identity.public_key())?;
+                reservation.store(&identity)?;
                 println!("enrolled machine {} with {}", identity.machine_id(), server);
-                println!("start the gateway with `vvmux serve --connect {server}/t/v1/control`");
+                println!(
+                    "start the gateway with `vvmux serve --connect {server} --acknowledge-content-visible-gateway`"
+                );
                 Ok(())
             }
         },

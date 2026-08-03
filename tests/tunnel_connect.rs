@@ -8,9 +8,11 @@
 
 mod common;
 
+use std::io::Write as _;
+use std::process::Stdio;
 use std::time::Duration;
 
-use common::{ClientControl, TunnelHarness};
+use common::{ClientControl, LegSocket, TunnelHarness};
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::timeout;
 
@@ -23,20 +25,56 @@ fn private_directory(path: &std::path::Path) {
     }
 }
 
-/// Enroll a machine and start its gateway in connect mode.
-async fn enroll_and_connect(
+fn enroll_machine(
     harness: &TunnelHarness,
     runtime: &std::path::Path,
-) -> (String, std::process::Child) {
-    let identity = runtime.join("cloud-identity.json");
-    let enroll = common::vvmux_command(runtime)
-        .args(["cloud", "enroll", "test-code"])
+    identity: &std::path::Path,
+    code: &str,
+) -> std::process::Output {
+    let mut child = common::vvmux_command(runtime)
+        .args(["cloud", "enroll"])
         .arg("--server")
         .arg(harness.enroll_url())
+        .args(["--code-file", "-"])
         .arg("--identity-file")
-        .arg(&identity)
-        .output()
+        .arg(identity)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+
+    // The code is supplied only after process creation, and never through argv
+    // or the environment. Linux lets this integration test verify the actual
+    // kernel-visible process records rather than merely inspecting Command.
+    #[cfg(target_os = "linux")]
+    {
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", child.id())).unwrap();
+        let environ = std::fs::read(format!("/proc/{}/environ", child.id())).unwrap();
+        assert!(
+            !cmdline
+                .windows(code.len())
+                .any(|window| window == code.as_bytes())
+        );
+        assert!(
+            !environ
+                .windows(code.len())
+                .any(|window| window == code.as_bytes())
+        );
+    }
+
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{code}").unwrap();
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
+fn enroll_identity(
+    harness: &TunnelHarness,
+    runtime: &std::path::Path,
+) -> (String, std::path::PathBuf) {
+    let identity = runtime.join("cloud-identity.json");
+    let enroll = enroll_machine(harness, runtime, &identity, "test-code");
     assert!(
         enroll.status.success(),
         "enroll failed: {}",
@@ -44,6 +82,13 @@ async fn enroll_and_connect(
     );
     let machine_id = {
         let output = String::from_utf8_lossy(&enroll.stdout);
+        assert!(
+            output.contains(&format!(
+                "vvmux serve --connect {} --acknowledge-content-visible-gateway",
+                harness.enroll_url()
+            )),
+            "enrollment printed an unusable connect command: {output}"
+        );
         output
             .lines()
             .next()
@@ -56,17 +101,53 @@ async fn enroll_and_connect(
         harness.registered_key(&machine_id).is_some(),
         "harness did not record the enrolled key"
     );
+    (machine_id, identity)
+}
 
-    let gateway = common::vvmux_command(runtime)
+fn start_gateway(
+    harness: &TunnelHarness,
+    runtime: &std::path::Path,
+    identity: &std::path::Path,
+) -> std::process::Child {
+    common::vvmux_command(runtime)
         .args(["serve", "--connect"])
-        .arg(harness.url())
+        .arg(harness.enroll_url())
         .arg("--identity-file")
-        .arg(&identity)
+        .arg(identity)
         .args(["--tunnel-heartbeat-ms", "250"])
         .args(["--tunnel-miss-limit", "3"])
+        .args(["--tunnel-handshake-timeout-ms", "250"])
         .spawn()
-        .unwrap();
+        .unwrap()
+}
+
+/// Enroll a machine and start its gateway in connect mode.
+async fn enroll_and_connect(
+    harness: &TunnelHarness,
+    runtime: &std::path::Path,
+) -> (String, std::process::Child) {
+    let (machine_id, identity) = enroll_identity(harness, runtime);
+    let gateway = start_gateway(harness, runtime, &identity);
     (machine_id, gateway)
+}
+
+async fn complete_leg_hello(leg: &mut LegSocket) {
+    leg.sink
+        .send(axum::extract::ws::Message::Text(
+            r#"{"type":"hello","protocol":1,"auth":"tunnel"}"#.into(),
+        ))
+        .await
+        .unwrap();
+    let message = timeout(Duration::from_secs(10), leg.stream.next())
+        .await
+        .expect("no hello reply")
+        .expect("leg closed during hello")
+        .expect("leg hello failed");
+    let axum::extract::ws::Message::Text(text) = message else {
+        panic!("expected text hello reply");
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["type"], "hello");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -97,6 +178,124 @@ async fn enroll_then_tunnel_authenticates_and_reports_status() {
     assert!(!capabilities.iter().any(|cap| cap == "session-kill-v1"));
 
     gateway.kill().unwrap();
+    gateway.wait().unwrap();
+    std::fs::remove_dir_all(&runtime).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enrollment_preflights_identity_and_uses_the_correct_http_authority() {
+    let runtime =
+        std::env::temp_dir().join(format!("vvmux-tun-enroll-preflight-{}", std::process::id()));
+    private_directory(&runtime);
+    let harness = TunnelHarness::start("test-code").await;
+    let identity = runtime.join("cloud-identity.json");
+    std::fs::write(&identity, "existing").unwrap();
+    let code_file = runtime.join("enrollment-code");
+    std::fs::write(&code_file, "test-code\n").unwrap();
+
+    let refused = common::vvmux_command(&runtime)
+        .args(["cloud", "enroll"])
+        .arg("--server")
+        .arg(harness.enroll_url())
+        .arg("--code-file")
+        .arg(&code_file)
+        .arg("--identity-file")
+        .arg(&identity)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        harness.last_enrollment_host().is_none(),
+        "existing identity still reached enrollment server"
+    );
+
+    std::fs::remove_file(&identity).unwrap();
+    let enrolled = enroll_machine(&harness, &runtime, &identity, "test-code");
+    assert!(
+        enrolled.status.success(),
+        "one-use code was consumed by preflight failure"
+    );
+    let expected_host = format!("127.0.0.1:{}", harness.addr.port());
+    assert_eq!(
+        harness.last_enrollment_host().as_deref(),
+        Some(expected_host.as_str())
+    );
+
+    std::fs::remove_dir_all(&runtime).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enrollment_rejects_a_machine_id_for_another_key_and_removes_reservation() {
+    let runtime = std::env::temp_dir().join(format!("vvmux-tun-enroll-id-{}", std::process::id()));
+    private_directory(&runtime);
+    let harness = TunnelHarness::start("test-code").await;
+    harness.set_enrollment_machine_id_override("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let identity = runtime.join("cloud-identity.json");
+    let output = enroll_machine(&harness, &runtime, &identity, "test-code");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("different public key"),
+        "stderr was {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !identity.exists(),
+        "failed enrollment left a reserved identity file"
+    );
+    std::fs::remove_dir_all(&runtime).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_initial_challenge_timeout_reconnects() {
+    let runtime = std::env::temp_dir().join(format!(
+        "vvmux-tun-challenge-timeout-{}",
+        std::process::id()
+    ));
+    private_directory(&runtime);
+    let harness = TunnelHarness::start("test-code").await;
+    harness.set_challenge_enabled(false);
+    let (_machine_id, identity) = enroll_identity(&harness, &runtime);
+    let mut gateway = start_gateway(&harness, &runtime, &identity);
+
+    timeout(Duration::from_secs(4), async {
+        while harness.control_attempts() < 2 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("gateway did not reconnect after the initial challenge timeout");
+
+    gateway.kill().unwrap();
+    gateway.wait().unwrap();
+    std::fs::remove_dir_all(&runtime).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_upgrade_honors_retry_after() {
+    let runtime =
+        std::env::temp_dir().join(format!("vvmux-tun-retry-after-{}", std::process::id()));
+    private_directory(&runtime);
+    let harness = TunnelHarness::start("test-code").await;
+    let (_machine_id, identity) = enroll_identity(&harness, &runtime);
+    harness.reject_next_control(1);
+    let mut gateway = start_gateway(&harness, &runtime, &identity);
+
+    let status = timeout(Duration::from_secs(5), harness.next_control())
+        .await
+        .expect("gateway did not reconnect after Retry-After")
+        .expect("control tunnel closed");
+    assert!(matches!(status, ClientControl::MachineStatus { .. }));
+    let attempts = harness.control_attempt_times();
+    assert!(attempts.len() >= 2);
+    assert!(
+        attempts[1].duration_since(attempts[0]) >= Duration::from_millis(900),
+        "Retry-After was not honored: {:?}",
+        attempts[1].duration_since(attempts[0])
+    );
+
+    gateway.kill().unwrap();
+    gateway.wait().unwrap();
+    gateway.wait().unwrap();
     std::fs::remove_dir_all(&runtime).ok();
 }
 
@@ -266,6 +465,7 @@ async fn a_tunnel_leg_drives_a_real_session() {
     assert!(detached, "never detached");
 
     gateway.kill().unwrap();
+    gateway.wait().unwrap();
     std::fs::remove_dir_all(&runtime).ok();
 }
 
@@ -292,7 +492,83 @@ async fn an_unknown_leg_ticket_is_refused_and_reported() {
     assert_eq!(code, "ticket_rejected");
 
     gateway.kill().unwrap();
+    gateway.wait().unwrap();
     std::fs::remove_dir_all(&runtime).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn duplicate_leg_id_is_source_scoped_and_close_releases_only_its_attachment() {
+    let runtime_a =
+        std::env::temp_dir().join(format!("vvmux-tun-duplicate-a-{}", std::process::id()));
+    let runtime_b =
+        std::env::temp_dir().join(format!("vvmux-tun-duplicate-b-{}", std::process::id()));
+    private_directory(&runtime_a);
+    private_directory(&runtime_b);
+    let harness_a = TunnelHarness::start("test-code").await;
+    let harness_b = TunnelHarness::start("test-code").await;
+    let (_machine_a, mut gateway_a) = enroll_and_connect(&harness_a, &runtime_a).await;
+    let (_machine_b, mut gateway_b) = enroll_and_connect(&harness_b, &runtime_b).await;
+    assert!(matches!(
+        timeout(Duration::from_secs(10), harness_a.next_control()).await,
+        Ok(Some(ClientControl::MachineStatus { .. }))
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(10), harness_b.next_control()).await,
+        Ok(Some(ClientControl::MachineStatus { .. }))
+    ));
+
+    // Two independent tunnel generations deliberately reuse the same numeric
+    // leg ID. The duplicate is injected only into owner A.
+    harness_a.open_leg(9, "vvws", Vec::new()).await;
+    harness_b.open_leg(9, "vvws", Vec::new()).await;
+    let mut leg_a = harness_a.accept_leg(9).await;
+    let mut leg_b = harness_b.accept_leg(9).await;
+    harness_a.open_leg(9, "vvws", Vec::new()).await;
+    let failure = timeout(Duration::from_secs(10), harness_a.next_control())
+        .await
+        .expect("duplicate leg was not rejected")
+        .expect("owner A control tunnel closed");
+    assert!(matches!(
+        failure,
+        ClientControl::LegFailed { leg_id: 9, ref code } if code == "invalid_request"
+    ));
+
+    // The original A leg and the same-numbered B leg both remain usable.
+    complete_leg_hello(&mut leg_a).await;
+    complete_leg_hello(&mut leg_b).await;
+
+    harness_a.close_leg(9);
+    timeout(Duration::from_secs(10), leg_a.stream.next())
+        .await
+        .expect("closing owner A's leg did not tear it down");
+
+    // Owner B's next valid request must still work after A's scoped failure and
+    // teardown.
+    leg_b
+        .sink
+        .send(axum::extract::ws::Message::Text(
+            r#"{"type":"list_sessions","request_id":41}"#.into(),
+        ))
+        .await
+        .unwrap();
+    let reply = timeout(Duration::from_secs(10), leg_b.stream.next())
+        .await
+        .expect("owner B stopped responding")
+        .expect("owner B leg closed")
+        .expect("owner B leg failed");
+    let axum::extract::ws::Message::Text(reply) = reply else {
+        panic!("expected owner B sessions reply");
+    };
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["type"], "sessions");
+    assert_eq!(reply["request_id"], 41);
+
+    gateway_a.kill().unwrap();
+    gateway_b.kill().unwrap();
+    gateway_a.wait().unwrap();
+    gateway_b.wait().unwrap();
+    std::fs::remove_dir_all(&runtime_a).ok();
+    std::fs::remove_dir_all(&runtime_b).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -336,6 +612,7 @@ async fn a_tunnel_loss_reconnects_and_sessions_survive() {
     );
 
     gateway.kill().unwrap();
+    gateway.wait().unwrap();
     std::fs::remove_dir_all(&runtime).ok();
 }
 
@@ -353,4 +630,21 @@ fn connect_rejects_plain_ws_across_a_host_boundary() {
         stderr.contains("loopback development only"),
         "stderr was: {stderr}"
     );
+}
+
+#[test]
+fn public_connect_requires_content_visibility_acknowledgement() {
+    let runtime = std::env::temp_dir().join(format!("vvmux-tun-ack-{}", std::process::id()));
+    private_directory(&runtime);
+    let output = common::vvmux_command(&runtime)
+        .args(["serve", "--connect", "https://vvmux.example"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--acknowledge-content-visible-gateway"),
+        "stderr was: {stderr}"
+    );
+    std::fs::remove_dir_all(&runtime).ok();
 }

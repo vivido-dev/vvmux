@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use futures_util::StreamExt as _;
@@ -25,7 +25,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
+use tokio_tungstenite::tungstenite::http::header::{RETRY_AFTER, SEC_WEBSOCKET_PROTOCOL};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, client_async_tls_with_config};
 
@@ -57,11 +57,13 @@ const DEFAULT_MISS_LIMIT: u32 = 3;
 pub(crate) struct ConnectOptions {
     pub url: String,
     pub identity_file: PathBuf,
+    pub acknowledge_content_visible_gateway: bool,
     pub allow_accounts: Vec<String>,
     pub allow_kill: bool,
     /// Test and diagnostic knobs; the defaults are the VVTUN-1 constants.
     pub heartbeat: Option<Duration>,
     pub miss_limit: Option<u32>,
+    pub handshake_timeout: Option<Duration>,
 }
 
 /// Strict VVTUN/1 server-to-gateway control frames.
@@ -146,7 +148,15 @@ struct TunnelRunner {
     allow_kill: bool,
     heartbeat: Duration,
     miss_limit: u32,
+    handshake_timeout: Duration,
     legs: Arc<Semaphore>,
+}
+
+struct ConnectEndpoints {
+    control_url: String,
+    hostname: String,
+    leg_url: String,
+    requires_content_acknowledgement: bool,
 }
 
 pub(crate) fn run_connect(
@@ -154,8 +164,14 @@ pub(crate) fn run_connect(
     config_path: Option<PathBuf>,
     options: ConnectOptions,
 ) -> io::Result<()> {
+    let endpoints = split_urls(&options.url)?;
+    if endpoints.requires_content_acknowledgement && !options.acknowledge_content_visible_gateway {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a public tunnel makes terminal and media content visible to the gateway; pass --acknowledge-content-visible-gateway to continue",
+        ));
+    }
     let state = super::build_state(config, config_path, HashSet::new(), None);
-    let (base, hostname, leg_url) = split_urls(&options.url)?;
     let identity = MachineIdentity::load(&options.identity_file).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -166,15 +182,16 @@ pub(crate) fn run_connect(
         )
     })?;
     let runner = TunnelRunner {
-        url: base + "/t/v1/control",
-        hostname,
-        leg_url,
+        url: endpoints.control_url,
+        hostname: endpoints.hostname,
+        leg_url: endpoints.leg_url,
         identity,
         state,
         allow_accounts: options.allow_accounts.into_iter().collect(),
         allow_kill: options.allow_kill,
         heartbeat: options.heartbeat.unwrap_or(DEFAULT_HEARTBEAT),
         miss_limit: options.miss_limit.unwrap_or(DEFAULT_MISS_LIMIT),
+        handshake_timeout: options.handshake_timeout.unwrap_or(HANDSHAKE_TIMEOUT),
         legs: Arc::new(Semaphore::new(MAX_TUNNEL_LEGS)),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -184,34 +201,48 @@ pub(crate) fn run_connect(
     runtime.block_on(run_reconnect_loop(&runner))
 }
 
-/// Split a connect URL into the control URL, the hostname for the handshake
-/// signature, and the leg URL. `wss://` is required across a host boundary;
-/// `ws://` is accepted for loopback development only.
-fn split_urls(url: &str) -> io::Result<(String, String, String)> {
+/// Validate a deployment base or an explicit WebSocket fallback URL and derive
+/// the two W3 WebSocket endpoints. HTTPS is the canonical public form.
+fn split_urls(url: &str) -> io::Result<ConnectEndpoints> {
     let parsed = url::Url::parse(url).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("invalid --connect URL: {error}"),
         )
     })?;
-    let (scheme, tls) = match parsed.scheme() {
-        "wss" => ("wss", true),
-        "ws" => ("ws", false),
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--connect must not contain credentials, a query, or a fragment",
+        ));
+    }
+    let (scheme, tls, base_only) = match parsed.scheme() {
+        "https" => ("wss", true, true),
+        "http" => ("ws", false, true),
+        "wss" => ("wss", true, false),
+        "ws" => ("ws", false, false),
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("--connect scheme must be wss or ws, got {other}"),
+                format!("--connect scheme must be https, wss, or loopback http/ws, got {other}"),
             ));
         }
     };
-    if !tls {
-        let host = parsed.host_str().unwrap_or_default();
-        if host != "127.0.0.1" && host != "::1" && host != "localhost" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ws:// is accepted for loopback development only; use wss:// across a host boundary",
-            ));
-        }
+    let path = parsed.path();
+    let valid_path = if base_only {
+        path.is_empty() || path == "/"
+    } else {
+        path.is_empty() || path == "/" || path == "/t/v1/control"
+    };
+    if !valid_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--connect must be a deployment base or the exact /t/v1/control WebSocket endpoint",
+        ));
     }
     let Some(host) = parsed.host_str() else {
         return Err(io::Error::new(
@@ -219,18 +250,36 @@ fn split_urls(url: &str) -> io::Result<(String, String, String)> {
             "--connect URL has no host",
         ));
     };
+    let loopback = is_loopback_host(host);
+    if !tls && !loopback {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plaintext http/ws is accepted for loopback development only; use https:// across a host boundary",
+        ));
+    }
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--connect URL has no port"))?;
-    let host_port = match parsed.host() {
-        Some(url::Host::Ipv6(_)) => format!("[{host}]:{port}"),
-        _ => format!("{host}:{port}"),
+    let authority = match parsed.host() {
+        Some(url::Host::Ipv6(_)) if parsed.port().is_some() => format!("[{host}]:{port}"),
+        Some(url::Host::Ipv6(_)) => format!("[{host}]"),
+        Some(_) if parsed.port().is_some() => format!("{host}:{port}"),
+        Some(_) => host.to_owned(),
+        None => unreachable!("host_str was checked above"),
     };
-    Ok((
-        format!("{scheme}://{host_port}"),
-        host.to_owned(),
-        format!("{scheme}://{host_port}/t/v1/leg"),
-    ))
+    Ok(ConnectEndpoints {
+        control_url: format!("{scheme}://{authority}/t/v1/control"),
+        hostname: host.to_owned(),
+        leg_url: format!("{scheme}://{authority}/t/v1/leg"),
+        requires_content_acknowledgement: !loopback,
+    })
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn full_jitter(cap: Duration) -> Duration {
@@ -241,14 +290,34 @@ fn full_jitter(cap: Duration) -> Duration {
     Duration::from_nanos(value % cap_nanos.saturating_add(1))
 }
 
+#[derive(Debug)]
+struct TunnelAttemptError {
+    error: io::Error,
+    retry_after_seconds: Option<u64>,
+}
+
+impl From<io::Error> for TunnelAttemptError {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            retry_after_seconds: None,
+        }
+    }
+}
+
+struct ConnectedTunnel {
+    socket: TunnelStream,
+    exporter: Option<[u8; 32]>,
+}
+
 async fn run_reconnect_loop(runner: &TunnelRunner) -> io::Result<()> {
     let mut backoff_cap = RECONNECT_MIN;
     loop {
         let (completed, retry_after) = match run_tunnel_once(runner).await {
             Ok(outcome) => outcome,
-            Err(error) => {
-                eprintln!("vvmux tunnel: {error}");
-                (false, None)
+            Err(failure) => {
+                eprintln!("vvmux tunnel: {}", failure.error);
+                (false, failure.retry_after_seconds)
             }
         };
         if completed {
@@ -268,14 +337,21 @@ async fn run_reconnect_loop(runner: &TunnelRunner) -> io::Result<()> {
 }
 
 /// One tunnel lifetime. Returns `(completed, retry_after_hint)`.
-async fn run_tunnel_once(runner: &TunnelRunner) -> io::Result<(bool, Option<u64>)> {
-    let (socket, _response) = connect_with_exporter(
+async fn run_tunnel_once(runner: &TunnelRunner) -> Result<(bool, Option<u64>), TunnelAttemptError> {
+    let connected = connect_with_exporter(
         &runner.url,
         &[TUNNEL_SUBPROTOCOL.to_owned()],
         CONTROL_MAX_BYTES,
     )
     .await?;
-    let (exporter, stream) = split_tunnel(socket);
+    let ConnectedTunnel {
+        socket: stream,
+        exporter,
+    } = connected;
+    let exporter = exporter
+        .as_ref()
+        .map(|bytes| bytes.as_slice())
+        .unwrap_or_default();
 
     let (mut sink, mut reader) = {
         let (sink, stream) = stream.split();
@@ -283,33 +359,33 @@ async fn run_tunnel_once(runner: &TunnelRunner) -> io::Result<(bool, Option<u64>
     };
 
     // Handshake: challenge -> auth -> authed -> machine_status.
-    let challenge = read_control_frame(&mut reader).await?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "server closed before challenge",
-        )
-    })?;
+    let challenge = tokio::time::timeout(runner.handshake_timeout, read_control_frame(&mut reader))
+        .await
+        .map_err(|_| io::Error::other("initial challenge timed out"))??
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "server closed before challenge",
+            )
+        })?;
     let ServerControl::Challenge {
         protocol, nonce, ..
     } = challenge
     else {
-        return Err(io::Error::other("expected VVTUN challenge"));
+        return Err(io::Error::other("expected VVTUN challenge").into());
     };
     if protocol != 1 {
-        return Err(io::Error::other("unsupported VVTUN protocol version"));
+        return Err(io::Error::other("unsupported VVTUN protocol version").into());
     }
     let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(nonce.as_str())
         .map_err(|_| io::Error::other("challenge nonce is not base64url"))?;
     if nonce.len() != 32 {
-        return Err(io::Error::other("challenge nonce must be 32 bytes"));
+        return Err(io::Error::other("challenge nonce must be 32 bytes").into());
     }
-    let exporter = exporter
-        .map(|bytes| bytes.as_slice().to_vec())
-        .unwrap_or_default();
     let signature = runner
         .identity
-        .sign_handshake(&nonce, &runner.hostname, &exporter);
+        .sign_handshake(&nonce, &runner.hostname, exporter);
     send_control(
         &mut sink,
         &ClientControl::Auth {
@@ -319,7 +395,7 @@ async fn run_tunnel_once(runner: &TunnelRunner) -> io::Result<(bool, Option<u64>
     )
     .await?;
 
-    let authed = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_control_frame(&mut reader))
+    let authed = tokio::time::timeout(runner.handshake_timeout, read_control_frame(&mut reader))
         .await
         .map_err(|_| io::Error::other("authentication timed out"))??
         .ok_or_else(|| io::Error::other("server closed during authentication"))?;
@@ -329,10 +405,10 @@ async fn run_tunnel_once(runner: &TunnelRunner) -> io::Result<(bool, Option<u64>
         reconnect_after_seconds: _,
     } = authed
     else {
-        return Err(io::Error::other("expected VVTUN authed"));
+        return Err(io::Error::other("expected VVTUN authed").into());
     };
     if protocol != 1 {
-        return Err(io::Error::other("unsupported VVTUN protocol version"));
+        return Err(io::Error::other("unsupported VVTUN protocol version").into());
     }
     let server_version = bounded_ascii(&server_version, 64)?;
 
@@ -364,6 +440,7 @@ async fn run_tunnel_once(runner: &TunnelRunner) -> io::Result<(bool, Option<u64>
     let (leg_reports, mut report_receiver) = mpsc::unbounded_channel::<ClientControl>();
     let mut legs: std::collections::HashMap<u64, tokio::task::JoinHandle<()>> =
         std::collections::HashMap::new();
+    let mut seen_leg_ids = HashSet::new();
     let mut heartbeat = tokio::time::interval(runner.heartbeat);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ping_nonce: u64 = 0;
@@ -379,6 +456,7 @@ async fn run_tunnel_once(runner: &TunnelRunner) -> io::Result<(bool, Option<u64>
                         match handle_server_frame(
                             &mut sink,
                             &mut legs,
+                            &mut seen_leg_ids,
                             &leg_reports,
                             runner,
                             frame,
@@ -444,6 +522,7 @@ async fn run_tunnel_once(runner: &TunnelRunner) -> io::Result<(bool, Option<u64>
 async fn handle_server_frame<Si: FrameSink>(
     sink: &mut Si,
     legs: &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
+    seen_leg_ids: &mut HashSet<u64>,
     leg_reports: &mpsc::UnboundedSender<ClientControl>,
     runner: &TunnelRunner,
     frame: Frame,
@@ -472,6 +551,7 @@ async fn handle_server_frame<Si: FrameSink>(
             } => {
                 open_leg(
                     legs,
+                    seen_leg_ids,
                     leg_reports,
                     runner,
                     leg_id,
@@ -519,6 +599,7 @@ fn decode_server_control(text: &str) -> io::Result<ServerControl> {
 #[allow(clippy::too_many_arguments)]
 async fn open_leg(
     legs: &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
+    seen_leg_ids: &mut HashSet<u64>,
     leg_reports: &mpsc::UnboundedSender<ClientControl>,
     runner: &TunnelRunner,
     leg_id: u64,
@@ -528,6 +609,14 @@ async fn open_leg(
     ticket: &str,
     subprotocols: &[String],
 ) -> io::Result<()> {
+    legs.retain(|_, handle| !handle.is_finished());
+    if !seen_leg_ids.insert(leg_id) {
+        let _ = leg_reports.send(ClientControl::LegFailed {
+            leg_id,
+            code: "invalid_request".to_owned(),
+        });
+        return Ok(());
+    }
     if !runner.allow_accounts.is_empty() && !runner.allow_accounts.contains(account) {
         let _ = leg_reports.send(ClientControl::LegFailed {
             leg_id,
@@ -546,7 +635,7 @@ async fn open_leg(
             return Ok(());
         }
     };
-    if legs.len() >= MAX_TUNNEL_LEGS || runner.legs.clone().try_acquire_owned().is_err() {
+    if legs.len() >= MAX_TUNNEL_LEGS {
         let _ = leg_reports.send(ClientControl::LegFailed {
             leg_id,
             code: "capacity".to_owned(),
@@ -570,7 +659,16 @@ async fn open_leg(
         return Ok(());
     }
 
-    let permit = runner.legs.clone().acquire_owned().await;
+    let permit = match runner.legs.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let _ = leg_reports.send(ClientControl::LegFailed {
+                leg_id,
+                code: "capacity".to_owned(),
+            });
+            return Ok(());
+        }
+    };
     let state = runner.state.clone();
     let allow_kill = runner.allow_kill;
     let ticket = ticket.to_owned();
@@ -627,8 +725,10 @@ async fn run_leg(
         LEG_SUBPROTOCOL.to_owned(),
         format!("{LEG_TICKET_PREFIX}{ticket}"),
     ];
-    let (socket, _response) = connect_with_exporter(leg_url, &offered, max_bytes).await?;
-    let (_exporter, stream) = split_tunnel(socket);
+    let connected = connect_with_exporter(leg_url, &offered, max_bytes)
+        .await
+        .map_err(|failure| failure.error)?;
+    let stream = connected.socket;
     let (sink, reader) = {
         let (sink, stream) = stream.split();
         (TungsteniteSink(sink), TungsteniteStream(stream))
@@ -697,7 +797,16 @@ async fn connect_with_exporter(
     url: &str,
     offered: &[String],
     max_bytes: usize,
-) -> io::Result<(TunnelStream, Option<[u8; 32]>)> {
+) -> Result<ConnectedTunnel, TunnelAttemptError> {
+    connect_with_exporter_config(url, offered, max_bytes, None).await
+}
+
+async fn connect_with_exporter_config(
+    url: &str,
+    offered: &[String],
+    max_bytes: usize,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+) -> Result<ConnectedTunnel, TunnelAttemptError> {
     let parsed = url::Url::parse(url).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -711,19 +820,40 @@ async fn connect_with_exporter(
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "WebSocket URL has no port"))?;
-    let tls = parsed.scheme() == "wss";
+    let tls = match parsed.scheme() {
+        "wss" => true,
+        "ws" => false,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("WebSocket URL scheme must be wss or ws, got {other}"),
+            )
+            .into());
+        }
+    };
     let stream = TcpStream::connect((host.as_str(), port))
         .await
         .map_err(io::Error::other)?;
     let connector = if tls {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            roots.add(cert).map_err(io::Error::other)?;
-        }
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        Some(Connector::Rustls(std::sync::Arc::new(config)))
+        let config = match tls_config {
+            Some(config) => config,
+            None => {
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in rustls_native_certs::load_native_certs().certs {
+                    roots.add(cert).map_err(io::Error::other)?;
+                }
+                Arc::new(
+                    rustls::ClientConfig::builder_with_provider(Arc::new(
+                        rustls::crypto::ring::default_provider(),
+                    ))
+                    .with_safe_default_protocol_versions()
+                    .map_err(io::Error::other)?
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+                )
+            }
+        };
+        Some(Connector::Rustls(config))
     } else {
         Some(Connector::Plain)
     };
@@ -747,37 +877,68 @@ async fn connect_with_exporter(
         client_async_tls_with_config(request, stream, Some(config), connector)
             .await
             .map_err(|error| match error {
-                // An HTTP rejection is an upgrade failure, not a transport one; the
-                // leg path maps it to `ticket_rejected` via PermissionDenied.
-                tokio_tungstenite::tungstenite::Error::Http(_) => io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "WebSocket upgrade was rejected",
-                ),
-                other => io::Error::other(other),
+                tokio_tungstenite::tungstenite::Error::Http(response) => {
+                    let retry_after_seconds = response
+                        .headers()
+                        .get(RETRY_AFTER)
+                        .and_then(|value| parse_retry_after(value, SystemTime::now()));
+                    TunnelAttemptError {
+                        error: io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "WebSocket upgrade was rejected with HTTP {}",
+                                response.status()
+                            ),
+                        ),
+                        retry_after_seconds,
+                    }
+                }
+                other => io::Error::other(other).into(),
             })?;
-    let (exporter, socket) = split_tunnel(socket);
-    Ok((socket, exporter))
+    let exporter = session_exporter(&socket, tls)?;
+    Ok(ConnectedTunnel { socket, exporter })
 }
 
-/// Split a connected tunnel stream into its exporter binding and its halves.
-fn split_tunnel(socket: TunnelStream) -> (Option<[u8; 32]>, TunnelStream) {
+fn session_exporter(socket: &TunnelStream, tls_required: bool) -> io::Result<Option<[u8; 32]>> {
     let exporter = match socket.get_ref() {
         MaybeTlsStream::Rustls(tls) => {
             let mut out = [0_u8; 32];
-            if tls
-                .get_ref()
+            tls.get_ref()
                 .1
                 .export_keying_material(&mut out, EXPORTER_LABEL, None)
-                .is_ok()
-            {
-                Some(out)
-            } else {
-                None
-            }
+                .map_err(|_| io::Error::other("TLS exporter derivation failed"))?;
+            Some(out)
         }
         _ => None,
     };
-    (exporter, socket)
+    require_exporter(tls_required, exporter)
+}
+
+fn require_exporter(
+    tls_required: bool,
+    exporter: Option<[u8; 32]>,
+) -> io::Result<Option<[u8; 32]>> {
+    if tls_required && exporter.is_none() {
+        return Err(io::Error::other(
+            "TLS tunnel did not provide exporter binding material",
+        ));
+    }
+    Ok(exporter)
+}
+
+fn parse_retry_after(value: &HeaderValue, now: SystemTime) -> Option<u64> {
+    let value = value.to_str().ok()?.trim();
+    let seconds = match value.parse::<u64>() {
+        Ok(seconds) => seconds,
+        Err(_) => {
+            let deadline = httpdate::parse_http_date(value).ok()?;
+            deadline
+                .duration_since(now)
+                .unwrap_or(Duration::ZERO)
+                .as_secs()
+        }
+    };
+    Some(seconds.min(RECONNECT_MAX.as_secs()))
 }
 
 fn bounded_ascii(value: &str, max: usize) -> io::Result<&str> {
@@ -798,12 +959,141 @@ fn bounded_ascii(value: &str, max: usize) -> io::Result<&str> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::result_large_err)]
+    fn select_test_subprotocol(
+        _request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        response.headers_mut().insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static(TUNNEL_SUBPROTOCOL),
+        );
+        Ok(response)
+    }
+
     #[test]
     fn ws_scheme_is_rejected_for_non_loopback_hosts() {
         assert!(split_urls("ws://vvmux.example/t/v1/control").is_err());
         assert!(split_urls("wss://vvmux.example/t/v1/control").is_ok());
         assert!(split_urls("ws://127.0.0.1:8000/t/v1/control").is_ok());
-        assert!(split_urls("http://127.0.0.1:8000/t/v1/control").is_err());
+        assert!(split_urls("http://127.0.0.1:8000").is_ok());
+    }
+
+    #[test]
+    fn https_base_is_canonical_and_urls_are_strict() {
+        let endpoints = split_urls("https://vvmux.example:8443").unwrap();
+        assert_eq!(
+            endpoints.control_url,
+            "wss://vvmux.example:8443/t/v1/control"
+        );
+        assert_eq!(endpoints.leg_url, "wss://vvmux.example:8443/t/v1/leg");
+        assert_eq!(endpoints.hostname, "vvmux.example");
+        assert!(endpoints.requires_content_acknowledgement);
+
+        for bad in [
+            "https://user@vvmux.example",
+            "https://vvmux.example?route=secret",
+            "https://vvmux.example/#fragment",
+            "https://vvmux.example/unexpected",
+            "wss://vvmux.example/t/v1/leg",
+        ] {
+            assert!(split_urls(bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn tls_exporter_is_required_and_plaintext_uses_an_empty_binding() {
+        assert!(require_exporter(true, None).is_err());
+        assert_eq!(require_exporter(false, None).unwrap(), None);
+        assert_eq!(
+            require_exporter(true, Some([7; 32])).unwrap(),
+            Some([7; 32])
+        );
+    }
+
+    #[test]
+    fn retry_after_supports_delta_and_date_and_is_capped() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert_eq!(
+            parse_retry_after(&HeaderValue::from_static("17"), now),
+            Some(17)
+        );
+        assert_eq!(
+            parse_retry_after(&HeaderValue::from_static("999999"), now),
+            Some(RECONNECT_MAX.as_secs())
+        );
+        let deadline = httpdate::fmt_http_date(now + Duration::from_secs(23));
+        assert_eq!(
+            parse_retry_after(&HeaderValue::from_str(&deadline).unwrap(), now),
+            Some(23)
+        );
+        assert_eq!(
+            parse_retry_after(&HeaderValue::from_static("invalid"), now),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn real_rustls_session_derives_the_same_exporter_on_both_ends() {
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+        let certificate = cert.der().clone();
+        let private_key = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], private_key.into())
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (exporter_sender, exporter_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let mut exporter = [0_u8; 32];
+            tls.get_ref()
+                .1
+                .export_keying_material(&mut exporter, EXPORTER_LABEL, None)
+                .unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(tls, select_test_subprotocol)
+                .await
+                .unwrap();
+            let _ = exporter_sender.send(exporter);
+            let _ = socket.next().await;
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        );
+        let connected = connect_with_exporter_config(
+            &format!("wss://127.0.0.1:{port}/t/v1/control"),
+            &[TUNNEL_SUBPROTOCOL.to_owned()],
+            CONTROL_MAX_BYTES,
+            Some(client_config),
+        )
+        .await
+        .unwrap();
+        let client_exporter = connected.exporter.expect("TLS exporter missing");
+        let server_exporter = exporter_receiver.await.unwrap();
+        assert_eq!(client_exporter, server_exporter);
+        assert_ne!(client_exporter, [0; 32]);
+        drop(connected);
+        server.await.unwrap();
     }
 
     #[test]

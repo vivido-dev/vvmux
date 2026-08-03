@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 
@@ -119,6 +121,16 @@ struct HarnessState {
     leg_sockets: Mutex<HashMap<u64, oneshot::Receiver<LegSocket>>>,
     /// The hostname this harness challenges with; the signature must match it.
     hostname: Mutex<String>,
+    /// Whether a control connection receives its initial challenge.
+    challenge_enabled: AtomicBool,
+    /// Control upgrade attempts, including rejected ones.
+    control_attempts: AtomicUsize,
+    control_attempt_times: Mutex<Vec<Instant>>,
+    /// Optional Retry-After value for the next control upgrade rejection.
+    reject_next_control: Mutex<Option<u64>>,
+    /// Optional deliberately incorrect enrollment response machine ID.
+    enrollment_machine_id_override: Mutex<Option<String>>,
+    last_enrollment_host: Mutex<Option<String>>,
 }
 
 pub struct TunnelHarness {
@@ -134,6 +146,7 @@ impl TunnelHarness {
             // The gateway signs the hostname from its connect URL; for loopback
             // tests that is "127.0.0.1", so that is the default here.
             hostname: Mutex::new("127.0.0.1".to_owned()),
+            challenge_enabled: AtomicBool::new(true),
             ..HarnessState::default()
         });
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
@@ -159,16 +172,38 @@ impl TunnelHarness {
         }
     }
 
-    pub fn url(&self) -> String {
-        format!("ws://{}/t/v1/control", self.addr)
-    }
-
     pub fn enroll_url(&self) -> String {
         format!("http://{}", self.addr)
     }
 
     pub fn set_hostname(&self, hostname: &str) {
         *self.state.hostname.lock().unwrap() = hostname.to_owned();
+    }
+
+    pub fn set_challenge_enabled(&self, enabled: bool) {
+        self.state
+            .challenge_enabled
+            .store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn control_attempts(&self) -> usize {
+        self.state.control_attempts.load(Ordering::SeqCst)
+    }
+
+    pub fn control_attempt_times(&self) -> Vec<Instant> {
+        self.state.control_attempt_times.lock().unwrap().clone()
+    }
+
+    pub fn reject_next_control(&self, retry_after_seconds: u64) {
+        *self.state.reject_next_control.lock().unwrap() = Some(retry_after_seconds);
+    }
+
+    pub fn set_enrollment_machine_id_override(&self, machine_id: &str) {
+        *self.state.enrollment_machine_id_override.lock().unwrap() = Some(machine_id.to_owned());
+    }
+
+    pub fn last_enrollment_host(&self) -> Option<String> {
+        self.state.last_enrollment_host.lock().unwrap().clone()
     }
 
     /// Wait for the gateway's next control frame.
@@ -237,6 +272,14 @@ impl TunnelHarness {
         }));
     }
 
+    pub fn close_leg(&self, leg_id: u64) {
+        self.send_control(serde_json::json!({
+            "type": "close_leg",
+            "leg_id": leg_id,
+            "reason": "test close",
+        }));
+    }
+
     /// Wait for the gateway's leg connection and take its server-side halves.
     pub async fn accept_leg(&self, leg_id: u64) -> LegSocket {
         loop {
@@ -281,8 +324,13 @@ fn random_ticket() -> String {
 
 async fn enroll_handler(
     axum::extract::State(state): axum::extract::State<Arc<HarnessState>>,
+    headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
+    *state.last_enrollment_host.lock().unwrap() = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let code = body
         .get("code")
         .and_then(|v| v.as_str())
@@ -319,9 +367,15 @@ async fn enroll_handler(
         .lock()
         .unwrap()
         .insert(machine_id.clone(), key);
+    let returned_machine_id = state
+        .enrollment_machine_id_override
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or(machine_id);
     (
         StatusCode::OK,
-        axum::Json(serde_json::json!({"machine_id": machine_id})),
+        axum::Json(serde_json::json!({"machine_id": returned_machine_id})),
     )
         .into_response()
 }
@@ -330,6 +384,20 @@ async fn control_upgrade(
     axum::extract::State(state): axum::extract::State<Arc<HarnessState>>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    state.control_attempts.fetch_add(1, Ordering::SeqCst);
+    state
+        .control_attempt_times
+        .lock()
+        .unwrap()
+        .push(Instant::now());
+    if let Some(seconds) = state.reject_next_control.lock().unwrap().take() {
+        let mut response = (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response();
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_str(&seconds.to_string()).unwrap(),
+        );
+        return response;
+    }
     ws.protocols(["vvtun.v1"])
         .max_frame_size(64 * 1024)
         .max_message_size(64 * 1024)
@@ -338,6 +406,10 @@ async fn control_upgrade(
 
 async fn control_session(state: Arc<HarnessState>, socket: WebSocket) {
     let (mut writer, mut reader) = socket.split();
+    if !state.challenge_enabled.load(Ordering::SeqCst) {
+        while reader.next().await.is_some() {}
+        return;
+    }
     // Challenge with a fresh nonce.
     let nonce = random_ticket();
     let hostname = state.hostname.lock().unwrap().clone();

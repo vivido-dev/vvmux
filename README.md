@@ -164,19 +164,23 @@ integration shape.
 
 ### Connect mode: serve from anywhere, without opening a port
 
-`vvmux serve --connect wss://host/t/v1/control` opens no listener at all. The gateway authenticates
-to a vvmux_server deployment with an enrolled Ed25519 identity and holds one outbound VVTUN/1
-tunnel; the deployment dials one additional leg per browser socket, and the same VVWS/1 and Vivid
-loops run on the legs. This is how a machine behind NAT becomes reachable from a browser anywhere.
+`vvmux serve --connect https://host --acknowledge-content-visible-gateway` opens no listener at
+all. The gateway authenticates to a vvmux_server deployment with an enrolled Ed25519 identity and
+holds one outbound VVTUN/1 tunnel; the deployment dials one additional leg per browser socket, and
+the same VVWS/1 and Vivid loops run on the legs. This is how a machine behind NAT becomes reachable
+from a browser anywhere.
 
 ```sh
-vvmux cloud enroll <code> --server https://vvmux.example
-vvmux serve --connect wss://vvmux.example/t/v1/control --allow-account 'https://accounts.google.com#1234567890'
+vvmux cloud enroll --server https://vvmux.example
+vvmux serve --connect https://vvmux.example --acknowledge-content-visible-gateway \
+  --allow-account 'https://accounts.google.com#1234567890'
 ```
 
-`vvmux cloud enroll` generates the identity, submits only the public key under a one-time code from
-the deployment's website, and stores the private key in an owner-only file. The private key never
-leaves the machine and never appears in argv, an environment variable, or a log.
+`vvmux cloud enroll` reads the one-time code from a no-echo prompt, generates the identity, submits
+only the public key, and stores the private key in an owner-only file. For automation,
+`--code-file PATH` reads a bounded one-line code from a file and `--code-file -` reads it from stdin.
+The code and private key never appear in argv, an environment variable, or a log. The identity path
+is reserved before the code is read or consumed.
 
 The tunnel gateway uses the tunnel-asserted VVWS authentication of
 [VVWS-1.md](VVWS-1.md) — the browser sends `{"type":"hello","protocol":1,"auth":"tunnel"}` and no
@@ -184,9 +188,11 @@ bearer token is involved. It advertises `tunnel-attached-v1`, and `session-kill-
 started with `--allow-kill`, which additionally enables the `kill_session` VVWS control.
 
 `--allow-account` is repeatable and bounds which authenticated accounts the deployment may present
-when opening legs; without it, any account is accepted. `ws://` is accepted for loopback
-development only; `wss://` is required across a host boundary. The tunnel reconnects with
-full-jittered exponential backoff and survives a deployment restart; sessions are untouched by
+when opening legs; without it, any account is accepted. The visibility acknowledgement is required
+for a non-loopback deployment because the relay necessarily sees terminal and media bytes. An
+`https://` deployment base is canonical; an exact `wss://.../t/v1/control` URL forces the WebSocket
+mapping. Plain `http://` or `ws://` is accepted for loopback development only. The tunnel reconnects
+with full-jittered exponential backoff and survives a deployment restart; sessions are untouched by
 tunnel loss, because the hidden session daemon is fully detached from the gateway. See
 [VVTUN-1.md](VVTUN-1.md) for the tunnel protocol.
 

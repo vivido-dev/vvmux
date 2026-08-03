@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 
 const IDENTITY_SCHEMA: u32 = 1;
 const MAX_IDENTITY_RECORD_BYTES: u64 = 16 * 1024;
+const MAX_ENROLL_CODE_BYTES: usize = 4 * 1024;
 /// The domain-separated prefix bound into every tunnel handshake signature.
 pub(crate) const AUTH_DOMAIN: &[u8] = b"vvmux tunnel auth v1\0";
 
@@ -50,34 +51,6 @@ impl MachineIdentity {
         })
     }
 
-    /// Write the identity to an owner-only record at `path`.
-    pub fn store(&self, path: &Path) -> io::Result<()> {
-        if path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("identity record {} already exists", path.display()),
-            ));
-        }
-        ensure_parent(path)?;
-        let record = IdentityRecord {
-            schema: IDENTITY_SCHEMA,
-            private_key: Zeroizing::new(
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.signing.to_bytes()),
-            ),
-        };
-        let encoded = serde_json::to_vec(&record).map_err(io::Error::other)?;
-        let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        let mut file = create_identity_file(&temporary)?;
-        let result = file.write_all(&encoded).and_then(|()| file.sync_all());
-        drop(file);
-        let result = result.and_then(|()| crate::runtime::atomic_replace(&temporary, path));
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result?;
-        validate_file(path)
-    }
-
     /// Generate a fresh identity, storing it with owner-only protection.
     #[cfg(test)]
     pub fn generate(path: &Path) -> io::Result<Self> {
@@ -95,16 +68,13 @@ impl MachineIdentity {
         let mut seed = Zeroizing::new([0_u8; 32]);
         getrandom::fill(seed.as_mut()).map_err(io::Error::other)?;
         let signing = SigningKey::from_bytes(&seed);
-        let record = IdentityRecord {
-            schema: IDENTITY_SCHEMA,
-            private_key: Zeroizing::new(
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.to_bytes()),
-            ),
-        };
-        let encoded = serde_json::to_vec(&record).map_err(io::Error::other)?;
+        let identity = Self { signing };
+        let encoded = identity.encoded_record()?;
         let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
         let mut file = create_identity_file(&temporary)?;
-        let result = file.write_all(&encoded).and_then(|()| file.sync_all());
+        let result = file
+            .write_all(encoded.as_slice())
+            .and_then(|()| file.sync_all());
         drop(file);
         let result = result.and_then(|()| crate::runtime::atomic_replace(&temporary, path));
         if result.is_err() {
@@ -112,7 +82,7 @@ impl MachineIdentity {
         }
         result?;
         validate_file(path)?;
-        Ok(Self { signing })
+        Ok(identity)
     }
 
     /// Load the stored identity, verifying the record and the file protections.
@@ -125,10 +95,10 @@ impl MachineIdentity {
                 "identity record exceeds 16 KiB",
             ));
         }
-        let mut bytes = Vec::with_capacity(length as usize);
+        let mut bytes = Zeroizing::new(Vec::with_capacity(length as usize));
         Read::by_ref(&mut file)
             .take(MAX_IDENTITY_RECORD_BYTES + 1)
-            .read_to_end(&mut bytes)?;
+            .read_to_end(bytes.as_mut())?;
         if bytes.len() as u64 > MAX_IDENTITY_RECORD_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -152,12 +122,25 @@ impl MachineIdentity {
                 .decode(record.private_key.as_str())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid private key"))?,
         );
-        let seed: [u8; 32] = seed.as_slice().try_into().map_err(|_| {
+        let seed: &[u8; 32] = seed.as_slice().try_into().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "private key must be 32 bytes")
         })?;
         Ok(Self {
-            signing: SigningKey::from_bytes(&seed),
+            signing: SigningKey::from_bytes(seed),
         })
+    }
+
+    fn encoded_record(&self) -> io::Result<Zeroizing<Vec<u8>>> {
+        let seed = Zeroizing::new(self.signing.to_bytes());
+        let record = IdentityRecord {
+            schema: IDENTITY_SCHEMA,
+            private_key: Zeroizing::new(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(seed.as_slice()),
+            ),
+        };
+        let mut encoded = Zeroizing::new(Vec::new());
+        serde_json::to_writer(&mut *encoded, &record).map_err(io::Error::other)?;
+        Ok(encoded)
     }
 
     /// The machine identifier presented in `machine_id`: the base64url public key.
@@ -183,6 +166,62 @@ impl MachineIdentity {
         message.extend_from_slice(self.machine_id().as_bytes());
         let signature = self.signing.sign(&message);
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    }
+}
+
+/// Race-free reservation of an identity destination. Creating this before the
+/// enrollment POST proves that no identity will be overwritten and prevents a
+/// concurrent enrollment from consuming another one-use code for the same path.
+pub(crate) struct IdentityReservation {
+    path: PathBuf,
+    file: Option<File>,
+    committed: bool,
+}
+
+impl IdentityReservation {
+    pub(crate) fn new(path: &Path) -> io::Result<Self> {
+        ensure_parent(path)?;
+        let file = create_identity_file(path).map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("identity record {} already exists", path.display()),
+                )
+            } else {
+                error
+            }
+        })?;
+        Ok(Self {
+            path: path.to_owned(),
+            file: Some(file),
+            committed: false,
+        })
+    }
+
+    pub(crate) fn store(mut self, identity: &MachineIdentity) -> io::Result<()> {
+        let encoded = identity.encoded_record()?;
+        let mut file = self
+            .file
+            .take()
+            .expect("identity reservation owns its file");
+        let result = file
+            .write_all(encoded.as_slice())
+            .and_then(|()| file.sync_all());
+        drop(file);
+        result?;
+        validate_file(&self.path)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for IdentityReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -378,6 +417,20 @@ mod tests {
     }
 
     #[test]
+    fn reservation_refuses_an_existing_record_and_removes_an_uncommitted_file() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("cloud-identity.json");
+        {
+            let _reservation = IdentityReservation::new(&path).unwrap();
+            assert!(path.exists());
+            assert!(IdentityReservation::new(&path).is_err());
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn stored_record_contains_no_private_material_in_plaintext_fields() {
         let directory = tempfile::tempdir().unwrap();
         #[cfg(unix)]
@@ -398,11 +451,80 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Enrollment: `vvmux cloud enroll <code> --server <url>`
+// Enrollment: `vvmux cloud enroll --server <url>`
 // ---------------------------------------------------------------------------
 
 const ENROLL_PATH: &str = "/api/v1/machines/enroll";
 const MAX_ENROLL_RESPONSE_BYTES: usize = 64 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollResponse {
+    machine_id: String,
+}
+
+#[derive(Serialize)]
+struct EnrollRequest<'a> {
+    code: &'a str,
+    public_key: &'a str,
+}
+
+/// Obtain a one-use enrollment code without accepting it through argv or the
+/// environment. `--code-file -` is the explicit automation form for stdin.
+pub(crate) fn read_enrollment_code(path: Option<&Path>) -> io::Result<Zeroizing<String>> {
+    let code = match path {
+        None => Zeroizing::new(
+            rpassword::prompt_password("Enrollment code: ")
+                .map_err(|error| io::Error::new(error.kind(), "could not read enrollment code"))?,
+        ),
+        Some(path) if path == Path::new("-") => read_bounded_code(io::stdin().lock())?,
+        Some(path) => read_bounded_code(File::open(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not open enrollment code file {}", path.display()),
+            )
+        })?)?,
+    };
+    normalize_enrollment_code(code)
+}
+
+fn read_bounded_code(mut reader: impl Read) -> io::Result<Zeroizing<String>> {
+    let mut code = Zeroizing::new(String::new());
+    reader
+        .by_ref()
+        .take((MAX_ENROLL_CODE_BYTES + 1) as u64)
+        .read_to_string(&mut code)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "enrollment code is not UTF-8"))?;
+    Ok(code)
+}
+
+fn normalize_enrollment_code(mut code: Zeroizing<String>) -> io::Result<Zeroizing<String>> {
+    while code.ends_with('\r') || code.ends_with('\n') {
+        code.pop();
+    }
+    if code.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "enrollment code is empty",
+        ));
+    }
+    if code.len() > MAX_ENROLL_CODE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "enrollment code exceeds 4 KiB",
+        ));
+    }
+    if code
+        .chars()
+        .any(|character| matches!(character, '\r' | '\n' | '\0'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "enrollment code must be one line",
+        ));
+    }
+    Ok(code)
+}
 
 /// Register `public_key` with the server under a one-time `code`.
 ///
@@ -419,11 +541,21 @@ pub(crate) fn enroll(server: &str, code: &str, public_key: &VerifyingKey) -> io:
             format!("invalid --server URL: {error}"),
         )
     })?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--server must not contain credentials, a query, or a fragment",
+        ));
+    }
     let tls = match parsed.scheme() {
         "https" => true,
         "http" => {
             let host = parsed.host_str().unwrap_or_default();
-            if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+            if !is_loopback_host(host) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "http:// is accepted for loopback development only; use https:// across a host boundary",
@@ -451,12 +583,25 @@ pub(crate) fn enroll(server: &str, code: &str, public_key: &VerifyingKey) -> io:
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--server URL has no port"))?;
+    let authority = match parsed.host() {
+        Some(url::Host::Ipv6(_)) if parsed.port().is_some() => format!("[{host}]:{port}"),
+        Some(url::Host::Ipv6(_)) => format!("[{host}]"),
+        Some(_) if parsed.port().is_some() => format!("{host}:{port}"),
+        Some(_) => host.clone(),
+        None => unreachable!("host_str was checked above"),
+    };
 
-    let body = serde_json::json!({
-        "code": code,
-        "public_key": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_key.to_bytes()),
-    });
-    let body = serde_json::to_vec(&body).map_err(io::Error::other)?;
+    let expected_machine_id =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_key.to_bytes());
+    let mut body = Zeroizing::new(Vec::new());
+    serde_json::to_writer(
+        &mut *body,
+        &EnrollRequest {
+            code,
+            public_key: &expected_machine_id,
+        },
+    )
+    .map_err(io::Error::other)?;
 
     use std::net::ToSocketAddrs as _;
     let address = (host.as_str(), port)
@@ -489,9 +634,13 @@ pub(crate) fn enroll(server: &str, code: &str, public_key: &VerifyingKey) -> io:
             roots.add(cert).map_err(io::Error::other)?;
         }
         let config = Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
         );
         let server_name = rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid server hostname"))?
@@ -504,7 +653,7 @@ pub(crate) fn enroll(server: &str, code: &str, public_key: &VerifyingKey) -> io:
     };
     write!(
         stream,
-        "POST {ENROLL_PATH} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {ENROLL_PATH} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .map_err(io::Error::other)?;
@@ -519,15 +668,34 @@ pub(crate) fn enroll(server: &str, code: &str, public_key: &VerifyingKey) -> io:
             "enrollment server used chunked encoding, which is not supported",
         ));
     }
-    let body = reader.read_body(content_length)?;
+    let body = Zeroizing::new(reader.read_body(content_length)?);
     if status != 200 {
-        let detail = String::from_utf8_lossy(&body);
+        // The peer controls the body and could reflect the one-use code. Never
+        // include it in the CLI error or a log.
         return Err(io::Error::other(format!(
-            "enrollment refused with HTTP {status}: {}",
-            detail.trim()
+            "enrollment refused with HTTP {status}"
         )));
     }
+    let response: EnrollResponse = serde_json::from_slice(&body).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid enrollment response: {error}"),
+        )
+    })?;
+    if response.machine_id != expected_machine_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "enrollment server returned a machine ID for a different public key",
+        ));
+    }
     Ok(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// The enrollment connection, plain or TLS, so the two stream types share one path.
@@ -669,10 +837,11 @@ impl<S: std::io::Read> ResponseReader<S> {
             None => {
                 // Read until EOF, bounded.
                 loop {
-                    match self.stream.read(&mut [0_u8; 4096]) {
+                    let mut buffer = [0_u8; 4096];
+                    match self.stream.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(count) => {
-                            self.pending.extend_from_slice(&[0_u8; 4096][..count]);
+                            self.pending.extend_from_slice(&buffer[..count]);
                             if self.pending.len() > MAX_ENROLL_RESPONSE_BYTES {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
@@ -699,6 +868,9 @@ mod enroll_tests {
         assert!(enroll("ftp://vvmux.example", "code", &key).is_err());
         assert!(enroll("http://vvmux.example", "code", &key).is_err());
         assert!(enroll("https://vvmux.example/path", "code", &key).is_err());
+        assert!(enroll("https://user@vvmux.example", "code", &key).is_err());
+        assert!(enroll("https://vvmux.example?code=secret", "code", &key).is_err());
+        assert!(enroll("https://vvmux.example/#fragment", "code", &key).is_err());
     }
 
     #[test]
@@ -715,5 +887,40 @@ mod enroll_tests {
         assert_eq!(length, Some(2));
         assert!(!chunked);
         assert_eq!(reader.read_body(length).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn response_reader_preserves_a_body_without_content_length() {
+        let mut reader = ResponseReader {
+            stream: std::io::Cursor::new(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"machine_id\":\"abc\"}"
+                    .to_vec(),
+            ),
+            pending: Vec::new(),
+        };
+        assert_eq!(reader.read_status().unwrap(), 200);
+        let (length, chunked) = reader.read_headers().unwrap();
+        assert_eq!(length, None);
+        assert!(!chunked);
+        assert_eq!(
+            reader.read_body(length).unwrap(),
+            br#"{"machine_id":"abc"}"#
+        );
+    }
+
+    #[test]
+    fn enrollment_code_is_bounded_and_single_line() {
+        assert_eq!(
+            normalize_enrollment_code(Zeroizing::new("one-use\r\n".to_owned()))
+                .unwrap()
+                .as_str(),
+            "one-use"
+        );
+        assert!(normalize_enrollment_code(Zeroizing::new(String::new())).is_err());
+        assert!(normalize_enrollment_code(Zeroizing::new("one\ntwo".to_owned())).is_err());
+        assert!(
+            normalize_enrollment_code(Zeroizing::new("x".repeat(MAX_ENROLL_CODE_BYTES + 1)))
+                .is_err()
+        );
     }
 }

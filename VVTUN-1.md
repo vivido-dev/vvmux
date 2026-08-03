@@ -9,9 +9,14 @@ on the machine. The gateway dials out; the server never dials in.
 The control tunnel is `GET /t/v1/control` over WebSocket with the `vvtun.v1` subprotocol. A data
 leg is `GET /t/v1/leg` with the subprotocols `vvtun.leg.v1` and `vvtun.ticket.<BASE64URL_TICKET>`.
 
-TLS is mandatory across a host boundary. `wss://` is the only scheme accepted for a non-loopback
-host. `ws://` is accepted for loopback addresses only, for development and testing; a `ws://`
-tunnel has no TLS exporter and the handshake signature covers an empty exporter.
+TLS is mandatory across a host boundary. The canonical CLI input is a bare `https://host[:port]`
+deployment base, from which the gateway derives the W3 `wss://` endpoints. An exact
+`wss://host[:port]/t/v1/control` URL explicitly forces this mapping. Plain `http://` or `ws://` is
+accepted for loopback addresses only, for development and testing. Connect URLs reject credentials,
+queries, fragments, and unexpected paths. A public connect also requires the explicit
+`--acknowledge-content-visible-gateway` flag because the relay can observe terminal and media bytes.
+A loopback plaintext tunnel has no TLS exporter and its handshake signature covers an empty
+exporter.
 
 The gateway connects with its enrolled identity: an Ed25519 key pair stored in an owner-only file
 (`cloud-identity.json`). Only the public key leaves the machine.
@@ -47,6 +52,9 @@ so the two bindings can never be confused. The server verifies the
 signature against the enrolled public key for `machine_id`, in constant time, and rejects the
 connection on any mismatch, indistinguishably from an unknown machine.
 
+Exporter derivation is mandatory on every TLS tunnel. If rustls cannot derive exactly 32 bytes, the
+gateway fails the connection; it must never substitute the loopback empty binding on `wss://`.
+
 Because `hostname` and `exporter` are inside the signed payload, a signature captured from one
 deployment or one TLS session cannot be replayed to another.
 
@@ -57,6 +65,9 @@ On success the server replies:
 ```
 
 `reconnect_after_seconds` is a scheduling hint for a planned drain; it is never an order.
+
+Both the initial `challenge` wait and the subsequent `authed` wait have a 10-second deadline. A peer
+cannot retain an unauthenticated gateway task by completing the upgrade and then remaining silent.
 
 The gateway then sends `machine_status`:
 
@@ -99,8 +110,8 @@ A peer that misses three consecutive intervals is dead at 90 seconds: the gatewa
 tunnel and reconnects; the server marks the machine offline. The gateway reconnects with
 full-jittered exponential backoff, a uniform random delay in `[0, cap]` with the cap doubling from
 1 second to 60 seconds. When the server answers a connection attempt with `503` and
-`Retry-After`, the gateway treats the header as its next delay, capped at 60 seconds, rather than
-as a generic failure.
+`Retry-After`, the gateway parses either delta-seconds or an HTTP date and treats it as its next
+delay, capped at 60 seconds, rather than as a generic failure.
 
 ## Legs
 
@@ -142,7 +153,10 @@ frames on a leg are a protocol error. Byte zero after admission is the first byt
 socket's stream.
 
 A gateway bounds its legs: at most 32 open legs per tunnel. A leg beyond the bound is answered
-with `leg_failed{code:"capacity"}`. The gateway closes a leg promptly when `close_leg` arrives,
+with `leg_failed{code:"capacity"}`. A `leg_id` is unique for the lifetime of one authenticated tunnel
+generation; any reuse is rejected with `leg_failed{code:"invalid_request"}` without replacing or
+cancelling the original. The same numeric ID in another generation is independent. The gateway
+closes a leg promptly when `close_leg` arrives,
 when its browser peer closes, or when its side of the VVWS or Vivid loop ends, and it must tear
 down the VVMX attachment the leg carried so that a later attach is not refused as occupied.
 
@@ -175,6 +189,9 @@ POST /api/v1/machines/enroll
 ```
 
 The server mints one-time codes and stores only hashes. Enrollment is refused for an expired,
-reused, or unknown code. The gateway generates its key, submits the public key, and on success
-writes the identity file; the private key never leaves the machine and never appears in argv, an
-environment variable, or a log.
+reused, or unknown code. Before reading or redeeming a code, the gateway race-safely reserves the
+owner-only identity destination. It reads the code from a no-echo prompt or explicit bounded
+file/stdin source, never argv or the environment. The gateway generates its key, submits the public
+key, verifies that the returned `machine_id` is exactly that public key, and then commits the
+reserved identity file. The enrollment code and private key never leave their intended channels or
+appear in argv, an environment variable, or a log; transient private-key buffers are zeroized.
