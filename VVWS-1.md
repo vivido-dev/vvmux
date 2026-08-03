@@ -241,15 +241,9 @@ strings with `TextEncoder`, and send `resize` from the fit/resize handler. Title
 status, errors, and lifecycle events are handled from JSON text frames. vvmux does not serve HTML,
 JavaScript, or other client assets.
 
-Vivido.js applications can use its built-in coordinator:
-
-```ts
-const gateway = await terminal.connectVvmux({
-  url: 'ws://127.0.0.1:7880/v1/ws',
-  token
-});
-await gateway.attach('work');
-```
-
-This keeps ANSI on VVWS and routes the advertised Vivid WebSockets into Vivido.js's existing Vivid
-presenter. Set `vivid: false` on the connection or attach options for a text-only client.
+The vvmux_server web frontend (`vvmux_server/web`) is the maintained browser coordinator: it owns
+the VVWS hello, the advertised Vivid WebSockets or WebTransport session, and attach/reattach. Over
+a public tunnel leg it uses the `auth: "tunnel"` form above; the loopback development path may use
+the bearer token form. Text-only clients send the same JSON hello and ignore the `vivid` block.
+The retired vivido.js `connectVvmux` API is gone with its submodule; no client asset is served by
+this gateway.
