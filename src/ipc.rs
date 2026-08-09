@@ -108,6 +108,14 @@ pub enum AutomationMethod {
         row_count: Option<u16>,
         since_screen: Option<u64>,
     },
+    Search {
+        pattern: String,
+        regex: bool,
+        direction: crate::search::SearchDirection,
+        start_line: Option<isize>,
+        start_column: Option<usize>,
+        limit: u16,
+    },
     WaitText {
         text: String,
         regex: bool,

@@ -554,6 +554,43 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
                 .any(|window| window == b"VVWS_GATEWAY_OK")
         );
 
+        // The browser transport must drive the same copy-search path as a local client. Keep the
+        // prefix and prompt in separate frames so the actor observes entry into copy mode before
+        // it receives prompt input.
+        socket
+            .send(Message::Binary(b"\x02[".to_vec().into()))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Binary(b"/VVWS_GATEWAY_OK\r".to_vec().into()))
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let copy = loop {
+            let inspected = command(executable, &runtime_root, &config_root)
+                .args(["msg", "--target", &session, "inspect", "--pane-id", "1"])
+                .output()
+                .unwrap();
+            if inspected.status.success() {
+                let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+                if inspected["pane"]["copy"]["search_query"] == "VVWS_GATEWAY_OK" {
+                    break inspected["pane"]["copy"].clone();
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "gateway copy search never became observable through inspect"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(copy["offset"].as_u64().is_some());
+        assert!(copy["row"].as_u64().is_some());
+        assert!(copy["column"].as_u64().is_some());
+        socket
+            .send(Message::Binary(b"q".to_vec().into()))
+            .await
+            .unwrap();
+
         socket
             .send(Message::Text(
                 serde_json::json!({

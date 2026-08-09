@@ -122,6 +122,10 @@ pub struct Theme {
     pub frame_background: Option<ThemeColor>,
     pub status_foreground: Option<ThemeColor>,
     pub status_background: Option<ThemeColor>,
+    pub search_match_foreground: Option<ThemeColor>,
+    pub search_match_background: Option<ThemeColor>,
+    pub search_current_foreground: Option<ThemeColor>,
+    pub search_current_background: Option<ThemeColor>,
     /// Whether the status bar paints its background across the full width. Without it the bar is
     /// only as wide as its text, which looks broken against a colored background.
     pub status_fill: Option<bool>,
@@ -137,6 +141,10 @@ pub struct ResolvedTheme {
     pub frame_background: TerminalColor,
     pub status_foreground: TerminalColor,
     pub status_background: TerminalColor,
+    pub search_match_foreground: TerminalColor,
+    pub search_match_background: TerminalColor,
+    pub search_current_foreground: TerminalColor,
+    pub search_current_background: TerminalColor,
     pub status_fill: bool,
 }
 
@@ -163,6 +171,20 @@ impl ResolvedTheme {
             background: self.status_background,
         }
     }
+
+    pub fn search_match(&self) -> TextStyle {
+        TextStyle {
+            foreground: self.search_match_foreground,
+            background: self.search_match_background,
+        }
+    }
+
+    pub fn search_current(&self) -> TextStyle {
+        TextStyle {
+            foreground: self.search_current_foreground,
+            background: self.search_current_background,
+        }
+    }
 }
 
 /// The built-in look: exactly the colors vvmux used before themes existed.
@@ -175,6 +197,10 @@ fn base() -> ResolvedTheme {
         frame_background: TerminalColor::Default,
         status_foreground: TerminalColor::Indexed(15),
         status_background: TerminalColor::Indexed(4),
+        search_match_foreground: TerminalColor::Indexed(0),
+        search_match_background: TerminalColor::Indexed(11),
+        search_current_foreground: TerminalColor::Indexed(15),
+        search_current_background: TerminalColor::Indexed(5),
         status_fill: true,
     }
 }
@@ -196,6 +222,10 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             frame_background: TerminalColor::Default,
             status_foreground: TerminalColor::Indexed(0),
             status_background: TerminalColor::Indexed(7),
+            search_match_foreground: TerminalColor::Indexed(0),
+            search_match_background: TerminalColor::Indexed(7),
+            search_current_foreground: TerminalColor::Indexed(15),
+            search_current_background: TerminalColor::Indexed(8),
             status_fill: true,
         },
         "nord" => ResolvedTheme {
@@ -206,6 +236,10 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             frame_background: TerminalColor::Default,
             status_foreground: rgb(0xec, 0xef, 0xf4),
             status_background: rgb(0x3b, 0x42, 0x52),
+            search_match_foreground: rgb(0x2e, 0x34, 0x40),
+            search_match_background: rgb(0xeb, 0xcb, 0x8b),
+            search_current_foreground: rgb(0x2e, 0x34, 0x40),
+            search_current_background: rgb(0xd0, 0x87, 0x70),
             status_fill: true,
         },
         "solarized-dark" => ResolvedTheme {
@@ -216,6 +250,10 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             frame_background: TerminalColor::Default,
             status_foreground: rgb(0x93, 0xa1, 0xa1),
             status_background: rgb(0x07, 0x36, 0x42),
+            search_match_foreground: rgb(0x00, 0x2b, 0x36),
+            search_match_background: rgb(0xb5, 0x89, 0x00),
+            search_current_foreground: rgb(0x00, 0x2b, 0x36),
+            search_current_background: rgb(0xcb, 0x4b, 0x16),
             status_fill: true,
         },
         "gruvbox-dark" => ResolvedTheme {
@@ -226,6 +264,10 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             frame_background: TerminalColor::Default,
             status_foreground: rgb(0xeb, 0xdb, 0xb2),
             status_background: rgb(0x3c, 0x38, 0x36),
+            search_match_foreground: rgb(0x28, 0x28, 0x28),
+            search_match_background: rgb(0xfa, 0xbd, 0x2f),
+            search_current_foreground: rgb(0x28, 0x28, 0x28),
+            search_current_background: rgb(0xfe, 0x80, 0x19),
             status_fill: true,
         },
         _ => return None,
@@ -276,6 +318,26 @@ pub fn resolve(theme: &Theme, appearance: &Appearance) -> ResolvedTheme {
         theme.status_background,
         legacy(appearance.status_background),
         resolved.status_background,
+    );
+    resolved.search_match_foreground = pick(
+        theme.search_match_foreground,
+        None,
+        resolved.search_match_foreground,
+    );
+    resolved.search_match_background = pick(
+        theme.search_match_background,
+        None,
+        resolved.search_match_background,
+    );
+    resolved.search_current_foreground = pick(
+        theme.search_current_foreground,
+        None,
+        resolved.search_current_foreground,
+    );
+    resolved.search_current_background = pick(
+        theme.search_current_background,
+        None,
+        resolved.search_current_background,
     );
     resolved.status_fill = theme.status_fill.unwrap_or(resolved.status_fill);
     resolved
@@ -335,6 +397,11 @@ mod tests {
         assert_eq!(resolved.inactive_frame, TerminalColor::Indexed(8));
         assert_eq!(resolved.status_foreground, TerminalColor::Indexed(15));
         assert_eq!(resolved.status_background, TerminalColor::Indexed(4));
+        assert_eq!(resolved.search_match_background, TerminalColor::Indexed(11));
+        assert_eq!(
+            resolved.search_current_background,
+            TerminalColor::Indexed(5)
+        );
         assert_eq!(resolved.frame_background, TerminalColor::Default);
         assert_eq!(
             resolved.active_title, resolved.active_frame,
@@ -374,6 +441,7 @@ mod tests {
         let theme = Theme {
             preset: Some("nord".into()),
             active_frame: Some(ThemeColor(TerminalColor::Rgb(1, 2, 3))),
+            search_current_background: Some(ThemeColor(TerminalColor::Rgb(4, 5, 6))),
             ..Theme::default()
         };
         let resolved = resolve(&theme, &appearance);
@@ -392,6 +460,10 @@ mod tests {
             resolved.status_background,
             preset("nord").unwrap().status_background,
             "the preset supplies what neither section set"
+        );
+        assert_eq!(
+            resolved.search_current_background,
+            TerminalColor::Rgb(4, 5, 6)
         );
     }
 

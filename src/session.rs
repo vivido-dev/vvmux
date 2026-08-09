@@ -27,6 +27,10 @@ use crate::media_trace::{MediaKeyframeStage, MediaTraceFilter, MediaTraceJournal
 use crate::platform::VirtualPresenterEndpoint;
 use crate::region::{FixedRect, from_cells, intersect, subtract_all};
 use crate::screen::{ScreenBuffer, ansi_diff};
+use crate::search::{
+    PromptAction, SearchDirection, SearchMatch, SearchPattern, apply_prompt_key, find_all,
+    find_next, find_on_line, row_text_with_columns,
+};
 
 const EVENT_QUEUE: usize = 1024;
 /// Slots on the dedicated media-event receiver.
@@ -259,6 +263,16 @@ struct CopyState {
     row: usize,
     column: usize,
     selection_start: Option<(isize, usize)>,
+    search: Option<CopySearch>,
+    matches: Vec<SearchMatch>,
+    current: Option<SearchMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopySearch {
+    prompt: Option<String>,
+    direction: SearchDirection,
+    query: String,
 }
 
 struct Tab {
@@ -585,6 +599,7 @@ struct SessionActor {
     next_pane_id: PaneId,
     next_tab_id: u64,
     copy_buffer: Vec<u8>,
+    search_pattern: Option<(String, SearchPattern)>,
     frame_id: u64,
     last_screen: Option<ScreenBuffer>,
     #[cfg(windows)]
@@ -728,6 +743,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         next_pane_id: 1,
         next_tab_id: 1,
         copy_buffer: Vec::new(),
+        search_pattern: None,
         frame_id: 0,
         last_screen: None,
         #[cfg(windows)]
@@ -1740,6 +1756,39 @@ impl SessionActor {
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
+            AutomationMethod::Search {
+                pattern,
+                regex,
+                direction,
+                start_line,
+                start_column,
+                limit,
+            } => {
+                let pane = &self.panes[&pane_id.unwrap()];
+                match crate::search::compile(&pattern, regex, true) {
+                    Ok(compiled) => {
+                        let (matches, truncated) = automation_search(
+                            &pane.terminal,
+                            &compiled,
+                            direction,
+                            start_line,
+                            start_column,
+                            usize::from(limit),
+                        );
+                        self.reply_automation(
+                            target,
+                            serde_json::json!({
+                                "matches": matches,
+                                "truncated": truncated,
+                            }),
+                        );
+                    }
+                    Err(error) => self.reply_automation_error(
+                        target,
+                        AutomationError::new("invalid_params", error),
+                    ),
+                }
+            }
             AutomationMethod::WaitText {
                 text,
                 regex,
@@ -2255,6 +2304,12 @@ impl SessionActor {
             "history_size": pane.terminal.history_len(),
             "display_offset": pane.copy.as_ref().map_or(0, |copy| copy.offset),
             "copy_mode": pane.copy.is_some(),
+            "copy": pane.copy.as_ref().map(|copy| serde_json::json!({
+                "offset": copy.offset,
+                "row": copy.row,
+                "column": copy.column,
+                "search_query": copy.search.as_ref().map(|search| search.query.as_str()),
+            })),
             "cursor": { "row": cursor.0, "column": cursor.1, "visible": pane.terminal.modes().cursor_visible },
             "modes": terminal_mode_names(pane.terminal.modes()),
             "screen": if pane.terminal.alternate_screen() { "alternate" } else { "primary" },
@@ -2863,6 +2918,9 @@ impl SessionActor {
                     row: 0,
                     column: 0,
                     selection_start: None,
+                    search: None,
+                    matches: Vec::new(),
+                    current: None,
                 });
                 if mouse.button == 0 {
                     copy.offset = (copy.offset + 3).min(pane.terminal.history_len());
@@ -3096,6 +3154,9 @@ impl SessionActor {
                         row: rows.saturating_sub(1),
                         column: 0,
                         selection_start: None,
+                        search: None,
+                        matches: Vec::new(),
+                        current: None,
                     });
                     self.mark_pane_screen_change(pane_id, None);
                     self.schedule_render();
@@ -3837,6 +3898,12 @@ impl SessionActor {
                     .title()
                     .map_or_else(|| format!("pane {}", pane.id), ToOwned::to_owned);
                 let copy_suffix = pane.copy.as_ref().map(|_| " [copy]").unwrap_or("");
+                let search_suffix = pane
+                    .copy
+                    .as_ref()
+                    .and_then(|copy| copy.search.as_ref())
+                    .filter(|search| !search.query.is_empty())
+                    .map_or_else(String::new, |search| format!(" [search: {}]", search.query));
                 let pin_suffix = if projection.layer == PaneLayer::Pinned {
                     " [pin]"
                 } else {
@@ -3847,12 +3914,36 @@ impl SessionActor {
                 let exit_suffix = pane.exit_status.map(|_| " [exited]").unwrap_or("");
                 screen.draw_frame(
                     projection.outer,
-                    &format!(" {title}{copy_suffix}{pin_suffix}{exit_suffix} "),
+                    &format!(" {title}{copy_suffix}{search_suffix}{pin_suffix}{exit_suffix} "),
                     theme.frame(active),
                 );
                 let content = projection.content;
                 let offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
                 screen.draw_terminal(content, &pane.terminal, offset);
+                if let Some(copy) = &pane.copy {
+                    for found in &copy.matches {
+                        let row = found.line + copy.offset as isize;
+                        if row < 0 || row >= usize::from(content.height) as isize {
+                            continue;
+                        }
+                        let start = found.start_column.min(usize::from(content.width));
+                        let width = found
+                            .end_column
+                            .saturating_sub(found.start_column)
+                            .min(usize::from(content.width).saturating_sub(start));
+                        let style = if copy.current == Some(*found) {
+                            theme.search_current()
+                        } else {
+                            theme.search_match()
+                        };
+                        screen.restyle(
+                            content.x.saturating_add(start as u16),
+                            content.y.saturating_add(row as u16),
+                            width as u16,
+                            style,
+                        );
+                    }
+                }
                 if active {
                     if let Some(copy) = &pane.copy {
                         cursor = Some((
@@ -3896,16 +3987,33 @@ impl SessionActor {
                 .active_tab()
                 .and_then(|tab| tab.name.as_deref())
                 .map_or_else(String::new, |name| format!(" ({name})"));
-            let status = format!(
-                " vvmux:{}  tab {}/{}{} (id:{})  panes:{}  rev:{} ",
-                self.name,
-                tab_number,
-                self.tabs.len(),
-                tab_name,
-                tab_id,
-                self.panes.len(),
-                self.layout_revision
-            );
+            let prompt = self.active_tab().and_then(|tab| {
+                self.panes
+                    .get(&tab.focused)
+                    .and_then(|pane| pane.copy.as_ref())
+                    .and_then(|copy| copy.search.as_ref())
+                    .and_then(|search| {
+                        search.prompt.as_ref().map(|prompt| {
+                            let leader = match search.direction {
+                                SearchDirection::Forward => '/',
+                                SearchDirection::Backward => '?',
+                            };
+                            format!("{leader}{prompt}")
+                        })
+                    })
+            });
+            let status = prompt.unwrap_or_else(|| {
+                format!(
+                    " vvmux:{}  tab {}/{}{} (id:{})  panes:{}  rev:{} ",
+                    self.name,
+                    tab_number,
+                    self.tabs.len(),
+                    tab_name,
+                    tab_id,
+                    self.panes.len(),
+                    self.layout_revision
+                )
+            });
             let style = theme.status();
             let row = screen.rows - 1;
             if theme.status_fill {
@@ -3914,6 +4022,12 @@ impl SessionActor {
                 screen.fill_row(row, style);
             }
             screen.draw_text(0, row, &status, style);
+            if status.starts_with('/') || status.starts_with('?') {
+                screen.cursor = Some((
+                    status.chars().count().min(usize::from(screen.columns - 1)) as u16,
+                    row,
+                ));
+            }
         }
         self.frame_id = self.frame_id.wrapping_add(1);
         // Mutated only by the Windows bracketed-paste prepend below.
@@ -4475,14 +4589,102 @@ impl SessionActor {
     }
 
     fn copy_input(&mut self, pane_id: PaneId, bytes: &[u8]) {
-        let remapped = copy_chord_name(bytes)
+        let prompt_active = self.panes.get(&pane_id).is_some_and(|pane| {
+            pane.copy
+                .as_ref()
+                .and_then(|copy| copy.search.as_ref())
+                .is_some_and(|search| search.prompt.is_some())
+        });
+        if !prompt_active && bytes.len() > 1 && matches!(bytes.first(), Some(b'/') | Some(b'?')) {
+            self.copy_input(pane_id, &bytes[..1]);
+            self.copy_input(pane_id, &bytes[1..]);
+            return;
+        }
+        let remapped = (!prompt_active)
+            .then(|| copy_chord_name(bytes))
+            .flatten()
             .and_then(|chord| self.config.keys.copy.get(chord))
             .and_then(|action| copy_action_bytes(action));
         let bytes = remapped.as_deref().unwrap_or(bytes);
+        let Some(previous) = self.panes.get(&pane_id).and_then(|pane| pane.copy.clone()) else {
+            return;
+        };
+
+        if prompt_active {
+            let (action, direction) = {
+                let pane = self.panes.get_mut(&pane_id).unwrap();
+                let copy = pane.copy.as_mut().unwrap();
+                let search = copy.search.as_mut().unwrap();
+                let action = apply_prompt_key(search.prompt.as_mut().unwrap(), bytes);
+                (action, search.direction)
+            };
+            match action {
+                PromptAction::Editing => {}
+                PromptAction::Cancel => {
+                    if let Some(search) = self
+                        .panes
+                        .get_mut(&pane_id)
+                        .unwrap()
+                        .copy
+                        .as_mut()
+                        .and_then(|copy| copy.search.as_mut())
+                    {
+                        search.prompt = None;
+                    }
+                }
+                PromptAction::Submit(query) => match crate::search::compile(&query, true, true) {
+                    Ok(pattern) => {
+                        self.search_pattern = Some((query.clone(), pattern));
+                        let from = {
+                            let copy = self.panes[&pane_id].copy.as_ref().unwrap();
+                            (copy.row as isize - copy.offset as isize, copy.column)
+                        };
+                        let found = {
+                            let pane = &self.panes[&pane_id];
+                            find_next(
+                                &pane.terminal,
+                                &self.search_pattern.as_ref().unwrap().1,
+                                from,
+                                direction,
+                                true,
+                            )
+                        };
+                        let pane = &mut self.panes.get_mut(&pane_id).unwrap();
+                        let copy = pane.copy.as_mut().unwrap();
+                        let search = copy.search.as_mut().unwrap();
+                        search.prompt = None;
+                        search.query = query;
+                        if let Some(found) = found {
+                            copy_jump_to(pane, &self.search_pattern.as_ref().unwrap().1, found);
+                        } else {
+                            copy.current = None;
+                            copy.matches.clear();
+                            self.status("search pattern not found");
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(search) = self
+                            .panes
+                            .get_mut(&pane_id)
+                            .unwrap()
+                            .copy
+                            .as_mut()
+                            .and_then(|copy| copy.search.as_mut())
+                        {
+                            search.prompt = None;
+                        }
+                        self.status(&format!("invalid search pattern: {error}"));
+                    }
+                },
+            }
+            self.finish_copy_input(pane_id, previous);
+            return;
+        }
+
+        let mut search_not_found = false;
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             return;
         };
-        let previous = pane.copy.clone();
         let Some(copy) = &mut pane.copy else {
             return;
         };
@@ -4510,6 +4712,74 @@ impl SessionActor {
                 copy.offset = (copy.offset + rows).min(pane.terminal.history_len());
             }
             b"\x1b[6~" => copy.offset = copy.offset.saturating_sub(rows),
+            b"/" | b"?" => {
+                copy.search = Some(CopySearch {
+                    prompt: Some(String::new()),
+                    direction: if bytes == b"/" {
+                        SearchDirection::Forward
+                    } else {
+                        SearchDirection::Backward
+                    },
+                    query: copy
+                        .search
+                        .as_ref()
+                        .map_or_else(String::new, |search| search.query.clone()),
+                });
+            }
+            b"n" | b"N" => {
+                let Some(search) = copy.search.as_ref() else {
+                    self.status("no search query");
+                    self.finish_copy_input(pane_id, previous);
+                    return;
+                };
+                if search.query.is_empty() {
+                    self.status("no search query");
+                    self.finish_copy_input(pane_id, previous);
+                    return;
+                }
+                let direction = if bytes == b"n" {
+                    search.direction
+                } else {
+                    search.direction.opposite()
+                };
+                let query = search.query.clone();
+                let current = copy.current;
+                let from = current.map_or(
+                    (copy.row as isize - copy.offset as isize, copy.column),
+                    |found| match direction {
+                        SearchDirection::Forward => (found.line, found.end_column),
+                        SearchDirection::Backward => {
+                            (found.line, found.start_column.saturating_sub(1))
+                        }
+                    },
+                );
+                let needs_compile = self
+                    .search_pattern
+                    .as_ref()
+                    .is_none_or(|(compiled, _)| compiled != &query);
+                if needs_compile {
+                    match crate::search::compile(&query, true, true) {
+                        Ok(pattern) => self.search_pattern = Some((query, pattern)),
+                        Err(error) => {
+                            self.status(&format!("invalid search pattern: {error}"));
+                            self.finish_copy_input(pane_id, previous);
+                            return;
+                        }
+                    }
+                }
+                let found = find_next(
+                    &pane.terminal,
+                    &self.search_pattern.as_ref().unwrap().1,
+                    from,
+                    direction,
+                    true,
+                );
+                if let Some(found) = found {
+                    copy_jump_to(pane, &self.search_pattern.as_ref().unwrap().1, found);
+                } else {
+                    search_not_found = true;
+                }
+            }
             b" " => {
                 copy.selection_start =
                     Some((copy.row as isize - copy.offset as isize, copy.column));
@@ -4527,6 +4797,27 @@ impl SessionActor {
             }
             _ => {}
         }
+        if let Some((query, pattern)) = &self.search_pattern
+            && pane
+                .copy
+                .as_ref()
+                .and_then(|copy| copy.search.as_ref())
+                .is_some_and(|search| search.query == *query)
+        {
+            refresh_copy_matches(pane, pattern);
+        }
+        let _ = pane;
+        if search_not_found {
+            self.status("search pattern not found");
+        }
+        self.finish_copy_input(pane_id, previous);
+    }
+
+    fn finish_copy_input(&mut self, pane_id: PaneId, previous: CopyState) {
+        let Some(pane) = self.panes.get(&pane_id) else {
+            return;
+        };
+        let previous = Some(previous);
         let changed = previous != pane.copy;
         let media_view_changed = previous.as_ref().map_or(0, |copy| copy.offset)
             != pane.copy.as_ref().map_or(0, |copy| copy.offset);
@@ -4675,6 +4966,25 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
             }
             Ok(())
         }
+        AutomationMethod::Search { pattern, limit, .. }
+            if pattern.len() > crate::search::MAX_PATTERN_BYTES =>
+        {
+            Err(AutomationError::new(
+                "limit_exceeded",
+                "search pattern exceeds 8 KiB",
+            ))
+        }
+        AutomationMethod::Search { limit, .. } if !(1..=1000).contains(limit) => Err(
+            AutomationError::new("invalid_params", "search limit must be from 1 through 1000"),
+        ),
+        AutomationMethod::Search {
+            start_line: None,
+            start_column: Some(_),
+            ..
+        } => Err(AutomationError::new(
+            "invalid_params",
+            "start_column requires start_line",
+        )),
         AutomationMethod::WaitText { text, regex, .. } if *regex && text.len() > 8 * 1024 => Err(
             AutomationError::new("limit_exceeded", "regular expression exceeds 8 KiB"),
         ),
@@ -4736,7 +5046,7 @@ fn automation_capabilities() -> serde_json::Value {
         "protocol_version": crate::ipc::VERSION,
         "methods": [
             "capabilities", "list_panes", "inspect", "inspect_media", "split", "focus", "close_pane",
-            "typing", "key", "paste", "get_text", "get_grid", "wait_text",
+            "typing", "key", "paste", "get_text", "get_grid", "search", "wait_text",
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
             "trace_media", "reload_config", "run"
         ],
@@ -4752,6 +5062,8 @@ fn automation_limits() -> serde_json::Value {
         "rows": 1000,
         "key_repeats": 1000,
         "regex_bytes": 8 * 1024,
+        "search_results": 1000,
+        "search_scan_lines": crate::search::MAX_SEARCH_SCAN_LINES,
         "command_bytes": MAX_RUN_COMMAND_BYTES,
         "media_trace_events": crate::media_trace::MAX_MEDIA_TRACE_EVENTS,
         "media_trace_bytes": crate::media_trace::MAX_MEDIA_TRACE_BYTES,
@@ -5152,6 +5464,10 @@ fn copy_chord_name(bytes: &[u8]) -> Option<&'static str> {
         b" " => Some("Space"),
         b"\r" | b"\n" => Some("Enter"),
         b"q" => Some("q"),
+        b"/" => Some("/"),
+        b"?" => Some("?"),
+        b"n" => Some("n"),
+        b"N" => Some("N"),
         b"\x1b" => Some("Escape"),
         _ => None,
     }
@@ -5169,10 +5485,121 @@ pub(crate) fn copy_action_bytes(action: &str) -> Option<Vec<u8>> {
             "start-selection" => b" ".as_slice(),
             "copy" => b"\r".as_slice(),
             "cancel" => b"q".as_slice(),
+            "search-forward" => b"/".as_slice(),
+            "search-backward" => b"?".as_slice(),
+            "search-next" => b"n".as_slice(),
+            "search-previous" => b"N".as_slice(),
             _ => return None,
         }
         .to_vec(),
     )
+}
+
+fn refresh_copy_matches(pane: &mut Pane, pattern: &SearchPattern) {
+    let Some(copy) = pane.copy.as_mut() else {
+        return;
+    };
+    copy.matches.clear();
+    for row in 0..pane.terminal.rows() {
+        let line = row as isize - copy.offset as isize;
+        copy.matches
+            .extend(find_on_line(&pane.terminal, pattern, line));
+    }
+}
+
+fn copy_jump_to(pane: &mut Pane, pattern: &SearchPattern, found: SearchMatch) {
+    let rows = pane.terminal.rows();
+    let centered = rows as isize / 2 - found.line;
+    let offset = centered.clamp(0, pane.terminal.history_len() as isize) as usize;
+    let copy = pane.copy.as_mut().unwrap();
+    copy.offset = offset;
+    copy.row = (found.line + offset as isize).clamp(0, rows.saturating_sub(1) as isize) as usize;
+    copy.column = found
+        .start_column
+        .min(pane.terminal.cols().saturating_sub(1));
+    copy.current = Some(found);
+    refresh_copy_matches(pane, pattern);
+}
+
+fn automation_search(
+    terminal: &Terminal,
+    pattern: &SearchPattern,
+    direction: SearchDirection,
+    start_line: Option<isize>,
+    start_column: Option<usize>,
+    limit: usize,
+) -> (Vec<serde_json::Value>, bool) {
+    if direction == SearchDirection::Forward && start_line.is_none() {
+        let (found, truncated) = find_all(terminal, pattern, limit);
+        return (search_values(terminal, &found), truncated);
+    }
+    let first = -(terminal.history_len() as isize);
+    let last = terminal.rows() as isize - 1;
+    let start = start_line
+        .unwrap_or(match direction {
+            SearchDirection::Forward => first,
+            SearchDirection::Backward => last,
+        })
+        .clamp(first, last);
+    let start_column = start_column.unwrap_or(match direction {
+        SearchDirection::Forward => 0,
+        SearchDirection::Backward => terminal.cols(),
+    });
+    let mut found = Vec::new();
+
+    let lines: Box<dyn Iterator<Item = isize>> = match direction {
+        SearchDirection::Forward => Box::new(start..=last),
+        SearchDirection::Backward => Box::new((first..=start).rev()),
+    };
+    for (scanned, line) in lines.enumerate() {
+        if scanned == crate::search::MAX_SEARCH_SCAN_LINES {
+            return (search_values(terminal, &found), true);
+        }
+        let mut line_matches = find_on_line(terminal, pattern, line);
+        if direction == SearchDirection::Backward {
+            line_matches.reverse();
+        }
+        for candidate in line_matches {
+            if line == start
+                && match direction {
+                    SearchDirection::Forward => candidate.start_column < start_column,
+                    SearchDirection::Backward => candidate.start_column > start_column,
+                }
+            {
+                continue;
+            }
+            if found.len() == limit {
+                return (search_values(terminal, &found), true);
+            }
+            found.push(candidate);
+        }
+    }
+    (search_values(terminal, &found), false)
+}
+
+fn search_values(terminal: &Terminal, matches: &[SearchMatch]) -> Vec<serde_json::Value> {
+    matches
+        .iter()
+        .map(|found| {
+            let text = row_text_with_columns(terminal, found.line)
+                .map(|(text, columns)| {
+                    text.chars()
+                        .zip(columns)
+                        .filter_map(|(ch, column)| {
+                            (column >= found.start_column && column < found.end_column)
+                                .then_some(ch)
+                        })
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "line": found.line,
+                "start_column": found.start_column,
+                "end_column": found.end_column,
+                "text": text,
+            })
+        })
+        .collect()
 }
 
 fn bridge_key(key: crate::media::SourceKey) -> BridgeSourceKey {
@@ -6090,6 +6517,28 @@ mod tests {
                 start_line: Some(0),
                 row_count: None,
                 since_screen: None,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::Search {
+                pattern: "x".repeat(crate::search::MAX_PATTERN_BYTES + 1),
+                regex: false,
+                direction: SearchDirection::Forward,
+                start_line: None,
+                start_column: None,
+                limit: 1,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::Search {
+                pattern: "x".into(),
+                regex: false,
+                direction: SearchDirection::Forward,
+                start_line: None,
+                start_column: Some(1),
+                limit: 1001,
             })
             .is_err()
         );

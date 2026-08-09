@@ -36,6 +36,11 @@ inactive_frame = "bright-black"
 # frame_background = "default"
 status_foreground = "bright-white"
 status_background = "blue"
+# Search matches are recolored in place; text, wide glyphs, and links are preserved.
+# search_match_foreground = "black"
+# search_match_background = "bright-yellow"
+# search_current_foreground = "bright-white"
+# search_current_background = "magenta"
 # The status bar paints its background across the full width. Set false for the
 # older look, where the background stopped where the text did.
 # status_fill = true
@@ -69,3 +74,7 @@ r = "enter-floating-resize-mode"
 
 [keys.copy]
 PageUp = "page-up"
+"/" = "search-forward"
+"?" = "search-backward"
+n = "search-next"
+N = "search-previous"

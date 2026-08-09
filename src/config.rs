@@ -257,6 +257,7 @@ impl Config {
         }
         const COPY_CHORDS: &[&str] = &[
             "Up", "Down", "Left", "Right", "PageUp", "PageDown", "Space", "Enter", "q", "Escape",
+            "/", "?", "n", "N",
         ];
         if self.keys.copy.iter().any(|(chord, action)| {
             !COPY_CHORDS.contains(&chord.as_str())

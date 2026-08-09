@@ -92,6 +92,7 @@ key KEY [--mods Shift,Alt,Ctrl,Super] [--repeat N] [--pane-id ID]
 paste TEXT [--pane-id ID]
 get-text [--rows N] [--pane-id ID]
 get-grid [--start-line LINE --row-count N | --since-screen SEQ] [--pane-id ID]
+search --pattern TEXT [--regex] [--direction forward|backward] [--start-line LINE --start-column COLUMN] [--limit N] [--pane-id ID]
 wait text TEXT [--regex] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait screen-change [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait screen-stable [--quiet DURATION] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
@@ -271,7 +272,10 @@ The prefix is `Ctrl-b`.
 | `Ctrl-b [` / `Ctrl-b ]` | Copy mode / paste copy buffer |
 
 Copy mode accepts arrows, Page Up/Down, Space to start selection, Enter to copy, and `q` or Escape
-to cancel. Copies are capped at 1 MiB and the client emits OSC 52. Paste honors the focused
+to cancel. `/` and `?` open forward and backward smart-case regular-expression search; `n` repeats
+in the original direction and `N` repeats in the opposite direction. Search operates on bounded
+physical terminal rows, including scrollback; wrapped rows are not joined in this version. Copies
+are capped at 1 MiB and the client emits OSC 52. Paste honors the focused
 application's bracketed-paste mode and neutralizes embedded bracketed-paste terminators.
 On Windows, the outer terminal's bracketed-paste mode follows the focused pane, so `Ctrl+V` from
 Windows Terminal or Vivido is delivered with bracket markers only when that pane requested them.
@@ -345,9 +349,10 @@ active_frame = "#ff8800"
 ```
 
 The keys are `preset`, `active_frame`, `inactive_frame`, `active_title`, `inactive_title`,
-`frame_background`, `status_foreground`, `status_background`, and `status_fill`. Titles default to
-their frame color. An unknown preset name or malformed color is rejected at startup with a message
-listing the accepted values.
+`frame_background`, `status_foreground`, `status_background`, `status_fill`,
+`search_match_foreground`, `search_match_background`, `search_current_foreground`, and
+`search_current_background`. Titles default to their frame color. An unknown preset name or
+malformed color is rejected at startup with a message listing the accepted values.
 
 The status bar paints its background across the full width. Set `status_fill = false` for the
 earlier behavior, where the background stopped where the text did.
@@ -400,11 +405,12 @@ and tab-scoped floating/pinned shell panes, zoom, scrollback/copy/paste, ordered
 composition, mouse focus/move/resize/forwarding, status line, truecolor theming, strict TOML with
 live reload, command panes with hold-on-exit, bounded TOML startup layouts, VVMX IPC, exact
 fragment-aware pane media occlusion, static rehydration, timed-media headless semantics,
-full-duplex outer control, linked A/V projection, and optional bulk-media endpoint discovery.
+full-duplex outer control, linked A/V projection, bounded scrollback search, and optional
+bulk-media endpoint discovery.
 
 Intentionally absent: plugins, a bundled web UI, direct non-loopback/TLS serving,
 arbitrary action sockets, stacked panes, pane-class conversion, multi-pane selection, scrollback
-editing/search, source transcoding, mirrored multi-client sessions, WinPTY, MSI/service installs,
+editing, source transcoding, mirrored multi-client sessions, WinPTY, MSI/service installs,
 and machine-wide PATH changes. `run` and a layout `command` take one shell command line, passed to
 the shell with `-c`; configured shell argument vectors remain absent.
 

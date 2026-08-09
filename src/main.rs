@@ -16,6 +16,7 @@ mod platform;
 mod region;
 mod runtime;
 mod screen;
+mod search;
 mod server;
 mod session;
 mod theme;

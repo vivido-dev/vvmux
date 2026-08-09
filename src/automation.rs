@@ -13,6 +13,7 @@ use crate::ipc::{
 use crate::media_trace::{
     MAX_MEDIA_TRACE_QUERY_EVENTS, MediaTraceBatch, MediaTraceCategory, MediaTraceFilter,
 };
+use crate::search::SearchDirection;
 
 const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -31,6 +32,21 @@ pub enum RunPlacementArg {
     Float,
     /// Open a new tab.
     Tab,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SearchDirectionArg {
+    Forward,
+    Backward,
+}
+
+impl From<SearchDirectionArg> for SearchDirection {
+    fn from(direction: SearchDirectionArg) -> Self {
+        match direction {
+            SearchDirectionArg::Forward => Self::Forward,
+            SearchDirectionArg::Backward => Self::Backward,
+        }
+    }
 }
 
 impl From<SplitAxis> for Axis {
@@ -163,6 +179,23 @@ pub enum MsgCommand {
         row_count: Option<u16>,
         #[arg(long)]
         since_screen: Option<u64>,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Search physical terminal rows and print structured matches.
+    Search {
+        #[arg(long)]
+        pattern: String,
+        #[arg(long)]
+        regex: bool,
+        #[arg(long, value_enum, default_value_t = SearchDirectionArg::Forward)]
+        direction: SearchDirectionArg,
+        #[arg(long, allow_hyphen_values = true)]
+        start_line: Option<isize>,
+        #[arg(long)]
+        start_column: Option<usize>,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
         #[arg(long)]
         pane_id: Option<u64>,
     },
@@ -521,6 +554,27 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 start_line,
                 row_count,
                 since_screen,
+            },
+            pane_id,
+            true,
+            Output::Json,
+        ),
+        MsgCommand::Search {
+            pattern,
+            regex,
+            direction,
+            start_line,
+            start_column,
+            limit,
+            pane_id,
+        } => (
+            AutomationMethod::Search {
+                pattern,
+                regex,
+                direction: direction.into(),
+                start_line,
+                start_column,
+                limit,
             },
             pane_id,
             true,
