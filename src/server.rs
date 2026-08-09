@@ -263,13 +263,24 @@ fn describe_recorded_version(version: Option<u16>) -> String {
 
 #[cfg(unix)]
 fn install_signal_forwarder(actor: ActorHandle) -> io::Result<()> {
-    let mut signals =
-        signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM, libc::SIGHUP])?;
+    let mut signals = signal_hook::iterator::Signals::new([
+        libc::SIGINT,
+        libc::SIGTERM,
+        libc::SIGHUP,
+        libc::SIGUSR1,
+    ])?;
     thread::Builder::new()
         .name("vvmux-signals".into())
         .spawn(move || {
-            if signals.forever().next().is_some() {
+            // Match on the signal: SIGUSR1 asks for a config reload, so it must not fall into the
+            // shutdown path the way an unexamined "any signal" check would put it.
+            for signal in signals.forever() {
+                if signal == libc::SIGUSR1 {
+                    let _ = actor.sender.try_send(session::ActorEvent::ConfigChanged);
+                    continue;
+                }
                 actor.shutdown.store(true, Ordering::Release);
+                break;
             }
         })?;
     Ok(())

@@ -43,6 +43,21 @@ the actor continues servicing media delivery, rendering, client events, and unre
 Vivid queries, waits, device operations, and status work use the same pattern.
 Workers must never mutate `SessionActor` state directly or write session replies themselves.
 
+The config watcher is the third worker that wakes the actor, after the PTY readers and the media
+wakeup. It polls the config path, requires one further identical observation before acting so a
+half-written file is never read, and treats a missing file as no change rather than a reset to
+defaults. Its wake is a payload-free `ConfigChanged` coalesced through a dirty bit, exactly like
+the media wakeup; the actor re-reads the file itself, so the watcher, `SIGUSR1`, and
+`msg reload-config` converge on one parse-validate-apply path and a dropped wake costs nothing.
+
+Reload adopts only what a live session can change. A parse or validation failure leaves the
+running config untouched. `[media]` was moved into the running `VirtualVivid` at startup, so its
+values are carried forward rather than swapped under live retained media and in-flight tracks.
+`general.prefix` and `[keys.prefix]` belong to the client's prefix parser and `[server]` to
+`vvmux serve`, so both are stored but reported as deferred. Changing `general.status_visible`
+moves the status row in or out of the pane area, so the stored displays are re-normalized before
+anything derives geometry from them, followed by exactly one `relayout` for the whole change.
+
 ## Vivid 1.5 nested presenter and revision domains
 
 The pane-facing virtual presenter and the outer presenter are different Vivid sessions. Virtual

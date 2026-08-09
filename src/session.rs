@@ -83,6 +83,11 @@ pub enum ActorEvent {
     /// Carries no payload: it exists only to wake the actor promptly. Losing one to a full queue
     /// is harmless because the actor drains media at the top of every iteration anyway.
     MediaReady,
+    /// The config file settled on new contents, or a reload was asked for directly.
+    ///
+    /// Carries no payload: the actor re-reads the file itself, so the watcher, SIGUSR1, and
+    /// `msg reload-config` all converge on one parse-validate-apply path.
+    ConfigChanged,
 }
 
 #[derive(Clone)]
@@ -102,6 +107,27 @@ struct AutomationResponseJob {
 pub struct ActorHandle {
     pub sender: mpsc::SyncSender<ActorEvent>,
     pub shutdown: Arc<AtomicBool>,
+}
+
+/// What a reload actually did, so the caller learns which sections could not take effect now
+/// rather than assuming the whole file applied.
+struct ReloadReport {
+    path: String,
+    /// Sections that cannot change in a live session and were carried forward.
+    ignored: Vec<String>,
+    /// Sections that were adopted but only affect future panes, clients, or processes.
+    deferred: Vec<String>,
+}
+
+impl ReloadReport {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "reloaded": true,
+            "path": self.path,
+            "ignored": self.ignored,
+            "deferred": self.deferred,
+        })
+    }
 }
 
 struct AttachedClient {
@@ -590,6 +616,9 @@ struct SessionActor {
     shutdown: Arc<AtomicBool>,
     vivid: VirtualVivid,
     media_projection_pending: Arc<AtomicBool>,
+    /// Coalesces config-change wakes from the watcher thread, as `media_projection_pending` does
+    /// for media: one queued wake the actor has not yet observed makes another redundant.
+    config_reload_pending: Arc<AtomicBool>,
     /// Latest foreground-bridge counter report. Diagnostic only; retained across a detach so
     /// `inspect-media` still describes the last live bridge.
     bridge_metrics: crate::metrics::BridgeMetrics,
@@ -633,6 +662,17 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         vivid.set_media_wakeup(Arc::new(move || {
             request_media_service(&wakeup, &pending);
         }));
+    }
+    let config_reload_pending = Arc::new(AtomicBool::new(false));
+    if let Some(path) = config_path.clone() {
+        // Watch the resolved path even when nothing is there yet: creating the file later is an
+        // ordinary way to start configuring a running session.
+        crate::config_watch::spawn(
+            path,
+            sender.clone(),
+            shutdown.clone(),
+            config_reload_pending.clone(),
+        )?;
     }
     let (response_sender, response_receiver) =
         mpsc::sync_channel::<AutomationResponseJob>(AUTOMATION_RESPONSE_QUEUE);
@@ -715,6 +755,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         shutdown: shutdown.clone(),
         vivid,
         media_projection_pending,
+        config_reload_pending,
         bridge_metrics: crate::metrics::BridgeMetrics::default(),
         client_ipc: None,
     };
@@ -999,6 +1040,14 @@ impl SessionActor {
             },
             // The payload or retained-projection dirty bit is drained by the run loop.
             ActorEvent::MediaReady => {}
+            ActorEvent::ConfigChanged => {
+                // Clear the coalescing bit before reading, so an edit landing during the reload
+                // queues a fresh wake instead of being folded into the one being handled.
+                self.config_reload_pending.store(false, Ordering::Release);
+                if let Err(error) = self.reload_config() {
+                    self.status(&format!("config reload failed: {error}"));
+                }
+            }
         }
         // Attachment, pane focus, tab switching, pane teardown, and a program enabling the mode
         // all move focus, so reconcile once here rather than at each of those call sites.
@@ -1475,6 +1524,15 @@ impl SessionActor {
             AutomationMethod::Capabilities => {
                 self.reply_automation(target, automation_capabilities());
             }
+            AutomationMethod::ReloadConfig => match self.reload_config() {
+                Ok(report) => self.reply_automation(target, report.to_json()),
+                Err(error) => {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("invalid_config", error),
+                    );
+                }
+            },
             AutomationMethod::ListPanes => {
                 let panes = self
                     .panes
@@ -3343,6 +3401,89 @@ impl SessionActor {
         self.relayout();
     }
 
+    /// Re-read the config file and adopt what can be adopted without disturbing live state.
+    ///
+    /// Three settings resist reloading, and each is handled rather than ignored:
+    ///
+    /// - `[media]` was moved into the running `VirtualVivid` at startup. Swapping it would strand
+    ///   live retained media and in-flight tracks, so the running values are carried forward.
+    /// - `general.prefix` and `[keys.prefix]` are interpreted by the *client's* prefix parser, and
+    ///   `[server]` only by `vvmux serve`. Both are stored, but neither reaches this process's
+    ///   behavior until the peer restarts or reattaches.
+    /// - `shell`, `default_cwd`, and `scrollback_lines` are read when a pane spawns, so they apply
+    ///   to the next pane rather than existing ones.
+    ///
+    /// A parse or validation failure leaves the running config completely untouched: a config
+    /// saved mid-edit must never degrade a live session.
+    fn reload_config(&mut self) -> Result<ReloadReport, String> {
+        let path = self
+            .config_path
+            .clone()
+            .or_else(crate::config::default_path)
+            .ok_or_else(|| "no config file could be resolved for this session".to_owned())?;
+        let source = std::fs::read_to_string(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                format!("{} does not exist", path.display())
+            } else {
+                format!("could not read {}: {error}", path.display())
+            }
+        })?;
+        let mut next = crate::config::Config::parse(&source, &path).map_err(|error| {
+            // `parse` already names the file and the offending key.
+            error.to_string()
+        })?;
+
+        let mut report = ReloadReport {
+            path: path.display().to_string(),
+            ignored: Vec::new(),
+            deferred: Vec::new(),
+        };
+
+        // MediaConfig comes from vivid_gateway and does not derive PartialEq; comparing the
+        // serialized form avoids depending on that.
+        let media_changed =
+            serde_json::to_value(&next.media).ok() != serde_json::to_value(&self.config.media).ok();
+        if media_changed {
+            next.media = self.config.media.clone();
+            report.ignored.push("media".to_owned());
+        }
+        if next.general.prefix != self.config.general.prefix
+            || next.keys.prefix != self.config.keys.prefix
+        {
+            report.deferred.push("keys.prefix".to_owned());
+        }
+        if next.general.shell != self.config.general.shell
+            || next.general.default_cwd != self.config.general.default_cwd
+            || next.general.scrollback_lines != self.config.general.scrollback_lines
+        {
+            report.deferred.push("general.pane_defaults".to_owned());
+        }
+
+        let status_changed = next.general.status_visible != self.config.general.status_visible;
+        self.config = next;
+        self.config_path = Some(path);
+
+        if status_changed {
+            // The status row is outside the pane area, so the usable height just changed. The
+            // stored displays were normalized against the old setting and must be re-normalized
+            // before anything derives geometry from them.
+            let status_visible = self.config.general.status_visible;
+            self.last_display = normalized_display(self.last_display, status_visible);
+            if let Some(client) = &mut self.attached {
+                client.display = normalized_display(client.display, status_visible);
+            }
+            self.force_full = true;
+            // One relayout for the whole change: it resizes every PTY and schedules the render.
+            self.relayout();
+        } else {
+            // Colors can change without any geometry moving, and a cell whose only difference is
+            // its color still diffs correctly; force_full is simply the cheapest way to be sure.
+            self.force_full = true;
+            self.schedule_render();
+        }
+        Ok(report)
+    }
+
     fn relayout(&mut self) {
         self.layout_revision = self.layout_revision.wrapping_add(1);
         self.session_sequence = self.session_sequence.wrapping_add(1);
@@ -4240,6 +4381,7 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
         AutomationMethod::Capabilities
             | AutomationMethod::ListPanes
             | AutomationMethod::WaitRendered { .. }
+            | AutomationMethod::ReloadConfig
     )
 }
 
@@ -4349,7 +4491,7 @@ fn automation_capabilities() -> serde_json::Value {
             "capabilities", "list_panes", "inspect", "inspect_media", "split", "focus", "close_pane",
             "typing", "key", "paste", "get_text", "get_grid", "wait_text",
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
-            "trace_media"
+            "trace_media", "reload_config"
         ],
         "limits": automation_limits(),
         "render_acknowledgment": "attached_client_write",

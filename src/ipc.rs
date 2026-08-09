@@ -127,6 +127,8 @@ pub enum AutomationMethod {
         after_session: u64,
         timeout_ms: u64,
     },
+    /// Re-read the session's config file now, instead of waiting for the watcher to notice.
+    ReloadConfig,
     WaitExit {
         timeout_ms: u64,
     },

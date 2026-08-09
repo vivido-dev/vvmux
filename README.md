@@ -79,6 +79,7 @@ Available commands are:
 
 ```text
 capabilities
+reload-config
 list-panes
 inspect [--pane-id ID]
 inspect-media [--pane-id ID]
@@ -235,6 +236,38 @@ vvmux scrolling/copy behavior.
 Strict floating defaults live under `[floating]`: `default_width_percent` and
 `default_height_percent` accept 10–100, and `border_drag_margin` accepts 1–4. New floats are centered
 at 60% by 60% by default, with a minimum 4-by-2 content area plus frame.
+
+## Configuration reload
+
+A running session picks up config edits without restarting. Three triggers reach the same
+parse-validate-apply path:
+
+```sh
+# Edit the file: the session notices within a couple of seconds.
+vvmux msg -t NAME reload-config      # or reload now, and report what happened
+kill -USR1 $(pgrep -f "__server --session NAME")
+```
+
+The watcher polls the config path about once a second and waits for the file to stop changing
+before acting, so an editor that truncates and rewrites is never read half-written. A config file
+that is deleted is not treated as a change: the last good config stays in force.
+
+A file that fails to parse or validate is rejected outright and the running session keeps its
+current config, so a config saved mid-edit cannot degrade a live session. `msg reload-config`
+reports the failure as `invalid_config`; the watcher and SIGUSR1 report it on the status line.
+
+Not everything can change under a live session, and `msg reload-config` names what it did:
+
+| Section | On reload |
+|---|---|
+| `[theme]`, `[appearance]` | Applied immediately, with a full repaint |
+| `general.status_visible` | Applied; every pane is resized around the status row |
+| `general.render_interval_ms` | Applied on the next loop iteration |
+| `[floating]`, `[keys.copy]` | Applied the next time they are used |
+| `general.shell`, `default_cwd`, `scrollback_lines` | Reported as `deferred`: they apply to panes spawned afterwards |
+| `general.prefix`, `[keys.prefix]` | Reported as `deferred`: the attached client owns the prefix parser until it reattaches |
+| `[media]` | Reported as `ignored`: the running virtual presenter owns it, and swapping it would strand live media |
+| `[server]` | Reported as `ignored`: only `vvmux serve` reads it, in its own process |
 
 ## Theming
 

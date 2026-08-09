@@ -3,6 +3,7 @@ mod bridge;
 mod client;
 mod client_input;
 mod config;
+mod config_watch;
 #[cfg(feature = "server-capability")]
 mod gateway;
 mod ipc;

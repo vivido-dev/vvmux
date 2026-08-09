@@ -40,6 +40,8 @@ pub struct PaneTarget {
 pub enum MsgCommand {
     /// Print the server's pane-automation capabilities.
     Capabilities,
+    /// Re-read the session's config file now, without waiting for the watcher.
+    ReloadConfig,
     /// List every pane in deterministic pane-ID order.
     ListPanes,
     /// Inspect one pane.
@@ -331,6 +333,7 @@ enum Output {
 fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u64>, bool, Output)> {
     let tuple = match command {
         MsgCommand::Capabilities => (AutomationMethod::Capabilities, None, false, Output::Json),
+        MsgCommand::ReloadConfig => (AutomationMethod::ReloadConfig, None, false, Output::Json),
         MsgCommand::ListPanes => (AutomationMethod::ListPanes, None, false, Output::Json),
         MsgCommand::Inspect(target) => (
             AutomationMethod::Inspect,
