@@ -83,6 +83,7 @@ done
     // PTY the test can write raw bytes into.
     let parts = PtyProcess::spawn(
         std::ffi::OsStr::new("/bin/sh"),
+        None,
         directory.path(),
         100,
         30,

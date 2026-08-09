@@ -102,6 +102,7 @@ impl PtyWaiter {
 
 pub(super) fn spawn(
     shell: &OsStr,
+    command: Option<&OsStr>,
     cwd: &Path,
     columns: u16,
     rows: u16,
@@ -144,23 +145,31 @@ pub(super) fn spawn(
     let stdout = slave_file.try_clone()?;
     let slave_fd = slave_file.as_raw_fd();
 
-    let mut command = Command::new(shell);
-    command
-        .arg("-l")
+    let mut builder = Command::new(shell);
+    // `-c <command>` runs one command and exits; `-l` is the ordinary interactive login shell.
+    match command {
+        Some(command) => {
+            builder.arg("-c").arg(command);
+        }
+        None => {
+            builder.arg("-l");
+        }
+    }
+    builder
         .current_dir(cwd)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(slave_file));
-    command.env_remove("VIVID_ENDPOINT");
-    command.env_remove("VIVID_ENDPOINT_BULK");
-    command.env_remove("VIVID_TOKEN");
-    command.env_remove("VIVID_SSH_ENDPOINT");
-    command.env_remove("VIVID_SSH_TOKEN");
+    builder.env_remove("VIVID_ENDPOINT");
+    builder.env_remove("VIVID_ENDPOINT_BULK");
+    builder.env_remove("VIVID_TOKEN");
+    builder.env_remove("VIVID_SSH_ENDPOINT");
+    builder.env_remove("VIVID_SSH_TOKEN");
     for (key, value) in environment {
-        command.env(key, value);
+        builder.env(key, value);
     }
     unsafe {
-        command.pre_exec(move || {
+        builder.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(io::Error::other(format!(
                     "PTY child setsid failed: {}",
@@ -176,7 +185,7 @@ pub(super) fn spawn(
             Ok(())
         });
     }
-    let child = command.spawn()?;
+    let child = builder.spawn()?;
     let process_group = child.id() as i32;
     let reader = master_file.try_clone()?;
     let resize = master_file.try_clone()?;

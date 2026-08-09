@@ -178,6 +178,7 @@ impl PtyWaiter {
 
 pub(super) fn spawn(
     shell: &OsStr,
+    command: Option<&OsStr>,
     cwd: &Path,
     columns: u16,
     rows: u16,
@@ -240,7 +241,7 @@ pub(super) fn spawn(
     startup.lpAttributeList = attributes.pointer();
 
     let application = wide(shell)?;
-    let mut command_line = wide(OsStr::new(&quote_argument(&shell.to_string_lossy())))?;
+    let mut command_line = wide(OsStr::new(&build_command_line(shell, command)))?;
     let cwd = wide(cwd.as_os_str())?;
     let environment = environment_block(environment)?;
 
@@ -561,6 +562,38 @@ fn validate_environment_pair(key: &OsStr, value: &OsStr) -> io::Result<()> {
     }
 }
 
+/// The flag that makes `shell` run a single command string and exit.
+///
+/// `cmd.exe` and the PowerShell hosts each spell this differently, and a shell we do not
+/// recognize is most likely POSIX-flavored (Git Bash, busybox), which takes `-c`.
+fn command_flag(shell: &OsStr) -> &'static str {
+    let stem = Path::new(shell)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match stem.as_str() {
+        "cmd" => "/C",
+        "powershell" | "pwsh" => "-Command",
+        _ => "-c",
+    }
+}
+
+/// Build the `CreateProcessW` command line for a pane.
+///
+/// Without a command this is just the quoted shell, exactly as before. With one, the command is
+/// passed as a single quoted argument so the shell — not `CreateProcessW` — does the parsing.
+fn build_command_line(shell: &OsStr, command: Option<&OsStr>) -> String {
+    let shell_argument = quote_argument(&shell.to_string_lossy());
+    match command {
+        Some(command) => format!(
+            "{shell_argument} {} {}",
+            command_flag(shell),
+            quote_argument(&command.to_string_lossy())
+        ),
+        None => shell_argument,
+    }
+}
+
 fn quote_argument(argument: &str) -> String {
     if !argument.is_empty()
         && !argument
@@ -627,6 +660,49 @@ mod tests {
         );
         assert_eq!(quote_argument(r#"C:\a "b"\"#), r#""C:\a \"b\"\\""#);
         assert_eq!(quote_argument(r#"a\"b"#), r#""a\\\"b""#);
+    }
+
+    #[test]
+    fn a_command_pane_uses_the_shell_specific_run_flag() {
+        assert_eq!(
+            command_flag(OsStr::new(r"C:\Windows\system32\cmd.exe")),
+            "/C"
+        );
+        assert_eq!(
+            command_flag(OsStr::new(r"C:\Windows\System32\CMD.EXE")),
+            "/C",
+            "the shell name is matched case-insensitively"
+        );
+        assert_eq!(command_flag(OsStr::new(r"C:\pwsh.exe")), "-Command");
+        assert_eq!(command_flag(OsStr::new(r"C:\powershell.exe")), "-Command");
+        assert_eq!(
+            command_flag(OsStr::new(r"C:\Program Files\Git\bin\bash.exe")),
+            "-c",
+            "an unrecognized shell is assumed POSIX-flavored"
+        );
+    }
+
+    #[test]
+    fn a_command_line_quotes_the_command_as_one_argument() {
+        let shell = OsStr::new(r"C:\Windows\system32\cmd.exe");
+
+        assert_eq!(
+            build_command_line(shell, None),
+            r"C:\Windows\system32\cmd.exe",
+            "a shell pane keeps the previous command line exactly"
+        );
+        assert_eq!(
+            build_command_line(shell, Some(OsStr::new("echo hello world"))),
+            r#"C:\Windows\system32\cmd.exe /C "echo hello world""#,
+            "the whole command stays one argument so the shell parses it"
+        );
+        assert_eq!(
+            build_command_line(
+                OsStr::new(r"C:\Program Files\Git\bin\bash.exe"),
+                Some(OsStr::new("printf 'a b'"))
+            ),
+            r#""C:\Program Files\Git\bin\bash.exe" -c "printf 'a b'""#
+        );
     }
 
     #[test]

@@ -149,8 +149,15 @@ impl Write for PtyInput {
 }
 
 impl PtyProcess {
+    /// Start a pane process.
+    ///
+    /// With `command`, the shell runs that one command string and the pane ends when it does;
+    /// without it, the shell starts as an interactive login shell. The command is handed to the
+    /// shell verbatim, so it may contain pipes and redirection — it is a shell command, not an
+    /// argument vector.
     pub fn spawn(
         shell: &OsStr,
+        command: Option<&OsStr>,
         cwd: &Path,
         columns: u16,
         rows: u16,
@@ -158,11 +165,11 @@ impl PtyProcess {
     ) -> io::Result<PtyParts> {
         #[cfg(unix)]
         {
-            unix::spawn(shell, cwd, columns, rows, environment)
+            unix::spawn(shell, command, cwd, columns, rows, environment)
         }
         #[cfg(windows)]
         {
-            windows::spawn(shell, cwd, columns, rows, environment)
+            windows::spawn(shell, command, cwd, columns, rows, environment)
         }
     }
 }
@@ -188,5 +195,64 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"written");
+    }
+
+    /// A command pane really does run its command and end with it.
+    ///
+    /// The `-c` path has no production caller yet, so without this the flag selection would be
+    /// unproven until the `run` action lands.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_pane_runs_the_command_and_exits() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut parts = PtyProcess::spawn(
+            std::ffi::OsStr::new("/bin/sh"),
+            Some(std::ffi::OsStr::new("printf 'COMMAND_RAN'")),
+            directory.path(),
+            80,
+            24,
+            &[],
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        // Read to EOF: the shell exits once the command finishes, closing the PTY.
+        while let Ok(read) = parts.reader.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..read]);
+        }
+
+        assert!(
+            String::from_utf8_lossy(&output).contains("COMMAND_RAN"),
+            "expected the command's output, got {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        let status = parts.waiter.wait().unwrap();
+        assert!(status.success, "a completed command should exit cleanly");
+    }
+
+    /// The default path must remain an interactive shell that outlives any single command.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_pane_stays_open_without_a_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let parts = PtyProcess::spawn(
+            std::ffi::OsStr::new("/bin/sh"),
+            None,
+            directory.path(),
+            80,
+            24,
+            &[],
+        )
+        .unwrap();
+
+        parts.input.send(b"printf 'STILL_HERE'\n").unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        parts.control.terminate();
     }
 }

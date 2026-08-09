@@ -114,6 +114,22 @@ struct AttachedClient {
     frame_sequences: VecDeque<(u64, u64)>,
 }
 
+/// How one pane's process should be started.
+///
+/// A shell pane is `PaneSpawn::default()`. A command pane carries the shell command string, an
+/// optional working directory, and whether the pane outlives the command so its output stays
+/// readable.
+#[derive(Debug, Clone, Default)]
+pub struct PaneSpawn {
+    /// A shell command run with `-c`, not an argument vector: pipes and redirection are the
+    /// caller's to write and the shell's to parse.
+    pub command: Option<OsString>,
+    pub cwd: Option<PathBuf>,
+    pub hold_on_exit: bool,
+    /// Extra environment applied before the fixed pane identity, so it can never shadow it.
+    pub extra_env: Vec<(String, String)>,
+}
+
 struct Pane {
     id: PaneId,
     terminal: Terminal,
@@ -121,6 +137,12 @@ struct Pane {
     control: PtyControl,
     copy: Option<CopyState>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
+    /// Whether the pane stays open after its process exits, keeping the output readable.
+    #[allow(dead_code)]
+    hold_on_exit: bool,
+    /// Set once a held pane's process has exited, so the corpse is reported only once.
+    #[allow(dead_code)]
+    exit_status: Option<PtyExitStatus>,
     /// Whether this pane was last told it holds the host terminal's focus. A pane that has not
     /// enabled focus reporting still tracks it, so enabling the mode later reports no stale event.
     focus_reported: bool,
@@ -517,6 +539,10 @@ fn next_outer_compatibility_revision(current: u64, incoming_bridge_revision: u64
 struct SessionActor {
     name: String,
     config: Config,
+    /// The config file backing `config`, re-read on reload. `None` when none could be resolved.
+    // Read by the config reload path.
+    #[allow(dead_code)]
+    config_path: Option<PathBuf>,
     sender: mpsc::SyncSender<ActorEvent>,
     panes: BTreeMap<PaneId, Pane>,
     tabs: Vec<Tab>,
@@ -572,11 +598,26 @@ struct SessionActor {
     client_ipc: Option<Arc<crate::metrics::IpcCounters>>,
 }
 
-pub fn start(
-    name: String,
-    config: Config,
-    vivid_endpoint: VirtualPresenterEndpoint,
-) -> io::Result<ActorHandle> {
+/// Everything the session server hands to a new actor.
+///
+/// A struct rather than positional arguments because the later phases add a startup layout and a
+/// watched config path here; growing a struct keeps `start`'s signature stable.
+pub struct SessionOptions {
+    pub name: String,
+    pub config: Config,
+    /// The config file the running config came from, watched for live reload. `None` when no
+    /// config file could be resolved at all.
+    pub config_path: Option<PathBuf>,
+    pub vivid_endpoint: VirtualPresenterEndpoint,
+}
+
+pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
+    let SessionOptions {
+        name,
+        config,
+        config_path,
+        vivid_endpoint,
+    } = options;
     let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE);
     let (media_sender, media_receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE);
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -630,6 +671,7 @@ pub fn start(
     let mut actor = SessionActor {
         name,
         config,
+        config_path,
         sender: sender.clone(),
         panes: BTreeMap::new(),
         tabs: Vec::new(),
@@ -689,9 +731,11 @@ impl SessionActor {
         receiver: mpsc::Receiver<ActorEvent>,
         media_receiver: mpsc::Receiver<crate::media::MediaEvent>,
     ) {
-        let interval = Duration::from_millis(self.config.general.render_interval_ms);
         let mut render_at = Instant::now();
         loop {
+            // Re-read every iteration: a config reload must be able to retune the render cadence
+            // without restarting the session.
+            let interval = Duration::from_millis(self.config.general.render_interval_ms);
             let mut timeout = if self.pending_render {
                 render_at.saturating_duration_since(Instant::now())
             } else {
@@ -1850,7 +1894,7 @@ impl SessionActor {
         candidate
             .split(pane_id, new_pane_id, axis, self.content_area())
             .map_err(|_| AutomationError::new("invalid_state", "pane is too small to split"))?;
-        self.spawn_pane(new_pane_id, tab_id)
+        self.spawn_pane(new_pane_id, tab_id, &PaneSpawn::default())
             .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
         self.next_pane_id = self.next_pane_id.wrapping_add(1);
         self.tabs[tab_index].tree = Some(candidate);
@@ -3018,7 +3062,10 @@ impl SessionActor {
             self.status("pane is too small to split");
             return;
         }
-        if self.spawn_pane(pane_id, tab_id).is_err() {
+        if self
+            .spawn_pane(pane_id, tab_id, &PaneSpawn::default())
+            .is_err()
+        {
             self.status("could not spawn shell");
             return;
         }
@@ -3076,7 +3123,10 @@ impl SessionActor {
         }
         let pane_id = self.next_pane_id;
         let tab_id = self.active_tab().map_or(self.next_tab_id, |tab| tab.id);
-        if self.spawn_pane(pane_id, tab_id).is_err() {
+        if self
+            .spawn_pane(pane_id, tab_id, &PaneSpawn::default())
+            .is_err()
+        {
             self.status("could not spawn shell");
             return;
         }
@@ -3140,7 +3190,7 @@ impl SessionActor {
     fn new_tab(&mut self) -> io::Result<()> {
         let pane_id = self.next_pane_id;
         let tab_id = self.next_tab_id;
-        self.spawn_pane(pane_id, tab_id)?;
+        self.spawn_pane(pane_id, tab_id, &PaneSpawn::default())?;
         self.next_pane_id += 1;
         self.tabs.push(Tab {
             id: tab_id,
@@ -3155,7 +3205,7 @@ impl SessionActor {
         Ok(())
     }
 
-    fn spawn_pane(&mut self, pane_id: PaneId, tab_id: u64) -> io::Result<()> {
+    fn spawn_pane(&mut self, pane_id: PaneId, tab_id: u64, spec: &PaneSpawn) -> io::Result<()> {
         let shell = self
             .config
             .general
@@ -3164,11 +3214,10 @@ impl SessionActor {
             .map(|path| OsString::from(path.as_os_str()))
             .or_else(default_shell)
             .unwrap_or_else(fallback_shell);
-        let cwd = self
-            .config
-            .general
-            .default_cwd
+        let cwd = spec
+            .cwd
             .clone()
+            .or_else(|| self.config.general.default_cwd.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(fallback_cwd);
         let term = if terminfo_installed() {
@@ -3176,7 +3225,10 @@ impl SessionActor {
         } else {
             "xterm-256color"
         };
-        let environment = vec![
+        // The caller's extras go first so the fixed pane identity below always wins: nothing a
+        // layout file or `run` supplies may shadow VIVID_ROOT_SECRET or VVMUX_PANE_ID.
+        let mut environment: Vec<(String, String)> = spec.extra_env.clone();
+        environment.extend([
             ("TERM".into(), term.into()),
             ("TERM_PROGRAM".into(), "vvmux".into()),
             ("COLORTERM".into(), "truecolor".into()),
@@ -3188,20 +3240,19 @@ impl SessionActor {
                 "VIVID_ROOT_SECRET".into(),
                 self.vivid.issue_pane_capability(pane_id)?,
             ),
-        ];
+        ]);
         #[cfg(windows)]
-        let environment = {
-            let mut environment = environment;
-            environment.push(("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into()));
-            environment
-        };
-        let parts = match PtyProcess::spawn(&shell, &cwd, 80, 22, &environment) {
-            Ok(parts) => parts,
-            Err(error) => {
-                self.vivid.revoke_pane(pane_id);
-                return Err(error);
-            }
-        };
+        environment.push(("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into()));
+        // Every failure past `issue_pane_capability` must revoke it: the capability is already
+        // minted, and leaving it live would let a dead pane's secret authenticate.
+        let parts =
+            match PtyProcess::spawn(&shell, spec.command.as_deref(), &cwd, 80, 22, &environment) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    self.vivid.revoke_pane(pane_id);
+                    return Err(error);
+                }
+            };
         let reader_sender = self.sender.clone();
         let mut reader = parts.reader;
         std::thread::Builder::new()
@@ -3241,6 +3292,8 @@ impl SessionActor {
                 control: parts.control,
                 copy: None,
                 vivid_metrics: None,
+                hold_on_exit: spec.hold_on_exit,
+                exit_status: None,
                 focus_reported: false,
                 last_input_warning: None,
                 screen_sequence: 1,
@@ -3422,7 +3475,7 @@ impl SessionActor {
                 screen.draw_frame(
                     projection.outer,
                     &format!(" {title}{copy_suffix}{pin_suffix} "),
-                    color,
+                    crate::screen::FrameStyle::indexed(color),
                 );
                 let content = projection.content;
                 let offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
@@ -3479,8 +3532,10 @@ impl SessionActor {
                 0,
                 screen.rows - 1,
                 &status,
-                self.config.appearance.status_foreground,
-                self.config.appearance.status_background,
+                crate::screen::TextStyle::indexed(
+                    self.config.appearance.status_foreground,
+                    self.config.appearance.status_background,
+                ),
             );
         }
         self.frame_id = self.frame_id.wrapping_add(1);
@@ -4705,7 +4760,7 @@ fn copy_chord_name(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn copy_action_bytes(action: &str) -> Option<Vec<u8>> {
+pub(crate) fn copy_action_bytes(action: &str) -> Option<Vec<u8>> {
     Some(
         match action {
             "up" => b"\x1b[A".as_slice(),

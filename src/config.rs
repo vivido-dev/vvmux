@@ -113,18 +113,34 @@ impl Default for Appearance {
 
 impl Config {
     pub fn load(override_path: Option<&Path>) -> io::Result<Self> {
+        Self::load_with_path(override_path).map(|(config, _)| config)
+    }
+
+    /// Load the config and report which file it came from.
+    ///
+    /// The session server needs the resolved path so it can watch that file for changes; `load`
+    /// discards it. The path is `None` only when no config file could be resolved at all.
+    pub fn load_with_path(override_path: Option<&Path>) -> io::Result<(Self, Option<PathBuf>)> {
         let path = override_path.map(Path::to_path_buf).or_else(default_path);
         let Some(path) = path else {
-            return Ok(Self::default());
+            return Ok((Self::default(), None));
         };
         let source = match fs::read_to_string(&path) {
             Ok(source) => source,
             Err(error) if error.kind() == io::ErrorKind::NotFound && override_path.is_none() => {
-                return Ok(Self::default());
+                // A missing default config is not an error, but the path still matters: a file
+                // created later must be picked up by a reload.
+                return Ok((Self::default(), Some(path)));
             }
             Err(error) => return Err(error),
         };
-        let config: Self = toml::from_str(&source).map_err(|error| {
+        let config = Self::parse(&source, &path)?;
+        Ok((config, Some(path)))
+    }
+
+    /// Parse and validate one config source, naming `path` in any error.
+    pub fn parse(source: &str, path: &Path) -> io::Result<Self> {
+        let config: Self = toml::from_str(source).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid vvmux config {}: {error}", path.display()),
@@ -134,7 +150,7 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> io::Result<()> {
+    pub fn validate(&self) -> io::Result<()> {
         if parse_control_chord(&self.general.prefix).is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -201,32 +217,13 @@ impl Config {
                 "[server].outbound_queue_bytes must be between 512 KiB and 64 MiB",
             ));
         }
-        const PREFIX_ACTIONS: &[&str] = &[
-            "split-horizontal",
-            "split-vertical",
-            "focus-left",
-            "focus-right",
-            "focus-up",
-            "focus-down",
-            "resize-left",
-            "resize-right",
-            "resize-up",
-            "resize-down",
-            "new-tab",
-            "next-tab",
-            "previous-tab",
-            "close-pane",
-            "toggle-zoom",
-            "copy-mode",
-            "paste",
-            "new-floating-pane",
-            "toggle-floating-panes",
-            "toggle-pane-pinned",
-            "enter-floating-move-mode",
-            "enter-floating-resize-mode",
-        ];
+        // The action vocabularies are defined by the code that interprets them, not duplicated
+        // here: `parse_configured_action` is what the client actually dispatches on, and
+        // `copy_action_bytes` is what copy mode actually replays. Validating through them means a
+        // new action cannot be accepted by config but unhandled at runtime, or vice versa.
         if self.keys.prefix.iter().any(|(chord, action)| {
-            chord.chars().count() != 1 || !PREFIX_ACTIONS.contains(&action.as_str())
+            chord.chars().count() != 1
+                || crate::client_input::parse_configured_action(action).is_none()
         }) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -236,19 +233,9 @@ impl Config {
         const COPY_CHORDS: &[&str] = &[
             "Up", "Down", "Left", "Right", "PageUp", "PageDown", "Space", "Enter", "q", "Escape",
         ];
-        const COPY_ACTIONS: &[&str] = &[
-            "up",
-            "down",
-            "left",
-            "right",
-            "page-up",
-            "page-down",
-            "start-selection",
-            "copy",
-            "cancel",
-        ];
         if self.keys.copy.iter().any(|(chord, action)| {
-            !COPY_CHORDS.contains(&chord.as_str()) || !COPY_ACTIONS.contains(&action.as_str())
+            !COPY_CHORDS.contains(&chord.as_str())
+                || crate::session::copy_action_bytes(action).is_none()
         }) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -268,7 +255,7 @@ pub fn parse_control_chord(chord: &str) -> Option<u8> {
 }
 
 #[cfg(unix)]
-fn default_path() -> Option<PathBuf> {
+pub fn default_path() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(root).join("vvmux/config.toml"));
     }
@@ -278,7 +265,7 @@ fn default_path() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn default_path() -> Option<PathBuf> {
+pub fn default_path() -> Option<PathBuf> {
     crate::platform::windows_config_path()
 }
 
@@ -334,6 +321,82 @@ mod tests {
             .prefix
             .insert("f".into(), "not-an-action".into());
         assert!(config.validate().is_err());
+    }
+
+    /// The documented vocabulary and the dispatch tables must agree in both directions.
+    ///
+    /// Validation delegates to `parse_configured_action` / `copy_action_bytes`, so this test is
+    /// what keeps the README and `config.example.toml` honest: a renamed action breaks it here
+    /// rather than silently becoming unbindable.
+    #[test]
+    fn every_documented_action_name_is_bindable() {
+        const DOCUMENTED_PREFIX_ACTIONS: &[&str] = &[
+            "split-horizontal",
+            "split-vertical",
+            "focus-left",
+            "focus-right",
+            "focus-up",
+            "focus-down",
+            "resize-left",
+            "resize-right",
+            "resize-up",
+            "resize-down",
+            "new-tab",
+            "next-tab",
+            "previous-tab",
+            "close-pane",
+            "toggle-zoom",
+            "copy-mode",
+            "paste",
+            "new-floating-pane",
+            "toggle-floating-panes",
+            "toggle-pane-pinned",
+            "enter-floating-move-mode",
+            "enter-floating-resize-mode",
+        ];
+        const DOCUMENTED_COPY_ACTIONS: &[&str] = &[
+            "up",
+            "down",
+            "left",
+            "right",
+            "page-up",
+            "page-down",
+            "start-selection",
+            "copy",
+            "cancel",
+        ];
+
+        for action in DOCUMENTED_PREFIX_ACTIONS {
+            assert!(
+                crate::client_input::parse_configured_action(action).is_some(),
+                "documented prefix action {action} is not dispatchable"
+            );
+            let mut config = Config::default();
+            config.keys.prefix.insert("g".into(), (*action).into());
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{action} rejected by validation: {error}"));
+        }
+
+        for action in DOCUMENTED_COPY_ACTIONS {
+            assert!(
+                crate::session::copy_action_bytes(action).is_some(),
+                "documented copy action {action} has no key bytes"
+            );
+            let mut config = Config::default();
+            config.keys.copy.insert("q".into(), (*action).into());
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{action} rejected by validation: {error}"));
+        }
+
+        let mut unknown_copy = Config::default();
+        unknown_copy.keys.copy.insert("q".into(), "warp".into());
+        assert!(unknown_copy.validate().is_err());
+
+        let mut unknown_chord = Config::default();
+        unknown_chord.keys.copy.insert("F1".into(), "up".into());
+        assert!(unknown_chord.validate().is_err());
     }
 
     #[test]

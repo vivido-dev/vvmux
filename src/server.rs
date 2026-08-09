@@ -66,11 +66,18 @@ fn run_inner(
     let registry = paths
         .write_registry(&name, &nonce)
         .map_err(|error| context("write session registry", error))?;
-    let config = Config::load(config_path.as_deref()).map_err(|error| {
-        paths.remove_instance(&registry);
-        context("load session config", error)
-    })?;
-    let actor = session::start(name, config, paths.vivid_socket.clone()).map_err(|error| {
+    let (config, resolved_config_path) =
+        Config::load_with_path(config_path.as_deref()).map_err(|error| {
+            paths.remove_instance(&registry);
+            context("load session config", error)
+        })?;
+    let actor = session::start(session::SessionOptions {
+        name,
+        config,
+        config_path: resolved_config_path,
+        vivid_endpoint: paths.vivid_socket.clone(),
+    })
+    .map_err(|error| {
         paths.remove_instance(&registry);
         context("start session actor", error)
     })?;

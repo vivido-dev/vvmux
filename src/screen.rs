@@ -2,6 +2,44 @@ use vvmux_terminal::{Cell, Terminal, TerminalColor, TerminalHyperlink, Underline
 
 use crate::layout::Rect;
 
+/// Foreground and background for drawn text.
+///
+/// Carrying the pair in one struct keeps call sites self-documenting and leaves room for the
+/// themed colors to be `Rgb` as well as `Indexed`; `write_color` already encodes all three forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextStyle {
+    pub foreground: TerminalColor,
+    pub background: TerminalColor,
+}
+
+impl TextStyle {
+    pub fn indexed(foreground: u8, background: u8) -> Self {
+        Self {
+            foreground: TerminalColor::Indexed(foreground),
+            background: TerminalColor::Indexed(background),
+        }
+    }
+}
+
+/// Border, title, and background colors for a pane frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameStyle {
+    pub border: TerminalColor,
+    pub title: TerminalColor,
+    pub background: TerminalColor,
+}
+
+impl FrameStyle {
+    /// A frame drawn in one indexed color over the default background.
+    pub fn indexed(color: u8) -> Self {
+        Self {
+            border: TerminalColor::Indexed(color),
+            title: TerminalColor::Indexed(color),
+            background: TerminalColor::Default,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenBuffer {
     pub rows: u16,
@@ -36,7 +74,7 @@ impl ScreenBuffer {
         }
     }
 
-    pub fn draw_text(&mut self, x: u16, y: u16, text: &str, foreground: u8, background: u8) {
+    pub fn draw_text(&mut self, x: u16, y: u16, text: &str, style: TextStyle) {
         for (offset, ch) in text.chars().enumerate() {
             let x = x.saturating_add(offset as u16);
             if x >= self.columns {
@@ -47,21 +85,69 @@ impl ScreenBuffer {
                 y,
                 Cell {
                     ch,
-                    foreground: TerminalColor::Indexed(foreground),
-                    background: TerminalColor::Indexed(background),
+                    foreground: style.foreground,
+                    background: style.background,
                     ..Cell::default()
                 },
             );
         }
     }
 
-    pub fn draw_frame(&mut self, rect: Rect, title: &str, color: u8) {
+    /// Paint an entire row with `style`, so a themed status bar spans the full width instead of
+    /// only the columns its text happens to occupy.
+    // Consumed by the themed status bar; only the unit tests exercise it until then.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn fill_row(&mut self, y: u16, style: TextStyle) {
+        if y >= self.rows {
+            return;
+        }
+        for x in 0..self.columns {
+            self.set(
+                x,
+                y,
+                Cell {
+                    ch: ' ',
+                    foreground: style.foreground,
+                    background: style.background,
+                    ..Cell::default()
+                },
+            );
+        }
+    }
+
+    /// Recolor a run of existing cells without disturbing their text.
+    ///
+    /// Search highlighting needs to restyle a match in place: rewriting the cells would lose wide
+    /// glyphs, combining marks, and hyperlinks that the pane's own output put there.
+    // Consumed by scrollback search highlighting; only the unit tests exercise it until then.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn restyle(&mut self, x: u16, y: u16, width: u16, style: TextStyle) {
+        if y >= self.rows {
+            return;
+        }
+        let end = x.saturating_add(width).min(self.columns);
+        for column in x..end {
+            let index = usize::from(y) * usize::from(self.columns) + usize::from(column);
+            let cell = &mut self.cells[index];
+            cell.foreground = style.foreground;
+            cell.background = style.background;
+        }
+    }
+
+    pub fn draw_frame(&mut self, rect: Rect, title: &str, style: FrameStyle) {
         if rect.width < 2 || rect.height < 2 {
             return;
         }
         let styled = |ch| Cell {
             ch,
-            foreground: TerminalColor::Indexed(color),
+            foreground: style.border,
+            background: style.background,
+            ..Cell::default()
+        };
+        let titled = |ch| Cell {
+            ch,
+            foreground: style.title,
+            background: style.background,
             ..Cell::default()
         };
         let right = rect.x + rect.width - 1;
@@ -83,7 +169,7 @@ impl ScreenBuffer {
             .take(rect.width.saturating_sub(4) as usize)
             .enumerate()
         {
-            self.set(rect.x + 2 + offset as u16, rect.y, styled(ch));
+            self.set(rect.x + 2 + offset as u16, rect.y, titled(ch));
         }
     }
 
@@ -312,7 +398,7 @@ mod tests {
     #[test]
     fn diff_skips_unchanged_cells() {
         let mut first = ScreenBuffer::new(4, 2);
-        first.draw_text(0, 0, "test", 7, 0);
+        first.draw_text(0, 0, "test", TextStyle::indexed(7, 0));
         let full = ansi_diff(None, &first, true);
         let unchanged = ansi_diff(Some(&first), &first, false);
         assert!(full.len() > unchanged.len());
@@ -361,6 +447,106 @@ mod tests {
         continuation_overlap.set(2, 0, continuation);
         continuation_overlap.set(2, 0, Cell::default());
         assert_eq!(continuation_overlap.cells[1], Cell::default());
+    }
+
+    #[test]
+    fn truecolor_styles_reach_the_outer_terminal() {
+        let mut screen = ScreenBuffer::new(4, 1);
+        screen.draw_text(
+            0,
+            0,
+            "hi",
+            TextStyle {
+                foreground: TerminalColor::Rgb(10, 20, 30),
+                background: TerminalColor::Rgb(40, 50, 60),
+            },
+        );
+        let output = ansi_diff(None, &screen, true);
+
+        assert!(
+            output
+                .windows(b";38;2;10;20;30".len())
+                .any(|bytes| bytes == b";38;2;10;20;30"),
+            "an RGB theme foreground must survive to the wire"
+        );
+        assert!(
+            output
+                .windows(b";48;2;40;50;60".len())
+                .any(|bytes| bytes == b";48;2;40;50;60"),
+            "an RGB theme background must survive to the wire"
+        );
+    }
+
+    #[test]
+    fn a_frame_can_color_its_title_apart_from_its_border() {
+        let mut screen = ScreenBuffer::new(10, 3);
+        screen.draw_frame(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 3,
+            },
+            "ab",
+            FrameStyle {
+                border: TerminalColor::Indexed(1),
+                title: TerminalColor::Indexed(2),
+                background: TerminalColor::Indexed(3),
+            },
+        );
+
+        assert_eq!(screen.cells[0].ch, '┌');
+        assert_eq!(screen.cells[0].foreground, TerminalColor::Indexed(1));
+        assert_eq!(screen.cells[0].background, TerminalColor::Indexed(3));
+        assert_eq!(screen.cells[2].ch, 'a');
+        assert_eq!(screen.cells[2].foreground, TerminalColor::Indexed(2));
+        assert_eq!(screen.cells[2].background, TerminalColor::Indexed(3));
+    }
+
+    #[test]
+    fn fill_row_spans_the_full_width_before_text_is_drawn() {
+        let mut screen = ScreenBuffer::new(6, 2);
+        let style = TextStyle::indexed(15, 4);
+        screen.fill_row(1, style);
+        screen.draw_text(0, 1, "ab", style);
+
+        for column in 0..6 {
+            let cell = &screen.cells[usize::from(screen.columns) + column];
+            assert_eq!(
+                cell.background,
+                TerminalColor::Indexed(4),
+                "column {column} must carry the status background"
+            );
+        }
+        assert_eq!(screen.cells[usize::from(screen.columns)].ch, 'a');
+    }
+
+    #[test]
+    fn restyle_recolors_without_disturbing_text() {
+        let mut screen = ScreenBuffer::new(6, 1);
+        screen.draw_text(0, 0, "needle", TextStyle::indexed(7, 0));
+        screen.restyle(2, 0, 3, TextStyle::indexed(0, 11));
+
+        assert_eq!(screen.cells[2].ch, 'e', "text must survive a restyle");
+        assert_eq!(screen.cells[2].background, TerminalColor::Indexed(11));
+        assert_eq!(screen.cells[4].background, TerminalColor::Indexed(11));
+        assert_eq!(
+            screen.cells[5].background,
+            TerminalColor::Indexed(0),
+            "restyle must stop at the requested width"
+        );
+    }
+
+    #[test]
+    fn restyle_clamps_to_the_buffer() {
+        let mut screen = ScreenBuffer::new(4, 1);
+        screen.draw_text(0, 0, "abcd", TextStyle::indexed(7, 0));
+
+        screen.restyle(3, 0, 99, TextStyle::indexed(1, 2));
+        screen.restyle(0, 5, 2, TextStyle::indexed(1, 2));
+
+        assert_eq!(screen.cells[3].background, TerminalColor::Indexed(2));
+        assert_eq!(screen.cells[0].background, TerminalColor::Indexed(0));
     }
 
     #[test]
