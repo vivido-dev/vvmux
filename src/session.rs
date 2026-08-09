@@ -284,6 +284,7 @@ struct Tab {
     focused: PaneId,
     last_focused_tiled: Option<PaneId>,
     zoomed: Option<PaneId>,
+    sync_input: bool,
 }
 
 impl Tab {
@@ -319,6 +320,29 @@ impl Tab {
             self.floating.raise(pane);
         }
     }
+}
+
+fn sync_targets(tab: &Tab, in_copy_mode: &dyn Fn(PaneId) -> bool) -> Vec<PaneId> {
+    let mut targets = tab.tree.as_ref().map_or_else(Vec::new, TiledNode::pane_ids);
+    targets.extend(tab.floating.pane_ids());
+    targets.retain(|pane_id| !in_copy_mode(*pane_id));
+    targets
+}
+
+fn queue_input_targets(
+    panes: &mut BTreeMap<PaneId, Pane>,
+    targets: &[PaneId],
+    bytes: &[u8],
+) -> Vec<(PaneId, InputFailure)> {
+    targets
+        .iter()
+        .filter_map(|pane_id| {
+            panes
+                .get_mut(pane_id)
+                .and_then(|pane| queue_pane_input(pane, bytes))
+                .map(|failure| (*pane_id, failure))
+        })
+        .collect()
 }
 
 /// The ordered bottom-to-top paint list for one tab: tiled leaves, visible ordinary floats,
@@ -1789,6 +1813,29 @@ impl SessionActor {
                     ),
                 }
             }
+            AutomationMethod::SetSyncInput { enabled } => {
+                let pane_id = pane_id.unwrap();
+                let Some(tab_index) = self.tabs.iter().position(|tab| tab.contains(pane_id)) else {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("pane_not_found", "pane no longer exists"),
+                    );
+                    return;
+                };
+                self.tabs[tab_index].sync_input = enabled;
+                self.session_sequence = self.session_sequence.wrapping_add(1);
+                if tab_index == self.active_tab {
+                    self.force_full = true;
+                    self.schedule_render();
+                }
+                self.reply_automation(
+                    target,
+                    serde_json::json!({
+                        "tab_id": self.tabs[tab_index].id,
+                        "sync_input": enabled,
+                    }),
+                );
+            }
             AutomationMethod::WaitText {
                 text,
                 regex,
@@ -2130,6 +2177,7 @@ impl SessionActor {
                     focused: new_pane_id,
                     last_focused_tiled: Some(new_pane_id),
                     zoomed: None,
+                    sync_input: false,
                 });
                 self.next_tab_id += 1;
                 tab_id
@@ -2296,6 +2344,7 @@ impl SessionActor {
             "visible": visible,
             "layer": layer,
             "zoomed": tab.zoomed == Some(pane_id),
+            "sync_input": tab.sync_input,
             "title": pane.terminal.title(),
             "geometry": rect_json(outer),
             "content_geometry": rect_json(outer.content()),
@@ -2762,9 +2811,25 @@ impl SessionActor {
             .is_some_and(|pane| pane.copy.is_some())
         {
             self.copy_input(pane_id, &bytes);
+        } else if self.active_tab().is_some_and(|tab| tab.sync_input) {
+            self.broadcast_input(&bytes);
         } else if let Some(pane) = self.panes.get_mut(&pane_id) {
             let failure = queue_pane_input(pane, &bytes);
             self.report_input_failure(pane_id, failure);
+        }
+    }
+
+    fn broadcast_input(&mut self, bytes: &[u8]) {
+        let targets = self.active_tab().map_or_else(Vec::new, |tab| {
+            sync_targets(tab, &|pane_id| {
+                self.panes
+                    .get(&pane_id)
+                    .is_some_and(|pane| pane.copy.is_some())
+            })
+        });
+        let failures = queue_input_targets(&mut self.panes, &targets, bytes);
+        for (pane_id, failure) in failures {
+            self.report_input_failure(pane_id, Some(failure));
         }
     }
 
@@ -3144,6 +3209,14 @@ impl SessionActor {
                     self.relayout();
                 }
             }
+            Action::ToggleSyncInput => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.sync_input = !tab.sync_input;
+                    self.session_sequence = self.session_sequence.wrapping_add(1);
+                    self.force_full = true;
+                    self.schedule_render();
+                }
+            }
             Action::EnterCopyMode => {
                 let rows = self.content_area().height.saturating_sub(2) as usize;
                 if let Some(pane_id) = self.active_tab().map(|tab| tab.focused)
@@ -3458,6 +3531,7 @@ impl SessionActor {
             focused: pane_id,
             last_focused_tiled: Some(pane_id),
             zoomed: None,
+            sync_input: false,
         });
         self.next_tab_id += 1;
         self.schedule_render();
@@ -3544,6 +3618,7 @@ impl SessionActor {
                 focused,
                 last_focused_tiled,
                 zoomed: None,
+                sync_input: false,
             });
         }
         if self.tabs.is_empty() {
@@ -3904,6 +3979,7 @@ impl SessionActor {
                     .and_then(|copy| copy.search.as_ref())
                     .filter(|search| !search.query.is_empty())
                     .map_or_else(String::new, |search| format!(" [search: {}]", search.query));
+                let sync_suffix = if tab.sync_input { " [sync]" } else { "" };
                 let pin_suffix = if projection.layer == PaneLayer::Pinned {
                     " [pin]"
                 } else {
@@ -3914,7 +3990,9 @@ impl SessionActor {
                 let exit_suffix = pane.exit_status.map(|_| " [exited]").unwrap_or("");
                 screen.draw_frame(
                     projection.outer,
-                    &format!(" {title}{copy_suffix}{search_suffix}{pin_suffix}{exit_suffix} "),
+                    &format!(
+                        " {title}{copy_suffix}{search_suffix}{sync_suffix}{pin_suffix}{exit_suffix} "
+                    ),
                     theme.frame(active),
                 );
                 let content = projection.content;
@@ -3987,6 +4065,11 @@ impl SessionActor {
                 .active_tab()
                 .and_then(|tab| tab.name.as_deref())
                 .map_or_else(String::new, |name| format!(" ({name})"));
+            let sync = if self.active_tab().is_some_and(|tab| tab.sync_input) {
+                "  sync"
+            } else {
+                ""
+            };
             let prompt = self.active_tab().and_then(|tab| {
                 self.panes
                     .get(&tab.focused)
@@ -4002,16 +4085,18 @@ impl SessionActor {
                         })
                     })
             });
+            let prompt_active = prompt.is_some();
             let status = prompt.unwrap_or_else(|| {
                 format!(
-                    " vvmux:{}  tab {}/{}{} (id:{})  panes:{}  rev:{} ",
+                    " vvmux:{}  tab {}/{}{} (id:{})  panes:{}  rev:{}{} ",
                     self.name,
                     tab_number,
                     self.tabs.len(),
                     tab_name,
                     tab_id,
                     self.panes.len(),
-                    self.layout_revision
+                    self.layout_revision,
+                    sync
                 )
             });
             let style = theme.status();
@@ -4022,6 +4107,10 @@ impl SessionActor {
                 screen.fill_row(row, style);
             }
             screen.draw_text(0, row, &status, style);
+            if !prompt_active && !sync.is_empty() {
+                let start = status.chars().count().saturating_sub(5);
+                screen.restyle(start as u16, row, 4, theme.sync_indicator());
+            }
             if status.starts_with('/') || status.starts_with('?') {
                 screen.cursor = Some((
                     status.chars().count().min(usize::from(screen.columns - 1)) as u16,
@@ -4832,24 +4921,50 @@ impl SessionActor {
     }
 
     fn paste(&mut self) {
-        let Some(pane_id) = self.active_tab().map(|tab| tab.focused) else {
+        let Some(tab) = self.active_tab() else {
             return;
         };
-        let bracketed = self
+        let focused = tab.focused;
+        let targets = if tab.sync_input {
+            sync_targets(tab, &|pane_id| {
+                self.panes
+                    .get(&pane_id)
+                    .is_some_and(|pane| pane.copy.is_some())
+            })
+        } else {
+            vec![focused]
+        };
+        let sanitized = sanitize_bracketed_paste(&self.copy_buffer);
+        let mut failures = Vec::new();
+        for pane_id in targets {
+            let bytes = self.paste_payload_for(pane_id, &sanitized);
+            if let Some(failure) = self
+                .panes
+                .get_mut(&pane_id)
+                .and_then(|pane| queue_pane_input(pane, &bytes))
+            {
+                failures.push((pane_id, failure));
+            }
+        }
+        for (pane_id, failure) in failures {
+            self.report_input_failure(pane_id, Some(failure));
+        }
+    }
+
+    fn paste_payload_for(&self, pane_id: PaneId, sanitized: &[u8]) -> Vec<u8> {
+        if self
             .panes
             .get(&pane_id)
-            .is_some_and(|pane| pane.terminal.modes().bracketed_paste);
-        let bytes = if bracketed {
-            let sanitized = sanitize_bracketed_paste(&self.copy_buffer);
+            .is_some_and(|pane| pane.terminal.modes().bracketed_paste)
+        {
             let mut bytes = Vec::with_capacity(sanitized.len() + 12);
             bytes.extend_from_slice(b"\x1b[200~");
-            bytes.extend_from_slice(&sanitized);
+            bytes.extend_from_slice(sanitized);
             bytes.extend_from_slice(b"\x1b[201~");
             bytes
         } else {
             self.copy_buffer.clone()
-        };
-        self.send_pane_input(pane_id, &bytes);
+        }
     }
 
     fn terminate_children(&mut self) {
@@ -5046,7 +5161,7 @@ fn automation_capabilities() -> serde_json::Value {
         "protocol_version": crate::ipc::VERSION,
         "methods": [
             "capabilities", "list_panes", "inspect", "inspect_media", "split", "focus", "close_pane",
-            "typing", "key", "paste", "get_text", "get_grid", "search", "wait_text",
+            "typing", "key", "paste", "get_text", "get_grid", "search", "set_sync_input", "wait_text",
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
             "trace_media", "reload_config", "run"
         ],
@@ -6061,7 +6176,38 @@ mod tests {
             focused: 1,
             last_focused_tiled: Some(1),
             zoomed: None,
+            sync_input: false,
         }
+    }
+
+    #[test]
+    fn sync_targets_include_hidden_live_panes_and_exclude_copy_mode() {
+        let mut tab = tab_with_floats();
+        tab.floating.ordinary_visible = false;
+        tab.zoomed = Some(1);
+        assert_eq!(
+            sync_targets(&tab, &|pane| matches!(pane, 2 | 10)),
+            [1, 11],
+            "visibility and zoom do not remove live targets, but copy mode does"
+        );
+
+        let empty = Tab {
+            id: 9,
+            name: None,
+            tree: None,
+            floating: FloatingLayer::default(),
+            focused: 99,
+            last_focused_tiled: None,
+            zoomed: None,
+            sync_input: true,
+        };
+        assert!(sync_targets(&empty, &|_| false).is_empty());
+    }
+
+    #[test]
+    fn a_removed_sync_target_is_a_no_op() {
+        let mut panes = BTreeMap::new();
+        assert!(queue_input_targets(&mut panes, &[7], b"ignored").is_empty());
     }
 
     #[test]

@@ -159,7 +159,6 @@ impl FloatingLayer {
         self.panes.is_empty()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pane_ids(&self) -> Vec<PaneId> {
         self.panes.iter().map(|pane| pane.pane_id).collect()
     }

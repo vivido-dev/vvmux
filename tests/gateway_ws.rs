@@ -591,6 +591,102 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
             .await
             .unwrap();
 
+        let split = command(executable, &runtime_root, &config_root)
+            .args([
+                "msg",
+                "--target",
+                &session,
+                "split",
+                "vertical",
+                "--pane-id",
+                "1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            split.status.success(),
+            "sync test split failed: {}",
+            String::from_utf8_lossy(&split.stderr)
+        );
+        let split: serde_json::Value = serde_json::from_slice(&split.stdout).unwrap();
+        let sibling = split["new_pane_id"].as_u64().unwrap().to_string();
+
+        // The default Ctrl-b S path enables tab-wide fan-out. A single browser input frame then
+        // reaches both real shells, not just the focused pane.
+        socket
+            .send(Message::Binary(b"\x02S".to_vec().into()))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Binary(
+                b"printf SYNC_FANOUT_OK\r".to_vec().into(),
+            ))
+            .await
+            .unwrap();
+        for pane in ["1", sibling.as_str()] {
+            let waited = command(executable, &runtime_root, &config_root)
+                .args([
+                    "msg",
+                    "--target",
+                    &session,
+                    "wait",
+                    "text",
+                    "SYNC_FANOUT_OK",
+                    "--pane-id",
+                    pane,
+                    "--timeout",
+                    "5s",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                waited.status.success(),
+                "sync input did not reach pane {pane}: {}",
+                String::from_utf8_lossy(&waited.stderr)
+            );
+        }
+
+        // With sync still enabled, copy mode on the focused sibling consumes ordinary bytes and
+        // suppresses the fan-out completely.
+        socket
+            .send(Message::Binary(b"\x02[".to_vec().into()))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Binary(
+                b"printf COPY_MODE_MUST_NOT_FAN_OUT\r".to_vec().into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let first_text = command(executable, &runtime_root, &config_root)
+            .args([
+                "msg",
+                "--target",
+                &session,
+                "get-text",
+                "--pane-id",
+                "1",
+            ])
+            .output()
+            .unwrap();
+        assert!(first_text.status.success());
+        assert!(
+            !first_text
+                .stdout
+                .windows(b"COPY_MODE_MUST_NOT_FAN_OUT".len())
+                .any(|window| window == b"COPY_MODE_MUST_NOT_FAN_OUT"),
+            "focused copy mode leaked bytes to a synchronized sibling"
+        );
+        socket
+            .send(Message::Binary(b"q".to_vec().into()))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Binary(b"\x02S".to_vec().into()))
+            .await
+            .unwrap();
+
         socket
             .send(Message::Text(
                 serde_json::json!({

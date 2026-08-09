@@ -126,6 +126,7 @@ pub struct Theme {
     pub search_match_background: Option<ThemeColor>,
     pub search_current_foreground: Option<ThemeColor>,
     pub search_current_background: Option<ThemeColor>,
+    pub sync_indicator: Option<ThemeColor>,
     /// Whether the status bar paints its background across the full width. Without it the bar is
     /// only as wide as its text, which looks broken against a colored background.
     pub status_fill: Option<bool>,
@@ -145,6 +146,7 @@ pub struct ResolvedTheme {
     pub search_match_background: TerminalColor,
     pub search_current_foreground: TerminalColor,
     pub search_current_background: TerminalColor,
+    pub sync_indicator: TerminalColor,
     pub status_fill: bool,
 }
 
@@ -185,6 +187,13 @@ impl ResolvedTheme {
             background: self.search_current_background,
         }
     }
+
+    pub fn sync_indicator(&self) -> TextStyle {
+        TextStyle {
+            foreground: self.sync_indicator,
+            background: self.status_background,
+        }
+    }
 }
 
 /// The built-in look: exactly the colors vvmux used before themes existed.
@@ -201,6 +210,7 @@ fn base() -> ResolvedTheme {
         search_match_background: TerminalColor::Indexed(11),
         search_current_foreground: TerminalColor::Indexed(15),
         search_current_background: TerminalColor::Indexed(5),
+        sync_indicator: TerminalColor::Indexed(14),
         status_fill: true,
     }
 }
@@ -226,6 +236,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             search_match_background: TerminalColor::Indexed(7),
             search_current_foreground: TerminalColor::Indexed(15),
             search_current_background: TerminalColor::Indexed(8),
+            sync_indicator: TerminalColor::Indexed(15),
             status_fill: true,
         },
         "nord" => ResolvedTheme {
@@ -240,6 +251,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             search_match_background: rgb(0xeb, 0xcb, 0x8b),
             search_current_foreground: rgb(0x2e, 0x34, 0x40),
             search_current_background: rgb(0xd0, 0x87, 0x70),
+            sync_indicator: rgb(0xa3, 0xbe, 0x8c),
             status_fill: true,
         },
         "solarized-dark" => ResolvedTheme {
@@ -254,6 +266,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             search_match_background: rgb(0xb5, 0x89, 0x00),
             search_current_foreground: rgb(0x00, 0x2b, 0x36),
             search_current_background: rgb(0xcb, 0x4b, 0x16),
+            sync_indicator: rgb(0x85, 0x99, 0x00),
             status_fill: true,
         },
         "gruvbox-dark" => ResolvedTheme {
@@ -268,6 +281,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             search_match_background: rgb(0xfa, 0xbd, 0x2f),
             search_current_foreground: rgb(0x28, 0x28, 0x28),
             search_current_background: rgb(0xfe, 0x80, 0x19),
+            sync_indicator: rgb(0xb8, 0xbb, 0x26),
             status_fill: true,
         },
         _ => return None,
@@ -339,6 +353,7 @@ pub fn resolve(theme: &Theme, appearance: &Appearance) -> ResolvedTheme {
         None,
         resolved.search_current_background,
     );
+    resolved.sync_indicator = pick(theme.sync_indicator, None, resolved.sync_indicator);
     resolved.status_fill = theme.status_fill.unwrap_or(resolved.status_fill);
     resolved
 }
@@ -507,5 +522,13 @@ mod tests {
             "both focus states share the frame background"
         );
         assert_eq!(resolved.status().foreground, resolved.status_foreground);
+        assert_eq!(
+            resolved.sync_indicator().foreground,
+            resolved.sync_indicator
+        );
+        assert_eq!(
+            resolved.sync_indicator().background,
+            resolved.status_background
+        );
     }
 }

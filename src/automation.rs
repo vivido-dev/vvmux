@@ -199,6 +199,15 @@ pub enum MsgCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Enable or disable synchronized input for the target pane's tab.
+    SyncInput {
+        #[arg(long, conflicts_with = "off", required_unless_present = "off")]
+        on: bool,
+        #[arg(long, conflicts_with = "on", required_unless_present = "on")]
+        off: bool,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Wait for pane or render state.
     Wait {
         #[command(subcommand)]
@@ -576,6 +585,16 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 start_column,
                 limit,
             },
+            pane_id,
+            true,
+            Output::Json,
+        ),
+        MsgCommand::SyncInput {
+            on,
+            off: _,
+            pane_id,
+        } => (
+            AutomationMethod::SetSyncInput { enabled: on },
             pane_id,
             true,
             Output::Json,

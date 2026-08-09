@@ -185,7 +185,7 @@ Mux actions use a nested tagged object:
 ```
 
 Action names are `split`, `focus`, `resize`, `new_tab`, `next_tab`, `previous_tab`, `select_tab`,
-`close_pane`, `toggle_zoom`, `enter_copy_mode`, `copy_input`, `paste`, `new_floating_pane`,
+`close_pane`, `toggle_zoom`, `toggle_sync_input`, `enter_copy_mode`, `copy_input`, `paste`, `new_floating_pane`,
 `toggle_floating_panes`, `toggle_pane_pinned`, `enter_floating_move_mode`, and
 `enter_floating_resize_mode`. Axes are `horizontal` or `vertical`; directions are `left`, `right`,
 `up`, or `down`. `copy_input` carries a JSON byte array named `bytes`.

@@ -66,6 +66,14 @@ to another session that reused the same numeric IDs. Weighted startup constructo
 not enforce the placeholder 80x23 display's interactive minimums. The first real attach supplies
 authoritative geometry and relayouts once; interactive splits continue to validate the live area.
 
+Synchronized input is tab-owned actor state. Its target snapshot deliberately enumerates the tiled
+tree and the complete floating layer rather than the visible projection, so zoomed and hidden live
+shells remain members; panes in copy mode are filtered out. PTY writes are attempted across the
+owned snapshot first and failures are reported only after iteration. Reporting may close a pane,
+remove its tab, refocus, and relayout, so mutating lifecycle state inside the fan-out loop would
+invalidate both the target set and its tab. Paste uses the same collect-then-report discipline and
+builds bracketed payloads per pane because terminal modes are pane-local.
+
 ## Vivid 1.5 nested presenter and revision domains
 
 The pane-facing virtual presenter and the outer presenter are different Vivid sessions. Virtual

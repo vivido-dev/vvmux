@@ -93,6 +93,7 @@ paste TEXT [--pane-id ID]
 get-text [--rows N] [--pane-id ID]
 get-grid [--start-line LINE --row-count N | --since-screen SEQ] [--pane-id ID]
 search --pattern TEXT [--regex] [--direction forward|backward] [--start-line LINE --start-column COLUMN] [--limit N] [--pane-id ID]
+sync-input (--on|--off) [--pane-id ID]
 wait text TEXT [--regex] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait screen-change [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait screen-stable [--quiet DURATION] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
@@ -265,6 +266,7 @@ The prefix is `Ctrl-b`.
 | `Ctrl-b c`, `n`, `p`, `0`–`9` | Create/cycle/select tabs |
 | `Ctrl-b x`, then `y` | Close the focused pane |
 | `Ctrl-b z` | Toggle zoom |
+| `Ctrl-b S` | Toggle synchronized input for the active tab |
 | `Ctrl-b f` / `Ctrl-b F` | Create a floating pane / show or hide ordinary floats |
 | `Ctrl-b P` | Pin or unpin the focused floating pane |
 | `Ctrl-b m` / `Ctrl-b r` | Enter floating move / resize mode |
@@ -284,6 +286,11 @@ In floating move or resize mode, arrows step by one cell and Shift-Arrow steps b
 commits and Escape restores the rectangle captured on entry. Zoom hides every other pane, including
 pinned floats, without mutating the tiled tree, floating rectangles, visibility, pins, z-order, or
 focus.
+
+Synchronized input fans ordinary typing and paste out to every live tiled and floating pane in the
+active tab, including hidden floats and panes hidden by zoom. Copy-mode panes are excluded, and a
+focused copy-mode pane suppresses fan-out entirely. The setting belongs to one tab and does not
+follow tab switches. Every frame title and the status row show `sync` while it is enabled.
 
 Mouse clicks focus panes. Tiled border drags resize. On a floating pane, the top title frame moves
 the pane, while side/bottom frames and corners resize it; drag geometry is based on the press-time
@@ -351,7 +358,8 @@ active_frame = "#ff8800"
 The keys are `preset`, `active_frame`, `inactive_frame`, `active_title`, `inactive_title`,
 `frame_background`, `status_foreground`, `status_background`, `status_fill`,
 `search_match_foreground`, `search_match_background`, `search_current_foreground`, and
-`search_current_background`. Titles default to their frame color. An unknown preset name or
+`search_current_background`, plus the status-row `sync_indicator`. Titles default to their frame
+color. An unknown preset name or
 malformed color is rejected at startup with a message listing the accepted values.
 
 The status bar paints its background across the full width. Set `status_fill = false` for the
@@ -405,8 +413,8 @@ and tab-scoped floating/pinned shell panes, zoom, scrollback/copy/paste, ordered
 composition, mouse focus/move/resize/forwarding, status line, truecolor theming, strict TOML with
 live reload, command panes with hold-on-exit, bounded TOML startup layouts, VVMX IPC, exact
 fragment-aware pane media occlusion, static rehydration, timed-media headless semantics,
-full-duplex outer control, linked A/V projection, bounded scrollback search, and optional
-bulk-media endpoint discovery.
+full-duplex outer control, linked A/V projection, bounded scrollback search, tab-local synchronized
+input, and optional bulk-media endpoint discovery.
 
 Intentionally absent: plugins, a bundled web UI, direct non-loopback/TLS serving,
 arbitrary action sockets, stacked panes, pane-class conversion, multi-pane selection, scrollback

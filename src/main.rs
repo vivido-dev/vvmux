@@ -349,6 +349,10 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["vvmux", "msg", "inspect-media", "--pane-id", "7"]).is_ok());
+        assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input", "--on"]).is_ok());
+        assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input", "--off"]).is_ok());
+        assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input"]).is_err());
+        assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input", "--on", "--off"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "vvmux",

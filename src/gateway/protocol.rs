@@ -100,6 +100,7 @@ pub(crate) enum WireAction {
     SelectTab { index: u16 },
     ClosePane,
     ToggleZoom,
+    ToggleSyncInput,
     EnterCopyMode,
     CopyInput { bytes: Vec<u8> },
     Paste,
@@ -122,6 +123,7 @@ impl WireAction {
             Self::SelectTab { index } => Ok(Action::SelectTab(index as usize)),
             Self::ClosePane => Ok(Action::ClosePane),
             Self::ToggleZoom => Ok(Action::ToggleZoom),
+            Self::ToggleSyncInput => Ok(Action::ToggleSyncInput),
             Self::EnterCopyMode => Ok(Action::EnterCopyMode),
             Self::CopyInput { bytes } if bytes.len() <= MAX_INPUT_BYTES => {
                 Ok(Action::CopyInput(bytes))
@@ -310,6 +312,10 @@ mod tests {
             .into_ipc()
             .unwrap(),
             Action::Focus(Direction::Left)
+        );
+        assert_eq!(
+            WireAction::ToggleSyncInput.into_ipc().unwrap(),
+            Action::ToggleSyncInput
         );
         assert!(
             WireAction::CopyInput {

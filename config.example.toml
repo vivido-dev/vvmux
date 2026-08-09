@@ -41,6 +41,8 @@ status_background = "blue"
 # search_match_background = "bright-yellow"
 # search_current_foreground = "bright-white"
 # search_current_background = "magenta"
+# Status-row indicator color for synchronized input; frame titles use their normal title color.
+# sync_indicator = "bright-cyan"
 # The status bar paints its background across the full width. Set false for the
 # older look, where the background stopped where the text did.
 # status_fill = true
@@ -66,6 +68,7 @@ max_connections = 32
 outbound_queue_bytes = 4194304
 
 [keys.prefix]
+S = "toggle-sync-input"
 f = "new-floating-pane"
 F = "toggle-floating-panes"
 P = "toggle-pane-pinned"

@@ -283,6 +283,7 @@ impl PrefixParser {
                 b'n' => output.push(ParsedInput::Action(Action::NextTab)),
                 b'p' => output.push(ParsedInput::Action(Action::PreviousTab)),
                 b'z' => output.push(ParsedInput::Action(Action::ToggleZoom)),
+                b'S' => output.push(ParsedInput::Action(Action::ToggleSyncInput)),
                 b'f' => output.push(ParsedInput::Action(Action::NewFloatingPane)),
                 b'F' => output.push(ParsedInput::Action(Action::ToggleFloatingPanes)),
                 b'P' => output.push(ParsedInput::Action(Action::TogglePanePinned)),
@@ -327,6 +328,7 @@ pub(crate) fn parse_configured_action(action: &str) -> Option<Action> {
         "previous-tab" => Some(Action::PreviousTab),
         "close-pane" => Some(Action::ClosePane),
         "toggle-zoom" => Some(Action::ToggleZoom),
+        "toggle-sync-input" => Some(Action::ToggleSyncInput),
         "copy-mode" => Some(Action::EnterCopyMode),
         "paste" => Some(Action::Paste),
         "new-floating-pane" => Some(Action::NewFloatingPane),
@@ -409,6 +411,10 @@ mod tests {
             ParsedInput::Action(Action::Split(Axis::Vertical))
         );
         assert!(matches!(&commands[3], ParsedInput::Input(bytes) if bytes == b"z"));
+        assert_eq!(
+            parser.feed(b"\x02S"),
+            [ParsedInput::Action(Action::ToggleSyncInput)]
+        );
 
         assert_eq!(
             parser.feed(b"\x1b[<64;5;7M"),

@@ -116,6 +116,9 @@ pub enum AutomationMethod {
         start_column: Option<usize>,
         limit: u16,
     },
+    SetSyncInput {
+        enabled: bool,
+    },
     WaitText {
         text: String,
         regex: bool,
@@ -262,6 +265,7 @@ pub enum Action {
     SelectTab(usize),
     ClosePane,
     ToggleZoom,
+    ToggleSyncInput,
     EnterCopyMode,
     CopyInput(Vec<u8>),
     Paste,
