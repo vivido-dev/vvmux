@@ -301,8 +301,19 @@ follow tab switches. Every frame title and the status row show `sync` while it i
 Mouse clicks focus panes. Tiled border drags resize. On a floating pane, the top title frame moves
 the pane, while side/bottom frames and corners resize it; drag geometry is based on the press-time
 rectangle and total pointer delta. Mouse input is translated into pane-local SGR coordinates when
-the application requested mouse reporting; Shift cancels or prevents pane dragging and forces
-vvmux scrolling/copy behavior.
+the application requested mouse reporting. Otherwise, a left-button drag selects text inside the
+pressed pane and copies it through OSC 52 on release; triple-click selects one displayed row, and
+triple-click-drag extends by displayed rows. Selection is clipped to the pressed pane even if the
+pointer crosses another tiled or floating pane, and the highlight remains until input, output, a
+layout change, or the next click invalidates it. Copy mode (`Ctrl-b [`) owns the same gestures even
+when the program in the pane requested mouse input.
+
+A Shift-modified left gesture also forces pane-local selection when the outer terminal forwards
+the standard SGR mouse report. Many terminals instead reserve Shift for their own native selection
+while application mouse tracking is active; those gestures never reach vvmux and can still select
+across pane boundaries. Use the unmodified gesture (or configure the outer terminal to forward
+Shift) when pane-bounded selection is required. Shift prevents pane-frame dragging when it is
+forwarded.
 
 Strict floating defaults live under `[floating]`: `default_width_percent` and
 `default_height_percent` accept 10–100, and `border_drag_margin` accepts 1–4. New floats are centered

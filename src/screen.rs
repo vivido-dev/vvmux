@@ -125,6 +125,22 @@ impl ScreenBuffer {
         }
     }
 
+    /// Toggle reverse video across an existing run without replacing any terminal cell data.
+    ///
+    /// A toggle, rather than forcing inverse on, keeps selection visible over applications that
+    /// already use reverse video for some cells. Text, wide-cell structure, combining marks, and
+    /// hyperlinks remain untouched.
+    pub fn invert(&mut self, x: u16, y: u16, width: u16) {
+        if y >= self.rows {
+            return;
+        }
+        let end = x.saturating_add(width).min(self.columns);
+        for column in x..end {
+            let index = usize::from(y) * usize::from(self.columns) + usize::from(column);
+            self.cells[index].inverse = !self.cells[index].inverse;
+        }
+    }
+
     pub fn draw_frame(&mut self, rect: Rect, title: &str, style: FrameStyle) {
         if rect.width < 2 || rect.height < 2 {
             return;
@@ -438,6 +454,24 @@ mod tests {
         continuation_overlap.set(2, 0, continuation);
         continuation_overlap.set(2, 0, Cell::default());
         assert_eq!(continuation_overlap.cells[1], Cell::default());
+    }
+
+    #[test]
+    fn selection_inversion_preserves_cells_and_toggles_existing_reverse_video() {
+        let mut screen = ScreenBuffer::new(3, 1);
+        screen.cells[0].ch = 'a';
+        screen.cells[1].ch = 'b';
+        screen.cells[1].inverse = true;
+        let original = screen.cells.clone();
+
+        screen.invert(0, 0, 2);
+        assert!(screen.cells[0].inverse);
+        assert!(!screen.cells[1].inverse);
+        assert_eq!(screen.cells[0].ch, original[0].ch);
+        assert_eq!(screen.cells[1].ch, original[1].ch);
+
+        screen.invert(0, 0, 2);
+        assert_eq!(screen.cells, original);
     }
 
     #[test]

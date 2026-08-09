@@ -46,6 +46,7 @@ const MEDIA_EVENT_QUEUE: usize = 256;
 /// and projection updates indefinitely.
 const MEDIA_EVENTS_PER_TURN: usize = 32;
 const COPY_BUFFER_LIMIT: usize = 1024 * 1024;
+const MOUSE_MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_NODE_FRAGMENTS: usize = 8;
 const MAX_PROJECTED_NODES: usize = 256;
 const INPUT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
@@ -169,6 +170,7 @@ struct Pane {
     input: PtyInput,
     control: PtyControl,
     copy: Option<CopyState>,
+    mouse_selection: Option<MouseSelection>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
     /// Whether the pane stays open after its process exits, keeping the output readable.
     #[allow(dead_code)]
@@ -266,6 +268,61 @@ struct CopyState {
     search: Option<CopySearch>,
     matches: Vec<SearchMatch>,
     current: Option<SearchMatch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseSelectionMode {
+    Character,
+    Line,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseSelection {
+    start: (isize, usize),
+    end: (isize, usize),
+    mode: MouseSelectionMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MouseSelectionDrag {
+    pane: PaneId,
+    content: Rect,
+    display_offset: usize,
+    start: (isize, usize),
+    mode: MouseSelectionMode,
+    moved: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MouseClickTracker {
+    pane: PaneId,
+    cell: (isize, usize),
+    count: u8,
+    last: Instant,
+}
+
+impl MouseClickTracker {
+    fn next(previous: Option<Self>, pane: PaneId, cell: (isize, usize), now: Instant) -> Self {
+        let count = previous
+            .filter(|previous| {
+                previous.pane == pane
+                    && previous.cell == cell
+                    && now.saturating_duration_since(previous.last) <= MOUSE_MULTI_CLICK_INTERVAL
+            })
+            .map_or(1, |previous| {
+                if previous.count >= 3 {
+                    1
+                } else {
+                    previous.count + 1
+                }
+            });
+        Self {
+            pane,
+            cell,
+            count,
+            last: now,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -648,6 +705,8 @@ struct SessionActor {
     fragment_assignments: HashMap<(u64, u64), FragmentMap>,
     last_projection_warning: Option<MediaProjectionKey>,
     pointer_drag: Option<PointerDrag>,
+    mouse_selection_drag: Option<MouseSelectionDrag>,
+    mouse_click_tracker: Option<MouseClickTracker>,
     float_modal: Option<FloatModal>,
     next_float_mode: u64,
     session_sequence: u64,
@@ -790,6 +849,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         fragment_assignments: HashMap::new(),
         last_projection_warning: None,
         pointer_drag: None,
+        mouse_selection_drag: None,
+        mouse_click_tracker: None,
         float_modal: None,
         next_float_mode: 0,
         session_sequence: 1,
@@ -968,6 +1029,7 @@ impl SessionActor {
                         MediaTraceKind::BridgeClientDetached,
                     );
                     self.cancel_pointer_drag(true);
+                    self.invalidate_mouse_selection_state();
                     self.attached = None;
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
@@ -985,6 +1047,7 @@ impl SessionActor {
                 }
             }
             ActorEvent::PtyOutput(pane_id, bytes) => {
+                self.invalidate_mouse_selection_for_pane(pane_id);
                 let focused = self.active_tab().is_some_and(|tab| tab.focused == pane_id);
                 let mut title = None;
                 let mut bell = false;
@@ -1148,6 +1211,7 @@ impl SessionActor {
                     );
                 }
                 self.cancel_pointer_drag(true);
+                self.invalidate_mouse_selection_state();
                 self.end_float_mode(true);
                 // Even a clean client replacement owns a different physical presenter and fresh
                 // decoder/audio devices. Park timed ingress until that client applies its first
@@ -1242,6 +1306,7 @@ impl SessionActor {
                     );
                     if changed {
                         self.cancel_pointer_drag(true);
+                        self.invalidate_mouse_selection_state();
                         self.end_float_mode(true);
                         if let Some(client) = &mut self.attached {
                             client.display = display;
@@ -1486,6 +1551,7 @@ impl SessionActor {
                         MediaTraceKind::BridgeClientDetached,
                     );
                     self.cancel_pointer_drag(true);
+                    self.invalidate_mouse_selection_state();
                     crate::ipc::send(
                         &writer,
                         &ServerMessage::Detached {
@@ -2233,6 +2299,9 @@ impl SessionActor {
     }
 
     fn automation_input(&mut self, target: AutomationReplyTarget, pane_id: PaneId, bytes: Vec<u8>) {
+        if self.invalidate_mouse_selection_for_pane(pane_id) {
+            self.schedule_render();
+        }
         if bytes.len() > 1024 * 1024 {
             self.reply_automation_error(
                 target,
@@ -2808,6 +2877,9 @@ impl SessionActor {
     }
 
     fn input(&mut self, bytes: Vec<u8>) {
+        if self.invalidate_mouse_selection_state() {
+            self.schedule_render();
+        }
         let Some(pane_id) = self.active_tab().map(|tab| tab.focused) else {
             return;
         };
@@ -2839,7 +2911,155 @@ impl SessionActor {
         }
     }
 
+    fn clear_retained_mouse_selections(&mut self) -> bool {
+        let mut changed = false;
+        for pane in self.panes.values_mut() {
+            changed |= pane.mouse_selection.take().is_some();
+        }
+        changed
+    }
+
+    fn invalidate_mouse_selection_state(&mut self) -> bool {
+        self.mouse_selection_drag = None;
+        self.mouse_click_tracker = None;
+        self.clear_retained_mouse_selections()
+    }
+
+    fn invalidate_mouse_selection_for_pane(&mut self, pane_id: PaneId) -> bool {
+        if self
+            .mouse_selection_drag
+            .is_some_and(|drag| drag.pane == pane_id)
+        {
+            self.mouse_selection_drag = None;
+        }
+        if self
+            .mouse_click_tracker
+            .is_some_and(|click| click.pane == pane_id)
+        {
+            self.mouse_click_tracker = None;
+        }
+        self.panes
+            .get_mut(&pane_id)
+            .and_then(|pane| pane.mouse_selection.take())
+            .is_some()
+    }
+
+    fn begin_mouse_selection(&mut self, pane_id: PaneId, content: Rect, mouse: MouseEvent) {
+        let Some(pane) = self.panes.get(&pane_id) else {
+            return;
+        };
+        let display_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
+        let Some(cell) = mouse_selection_cell(content, mouse.x, mouse.y, display_offset) else {
+            return;
+        };
+        let cell = normalize_mouse_selection_cell(&pane.terminal, cell);
+        let click =
+            MouseClickTracker::next(self.mouse_click_tracker, pane_id, cell, Instant::now());
+        self.mouse_click_tracker = Some(click);
+        let mode = if click.count == 3 {
+            MouseSelectionMode::Line
+        } else {
+            MouseSelectionMode::Character
+        };
+        self.mouse_selection_drag = Some(MouseSelectionDrag {
+            pane: pane_id,
+            content,
+            display_offset,
+            start: cell,
+            mode,
+            moved: false,
+        });
+        if mode == MouseSelectionMode::Line {
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                pane.mouse_selection = Some(MouseSelection {
+                    start: cell,
+                    end: cell,
+                    mode,
+                });
+            }
+            self.schedule_render();
+        }
+    }
+
+    fn update_mouse_selection(&mut self, mouse: MouseEvent) {
+        let Some(mut drag) = self.mouse_selection_drag.take() else {
+            return;
+        };
+        let Some(pane) = self.panes.get(&drag.pane) else {
+            return;
+        };
+        let Some(end) = mouse_selection_cell(drag.content, mouse.x, mouse.y, drag.display_offset)
+        else {
+            return;
+        };
+        let end = normalize_mouse_selection_cell(&pane.terminal, end);
+        drag.moved = true;
+        if let Some(pane) = self.panes.get_mut(&drag.pane) {
+            pane.mouse_selection = Some(MouseSelection {
+                start: drag.start,
+                end,
+                mode: drag.mode,
+            });
+        }
+        self.mouse_selection_drag = Some(drag);
+        self.schedule_render();
+    }
+
+    fn finish_mouse_selection(&mut self, mouse: MouseEvent) {
+        let Some(drag) = self.mouse_selection_drag.take() else {
+            return;
+        };
+        let Some(pane) = self.panes.get(&drag.pane) else {
+            return;
+        };
+        let Some(end) = mouse_selection_cell(drag.content, mouse.x, mouse.y, drag.display_offset)
+        else {
+            return;
+        };
+        let end = normalize_mouse_selection_cell(&pane.terminal, end);
+        let selected = drag.mode == MouseSelectionMode::Line || drag.moved || end != drag.start;
+        if !selected {
+            if let Some(pane) = self.panes.get_mut(&drag.pane) {
+                pane.mouse_selection = None;
+            }
+            self.schedule_render();
+            return;
+        }
+        let selection = MouseSelection {
+            start: drag.start,
+            end,
+            mode: drag.mode,
+        };
+        let bytes = extract_mouse_selection(&pane.terminal, selection);
+        if let Some(pane) = self.panes.get_mut(&drag.pane) {
+            pane.mouse_selection = Some(selection);
+        }
+        self.copy_buffer = bytes;
+        self.copy_buffer.truncate(COPY_BUFFER_LIMIT);
+        let clipboard = String::from_utf8_lossy(&self.copy_buffer).into_owned();
+        if let Some(client) = &self.attached {
+            let _ = crate::ipc::send(&client.writer, &ServerMessage::Clipboard(clipboard));
+        }
+        self.schedule_render();
+    }
+
     fn mouse(&mut self, mouse: MouseEvent) {
+        if self.mouse_selection_drag.is_some() {
+            match mouse.kind {
+                MouseKind::Move if mouse.button == 0 => {
+                    self.update_mouse_selection(mouse);
+                    return;
+                }
+                MouseKind::Release if mouse.button == 0 => {
+                    self.finish_mouse_selection(mouse);
+                    return;
+                }
+                _ => {
+                    self.mouse_selection_drag = None;
+                    self.mouse_click_tracker = None;
+                }
+            }
+        }
         if self.pointer_drag.is_some() {
             match mouse.kind {
                 MouseKind::Release if !mouse.shift && mouse.button == 0 => {
@@ -2859,6 +3079,17 @@ impl SessionActor {
         if matches!(mouse.kind, MouseKind::Move | MouseKind::Release) {
             return;
         }
+        if mouse.kind == MouseKind::Wheel && self.invalidate_mouse_selection_state() {
+            self.schedule_render();
+        }
+        let cleared_selection =
+            mouse.kind == MouseKind::Press && self.clear_retained_mouse_selections();
+        if cleared_selection {
+            self.schedule_render();
+        }
+        if mouse.kind == MouseKind::Press && mouse.button != 0 {
+            self.mouse_click_tracker = None;
+        }
         let area = self.content_area();
         let Some((tab_id, focused, original_tree, projection)) =
             self.active_tab().and_then(|tab| {
@@ -2871,6 +3102,9 @@ impl SessionActor {
                 Some((tab.id, tab.focused, tab.tree.clone(), hit))
             })
         else {
+            if mouse.kind == MouseKind::Press && mouse.button == 0 {
+                self.mouse_click_tracker = None;
+            }
             return;
         };
         let (pane_id, rect) = (projection.pane_id, projection.outer);
@@ -2917,10 +3151,12 @@ impl SessionActor {
                     },
                 });
                 self.schedule_render();
+                self.mouse_click_tracker = None;
                 return;
             }
         } else if mouse.kind == MouseKind::Press
             && mouse.button == 0
+            && !mouse.shift
             && (on_vertical || on_horizontal)
         {
             let axis = if on_vertical {
@@ -2944,6 +3180,7 @@ impl SessionActor {
                 original,
             });
             self.schedule_render();
+            self.mouse_click_tracker = None;
             return;
         }
 
@@ -2954,7 +3191,20 @@ impl SessionActor {
             || mouse.y >= content.y + content.height
         {
             self.schedule_render();
+            if mouse.kind == MouseKind::Press && mouse.button == 0 {
+                self.mouse_click_tracker = None;
+            }
             return;
+        }
+        let selection_gesture = self.panes.get(&pane_id).is_some_and(|pane| {
+            starts_mouse_selection(mouse, pane.copy.is_some(), pane.terminal.modes())
+        });
+        if selection_gesture {
+            self.begin_mouse_selection(pane_id, content, mouse);
+            return;
+        }
+        if mouse.kind == MouseKind::Press && mouse.button == 0 {
+            self.mouse_click_tracker = None;
         }
         let mut translated = None;
         let mut copy_view_render = false;
@@ -2981,7 +3231,7 @@ impl SessionActor {
                     mouse.x - content.x + 1,
                     mouse.y - content.y + 1
                 ));
-            } else if mouse.kind == MouseKind::Wheel || mouse.shift {
+            } else if mouse.kind == MouseKind::Wheel {
                 copy_view_render = true;
                 let previous_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
                 let copy = pane.copy.get_or_insert(CopyState {
@@ -2997,7 +3247,7 @@ impl SessionActor {
                     copy.offset = (copy.offset + 3).min(pane.terminal.history_len());
                 } else {
                     copy.offset = copy.offset.saturating_sub(3);
-                    if copy.offset == 0 && !mouse.shift {
+                    if copy.offset == 0 {
                         pane.copy = None;
                     }
                 }
@@ -3173,6 +3423,9 @@ impl SessionActor {
 
     fn action(&mut self, action: Action) {
         self.cancel_pointer_drag(true);
+        if self.invalidate_mouse_selection_state() {
+            self.schedule_render();
+        }
         // Any prefix action during a float-edit mode invalidates it (focus, tab, zoom, and
         // layout changes are all cancellation triggers); restore the entry rectangle first.
         self.end_float_mode(true);
@@ -3721,6 +3974,7 @@ impl SessionActor {
                 input: parts.input,
                 control: parts.control,
                 copy: None,
+                mouse_selection: None,
                 vivid_metrics: None,
                 hold_on_exit: spec.hold_on_exit,
                 exit_status: None,
@@ -3735,6 +3989,7 @@ impl SessionActor {
     }
 
     fn close_pane(&mut self, pane_id: PaneId) {
+        self.invalidate_mouse_selection_for_pane(pane_id);
         if let Some(drag) = &self.pointer_drag {
             self.cancel_pointer_drag(drag.pane() != Some(pane_id));
         }
@@ -3867,6 +4122,7 @@ impl SessionActor {
     }
 
     fn relayout(&mut self) {
+        self.invalidate_mouse_selection_state();
         self.layout_revision = self.layout_revision.wrapping_add(1);
         self.session_sequence = self.session_sequence.wrapping_add(1);
         self.resize_all();
@@ -4032,6 +4288,21 @@ impl SessionActor {
                             content.y.saturating_add(row as u16),
                             width as u16,
                             style,
+                        );
+                    }
+                }
+                if let Some(selection) = pane.mouse_selection {
+                    for (row, column, width) in mouse_selection_runs(
+                        &pane.terminal,
+                        selection,
+                        offset,
+                        usize::from(content.width),
+                        usize::from(content.height),
+                    ) {
+                        screen.invert(
+                            content.x.saturating_add(column as u16),
+                            content.y.saturating_add(row as u16),
+                            width as u16,
                         );
                     }
                 }
@@ -5986,6 +6257,124 @@ fn terminfo_installed() -> bool {
         .any(|root| root.join("v/vvmux").exists())
 }
 
+fn mouse_selection_cell(
+    content: Rect,
+    x: u16,
+    y: u16,
+    display_offset: usize,
+) -> Option<(isize, usize)> {
+    if content.width == 0 || content.height == 0 {
+        return None;
+    }
+    let right = content.x.saturating_add(content.width - 1);
+    let bottom = content.y.saturating_add(content.height - 1);
+    let column = usize::from(x.clamp(content.x, right) - content.x);
+    let row = isize::try_from(y.clamp(content.y, bottom) - content.y).ok()?;
+    let offset = isize::try_from(display_offset).unwrap_or(isize::MAX);
+    Some((row.saturating_sub(offset), column))
+}
+
+fn starts_mouse_selection(mouse: MouseEvent, copy_mode: bool, modes: TerminalModes) -> bool {
+    mouse.kind == MouseKind::Press
+        && mouse.button == 0
+        && (mouse.shift || copy_mode || !modes.mouse_clicks)
+}
+
+fn normalize_mouse_selection_cell(terminal: &Terminal, cell: (isize, usize)) -> (isize, usize) {
+    let (line, mut column) = cell;
+    if terminal
+        .viewport_line(line)
+        .and_then(|cells| cells.get(column))
+        .is_some_and(|cell| cell.wide_continuation)
+    {
+        column = column.saturating_sub(1);
+    }
+    (line, column)
+}
+
+fn mouse_selection_runs(
+    terminal: &Terminal,
+    selection: MouseSelection,
+    display_offset: usize,
+    viewport_width: usize,
+    viewport_height: usize,
+) -> Vec<(usize, usize, usize)> {
+    if viewport_width == 0 || viewport_height == 0 {
+        return Vec::new();
+    }
+    let (start, end) = if selection.start <= selection.end {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    };
+    let offset = isize::try_from(display_offset).unwrap_or(isize::MAX);
+    let mut runs = Vec::new();
+    for line in start.0..=end.0 {
+        let row = line.saturating_add(offset);
+        if row < 0 || row >= viewport_height as isize {
+            continue;
+        }
+        let (first, mut last) = match selection.mode {
+            MouseSelectionMode::Line => (0, viewport_width - 1),
+            MouseSelectionMode::Character => (
+                if line == start.0 { start.1 } else { 0 },
+                if line == end.0 {
+                    end.1
+                } else {
+                    viewport_width - 1
+                },
+            ),
+        };
+        if first >= viewport_width {
+            continue;
+        }
+        last = last.min(viewport_width - 1);
+        if last < first {
+            continue;
+        }
+        if selection.mode == MouseSelectionMode::Character
+            && last + 1 < viewport_width
+            && terminal
+                .viewport_line(line)
+                .and_then(|cells| cells.get(last + 1))
+                .is_some_and(|cell| cell.wide_continuation)
+        {
+            last += 1;
+        }
+        runs.push((row as usize, first, last - first + 1));
+    }
+    runs
+}
+
+fn extract_selection_row(
+    terminal: &Terminal,
+    line_index: isize,
+    first: usize,
+    last: usize,
+) -> Option<String> {
+    let line = terminal.viewport_line(line_index)?;
+    let mut row = String::new();
+    let mut column = first.min(line.len());
+    let last = last.min(line.len());
+    while column < last {
+        let cell = &line[column];
+        if let Some(width) = cell.tab_width {
+            row.push('\t');
+            column = column.saturating_add(usize::from(width).max(1));
+            continue;
+        }
+        if !cell.wide_continuation && !cell.leading_wide_spacer {
+            row.push(cell.ch);
+            row.push_str(&cell.combining);
+        }
+        column += 1;
+    }
+    while row.ends_with(' ') {
+        row.pop();
+    }
+    Some(row)
+}
+
 fn extract_selection(terminal: &Terminal, start: (isize, usize), end: (isize, usize)) -> Vec<u8> {
     let (start, end) = if start <= end {
         (start, end)
@@ -5994,40 +6383,52 @@ fn extract_selection(terminal: &Terminal, start: (isize, usize), end: (isize, us
     };
     let mut output = String::new();
     for line_index in start.0..=end.0 {
-        let Some(line) = terminal.viewport_line(line_index) else {
+        let Some(line_len) = terminal.viewport_line(line_index).map(|line| line.len()) else {
             continue;
         };
         let first = if line_index == start.0 { start.1 } else { 0 };
         let last = if line_index == end.0 {
             end.1 + 1
         } else {
-            line.len()
+            line_len
         };
-        let mut row = String::new();
-        let mut column = first.min(line.len());
-        let last = last.min(line.len());
-        while column < last {
-            let cell = &line[column];
-            if let Some(width) = cell.tab_width {
-                row.push('\t');
-                column = column.saturating_add(usize::from(width).max(1));
-                continue;
-            }
-            if !cell.wide_continuation && !cell.leading_wide_spacer {
-                row.push(cell.ch);
-                row.push_str(&cell.combining);
-            }
-            column += 1;
-        }
-        while row.ends_with(' ') {
-            row.pop();
-        }
+        let row = extract_selection_row(terminal, line_index, first, last).unwrap_or_default();
         output.push_str(&row);
         if line_index != end.0 && !terminal.line_wrapped(line_index).unwrap_or(false) {
             output.push('\n');
         }
     }
     output.into_bytes()
+}
+
+fn extract_mouse_selection(terminal: &Terminal, selection: MouseSelection) -> Vec<u8> {
+    match selection.mode {
+        MouseSelectionMode::Character => {
+            extract_selection(terminal, selection.start, selection.end)
+        }
+        MouseSelectionMode::Line => {
+            let (start, end) = if selection.start.0 <= selection.end.0 {
+                (selection.start.0, selection.end.0)
+            } else {
+                (selection.end.0, selection.start.0)
+            };
+            let mut output = String::new();
+            let mut wrote_row = false;
+            for line in start..=end {
+                let Some(line_len) = terminal.viewport_line(line).map(|line| line.len()) else {
+                    continue;
+                };
+                if wrote_row {
+                    output.push('\n');
+                }
+                output.push_str(
+                    &extract_selection_row(terminal, line, 0, line_len).unwrap_or_default(),
+                );
+                wrote_row = true;
+            }
+            output.into_bytes()
+        }
+    }
 }
 
 fn sanitize_bracketed_paste(bytes: &[u8]) -> Vec<u8> {
@@ -6121,6 +6522,178 @@ mod tests {
     #[test]
     fn bracketed_paste_cannot_inject_terminator() {
         assert_eq!(sanitize_bracketed_paste(b"a\x1b[201~b"), b"a\x1b[201;~b");
+    }
+
+    #[test]
+    fn pane_selection_clicks_are_counted_only_at_one_cell_within_the_interval() {
+        let start = Instant::now();
+        let first = MouseClickTracker::next(None, 7, (2, 3), start);
+        let second =
+            MouseClickTracker::next(Some(first), 7, (2, 3), start + Duration::from_millis(100));
+        let third =
+            MouseClickTracker::next(Some(second), 7, (2, 3), start + Duration::from_millis(200));
+        assert_eq!((first.count, second.count, third.count), (1, 2, 3));
+        assert_eq!(
+            MouseClickTracker::next(Some(third), 7, (2, 3), start + Duration::from_millis(300),)
+                .count,
+            1,
+            "a fourth click begins a new sequence"
+        );
+        assert_eq!(
+            MouseClickTracker::next(Some(second), 7, (2, 4), start + Duration::from_millis(200),)
+                .count,
+            1,
+            "moving to another cell resets the sequence"
+        );
+        assert_eq!(
+            MouseClickTracker::next(Some(second), 7, (2, 3), start + Duration::from_millis(700),)
+                .count,
+            1,
+            "an expired sequence resets"
+        );
+    }
+
+    #[test]
+    fn pane_selection_clamps_pointer_motion_to_the_captured_content_rectangle() {
+        let content = Rect {
+            x: 1,
+            y: 2,
+            width: 4,
+            height: 3,
+        };
+        assert_eq!(mouse_selection_cell(content, 1, 2, 0), Some((0, 0)));
+        assert_eq!(
+            mouse_selection_cell(content, 40, 20, 0),
+            Some((2, 3)),
+            "motion over a right-hand pane stays at the origin pane's bottom-right cell"
+        );
+        assert_eq!(
+            mouse_selection_cell(content, 0, 0, 2),
+            Some((-2, 0)),
+            "copy-view coordinates retain their history offset"
+        );
+    }
+
+    #[test]
+    fn child_mouse_keeps_normal_input_but_shift_and_copy_mode_select() {
+        let press = MouseEvent {
+            button: 0,
+            x: 3,
+            y: 4,
+            kind: MouseKind::Press,
+            shift: false,
+        };
+        let mut modes = TerminalModes::default();
+        assert!(starts_mouse_selection(press, false, modes));
+        modes.mouse_clicks = true;
+        assert!(!starts_mouse_selection(press, false, modes));
+        assert!(starts_mouse_selection(
+            MouseEvent {
+                shift: true,
+                ..press
+            },
+            false,
+            modes
+        ));
+        assert!(starts_mouse_selection(press, true, modes));
+    }
+
+    #[test]
+    fn pane_selection_runs_are_bounded_and_reverse_direction_is_equivalent() {
+        let terminal = Terminal::new(3, 4, 0);
+        let forward = MouseSelection {
+            start: (0, 2),
+            end: (2, 1),
+            mode: MouseSelectionMode::Character,
+        };
+        let backward = MouseSelection {
+            start: forward.end,
+            end: forward.start,
+            ..forward
+        };
+        let expected = vec![(0, 2, 2), (1, 0, 4), (2, 0, 2)];
+        assert_eq!(mouse_selection_runs(&terminal, forward, 0, 4, 3), expected);
+        assert_eq!(mouse_selection_runs(&terminal, backward, 0, 4, 3), expected);
+
+        let line = MouseSelection {
+            start: (0, 3),
+            end: (1, 1),
+            mode: MouseSelectionMode::Line,
+        };
+        assert_eq!(
+            mouse_selection_runs(&terminal, line, 0, 4, 3),
+            [(0, 0, 4), (1, 0, 4)]
+        );
+    }
+
+    #[test]
+    fn pane_selection_keeps_wide_glyphs_whole() {
+        let mut terminal = Terminal::new(1, 4, 0);
+        terminal.feed("界x".as_bytes());
+        assert_eq!(
+            normalize_mouse_selection_cell(&terminal, (0, 1)),
+            (0, 0),
+            "clicking the continuation addresses the leading cell"
+        );
+        let selection = MouseSelection {
+            start: (0, 0),
+            end: (0, 0),
+            mode: MouseSelectionMode::Character,
+        };
+        assert_eq!(
+            mouse_selection_runs(&terminal, selection, 0, 4, 1),
+            [(0, 0, 2)]
+        );
+        assert_eq!(
+            extract_mouse_selection(&terminal, selection),
+            "界".as_bytes()
+        );
+    }
+
+    #[test]
+    fn pane_selection_preserves_tabs_and_combining_text_and_trims_padding() {
+        let mut terminal = Terminal::new(1, 12, 0);
+        terminal.feed("e\u{301}\tb  ".as_bytes());
+        let selection = MouseSelection {
+            start: (0, 0),
+            end: (0, 11),
+            mode: MouseSelectionMode::Line,
+        };
+        assert_eq!(
+            extract_mouse_selection(&terminal, selection),
+            "e\u{301}\tb".as_bytes()
+        );
+    }
+
+    #[test]
+    fn triple_click_copies_visible_rows_instead_of_joining_soft_wraps() {
+        let mut terminal = Terminal::new(3, 4, 0);
+        terminal.feed(b"abcdefgh");
+        assert!(terminal.line_wrapped(0).unwrap());
+
+        let first_row = MouseSelection {
+            start: (0, 2),
+            end: (0, 2),
+            mode: MouseSelectionMode::Line,
+        };
+        assert_eq!(extract_mouse_selection(&terminal, first_row), b"abcd");
+
+        let two_rows = MouseSelection {
+            end: (1, 0),
+            ..first_row
+        };
+        assert_eq!(extract_mouse_selection(&terminal, two_rows), b"abcd\nefgh");
+
+        let character = MouseSelection {
+            start: (0, 0),
+            end: (1, 3),
+            mode: MouseSelectionMode::Character,
+        };
+        assert_eq!(
+            extract_mouse_selection(&terminal, character),
+            b"abcdefgh",
+            "ordinary selection preserves the existing soft-wrap copy semantics"
+        );
     }
 
     #[test]
