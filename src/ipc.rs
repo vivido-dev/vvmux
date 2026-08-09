@@ -129,6 +129,16 @@ pub enum AutomationMethod {
     },
     /// Re-read the session's config file now, instead of waiting for the watcher to notice.
     ReloadConfig,
+    /// Open a pane running one shell command.
+    Run {
+        /// Handed to the shell with `-c`, so pipes and redirection work. Not an argument vector.
+        command: String,
+        placement: RunPlacement,
+        cwd: Option<String>,
+        /// Keep the pane open after the command exits, so its output stays readable.
+        hold: bool,
+        focus: bool,
+    },
     WaitExit {
         timeout_ms: u64,
     },
@@ -212,6 +222,17 @@ impl ChannelKind {
 pub enum Axis {
     Vertical,
     Horizontal,
+}
+
+/// Where a `run` pane goes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RunPlacement {
+    /// Split the target pane, as `msg split` would.
+    Split { axis: Axis },
+    /// A floating pane over the target's tab.
+    Float,
+    /// A new tab of its own.
+    Tab,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

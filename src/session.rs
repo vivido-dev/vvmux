@@ -59,6 +59,8 @@ const SCREEN_CHANGE_HISTORY: usize = 1024;
 const EXIT_TOMBSTONES: usize = 128;
 const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTOMATION_REPLY_LIMIT: usize = 16 * 1024 * 1024;
+/// A `run` command is one shell command line, not a script; this only has to be generous.
+const MAX_RUN_COMMAND_BYTES: usize = 64 * 1024;
 #[cfg(windows)]
 const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
 #[cfg(windows)]
@@ -1020,13 +1022,29 @@ impl SessionActor {
                 }
             }
             ActorEvent::PtyExit(pane_id, status) => {
+                // Waiters and the tombstone are recorded whichever way the pane goes: `wait exit`
+                // must resolve for a held pane exactly as it does for one that closes.
                 self.complete_exit_waiters(pane_id, status);
                 self.exit_tombstones
                     .push_back(ExitTombstone { pane_id, status });
                 while self.exit_tombstones.len() > EXIT_TOMBSTONES {
                     self.exit_tombstones.pop_front();
                 }
-                self.close_pane(pane_id);
+                let held = self
+                    .panes
+                    .get(&pane_id)
+                    .is_some_and(|pane| pane.hold_on_exit && pane.exit_status.is_none());
+                if held {
+                    let note = format!("\r\n[{}]\r\n", describe_exit(status));
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.exit_status = status;
+                        pane.terminal.feed(note.as_bytes());
+                    }
+                    self.mark_pane_screen_change(pane_id, None);
+                    self.schedule_render();
+                } else {
+                    self.close_pane(pane_id);
+                }
             }
             ActorEvent::AutomationInputComplete { reply, result } => match result {
                 Ok(()) => {
@@ -1612,6 +1630,19 @@ impl SessionActor {
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
+            AutomationMethod::Run {
+                command,
+                placement,
+                cwd,
+                hold,
+                focus,
+            } => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_run(pane_id, command, placement, cwd, hold, focus) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
             AutomationMethod::Focus => {
                 let pane_id = pane_id.unwrap();
                 match self.automation_focus(pane_id) {
@@ -1962,6 +1993,105 @@ impl SessionActor {
         Ok(serde_json::json!({
             "pane_id": pane_id,
             "new_pane_id": new_pane_id,
+            "tab_id": tab_id,
+            "session_sequence": self.session_sequence,
+        }))
+    }
+
+    /// Open a pane running one command.
+    ///
+    /// Ordering mirrors `automation_split`: the tiled tree is cloned and validated *before* any
+    /// process is created, so a placement that cannot fit fails without leaving an orphan shell,
+    /// and the tree is committed only once the spawn has succeeded.
+    fn automation_run(
+        &mut self,
+        anchor: PaneId,
+        command: String,
+        placement: crate::ipc::RunPlacement,
+        cwd: Option<String>,
+        hold: bool,
+        focus: bool,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let tab_index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.contains(anchor))
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+        let spec = PaneSpawn {
+            command: Some(OsString::from(command)),
+            cwd: cwd.map(PathBuf::from),
+            hold_on_exit: hold,
+            extra_env: Vec::new(),
+        };
+        let new_pane_id = self.next_pane_id;
+
+        let tab_id = match placement {
+            crate::ipc::RunPlacement::Split { axis } => {
+                let tab_id = self.tabs[tab_index].id;
+                let mut candidate = self.tabs[tab_index].tree.clone().ok_or_else(|| {
+                    AutomationError::new("unsupported", "tab has no tiled layout")
+                })?;
+                if !candidate.contains(anchor) {
+                    return Err(AutomationError::new(
+                        "unsupported",
+                        "floating panes cannot be split",
+                    ));
+                }
+                candidate
+                    .split(anchor, new_pane_id, axis, self.content_area())
+                    .map_err(|_| {
+                        AutomationError::new("invalid_state", "pane is too small to split")
+                    })?;
+                self.spawn_pane(new_pane_id, tab_id, &spec)
+                    .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
+                self.tabs[tab_index].tree = Some(candidate);
+                tab_id
+            }
+            crate::ipc::RunPlacement::Float => {
+                let tab_id = self.tabs[tab_index].id;
+                self.spawn_pane(new_pane_id, tab_id, &spec)
+                    .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
+                let area = self.content_area();
+                let width_percent = self.config.floating.default_width_percent;
+                let height_percent = self.config.floating.default_height_percent;
+                self.tabs[tab_index].floating.insert(
+                    new_pane_id,
+                    area,
+                    width_percent,
+                    height_percent,
+                );
+                tab_id
+            }
+            crate::ipc::RunPlacement::Tab => {
+                let tab_id = self.next_tab_id;
+                self.spawn_pane(new_pane_id, tab_id, &spec)
+                    .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
+                self.tabs.push(Tab {
+                    id: tab_id,
+                    tree: Some(TiledNode::leaf(new_pane_id)),
+                    floating: FloatingLayer::default(),
+                    focused: new_pane_id,
+                    last_focused_tiled: Some(new_pane_id),
+                    zoomed: None,
+                });
+                self.next_tab_id += 1;
+                tab_id
+            }
+        };
+
+        self.next_pane_id = self.next_pane_id.wrapping_add(1);
+        if focus {
+            // A new tab is already focused on its own pane; only move the active tab when the
+            // caller asked for focus.
+            if let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
+                self.tabs[index].set_focus(new_pane_id);
+                self.active_tab = index;
+            }
+        }
+        self.force_full = true;
+        self.relayout();
+        Ok(serde_json::json!({
+            "pane_id": new_pane_id,
             "tab_id": tab_id,
             "session_sequence": self.session_sequence,
         }))
@@ -3609,9 +3739,12 @@ impl SessionActor {
                 } else {
                     ""
                 };
+                // A held pane outlives its process; say so, or it looks like a live shell that
+                // has stopped responding.
+                let exit_suffix = pane.exit_status.map(|_| " [exited]").unwrap_or("");
                 screen.draw_frame(
                     projection.outer,
-                    &format!(" {title}{copy_suffix}{pin_suffix} "),
+                    &format!(" {title}{copy_suffix}{pin_suffix}{exit_suffix} "),
                     theme.frame(active),
                 );
                 let content = projection.content;
@@ -4397,6 +4530,12 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
         ));
     }
     match method {
+        AutomationMethod::Run { command, .. } if command.trim().is_empty() => Err(
+            AutomationError::new("invalid_params", "run requires a non-empty command"),
+        ),
+        AutomationMethod::Run { command, .. } if command.len() > MAX_RUN_COMMAND_BYTES => Err(
+            AutomationError::new("limit_exceeded", "command exceeds 64 KiB"),
+        ),
         AutomationMethod::Key { repeat, .. } if !(1..=1000).contains(repeat) => Err(
             AutomationError::new("invalid_params", "key repeat must be from 1 through 1000"),
         ),
@@ -4491,7 +4630,7 @@ fn automation_capabilities() -> serde_json::Value {
             "capabilities", "list_panes", "inspect", "inspect_media", "split", "focus", "close_pane",
             "typing", "key", "paste", "get_text", "get_grid", "wait_text",
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
-            "trace_media", "reload_config"
+            "trace_media", "reload_config", "run"
         ],
         "limits": automation_limits(),
         "render_acknowledgment": "attached_client_write",
@@ -4505,6 +4644,7 @@ fn automation_limits() -> serde_json::Value {
         "rows": 1000,
         "key_repeats": 1000,
         "regex_bytes": 8 * 1024,
+        "command_bytes": MAX_RUN_COMMAND_BYTES,
         "media_trace_events": crate::media_trace::MAX_MEDIA_TRACE_EVENTS,
         "media_trace_bytes": crate::media_trace::MAX_MEDIA_TRACE_BYTES,
         "media_trace_query_events": crate::media_trace::MAX_MEDIA_TRACE_QUERY_EVENTS,
@@ -4610,6 +4750,18 @@ fn color_json(color: TerminalColor) -> serde_json::Value {
             "green": green,
             "blue": blue,
         }),
+    }
+}
+
+/// A short human description of how a process ended, written into a held pane.
+fn describe_exit(status: Option<PtyExitStatus>) -> String {
+    match status {
+        Some(status) => match (status.code, status.signal) {
+            (_, Some(signal)) => format!("killed by signal {signal}"),
+            (Some(code), None) => format!("exited {code}"),
+            (None, None) => "exited".to_owned(),
+        },
+        None => "exited with an unknown status".to_owned(),
     }
 }
 

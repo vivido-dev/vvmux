@@ -1,12 +1,14 @@
 use std::env;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use base64::Engine;
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::ipc::{
-    AutomationMethod, AutomationRequest, AutomationResponse, Axis, ClientMessage, ServerMessage,
+    AutomationMethod, AutomationRequest, AutomationResponse, Axis, ClientMessage, RunPlacement,
+    ServerMessage,
 };
 use crate::media_trace::{
     MAX_MEDIA_TRACE_QUERY_EVENTS, MediaTraceBatch, MediaTraceCategory, MediaTraceFilter,
@@ -19,6 +21,16 @@ const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub enum SplitAxis {
     Vertical,
     Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RunPlacementArg {
+    /// Split the target pane.
+    Split,
+    /// Float over the target's tab.
+    Float,
+    /// Open a new tab.
+    Tab,
 }
 
 impl From<SplitAxis> for Axis {
@@ -77,6 +89,28 @@ pub enum MsgCommand {
     Split {
         #[arg(value_enum)]
         axis: SplitAxis,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Open a pane running one shell command.
+    ///
+    /// The command is passed to the shell with `-c`, so pipes and redirection work; quote it as
+    /// one argument. Without `--hold` the pane closes when the command exits.
+    Run {
+        command: String,
+        #[arg(long, value_enum, default_value_t = RunPlacementArg::Split)]
+        placement: RunPlacementArg,
+        /// Split direction, when `--placement split`.
+        #[arg(long, value_enum, default_value_t = SplitAxis::Vertical)]
+        axis: SplitAxis,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Keep the pane open after the command exits, so its output stays readable.
+        #[arg(long)]
+        hold: bool,
+        /// Leave focus where it is instead of moving it to the new pane.
+        #[arg(long)]
+        no_focus: bool,
         #[arg(long)]
         pane_id: Option<u64>,
     },
@@ -387,6 +421,48 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             true,
             Output::Json,
         ),
+        MsgCommand::Run {
+            command,
+            placement,
+            axis,
+            cwd,
+            hold,
+            no_focus,
+            pane_id,
+        } => {
+            let cwd = match cwd {
+                // Resolve here rather than in the session: the caller's shell is what a relative
+                // path is relative to, and the daemon's working directory is not the caller's.
+                Some(path) => Some(
+                    std::fs::canonicalize(&path)
+                        .map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("--cwd {}: {error}", path.display()),
+                            )
+                        })?
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                None => None,
+            };
+            (
+                AutomationMethod::Run {
+                    command,
+                    placement: match placement {
+                        RunPlacementArg::Split => RunPlacement::Split { axis: axis.into() },
+                        RunPlacementArg::Float => RunPlacement::Float,
+                        RunPlacementArg::Tab => RunPlacement::Tab,
+                    },
+                    cwd,
+                    hold,
+                    focus: !no_focus,
+                },
+                pane_id,
+                true,
+                Output::Json,
+            )
+        }
         MsgCommand::Focus(target) => (
             AutomationMethod::Focus,
             target.pane_id,
