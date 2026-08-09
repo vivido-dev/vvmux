@@ -377,6 +377,7 @@ mod tests {
             "previous-tab",
             "close-pane",
             "toggle-zoom",
+            "toggle-sync-input",
             "copy-mode",
             "paste",
             "new-floating-pane",
@@ -395,6 +396,10 @@ mod tests {
             "start-selection",
             "copy",
             "cancel",
+            "search-forward",
+            "search-backward",
+            "search-next",
+            "search-previous",
         ];
 
         for action in DOCUMENTED_PREFIX_ACTIONS {

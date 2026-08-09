@@ -374,6 +374,9 @@ mod tests {
             .is_none(),
             "a match beyond the line budget must not be reached"
         );
+        let (matches, truncated) = find_all(&terminal, &compile("y", false, true).unwrap(), 1);
+        assert!(matches.is_empty());
+        assert!(truncated, "find_all must report scan-budget truncation");
     }
 
     #[test]

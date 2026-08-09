@@ -198,10 +198,29 @@ fn a_media_change_is_reported_as_ignored_rather_than_applied() {
 }
 
 #[test]
+fn a_server_change_is_reported_as_ignored_rather_than_adopted() {
+    let fixture = Fixture::start("server");
+
+    fixture.rewrite("status_visible = true\n\n[server]\nmax_connections = 7");
+    let reloaded = json(fixture.msg(&["reload-config"]));
+
+    assert!(
+        reloaded["ignored"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|section| section == "server"),
+        "the separate gateway process owns server config: {reloaded}"
+    );
+}
+
+#[test]
 fn a_deferred_section_is_named_in_the_report() {
     let fixture = Fixture::start("deferred");
 
-    fixture.rewrite("status_visible = true\nscrollback_lines = 4242");
+    fixture.rewrite(
+        "status_visible = true\nprefix = 'C-a'\nscrollback_lines = 4242\n\n[keys.prefix]\ng = 'new-tab'",
+    );
     let reloaded = json(fixture.msg(&["reload-config"]));
 
     assert!(
@@ -212,6 +231,16 @@ fn a_deferred_section_is_named_in_the_report() {
             .any(|section| section == "general.pane_defaults"),
         "a pane-spawn setting only affects future panes and must say so: {reloaded}"
     );
+    for section in ["general.prefix", "keys.prefix"] {
+        assert!(
+            reloaded["deferred"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == section),
+            "client-owned {section} must be reported separately: {reloaded}"
+        );
+    }
 }
 
 /// The watcher, with no explicit reload: the change must be picked up on its own.

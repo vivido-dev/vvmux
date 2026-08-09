@@ -119,7 +119,8 @@ vvmux msg run 'make 2>&1 | tail -40' --hold
 
 By default the pane closes when the command exits. `--hold` keeps it open with a `[exited N]`
 note in the pane and an `[exited]` marker in its frame, so short-lived output stays readable;
-`wait exit` resolves either way.
+`wait exit` resolves either way. Typing into an exited held pane closes it, because its PTY input
+queue is no longer available.
 
 ## Startup layouts
 
@@ -173,6 +174,11 @@ does not own the outer Vivido palette. Cells retain tabs, styled blanks, wide co
 combining characters, hyperlinks, and wrap state. `--since-screen` returns current replacement
 rows when retained history is sufficient; `full` plus `gap` identifies an evicted or invalidated
 delta. Vivid media, pane frames, status lines, and other panes are intentionally excluded.
+
+`search --pattern TEXT` reports bounded structured matches across the pane's physical live and
+scrollback rows; `--regex` enables regular expressions, `--direction` and `--start-line` choose the
+scan origin, and `--limit` reports truncation rather than growing an unbounded reply. Wrapped rows
+remain separate in this version, matching interactive copy-mode search.
 
 Structured observations and waits print JSON; `split` prints the new pane ID and committed session
 sequence. Input, focus, and close are silent on success. Waits default to 30 seconds and accept

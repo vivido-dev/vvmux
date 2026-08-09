@@ -2136,8 +2136,8 @@ impl SessionActor {
                 })?;
                 if !candidate.contains(anchor) {
                     return Err(AutomationError::new(
-                        "unsupported",
-                        "floating panes cannot be split",
+                        "invalid_state",
+                        "cannot split a floating pane",
                     ));
                 }
                 candidate
@@ -2146,14 +2146,14 @@ impl SessionActor {
                         AutomationError::new("invalid_state", "pane is too small to split")
                     })?;
                 self.spawn_pane(new_pane_id, tab_id, &spec)
-                    .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
+                    .map_err(|error| AutomationError::new("spawn_failed", error.to_string()))?;
                 self.tabs[tab_index].tree = Some(candidate);
                 tab_id
             }
             crate::ipc::RunPlacement::Float => {
                 let tab_id = self.tabs[tab_index].id;
                 self.spawn_pane(new_pane_id, tab_id, &spec)
-                    .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
+                    .map_err(|error| AutomationError::new("spawn_failed", error.to_string()))?;
                 let area = self.content_area();
                 let width_percent = self.config.floating.default_width_percent;
                 let height_percent = self.config.floating.default_height_percent;
@@ -2168,7 +2168,7 @@ impl SessionActor {
             crate::ipc::RunPlacement::Tab => {
                 let tab_id = self.next_tab_id;
                 self.spawn_pane(new_pane_id, tab_id, &spec)
-                    .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
+                    .map_err(|error| AutomationError::new("spawn_failed", error.to_string()))?;
                 self.tabs.push(Tab {
                     id: tab_id,
                     name: None,
@@ -3813,9 +3813,10 @@ impl SessionActor {
             next.media = self.config.media.clone();
             report.ignored.push("media".to_owned());
         }
-        if next.general.prefix != self.config.general.prefix
-            || next.keys.prefix != self.config.keys.prefix
-        {
+        if next.general.prefix != self.config.general.prefix {
+            report.deferred.push("general.prefix".to_owned());
+        }
+        if next.keys.prefix != self.config.keys.prefix {
             report.deferred.push("keys.prefix".to_owned());
         }
         if next.general.shell != self.config.general.shell
@@ -3826,6 +3827,12 @@ impl SessionActor {
         }
         if next.general.default_layout != self.config.general.default_layout {
             report.deferred.push("general.default_layout".to_owned());
+        }
+        let server_changed = serde_json::to_value(&next.server).ok()
+            != serde_json::to_value(&self.config.server).ok();
+        if server_changed {
+            next.server = self.config.server.clone();
+            report.ignored.push("server".to_owned());
         }
 
         let status_changed = next.general.status_visible != self.config.general.status_visible;

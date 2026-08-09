@@ -53,8 +53,9 @@ the media wakeup; the actor re-reads the file itself, so the watcher, `SIGUSR1`,
 Reload adopts only what a live session can change. A parse or validation failure leaves the
 running config untouched. `[media]` was moved into the running `VirtualVivid` at startup, so its
 values are carried forward rather than swapped under live retained media and in-flight tracks.
-`general.prefix` and `[keys.prefix]` belong to the client's prefix parser and `[server]` to
-`vvmux serve`, so both are stored but reported as deferred. Changing `general.status_visible`
+`general.prefix` and `[keys.prefix]` belong to the client's prefix parser, so new values are stored
+but reported as deferred. `[server]` belongs to a separate `vvmux serve` process, so the session
+carries its old values forward and reports an edit as ignored. Changing `general.status_visible`
 moves the status row in or out of the pane area, so the stored displays are re-normalized before
 anything derives geometry from them, followed by exactly one `relayout` for the whole change.
 

@@ -189,6 +189,21 @@ fn a_run_pane_can_float_or_open_its_own_tab() {
     assert_eq!(floated["tab_id"], 1, "a float stays in the anchor's tab");
     let inspected = json(fixture.msg(&["inspect", "--pane-id", &float_pane.to_string()]));
     assert_eq!(inspected["pane"]["layer"], "floating");
+    let rejected = fixture.msg(&[
+        "run",
+        "true",
+        "--placement",
+        "split",
+        "--pane-id",
+        &float_pane.to_string(),
+    ]);
+    assert!(!rejected.status.success());
+    let diagnostic = String::from_utf8_lossy(&rejected.stderr);
+    assert!(diagnostic.contains("invalid_state"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("cannot split a floating pane"),
+        "{diagnostic}"
+    );
 
     let tabbed = json(fixture.msg(&["run", "sleep 30", "--placement", "tab", "--pane-id", "1"]));
     assert_eq!(tabbed["tab_id"], 2, "a tab placement opens a new tab");
