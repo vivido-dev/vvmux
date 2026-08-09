@@ -13,6 +13,8 @@ pub struct TextStyle {
 }
 
 impl TextStyle {
+    // Themed colors reach production through `ResolvedTheme`; this shorthand is for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn indexed(foreground: u8, background: u8) -> Self {
         Self {
             foreground: TerminalColor::Indexed(foreground),
@@ -27,17 +29,6 @@ pub struct FrameStyle {
     pub border: TerminalColor,
     pub title: TerminalColor,
     pub background: TerminalColor,
-}
-
-impl FrameStyle {
-    /// A frame drawn in one indexed color over the default background.
-    pub fn indexed(color: u8) -> Self {
-        Self {
-            border: TerminalColor::Indexed(color),
-            title: TerminalColor::Indexed(color),
-            background: TerminalColor::Default,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

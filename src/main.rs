@@ -16,6 +16,7 @@ mod runtime;
 mod screen;
 mod server;
 mod session;
+mod theme;
 
 use std::io;
 use std::path::PathBuf;

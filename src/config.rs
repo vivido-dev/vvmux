@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub general: General,
+    /// Deprecated in favor of `[theme]`, which supersedes it and adds truecolor. Still honored:
+    /// see `crate::theme::resolve`.
     pub appearance: Appearance,
+    pub theme: Theme,
     pub media: Media,
     pub keys: Keys,
     pub floating: Floating,
@@ -28,15 +31,21 @@ pub struct General {
     pub render_interval_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The deprecated color section, superseded by `[theme]`.
+///
+/// Every field is optional so resolution can tell "the user chose this" from "nothing was
+/// written": a `[theme].preset` has to be able to win over a key nobody set, and a plain `u8`
+/// with a default cannot express that. The pre-theme defaults now live in `crate::theme`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Appearance {
-    pub active_frame: u8,
-    pub inactive_frame: u8,
-    pub status_foreground: u8,
-    pub status_background: u8,
+    pub active_frame: Option<u8>,
+    pub inactive_frame: Option<u8>,
+    pub status_foreground: Option<u8>,
+    pub status_background: Option<u8>,
 }
 
+pub use crate::theme::Theme;
 pub use vivid_gateway::MediaConfig as Media;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -100,17 +109,6 @@ impl Default for General {
     }
 }
 
-impl Default for Appearance {
-    fn default() -> Self {
-        Self {
-            active_frame: 12,
-            inactive_frame: 8,
-            status_foreground: 15,
-            status_background: 4,
-        }
-    }
-}
-
 impl Config {
     pub fn load(override_path: Option<&Path>) -> io::Result<Self> {
         Self::load_with_path(override_path).map(|(config, _)| config)
@@ -148,6 +146,12 @@ impl Config {
         })?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// The effective colors, after `[theme]`, `[appearance]`, the preset, and the built-in
+    /// default have been layered. Cheap enough to call once per render.
+    pub fn resolved_theme(&self) -> crate::theme::ResolvedTheme {
+        crate::theme::resolve(&self.theme, &self.appearance)
     }
 
     pub fn validate(&self) -> io::Result<()> {
@@ -217,6 +221,17 @@ impl Config {
                 "[server].outbound_queue_bytes must be between 512 KiB and 64 MiB",
             ));
         }
+        if let Some(preset) = &self.theme.preset
+            && crate::theme::preset(preset).is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "[theme].preset \"{preset}\" is not a known preset; valid names are {}",
+                    crate::theme::PRESET_NAMES.join(", ")
+                ),
+            ));
+        }
         // The action vocabularies are defined by the code that interprets them, not duplicated
         // here: `parse_configured_action` is what the client actually dispatches on, and
         // `copy_action_bytes` is what copy mode actually replays. Validating through them means a
@@ -272,6 +287,7 @@ pub fn default_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vvmux_terminal::TerminalColor;
 
     #[test]
     fn unknown_fields_are_rejected() {
@@ -397,6 +413,92 @@ mod tests {
         let mut unknown_chord = Config::default();
         unknown_chord.keys.copy.insert("F1".into(), "up".into());
         assert!(unknown_chord.validate().is_err());
+    }
+
+    #[test]
+    fn a_theme_section_parses_every_color_form() {
+        // `r##"…"##`: the hex colors contain `"#`, which would close an `r#"…"#` string.
+        let config: Config = toml::from_str(
+            r##"
+[theme]
+preset = "nord"
+active_frame = "#ff8800"
+inactive_frame = "bright-black"
+status_foreground = "15"
+status_background = "default"
+status_fill = false
+"##,
+        )
+        .unwrap();
+        config.validate().unwrap();
+
+        let resolved = config.resolved_theme();
+        assert_eq!(resolved.active_frame, TerminalColor::Rgb(0xff, 0x88, 0x00));
+        assert_eq!(resolved.inactive_frame, TerminalColor::Indexed(8));
+        assert_eq!(resolved.status_foreground, TerminalColor::Indexed(15));
+        assert_eq!(resolved.status_background, TerminalColor::Default);
+        assert!(!resolved.status_fill);
+        assert_eq!(
+            resolved.active_title,
+            crate::theme::preset("nord").unwrap().active_title,
+            "keys the user did not set still come from the preset"
+        );
+    }
+
+    #[test]
+    fn a_malformed_theme_color_names_the_accepted_forms() {
+        let error = toml::from_str::<Config>("[theme]\nactive_frame = \"chartreuse\"")
+            .expect_err("an unknown color must not parse");
+        let described = error.to_string();
+        assert!(described.contains("#rrggbb"), "{described}");
+
+        assert!(
+            toml::from_str::<Config>("[theme]\nactive_frame = 12").is_err(),
+            "a bare integer is not the documented form; colors are strings"
+        );
+        assert!(toml::from_str::<Config>("[theme]\nunknown = \"red\"").is_err());
+    }
+
+    #[test]
+    fn an_unknown_preset_is_rejected_with_the_valid_names() {
+        let config: Config = toml::from_str("[theme]\npreset = \"dracula\"").unwrap();
+        let error = config.validate().expect_err("unknown preset must fail");
+        let described = error.to_string();
+
+        assert!(described.contains("dracula"), "{described}");
+        assert!(described.contains("solarized-dark"), "{described}");
+    }
+
+    /// The pre-theme config must render exactly as it did before this section existed.
+    #[test]
+    fn a_config_without_a_theme_keeps_its_previous_colors() {
+        let resolved = Config::default().resolved_theme();
+        assert_eq!(resolved.active_frame, TerminalColor::Indexed(12));
+        assert_eq!(resolved.inactive_frame, TerminalColor::Indexed(8));
+        assert_eq!(resolved.status_foreground, TerminalColor::Indexed(15));
+        assert_eq!(resolved.status_background, TerminalColor::Indexed(4));
+
+        let legacy: Config = toml::from_str("[appearance]\nactive_frame = 2").unwrap();
+        legacy.validate().unwrap();
+        assert_eq!(
+            legacy.resolved_theme().active_frame,
+            TerminalColor::Indexed(2),
+            "the deprecated section is still honored"
+        );
+        assert_eq!(
+            legacy.resolved_theme().status_background,
+            TerminalColor::Indexed(4),
+            "and its unset keys keep the built-in default"
+        );
+    }
+
+    /// `config.example.toml` is part of the documented interface; `deny_unknown_fields` means a
+    /// stale example is a hard parse error for anyone who copies it.
+    #[test]
+    fn the_example_config_parses_and_validates() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let source = fs::read_to_string(&path).unwrap();
+        Config::parse(&source, &path).expect("config.example.toml must stay loadable");
     }
 
     #[test]

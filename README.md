@@ -236,6 +236,37 @@ Strict floating defaults live under `[floating]`: `default_width_percent` and
 `default_height_percent` accept 10–100, and `border_drag_margin` accepts 1–4. New floats are centered
 at 60% by 60% by default, with a minimum 4-by-2 content area plus frame.
 
+## Theming
+
+Frame and status colors live under `[theme]`. Every color is a string in one of four forms:
+
+| Form | Example | Meaning |
+|---|---|---|
+| `"default"` | `"default"` | The terminal's own default color |
+| Index | `"12"` | A palette index, 0 through 255 |
+| ANSI name | `"bright-blue"` | One of the 16 names, `black` … `bright-white` |
+| Truecolor | `"#ff8800"`, `"#f80"` | 24-bit RGB |
+
+`preset` supplies every color at once; individual keys override it. The presets are `default`,
+`mono`, `nord`, `solarized-dark`, and `gruvbox-dark`.
+
+```toml
+[theme]
+preset = "nord"
+active_frame = "#ff8800"
+```
+
+The keys are `preset`, `active_frame`, `inactive_frame`, `active_title`, `inactive_title`,
+`frame_background`, `status_foreground`, `status_background`, and `status_fill`. Titles default to
+their frame color. An unknown preset name or malformed color is rejected at startup with a message
+listing the accepted values.
+
+The status bar paints its background across the full width. Set `status_fill = false` for the
+earlier behavior, where the background stopped where the text did.
+
+`[appearance]` is deprecated in favor of `[theme]`. It still works, still takes palette indexes
+only, and still overrides a `preset`, so existing configs render exactly as before.
+
 ## Vivid behavior
 
 Every pane receives a distinct zeroizing 256-bit `VIVID_ROOT_SECRET` and
@@ -278,7 +309,7 @@ terminal use continues without media and the client emits a single status/title 
 Implemented: native Unix sockets and owner-restricted Windows named pipes; Unix PTYs and
 ConPTY/Job Object panes; Unix and Windows console clients; named detachable sessions, tabs, tiled
 and tab-scoped floating/pinned shell panes, zoom, scrollback/copy/paste, ordered overlap
-composition, mouse focus/move/resize/forwarding, status line, strict TOML, VVMX IPC, exact
+composition, mouse focus/move/resize/forwarding, status line, truecolor theming, strict TOML, VVMX IPC, exact
 fragment-aware pane media occlusion, static rehydration, timed-media headless semantics,
 full-duplex outer control, linked A/V projection, and optional bulk-media endpoint discovery.
 

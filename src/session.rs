@@ -3438,6 +3438,7 @@ impl SessionActor {
         let Some(client) = &self.attached else {
             return;
         };
+        let theme = self.config.resolved_theme();
         let display = client.display;
         let writer = client.writer.clone();
         #[cfg(windows)]
@@ -3457,11 +3458,6 @@ impl SessionActor {
                     continue;
                 };
                 let active = projection.focused;
-                let color = if active {
-                    self.config.appearance.active_frame
-                } else {
-                    self.config.appearance.inactive_frame
-                };
                 let title = pane
                     .terminal
                     .title()
@@ -3475,7 +3471,7 @@ impl SessionActor {
                 screen.draw_frame(
                     projection.outer,
                     &format!(" {title}{copy_suffix}{pin_suffix} "),
-                    crate::screen::FrameStyle::indexed(color),
+                    theme.frame(active),
                 );
                 let content = projection.content;
                 let offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
@@ -3528,15 +3524,14 @@ impl SessionActor {
                 self.panes.len(),
                 self.layout_revision
             );
-            screen.draw_text(
-                0,
-                screen.rows - 1,
-                &status,
-                crate::screen::TextStyle::indexed(
-                    self.config.appearance.status_foreground,
-                    self.config.appearance.status_background,
-                ),
-            );
+            let style = theme.status();
+            let row = screen.rows - 1;
+            if theme.status_fill {
+                // Paint the whole row first: a status background that stops where the text does
+                // reads as a rendering bug rather than a bar.
+                screen.fill_row(row, style);
+            }
+            screen.draw_text(0, row, &status, style);
         }
         self.frame_id = self.frame_id.wrapping_add(1);
         // Mutated only by the Windows bracketed-paste prepend below.

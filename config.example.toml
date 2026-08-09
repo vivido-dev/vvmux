@@ -7,11 +7,36 @@ status_visible = true
 mouse = true
 render_interval_ms = 16
 
-[appearance]
-active_frame = 12
-inactive_frame = 8
-status_foreground = 15
-status_background = 4
+# Deprecated: superseded by [theme], which accepts the same colors plus truecolor.
+# Still honored, and still overrides a [theme].preset, but prefer [theme] in new configs.
+# [appearance]
+# active_frame = 12
+# inactive_frame = 8
+# status_foreground = 15
+# status_background = 4
+
+[theme]
+# Every color is a string in one of four forms:
+#   "default"        the terminal's own default
+#   "0" ... "255"    a palette index
+#   "bright-blue"    any of the 16 ANSI names (black, red, ..., bright-white)
+#   "#rrggbb"        truecolor, also accepted as "#rgb"
+#
+# A preset supplies every color; the keys below override individual ones.
+# Presets: default, mono, nord, solarized-dark, gruvbox-dark
+# preset = "nord"
+
+active_frame = "bright-blue"
+inactive_frame = "bright-black"
+# Titles default to their frame color.
+# active_title = "bright-white"
+# inactive_title = "bright-black"
+# frame_background = "default"
+status_foreground = "bright-white"
+status_background = "blue"
+# The status bar paints its background across the full width. Set false for the
+# older look, where the background stopped where the text did.
+# status_fill = true
 
 [media]
 aggregate_retained_bytes = 268435456
