@@ -420,6 +420,46 @@ impl TiledNode {
         Self::Leaf(pane)
     }
 
+    /// Build a weighted branch without applying the interactive minimum-size check.
+    ///
+    /// Startup layouts are created before the real display is known, so validating them against
+    /// the placeholder 80x23 grid would reject layouts that fit as soon as a client attaches.
+    pub fn branch(
+        axis: Axis,
+        first: TiledNode,
+        second: TiledNode,
+        first_weight: u32,
+        second_weight: u32,
+    ) -> Self {
+        Self::Split {
+            axis,
+            first: Box::new(first),
+            second: Box::new(second),
+            first_weight: first_weight.clamp(1, 100_000),
+            second_weight: second_weight.clamp(1, 100_000),
+        }
+    }
+
+    /// Lower an n-ary weighted split to the binary tree used by the live layout engine.
+    pub fn from_children(axis: Axis, children: Vec<TiledNode>, sizes: &[u32]) -> TiledNode {
+        assert!(
+            !children.is_empty(),
+            "a tiled split needs at least one child"
+        );
+        let weights = if sizes.len() == children.len() {
+            sizes.to_vec()
+        } else {
+            vec![1; children.len()]
+        };
+        let mut children = children.into_iter().zip(weights).rev();
+        let (mut tree, mut accumulated_weight) = children.next().unwrap();
+        for (child, weight) in children {
+            tree = Self::branch(axis, child, tree, weight, accumulated_weight);
+            accumulated_weight = accumulated_weight.saturating_add(weight);
+        }
+        tree
+    }
+
     pub fn pane_ids(&self) -> Vec<PaneId> {
         let mut panes = Vec::new();
         self.collect(&mut panes);
@@ -728,6 +768,81 @@ mod tests {
         tree = tree.close(2).unwrap();
         assert_eq!(tree.pane_ids(), [1, 3]);
         assert_eq!(before.pane_ids(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn weighted_children_preserve_requested_proportions() {
+        let tree = TiledNode::from_children(
+            Axis::Vertical,
+            vec![TiledNode::leaf(1), TiledNode::leaf(2)],
+            &[30, 70],
+        );
+        let geometry = tree.geometry(Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 30,
+        });
+        assert_eq!(geometry[&1].width, 30);
+        assert_eq!(geometry[&2].width, 70);
+    }
+
+    #[test]
+    fn four_way_stack_builds_at_startup_display() {
+        let tree = TiledNode::from_children(
+            Axis::Horizontal,
+            (1..=4).map(TiledNode::leaf).collect(),
+            &[1, 1, 1, 1],
+        );
+        let geometry = tree.geometry(area());
+        assert_eq!(geometry.len(), 4);
+        assert_eq!(geometry.values().map(|rect| rect.height).sum::<u16>(), 23);
+        assert!(geometry.values().all(|rect| rect.height >= 1));
+    }
+
+    #[test]
+    fn randomized_weighted_layouts_partition_every_available_cell() {
+        let mut state = 0x9e37_79b9_u32;
+        for iteration in 0..500_u64 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let count = 2 + (state as usize % 15);
+            let mut sizes = Vec::with_capacity(count);
+            for _ in 0..count {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                sizes.push(1 + state % 1000);
+            }
+            let axis = if state & 1 == 0 {
+                Axis::Vertical
+            } else {
+                Axis::Horizontal
+            };
+            let area = Rect {
+                x: (state >> 24) as u16,
+                y: (state >> 16) as u16,
+                width: 1 + (state % 200) as u16,
+                height: 1 + ((state >> 8) % 80) as u16,
+            };
+            let tree = TiledNode::from_children(
+                axis,
+                (0..count)
+                    .map(|index| TiledNode::leaf(iteration * 32 + index as u64))
+                    .collect(),
+                &sizes,
+            );
+            let geometry = tree.geometry(area);
+            assert_eq!(geometry.len(), count);
+            let covered = geometry
+                .values()
+                .map(|rect| u32::from(rect.width) * u32::from(rect.height))
+                .sum::<u32>();
+            assert_eq!(covered, u32::from(area.width) * u32::from(area.height));
+            assert!(geometry.values().all(|rect| {
+                rect.x >= area.x
+                    && rect.y >= area.y
+                    && rect.x + rect.width <= area.x + area.width
+                    && rect.y + rect.height <= area.y + area.height
+            }));
+        }
     }
 
     #[test]

@@ -36,11 +36,12 @@ impl Drop for ClientSlot {
 pub fn run(
     name: String,
     config_path: Option<PathBuf>,
+    layout_path: Option<PathBuf>,
     ready_handle: Option<usize>,
 ) -> io::Result<()> {
     platform::prepare_server_process();
     let mut readiness = platform::ReadinessWriter::from_metadata(ready_handle)?;
-    match run_inner(name, config_path, &mut readiness) {
+    match run_inner(name, config_path, layout_path, &mut readiness) {
         Ok(()) => Ok(()),
         Err(error) => {
             readiness.failure(&error);
@@ -52,6 +53,7 @@ pub fn run(
 fn run_inner(
     name: String,
     config_path: Option<PathBuf>,
+    layout_path: Option<PathBuf>,
     readiness: &mut platform::ReadinessWriter,
 ) -> io::Result<()> {
     let paths =
@@ -71,11 +73,20 @@ fn run_inner(
             paths.remove_instance(&registry);
             context("load session config", error)
         })?;
+    let layout = layout_path
+        .as_deref()
+        .map(crate::layout_file::LayoutFile::load)
+        .transpose()
+        .map_err(|error| {
+            paths.remove_instance(&registry);
+            context("load startup layout", error)
+        })?;
     let actor = session::start(session::SessionOptions {
         name,
         config,
         config_path: resolved_config_path,
         vivid_endpoint: paths.vivid_socket.clone(),
+        layout,
     })
     .map_err(|error| {
         paths.remove_instance(&registry);

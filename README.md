@@ -119,6 +119,45 @@ By default the pane closes when the command exits. `--hold` keeps it open with a
 note in the pane and an `[exited]` marker in its frame, so short-lived output stays readable;
 `wait exit` resolves either way.
 
+## Startup layouts
+
+`vvmux new --layout NAME` loads `~/.config/vvmux/layouts/NAME.toml`; an existing path can be
+passed instead. `[general].default_layout` supplies the name or path when `--layout` is omitted.
+An explicitly requested missing or invalid layout fails before the daemon forks. A missing default
+layout prints a warning and starts the usual one-shell tab.
+
+```toml
+[[tabs]]
+name = "dev"
+focus = "shell"
+
+  [tabs.layout]
+  split = "vertical"
+  sizes = [30, 70]
+
+    [[tabs.layout.children]]
+    pane = "editor"
+    command = "nvim ."
+    cwd = "~/src/project"
+
+    [[tabs.layout.children]]
+    pane = "shell"
+
+  [[tabs.floating]]
+  pane = "notes"
+  width_percent = 50
+  height_percent = 60
+  pinned = true
+```
+
+Splits may nest and contain 2–16 children. `sizes` are relative integer weights from 1 through
+1000; omitting them gives every child equal weight. A layout may contain up to 16 tabs and 64
+panes total. Each pane label is tab-local and unique, and `focus` names one of those labels.
+Floating-only tabs are valid. `command` is one shell command line passed to `shell -c`, `cwd`
+accepts `~/`, and `hold = true` preserves command output after exit. If one pane cannot spawn, its
+leaf is removed and its siblings keep their exact owner-scoped layout; a layout where every pane
+fails falls back to one shell tab.
+
 `get-text` writes exact Unicode without adding a newline. Its default view is the pane as vvmux is
 currently displaying it, including copy-mode scroll position. `--rows N` instead returns the newest
 N physical rows ending at the live bottom. Trailing unused cells are removed, soft-wrapped rows are
@@ -280,6 +319,7 @@ Not everything can change under a live session, and `msg reload-config` names wh
 | `general.render_interval_ms` | Applied on the next loop iteration |
 | `[floating]`, `[keys.copy]` | Applied the next time they are used |
 | `general.shell`, `default_cwd`, `scrollback_lines` | Reported as `deferred`: they apply to panes spawned afterwards |
+| `general.default_layout` | Reported as `deferred`: it applies to the next session created |
 | `general.prefix`, `[keys.prefix]` | Reported as `deferred`: the attached client owns the prefix parser until it reattaches |
 | `[media]` | Reported as `ignored`: the running virtual presenter owns it, and swapping it would strand live media |
 | `[server]` | Reported as `ignored`: only `vvmux serve` reads it, in its own process |
@@ -358,12 +398,12 @@ Implemented: native Unix sockets and owner-restricted Windows named pipes; Unix 
 ConPTY/Job Object panes; Unix and Windows console clients; named detachable sessions, tabs, tiled
 and tab-scoped floating/pinned shell panes, zoom, scrollback/copy/paste, ordered overlap
 composition, mouse focus/move/resize/forwarding, status line, truecolor theming, strict TOML with
-live reload, command panes with hold-on-exit, VVMX IPC, exact
+live reload, command panes with hold-on-exit, bounded TOML startup layouts, VVMX IPC, exact
 fragment-aware pane media occlusion, static rehydration, timed-media headless semantics,
 full-duplex outer control, linked A/V projection, and optional bulk-media endpoint discovery.
 
 Intentionally absent: plugins, a bundled web UI, direct non-loopback/TLS serving,
-arbitrary action sockets, startup layout scripts, stacked panes, pane-class conversion, multi-pane selection, scrollback
+arbitrary action sockets, stacked panes, pane-class conversion, multi-pane selection, scrollback
 editing/search, source transcoding, mirrored multi-client sessions, WinPTY, MSI/service installs,
 and machine-wide PATH changes. `run` and a layout `command` take one shell command line, passed to
 the shell with `-c`; configured shell argument vectors remain absent.

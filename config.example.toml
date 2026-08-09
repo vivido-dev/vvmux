@@ -2,6 +2,8 @@
 prefix = "C-b"
 # shell = "/bin/zsh"
 # default_cwd = "/home/me"
+# Name under ~/.config/vvmux/layouts (the .toml suffix is optional), or a path.
+# default_layout = "dev"
 scrollback_lines = 10000
 status_visible = true
 mouse = true

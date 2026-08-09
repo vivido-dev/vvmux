@@ -21,6 +21,7 @@ use crate::ipc::{
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
 };
+use crate::layout_file::LayoutPlan;
 use crate::media::VirtualVivid;
 use crate::media_trace::{MediaKeyframeStage, MediaTraceFilter, MediaTraceJournal, MediaTraceKind};
 use crate::platform::VirtualPresenterEndpoint;
@@ -262,6 +263,7 @@ struct CopyState {
 
 struct Tab {
     id: u64,
+    name: Option<String>,
     /// `None` when the last tiled pane closed and only floats remain.
     tree: Option<TiledNode>,
     floating: FloatingLayer,
@@ -640,6 +642,7 @@ pub struct SessionOptions {
     /// config file could be resolved at all.
     pub config_path: Option<PathBuf>,
     pub vivid_endpoint: VirtualPresenterEndpoint,
+    pub layout: Option<LayoutPlan>,
 }
 
 pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
@@ -648,6 +651,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         config,
         config_path,
         vivid_endpoint,
+        layout,
     } = options;
     let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE);
     let (media_sender, media_receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE);
@@ -761,7 +765,10 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         bridge_metrics: crate::metrics::BridgeMetrics::default(),
         client_ipc: None,
     };
-    actor.new_tab()?;
+    match layout {
+        Some(layout) => actor.apply_layout_plan(layout)?,
+        None => actor.new_tab()?,
+    }
     std::thread::Builder::new()
         .name("vvmux-session".into())
         .spawn(move || actor.run(receiver, media_receiver))?;
@@ -2068,6 +2075,7 @@ impl SessionActor {
                     .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
                 self.tabs.push(Tab {
                     id: tab_id,
+                    name: None,
                     tree: Some(TiledNode::leaf(new_pane_id)),
                     floating: FloatingLayer::default(),
                     focused: new_pane_id,
@@ -2233,6 +2241,7 @@ impl SessionActor {
         Some(serde_json::json!({
             "pane_id": pane_id,
             "tab_id": tab.id,
+            "tab_name": tab.name,
             "active_tab": tab_index == self.active_tab,
             "focused": tab.focused == pane_id,
             "visible": visible,
@@ -3382,6 +3391,7 @@ impl SessionActor {
         self.next_pane_id += 1;
         self.tabs.push(Tab {
             id: tab_id,
+            name: None,
             tree: Some(TiledNode::leaf(pane_id)),
             floating: FloatingLayer::default(),
             focused: pane_id,
@@ -3389,6 +3399,96 @@ impl SessionActor {
             zoomed: None,
         });
         self.next_tab_id += 1;
+        self.schedule_render();
+        Ok(())
+    }
+
+    fn apply_layout_plan(&mut self, plan: LayoutPlan) -> io::Result<()> {
+        let area = self.content_area();
+        for planned in plan.tabs {
+            let tab_id = self.next_tab_id;
+            self.next_tab_id = self.next_tab_id.wrapping_add(1);
+
+            // Allocate every slot before spawning so the planned tree is independent of spawn
+            // order. Failed slots consume their scoped IDs and are then closed out of the tree.
+            let slot_ids = (0..planned.spawns.len())
+                .map(|_| {
+                    let pane_id = self.next_pane_id;
+                    self.next_pane_id = self.next_pane_id.wrapping_add(1);
+                    pane_id
+                })
+                .collect::<Vec<_>>();
+            let mut failed = HashSet::new();
+            for (slot, spec) in planned.spawns.iter().enumerate() {
+                if self.spawn_pane(slot_ids[slot], tab_id, spec).is_err() {
+                    failed.insert(slot_ids[slot]);
+                }
+            }
+
+            let mut tree = planned.tiled.as_ref().map(|node| node.to_tiled(&slot_ids));
+            for pane_id in slot_ids.iter().filter(|pane_id| failed.contains(pane_id)) {
+                tree = tree.and_then(|tree| tree.close(*pane_id));
+            }
+
+            let mut floating = FloatingLayer::default();
+            for (index, planned_float) in planned.floating.iter().enumerate() {
+                let pane_id = slot_ids[planned_float.slot];
+                if failed.contains(&pane_id) {
+                    continue;
+                }
+                floating.insert(
+                    pane_id,
+                    area,
+                    planned_float.width_percent,
+                    planned_float.height_percent,
+                );
+                floating.set_pinned(pane_id, planned_float.pinned);
+                if index != 0
+                    && let Some(rect) = floating.get(pane_id).map(|float| float.rect)
+                {
+                    floating.set_rect(
+                        pane_id,
+                        Rect {
+                            x: rect.x.saturating_add((index as u16).saturating_mul(2)),
+                            y: rect.y.saturating_add(index as u16),
+                            ..rect
+                        },
+                        area,
+                    );
+                }
+            }
+
+            if tree.is_none() && floating.is_empty() {
+                continue;
+            }
+            let first_tiled = tree
+                .as_ref()
+                .and_then(|tree| tree.pane_ids().into_iter().next());
+            let requested_focus = planned
+                .focus_slot
+                .map(|slot| slot_ids[slot])
+                .filter(|pane_id| !failed.contains(pane_id));
+            let last_focused_tiled = requested_focus
+                .filter(|pane_id| tree.as_ref().is_some_and(|tree| tree.contains(*pane_id)))
+                .or(first_tiled);
+            let focused = requested_focus
+                .or_else(|| floating.focus_candidate())
+                .or(last_focused_tiled)
+                .expect("a surviving layout tab has a focusable pane");
+            self.tabs.push(Tab {
+                id: tab_id,
+                name: planned.name,
+                tree,
+                floating,
+                focused,
+                last_focused_tiled,
+                zoomed: None,
+            });
+        }
+        if self.tabs.is_empty() {
+            return self.new_tab();
+        }
+        self.active_tab = 0;
         self.schedule_render();
         Ok(())
     }
@@ -3541,7 +3641,7 @@ impl SessionActor {
     ///   `[server]` only by `vvmux serve`. Both are stored, but neither reaches this process's
     ///   behavior until the peer restarts or reattaches.
     /// - `shell`, `default_cwd`, and `scrollback_lines` are read when a pane spawns, so they apply
-    ///   to the next pane rather than existing ones.
+    ///   to the next pane rather than existing ones. `default_layout` is a next-session setting.
     ///
     /// A parse or validation failure leaves the running config completely untouched: a config
     /// saved mid-edit must never degrade a live session.
@@ -3587,6 +3687,9 @@ impl SessionActor {
             || next.general.scrollback_lines != self.config.general.scrollback_lines
         {
             report.deferred.push("general.pane_defaults".to_owned());
+        }
+        if next.general.default_layout != self.config.general.default_layout {
+            report.deferred.push("general.default_layout".to_owned());
         }
 
         let status_changed = next.general.status_visible != self.config.general.status_visible;
@@ -3789,11 +3892,16 @@ impl SessionActor {
         if self.config.general.status_visible && screen.rows > 0 {
             let tab_number = self.active_tab + 1;
             let tab_id = self.active_tab().map_or(0, |tab| tab.id);
+            let tab_name = self
+                .active_tab()
+                .and_then(|tab| tab.name.as_deref())
+                .map_or_else(String::new, |name| format!(" ({name})"));
             let status = format!(
-                " vvmux:{}  tab {}/{} (id:{})  panes:{}  rev:{} ",
+                " vvmux:{}  tab {}/{}{} (id:{})  panes:{}  rev:{} ",
                 self.name,
                 tab_number,
                 self.tabs.len(),
+                tab_name,
                 tab_id,
                 self.panes.len(),
                 self.layout_revision
@@ -5520,6 +5628,7 @@ mod tests {
         floating.set_pinned(11, true);
         Tab {
             id: 1,
+            name: None,
             tree: Some(tree),
             floating,
             focused: 1,

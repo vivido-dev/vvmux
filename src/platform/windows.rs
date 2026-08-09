@@ -678,7 +678,11 @@ pub fn windows_pipe_name(session_name: &str) -> io::Result<String> {
 pub struct DaemonLauncher;
 
 impl DaemonLauncher {
-    pub fn launch(name: &str, config_path: Option<&std::path::Path>) -> io::Result<()> {
+    pub fn launch(
+        name: &str,
+        config_path: Option<&std::path::Path>,
+        layout_path: Option<&std::path::Path>,
+    ) -> io::Result<()> {
         let executable = std::env::current_exe()?;
         let (ready_reader, ready_writer) = inheritable_pipe()?;
         set_handle_inheritance(ready_reader.raw(), false)?;
@@ -691,6 +695,10 @@ impl DaemonLauncher {
         command_line.push_str(&(ready_writer.raw() as usize).to_string());
         if let Some(path) = config_path {
             command_line.push_str(" --config ");
+            command_line.push_str(&quote_windows(&path.to_string_lossy()));
+        }
+        if let Some(path) = layout_path {
+            command_line.push_str(" --layout ");
             command_line.push_str(&quote_windows(&path.to_string_lossy()));
         }
         let application = wide_os(executable.as_os_str())?;

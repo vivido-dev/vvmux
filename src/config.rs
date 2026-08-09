@@ -25,6 +25,7 @@ pub struct General {
     pub prefix: String,
     pub shell: Option<PathBuf>,
     pub default_cwd: Option<PathBuf>,
+    pub default_layout: Option<String>,
     pub scrollback_lines: usize,
     pub status_visible: bool,
     pub mouse: bool,
@@ -101,6 +102,7 @@ impl Default for General {
             prefix: "C-b".into(),
             shell: None,
             default_cwd: None,
+            default_layout: None,
             scrollback_lines: 10_000,
             status_visible: true,
             mouse: true,
@@ -165,6 +167,14 @@ impl Config {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "scrollback_lines exceeds 1,000,000",
+            ));
+        }
+        if let Some(layout) = &self.general.default_layout
+            && !crate::layout_file::validate_default_name(layout)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "default_layout must be non-empty and must not contain '..'",
             ));
         }
         if !(1..=1000).contains(&self.general.render_interval_ms) {
@@ -277,6 +287,10 @@ pub fn default_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".config/vvmux/config.toml"))
+}
+
+pub fn config_dir() -> Option<PathBuf> {
+    default_path()?.parent().map(Path::to_path_buf)
 }
 
 #[cfg(windows)]
@@ -499,6 +513,19 @@ status_fill = false
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
         let source = fs::read_to_string(&path).unwrap();
         Config::parse(&source, &path).expect("config.example.toml must stay loadable");
+    }
+
+    #[test]
+    fn default_layout_names_are_bounded_paths() {
+        let mut config = Config::default();
+        config.general.default_layout = Some("dev".into());
+        config.validate().unwrap();
+        config.general.default_layout = Some("layouts/dev.toml".into());
+        config.validate().unwrap();
+        config.general.default_layout = Some("../secret".into());
+        assert!(config.validate().is_err());
+        config.general.default_layout = Some("  ".into());
+        assert!(config.validate().is_err());
     }
 
     #[test]

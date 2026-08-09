@@ -701,7 +701,11 @@ async fn handle_socket_message(
                         let created_name = name.clone();
                         let config_path = state.config_path.clone();
                         match tokio::task::spawn_blocking(move || {
-                            crate::client::create_detached(&created_name, config_path.as_deref())
+                            crate::client::create_detached(
+                                &created_name,
+                                config_path.as_deref(),
+                                None,
+                            )
                         })
                         .await
                         {

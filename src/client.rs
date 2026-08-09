@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
@@ -47,7 +47,8 @@ pub fn attach(
     let (mut reader, writer) = match crate::server::connect(name) {
         Ok(connection) => connection,
         Err(error) if create && is_missing_session(&error) => {
-            spawn_server(name, config_path)?;
+            let layout = resolve_startup_layout(config_path, None)?;
+            spawn_server(name, config_path, layout.as_deref())?;
             wait_for_server(name)?
         }
         Err(error) => return Err(error),
@@ -1591,22 +1592,61 @@ pub fn kill(name: &str) -> io::Result<()> {
     send_client(&writer, &ClientMessage::Kill)
 }
 
-pub fn create_detached(name: &str, config_path: Option<&Path>) -> io::Result<()> {
+pub fn create_detached(
+    name: &str,
+    config_path: Option<&Path>,
+    layout: Option<&str>,
+) -> io::Result<()> {
+    let layout_path = resolve_startup_layout(config_path, layout)?;
     match crate::server::probe(name) {
         Ok(()) => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "session already exists",
         )),
         Err(_) => {
-            spawn_server(name, config_path)?;
+            spawn_server(name, config_path, layout_path.as_deref())?;
             let _ = wait_for_server(name)?;
             Ok(())
         }
     }
 }
 
-fn spawn_server(name: &str, config_path: Option<&Path>) -> io::Result<()> {
-    crate::platform::DaemonLauncher::launch(name, config_path)
+fn resolve_startup_layout(
+    config_path: Option<&Path>,
+    explicit: Option<&str>,
+) -> io::Result<Option<PathBuf>> {
+    let (value, required) = match explicit {
+        Some(value) => (Some(value.to_owned()), true),
+        None => (
+            crate::config::Config::load(config_path)?
+                .general
+                .default_layout,
+            false,
+        ),
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let path = match crate::layout_file::resolve_path(&value) {
+        Ok(path) => path,
+        Err(error) if !required && error.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "vvmux: default layout {value:?} was not found; starting with one shell pane"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    crate::layout_file::LayoutFile::load(&path)?;
+    Ok(Some(path))
+}
+
+fn spawn_server(
+    name: &str,
+    config_path: Option<&Path>,
+    layout_path: Option<&Path>,
+) -> io::Result<()> {
+    crate::platform::DaemonLauncher::launch(name, config_path, layout_path)
 }
 
 fn wait_for_server(name: &str) -> io::Result<(crate::ipc::RecordReader, SharedWriter)> {

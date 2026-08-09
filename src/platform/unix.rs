@@ -186,7 +186,11 @@ impl DaemonLauncher {
     /// server that has not finished starting: the client only sees its own connect error, which for
     /// a leftover endpoint file is a bare "connection refused" that names neither the session nor
     /// the reason.
-    pub fn launch(name: &str, config_path: Option<&Path>) -> io::Result<()> {
+    pub fn launch(
+        name: &str,
+        config_path: Option<&Path>,
+        layout_path: Option<&Path>,
+    ) -> io::Result<()> {
         let executable = std::env::current_exe()?;
         let (readiness, writer) = readiness_pipe()?;
         let writer_descriptor = writer.as_raw_fd();
@@ -194,6 +198,9 @@ impl DaemonLauncher {
         command.arg("__server").arg("--session").arg(name);
         if let Some(path) = config_path {
             command.arg("--config").arg(path);
+        }
+        if let Some(path) = layout_path {
+            command.arg("--layout").arg(path);
         }
         command
             .arg("--ready-handle")

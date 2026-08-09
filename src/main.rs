@@ -8,6 +8,7 @@ mod config_watch;
 mod gateway;
 mod ipc;
 mod layout;
+mod layout_file;
 mod media;
 mod media_trace;
 mod metrics;
@@ -45,6 +46,9 @@ enum Command {
         session: String,
         #[arg(short = 'd', long)]
         detached: bool,
+        /// Startup layout name from the config layouts directory, or a TOML path.
+        #[arg(long)]
+        layout: Option<String>,
     },
     /// Attach to an existing session by exact name.
     Attach {
@@ -117,6 +121,8 @@ enum Command {
     Server {
         #[arg(long)]
         session: String,
+        #[arg(long)]
+        layout: Option<PathBuf>,
         #[arg(long, hide = true)]
         ready_handle: Option<usize>,
     },
@@ -168,9 +174,13 @@ fn main() {
 fn run(cli: Cli) -> io::Result<()> {
     match cli.command {
         None => client::attach("default", false, true, cli.config.as_deref()),
-        Some(Command::New { session, detached }) => {
+        Some(Command::New {
+            session,
+            detached,
+            layout,
+        }) => {
             runtime::validate_session_name(&session)?;
-            client::create_detached(&session, cli.config.as_deref())?;
+            client::create_detached(&session, cli.config.as_deref(), layout.as_deref())?;
             if detached {
                 println!("created vvmux session {session}");
                 Ok(())
@@ -296,10 +306,11 @@ fn run(cli: Cli) -> io::Result<()> {
         },
         Some(Command::Server {
             session,
+            layout,
             ready_handle,
         }) => {
             runtime::validate_session_name(&session)?;
-            server::run(session, cli.config, ready_handle)
+            server::run(session, cli.config, layout, ready_handle)
         }
         #[cfg(windows)]
         Some(Command::ConsoleSelfTest) => platform::console_restoration_self_test(),

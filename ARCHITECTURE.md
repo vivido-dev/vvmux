@@ -58,6 +58,14 @@ values are carried forward rather than swapped under live retained media and in-
 moves the status row in or out of the pane area, so the stored displays are re-normalized before
 anything derives geometry from them, followed by exactly one `relayout` for the whole change.
 
+Startup layouts are parsed and bounded in the foreground process before daemonization, then loaded
+again by the server and lowered to pane-slot plans before the session actor starts. The actor
+allocates every tab-local slot before spawning, substitutes owner-scoped pane IDs only after that,
+and closes failed leaves out of the candidate tree; one owner's failed spawn cannot broaden cleanup
+to another session that reused the same numeric IDs. Weighted startup constructors deliberately do
+not enforce the placeholder 80x23 display's interactive minimums. The first real attach supplies
+authoritative geometry and relayouts once; interactive splits continue to validate the live area.
+
 ## Vivid 1.5 nested presenter and revision domains
 
 The pane-facing virtual presenter and the outer presenter are different Vivid sessions. Virtual
