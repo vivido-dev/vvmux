@@ -787,10 +787,20 @@ fn run_bridge_worker(
     let mut active_sources = Vec::new();
     let mut active_nodes = Vec::new();
     let mut started_sources = HashSet::new();
+    // A paused timed source normally rejects further media once it has started. Recovery is the
+    // exception: Vivi must pre-roll the replacement video and linked audio tracks before it can
+    // publish the new PLAY.
+    let mut recovering_sources = HashSet::new();
     // `videos_needing_keyframes` is level-triggered projection state. Convert it to one request
     // per recovery episode: media-only revisions can otherwise enqueue hundreds of identical
     // requests before the first keyframe delivery acknowledgement reaches the session actor.
     let mut requested_virtual_keyframes = HashSet::<BridgeSourceKey>::new();
+    // The bridge proactively requests a keyframe before replacing a recovering decoder. The new
+    // outer channel can report its own initial NEED_KEYFRAME after that keyframe was already sent
+    // and acknowledged; forwarding it would start a second recovery before PLAY and consume the
+    // replacement track's only pre-roll grant. Keep that initial request damped until the
+    // authoritative recovery PLAY completes.
+    let mut recovery_handoffs = HashSet::<BridgeSourceKey>::new();
     let mut desynchronized_sources = HashSet::new();
     let mut force_sources = false;
     let mut force_replacement = false;
@@ -901,7 +911,13 @@ fn run_bridge_worker(
                     },
                 );
             }
-            let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(outer_keyframes));
+            let forwarded = outer_keyframes
+                .into_iter()
+                .filter(|request| !recovery_handoffs.contains(&request.source))
+                .collect::<Vec<_>>();
+            if !forwarded.is_empty() {
+                let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(forwarded));
+            }
         }
         let outer_full_frames = bridge.take_full_frame_requests();
         if !outer_full_frames.is_empty() {
@@ -950,6 +966,11 @@ fn run_bridge_worker(
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>();
+            let newly_recovering_sources = needing_virtual_keyframes
+                .difference(&recovering_sources)
+                .copied()
+                .collect::<HashSet<_>>();
+            recovery_handoffs.extend(newly_recovering_sources.iter().copied());
             requested_virtual_keyframes.retain(|source| needing_virtual_keyframes.contains(source));
             let mut early_keyframes = pending
                 .videos_needing_keyframes
@@ -991,7 +1012,7 @@ fn run_bridge_worker(
                     source.playing = false;
                 }
             }
-            let change = if force_sources {
+            let change = if force_sources || !newly_recovering_sources.is_empty() {
                 ProjectionChange::Sources
             } else {
                 compare_projection(
@@ -1004,7 +1025,8 @@ fn run_bridge_worker(
                 )
             };
             let mut recreated = HashSet::new();
-            let source_scoped_recovery = !desynchronized_sources.is_empty();
+            let source_scoped_recovery =
+                !desynchronized_sources.is_empty() || !newly_recovering_sources.is_empty();
             if change == ProjectionChange::Sources && force_replacement {
                 metrics.session_replacements = metrics.session_replacements.saturating_add(1);
             }
@@ -1023,7 +1045,12 @@ fn run_bridge_worker(
                     let result = if force_replacement {
                         bridge.replace_session(&pending.surfaces, &pending.tracks, &pending.nodes)
                     } else {
-                        bridge.rebuild(&pending.surfaces, &pending.tracks, &pending.nodes)
+                        bridge.rebuild_resetting(
+                            &pending.surfaces,
+                            &pending.tracks,
+                            &pending.nodes,
+                            &newly_recovering_sources,
+                        )
                     };
                     result.map(|sources| recreated = sources)
                 }
@@ -1140,6 +1167,27 @@ fn run_bridge_worker(
             active_surfaces = pending.surfaces;
             active_sources = pending.tracks;
             active_nodes = pending.nodes;
+            recovering_sources = active_sources
+                .iter()
+                .filter(|source| {
+                    recovering_surfaces.contains(&(
+                        source.key.producer,
+                        source.key.context,
+                        source.key.surface,
+                    )) && matches!(
+                        source.kind,
+                        BridgeSourceKind::Video { .. } | BridgeSourceKind::Audio { .. }
+                    )
+                })
+                .map(|source| source.key)
+                .collect();
+            recovery_handoffs.retain(|source| {
+                active_sources
+                    .iter()
+                    .any(|candidate| candidate.key == *source)
+                    && (needing_virtual_keyframes.contains(source)
+                        || !source_is_playing(&active_sources, *source))
+            });
             started_sources.extend(
                 active_sources
                     .iter()
@@ -1198,8 +1246,11 @@ fn run_bridge_worker(
                 .get(&media.source)
                 .copied()
                 .unwrap_or(0)
-            || media.generation > active_generation
         {
+            release_bridge_delivery(&client_writer, media.delivery_id);
+            continue;
+        }
+        if media.generation > active_generation {
             acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
             continue;
         }
@@ -1227,6 +1278,7 @@ fn run_bridge_worker(
             vivid_protocol::messages::VIDEO_PACKET | vivid_protocol::messages::AUDIO_PACKET
         ) && !source_is_playing(&active_sources, media.source)
             && started_sources.contains(&media.source)
+            && !recovering_sources.contains(&media.source)
         {
             acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
             continue;
@@ -1584,6 +1636,12 @@ fn acknowledge_bridge_delivery(
             delivery_id,
             delivered,
         });
+    }
+}
+
+fn release_bridge_delivery(client_writer: &BridgeClientSender, delivery_id: u64) {
+    if delivery_id != 0 {
+        let _ = client_writer.send(ClientMessage::BridgeMediaReleased { delivery_id });
     }
 }
 
@@ -2049,6 +2107,7 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1024,
             },
+            audio_gain: None,
             capture_policy: 0,
             descriptor: None,
             playing: true,
@@ -2557,6 +2616,7 @@ mod tests {
                 compression_mode: 1,
                 delta_operation_limit: None,
             },
+            audio_gain: None,
             capture_policy: 0,
             descriptor: None,
             playing: false,
@@ -2678,6 +2738,7 @@ mod tests {
                 compression_mode: 1,
                 delta_operation_limit: Some(PAGE_DELTA_OPERATIONS),
             },
+            audio_gain: None,
             capture_policy: 0,
             descriptor: None,
             playing: false,
@@ -2947,6 +3008,7 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1024,
             },
+            audio_gain: None,
             capture_policy: 0,
             descriptor: None,
             playing: false,
@@ -2976,6 +3038,7 @@ mod tests {
                 bitrate: 0,
                 max_access_unit_bytes: 1024,
             },
+            audio_gain: Some(vivid_sdk::AudioGain::UNITY.raw()),
             capture_policy: 0,
             descriptor: None,
             playing: false,
@@ -3024,6 +3087,7 @@ mod tests {
 
         let (ack_sender, ack_receiver) = mpsc::channel();
         let (keyframe_sender, keyframe_receiver) = mpsc::channel();
+        let (applied_sender, applied_receiver) = mpsc::channel();
         thread::spawn(move || {
             while let Ok(message) = server_reader.recv::<ClientMessage>() {
                 match message {
@@ -3035,6 +3099,11 @@ mod tests {
                     }
                     ClientMessage::BridgeNeedKeyframes(requests) => {
                         let _ = keyframe_sender.send(requests);
+                    }
+                    ClientMessage::BridgeApplied {
+                        virtual_revision, ..
+                    } => {
+                        let _ = applied_sender.send(virtual_revision);
                     }
                     _ => {}
                 }
@@ -3135,21 +3204,25 @@ mod tests {
             "the first post-PLAY keyframe must reach the existing outer video source"
         );
         let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
+        let (initial_outer_video, initial_outer_audio) = loop {
             let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
-            if snapshot.sources.iter().any(|source| {
-                source.key.track != 0
-                    && matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
+            let video = snapshot.sources.iter().find(|source| {
+                matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
                     && source.playing
-            }) {
-                break;
+            });
+            let audio = snapshot.sources.iter().find(|source| {
+                matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_))
+                    && source.playing
+            });
+            if let (Some(video), Some(audio)) = (video, audio) {
+                break (video.key, audio.key);
             }
             assert!(
                 Instant::now() < deadline,
                 "outer video source never entered PLAY"
             );
             thread::sleep(Duration::from_millis(2));
-        }
+        };
         let packet = media::audio_packet_body(AudioPacket {
             epoch: 1,
             packet_id: 2,
@@ -3184,11 +3257,46 @@ mod tests {
             "post-PLAY audio retained a stop-and-wait hop instead of using outer flow control"
         );
         assert!(!presenter.complete_bridge_delivery(outer_audio.delivery_id, true));
+
+        // Consume the outer video's entire one-record flow grant and deliberately leave that
+        // packet unpresented. PAUSE cannot return this capacity: recovery has to replace the old
+        // timed decoder before its keyframe can enter the outer hop.
+        let stale_video = media::video_packet_body(VideoPacket {
+            epoch: 1,
+            packet_id: 2,
+            pts_us: 33_000,
+            dts_us: 33_000,
+            duration_us: 33_000,
+            key: false,
+            data: &[0, 0, 0, 1, 0x41, 0x99],
+        })
+        .unwrap();
+        assert!(worker.queue_media(BridgeMedia {
+            generation: 0,
+            delivery_id: 45,
+            source: video_key,
+            record_type: vivid_protocol::messages::VIDEO_PACKET,
+            offset: 0,
+            total: stale_video.len() as u32,
+            last: true,
+            bytes: stale_video,
+        }));
+        let stale_outer_video = outer_media_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("outer presenter did not receive the packet that saturates old video flow");
+        assert_eq!(
+            ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (45, true)
+        );
+        assert_ne!(stale_outer_video.delivery_id, 0);
+
+        let mut paused_video = playing_video.clone();
+        paused_video.playing = false;
         worker.replace_snapshot(BridgeSnapshot {
             generation: 0,
             virtual_revision: 10,
             surfaces: vec![test_surface(video_key)],
-            tracks: vec![playing_video, audio_source],
+            tracks: vec![paused_video, audio_source.clone()],
             nodes: Vec::new(),
             videos_needing_keyframes: vec![video_key],
         });
@@ -3197,6 +3305,188 @@ mod tests {
             .unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].source, video_key);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+            let replacement_video = snapshot.sources.iter().find(|source| {
+                matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
+            });
+            let replacement_audio = snapshot.sources.iter().find(|source| {
+                matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_))
+            });
+            if replacement_video.is_some_and(|source| source.key != initial_outer_video)
+                && replacement_audio.is_some_and(|source| source.key != initial_outer_audio)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "seek recovery did not replace the saturated outer timed decoder"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        loop {
+            let revision = applied_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("seek recovery projection was not acknowledged");
+            if revision == 10 {
+                break;
+            }
+        }
+
+        let recovery_audio = media::audio_packet_body(AudioPacket {
+            epoch: 2,
+            packet_id: 3,
+            pts_us: 10_000_000,
+            dts_us: 10_000_000,
+            duration_us: 20_000,
+            trim_start_samples: 0,
+            trim_end_samples: 0,
+            data: &[0, 0, 0, 0],
+        })
+        .unwrap();
+        assert!(worker.queue_media(BridgeMedia {
+            generation: 0,
+            delivery_id: 46,
+            source: key,
+            record_type: vivid_protocol::messages::AUDIO_PACKET,
+            offset: 0,
+            total: recovery_audio.len() as u32,
+            last: true,
+            bytes: recovery_audio,
+        }));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let outer_recovery_audio = loop {
+            if let Ok(media) = outer_media_receiver.try_recv() {
+                break media;
+            }
+            if let Ok(ack) = ack_receiver.try_recv() {
+                panic!(
+                    "replacement audio pre-roll was rejected before the outer presenter: {ack:?}"
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement audio pre-roll never reached the outer presenter"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(
+            outer_recovery_audio.record_type,
+            vivid_protocol::messages::AUDIO_PACKET
+        );
+
+        // Seeking pauses a source that has already played, then pre-rolls the replacement
+        // generation's keyframe before publishing its new PLAY. That recovery keyframe must not
+        // be mistaken for ordinary media arriving on a stopped source.
+        let recovery_keyframe = media::video_packet_body(VideoPacket {
+            epoch: 2,
+            packet_id: 4,
+            pts_us: 10_000_000,
+            dts_us: 10_000_000,
+            duration_us: 33_000,
+            key: true,
+            data: &[0, 0, 0, 1, 0x65, 0x99],
+        })
+        .unwrap();
+        assert!(worker.queue_media(BridgeMedia {
+            generation: 0,
+            delivery_id: 47,
+            source: video_key,
+            record_type: vivid_protocol::messages::VIDEO_PACKET,
+            offset: 0,
+            total: recovery_keyframe.len() as u32,
+            last: true,
+            bytes: recovery_keyframe,
+        }));
+        let outer_recovery = outer_media_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("paused seek recovery keyframe never reached the outer presenter");
+        assert_eq!(
+            outer_recovery.record_type,
+            vivid_protocol::messages::VIDEO_PACKET
+        );
+        assert!(!presenter.complete_bridge_delivery(outer_recovery.delivery_id, true));
+        assert_eq!(
+            ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (47, true),
+            "the paused recovery keyframe was rejected as stopped-source media"
+        );
+        assert!(
+            keyframe_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the replacement decoder's delayed initial request started a second recovery before PLAY"
+        );
+
+        let mut resumed_video = playing_video;
+        resumed_video.play_request.start_pts_us = 10_000_000;
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            virtual_revision: 11,
+            surfaces: vec![test_surface(video_key)],
+            tracks: vec![resumed_video.clone(), audio_source.clone()],
+            nodes: Vec::new(),
+            videos_needing_keyframes: Vec::new(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+            let timed = snapshot
+                .sources
+                .iter()
+                .filter(|source| {
+                    source.key.track != 0
+                        && matches!(
+                            source.descriptor,
+                            crate::media::SourceDescriptor::Video(_)
+                                | crate::media::SourceDescriptor::Audio(_)
+                        )
+                })
+                .collect::<Vec<_>>();
+            if timed.len() == 2 && timed.iter().all(|source| source.playing) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "outer audio/video remained paused after the recovery PLAY"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!presenter.complete_bridge_delivery(outer_recovery_audio.delivery_id, true));
+        assert_eq!(
+            ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (46, true),
+            "PLAY did not release the linked audio record that established output readiness"
+        );
+
+        let mut quieter_audio = audio_source;
+        let quieter_gain = vivid_sdk::AudioGain::from_percent(35).unwrap();
+        quieter_audio.audio_gain = Some(quieter_gain.raw());
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            virtual_revision: 12,
+            surfaces: vec![test_surface(video_key)],
+            tracks: vec![resumed_video, quieter_audio],
+            nodes: Vec::new(),
+            videos_needing_keyframes: Vec::new(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+            if snapshot.sources.iter().any(|source| {
+                matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_))
+                    && source.audio_gain == Some(quieter_gain)
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "audio gain did not cross the vvmux outer bridge"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 
     #[test]
@@ -3309,6 +3599,7 @@ mod tests {
                     sar_den: 1,
                     max_access_unit_bytes: 1024,
                 },
+                audio_gain: None,
                 capture_policy: 0,
                 descriptor: None,
                 playing,
@@ -3330,6 +3621,7 @@ mod tests {
                     bitrate: 0,
                     max_access_unit_bytes: 1024,
                 },
+                audio_gain: Some(vivid_sdk::AudioGain::UNITY.raw()),
                 capture_policy: 0,
                 descriptor: None,
                 playing: false,
@@ -3561,6 +3853,7 @@ mod tests {
                     encoded_length: u32::try_from(encoded.len()).unwrap(),
                     sha256: None,
                 },
+                audio_gain: None,
                 capture_policy: 0,
                 descriptor: None,
                 playing: false,
@@ -3970,6 +4263,7 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1_048_576,
             },
+            audio_gain: None,
             capture_policy: 0,
             descriptor: None,
             playing,
@@ -3999,6 +4293,7 @@ mod tests {
                 bitrate: 128_000,
                 max_access_unit_bytes: 4096,
             },
+            audio_gain: Some(vivid_sdk::AudioGain::UNITY.raw()),
             capture_policy: 0,
             descriptor: None,
             playing: false,
@@ -4111,6 +4406,7 @@ mod tests {
                 encoded_length: 32,
                 sha256: None,
             },
+            audio_gain: None,
             capture_policy: 0,
             descriptor: None,
             playing: false,

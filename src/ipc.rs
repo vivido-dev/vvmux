@@ -344,6 +344,10 @@ pub enum ClientMessage {
         delivery_id: u64,
         delivered: bool,
     },
+    /// A queued media delivery was superseded by a newer outer attachment generation.
+    BridgeMediaReleased {
+        delivery_id: u64,
+    },
     BridgeSnapshotRetry {
         /// The bridge control session is uncertain and its hop-local identities will be replaced.
         ///

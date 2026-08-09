@@ -1348,6 +1348,12 @@ impl SessionActor {
                     }
                 }
             }
+            ClientMessage::BridgeMediaReleased { delivery_id } => {
+                if self.client_is(id) {
+                    self.traced_recovery_deliveries.remove(&delivery_id);
+                    self.vivid.release_bridge_delivery(delivery_id);
+                }
+            }
             ClientMessage::BridgeRetainedHydrated { source } => {
                 if self.client_is(id) {
                     self.vivid.complete_retained_hydration(source);
@@ -4283,6 +4289,7 @@ impl SessionActor {
                     &source.descriptor,
                     source.raster_delta_operation_limit,
                 ),
+                audio_gain: source.audio_gain.map(|gain| gain.raw()),
                 capture_policy: source.capture_policy,
                 descriptor: source.semantic_descriptor.as_ref().map(|descriptor| {
                     BridgeSourceDescriptor {
