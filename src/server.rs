@@ -299,14 +299,15 @@ mod tests {
     use std::os::unix::fs::OpenOptionsExt;
 
     /// Writes a registry recording a foreign VVMX version, as a server built before a version bump
-    /// would have left behind, and removes it afterwards.
+    /// would have left behind, and removes its uniquely named artifacts afterwards.
     struct ForeignRegistry {
         paths: RuntimePaths,
     }
 
     impl ForeignRegistry {
-        fn write(name: &str, version: u16, pid: u32) -> Self {
-            let paths = RuntimePaths::for_session(name).unwrap();
+        fn write(name_prefix: &str, version: u16, pid: u32) -> Self {
+            let name = unique_fixture_name(name_prefix);
+            let paths = RuntimePaths::for_session(&name).unwrap();
             let body = format!(
                 "{{\"schema\":2,\"name\":\"{name}\",\"pid\":{pid},\
                  \"instance_nonce\":\"{}\",\"vvmx_version\":{version}}}",
@@ -314,8 +315,7 @@ mod tests {
             );
             let mut file = fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
                 .open(&paths.registry)
                 .unwrap();
@@ -327,7 +327,14 @@ mod tests {
     impl Drop for ForeignRegistry {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.paths.registry);
+            self.paths.remove_stale_endpoints();
         }
+    }
+
+    fn unique_fixture_name(prefix: &str) -> String {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).unwrap();
+        format!("{prefix}-{:032x}", u128::from_ne_bytes(random))
     }
 
     fn mismatch() -> io::Error {
@@ -352,8 +359,8 @@ mod tests {
 
     #[test]
     fn version_mismatch_without_a_registry_still_reports_this_build() {
-        let paths = RuntimePaths::for_session("vvmx-absent-fixture").unwrap();
-        let _ = fs::remove_file(&paths.registry);
+        let name = unique_fixture_name("vvmx-absent-fixture");
+        let paths = RuntimePaths::for_session(&name).unwrap();
         let described = describe_peer_version(&paths, mismatch()).to_string();
         assert!(described.starts_with(ipc::VERSION_MISMATCH), "{described}");
         assert!(!described.contains("PID"), "{described}");
@@ -378,7 +385,13 @@ mod tests {
         match std::os::unix::net::UnixListener::bind(&paths.socket) {
             Ok(listener) => {
                 drop(listener);
-                Some(())
+                for _ in 0..100 {
+                    if !platform::session_is_connectable(&paths.socket) {
+                        return Some(());
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                panic!("staged session endpoint remained connectable after its listener closed");
             }
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 eprintln!("skipping stale-endpoint socket test: {error}");
@@ -409,7 +422,6 @@ mod tests {
         // next bind succeeds instead of leaving every client to report "connection refused".
         assert!(!fixture.paths.artifacts_exist());
         SessionListener::bind(&fixture.paths.socket).unwrap();
-        let _ = fs::remove_file(&fixture.paths.socket);
     }
 
     #[test]
@@ -439,6 +451,5 @@ mod tests {
             fixture.paths.registry.exists(),
             "a running owner's registry must survive"
         );
-        let _ = fs::remove_file(&fixture.paths.socket);
     }
 }

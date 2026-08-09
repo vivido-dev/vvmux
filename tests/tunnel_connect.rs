@@ -28,6 +28,42 @@ fn private_directory(path: &std::path::Path) {
     }
 }
 
+/// Create a collision-safe runtime whose Unix socket names fit macOS `sockaddr_un::sun_path`.
+fn short_runtime_directory() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("vvt-");
+    #[cfg(unix)]
+    let directory = builder.tempdir_in("/tmp").unwrap();
+    #[cfg(not(unix))]
+    let directory = builder.tempdir().unwrap();
+    private_directory(directory.path());
+    directory
+}
+
+fn stop_session(runtime: &std::path::Path, name: &str) {
+    let stopped = common::vvmux_command(runtime)
+        .args(["kill-session", "--target", name])
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "session shutdown failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+
+    #[cfg(unix)]
+    {
+        let runtime_state = runtime.join("vvmux");
+        for _ in 0..100 {
+            if std::fs::read_dir(&runtime_state).is_ok_and(|mut entries| entries.next().is_none()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("session {name} did not remove its runtime artifacts after shutdown");
+    }
+}
+
 fn enroll_machine(
     harness: &TunnelHarness,
     runtime: &std::path::Path,
@@ -327,18 +363,21 @@ async fn a_signature_from_the_wrong_deployment_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tunnel_leg_drives_a_real_session() {
-    let runtime = std::env::temp_dir().join(format!("vvmux-tun-leg-{}", std::process::id()));
-    private_directory(&runtime);
+    let runtime = short_runtime_directory();
     let harness = TunnelHarness::start("test-code").await;
 
     // Create a detached session in the same runtime as the gateway.
-    let created = common::vvmux_command(&runtime)
+    let created = common::vvmux_command(runtime.path())
         .args(["new", "-s", "tun", "-d"])
         .output()
         .unwrap();
-    assert!(created.status.success(), "session creation failed");
+    assert!(
+        created.status.success(),
+        "session creation failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
 
-    let (_machine_id, mut gateway) = enroll_and_connect(&harness, &runtime).await;
+    let (_machine_id, mut gateway) = enroll_and_connect(&harness, runtime.path()).await;
     let status = timeout(Duration::from_secs(10), harness.next_control())
         .await
         .expect("no machine_status")
@@ -469,7 +508,7 @@ async fn a_tunnel_leg_drives_a_real_session() {
 
     gateway.kill().unwrap();
     gateway.wait().unwrap();
-    std::fs::remove_dir_all(&runtime).ok();
+    stop_session(runtime.path(), "tun");
 }
 
 async fn wt_send_json(send: &mut wtransport::SendStream, value: serde_json::Value) {
@@ -506,16 +545,19 @@ async fn wt_read_frame(recv: &mut wtransport::RecvStream) -> (u8, Vec<u8>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_webtransport_stream_drives_a_real_session_without_another_machine_connection() {
-    let runtime = std::env::temp_dir().join(format!("vvmux-tun-wt-{}", std::process::id()));
-    private_directory(&runtime);
+    let runtime = short_runtime_directory();
     let enrollment = TunnelHarness::start("test-code").await;
-    let (machine_id, identity_file) = enroll_identity(&enrollment, &runtime);
+    let (machine_id, identity_file) = enroll_identity(&enrollment, runtime.path());
     let public_key = enrollment.registered_key(&machine_id).unwrap();
-    let created = common::vvmux_command(&runtime)
+    let created = common::vvmux_command(runtime.path())
         .args(["new", "-s", "wt", "-d"])
         .output()
         .unwrap();
-    assert!(created.status.success());
+    assert!(
+        created.status.success(),
+        "session creation failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
 
     let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let address = probe.local_addr().unwrap();
@@ -613,7 +655,7 @@ async fn a_webtransport_stream_drives_a_real_session_without_another_machine_con
         connection.closed().await;
     });
 
-    let mut gateway = common::vvmux_command(&runtime)
+    let mut gateway = common::vvmux_command(runtime.path())
         .args(["serve", "--connect"])
         .arg(format!("https://{address}"))
         .arg("--identity-file")
@@ -698,7 +740,7 @@ async fn a_webtransport_stream_drives_a_real_session_without_another_machine_con
     gateway.kill().unwrap();
     gateway.wait().unwrap();
     server.abort();
-    std::fs::remove_dir_all(&runtime).ok();
+    stop_session(runtime.path(), "wt");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -805,17 +847,20 @@ async fn duplicate_leg_id_is_source_scoped_and_close_releases_only_its_attachmen
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tunnel_loss_reconnects_and_sessions_survive() {
-    let runtime = std::env::temp_dir().join(format!("vvmux-tun-restart-{}", std::process::id()));
-    private_directory(&runtime);
+    let runtime = short_runtime_directory();
     let harness = TunnelHarness::start("test-code").await;
 
-    let created = common::vvmux_command(&runtime)
+    let created = common::vvmux_command(runtime.path())
         .args(["new", "-s", "keep", "-d"])
         .output()
         .unwrap();
-    assert!(created.status.success());
+    assert!(
+        created.status.success(),
+        "session creation failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
 
-    let (_machine_id, mut gateway) = enroll_and_connect(&harness, &runtime).await;
+    let (_machine_id, mut gateway) = enroll_and_connect(&harness, runtime.path()).await;
     let status = timeout(Duration::from_secs(10), harness.next_control())
         .await
         .expect("no first machine_status");
@@ -833,7 +878,7 @@ async fn a_tunnel_loss_reconnects_and_sessions_survive() {
         "expected a second machine_status after reconnect"
     );
 
-    let listed = common::vvmux_command(&runtime)
+    let listed = common::vvmux_command(runtime.path())
         .args(["list"])
         .output()
         .unwrap();
@@ -845,7 +890,7 @@ async fn a_tunnel_loss_reconnects_and_sessions_survive() {
 
     gateway.kill().unwrap();
     gateway.wait().unwrap();
-    std::fs::remove_dir_all(&runtime).ok();
+    stop_session(runtime.path(), "keep");
 }
 
 /// The gateway must refuse `ws://` to a non-loopback host before connecting.
