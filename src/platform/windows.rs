@@ -36,7 +36,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FileAttributeTagInfo, FileDispositionInfo, GetFileInformationByHandleEx,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SetFileInformationByHandle, WriteFile,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SearchPathW, SetFileInformationByHandle,
+    WriteFile,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Console::{
@@ -90,6 +91,33 @@ pub fn windows_fallback_shell() -> OsString {
             .into_os_string();
     }
     OsString::from(r"C:\Windows\System32\cmd.exe")
+}
+
+/// Resolve a shell name the same way a native Windows process launch resolves an executable.
+///
+/// Vivido records a command such as `pwsh.exe` in `SHELL`, while the ConPTY backend requires the
+/// application path to be absolute so `CreateProcessW` cannot ambiguously reinterpret it.
+pub fn resolve_windows_executable(program: &OsStr) -> Option<OsString> {
+    if program.is_empty() {
+        return None;
+    }
+    let program = wide_os(program).ok()?;
+    let extension = wide_os(OsStr::new(".exe")).expect("static extension has no NUL");
+    let mut buffer = vec![0_u16; 32_768];
+    let length = unsafe {
+        SearchPathW(
+            ptr::null(),
+            program.as_ptr(),
+            extension.as_ptr(),
+            buffer.len() as u32,
+            buffer.as_mut_ptr(),
+            ptr::null_mut(),
+        )
+    } as usize;
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    Some(OsString::from_wide(&buffer[..length]))
 }
 
 pub struct ClientTerminal {
@@ -1732,6 +1760,20 @@ mod tests {
         assert_eq!(
             quote_windows(r"C:\path with space\"),
             r#""C:\path with space\\""#
+        );
+    }
+
+    #[test]
+    fn windows_executable_resolution_returns_an_absolute_shell_path() {
+        let comspec = std::env::var_os("COMSPEC").expect("Windows defines COMSPEC");
+        let file_name = std::path::Path::new(&comspec).file_name().unwrap();
+        let resolved = resolve_windows_executable(file_name).expect("COMSPEC is searchable");
+        assert!(std::path::Path::new(&resolved).is_absolute());
+        assert_eq!(
+            std::path::Path::new(&resolved)
+                .file_name()
+                .map(|name| name.to_ascii_lowercase()),
+            Some(file_name.to_ascii_lowercase())
         );
     }
 

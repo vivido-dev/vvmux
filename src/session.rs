@@ -3897,6 +3897,8 @@ impl SessionActor {
             .map(|path| OsString::from(path.as_os_str()))
             .or_else(default_shell)
             .unwrap_or_else(fallback_shell);
+        #[cfg(windows)]
+        let shell = crate::platform::resolve_windows_executable(&shell).unwrap_or(shell);
         let cwd = spec
             .cwd
             .clone()
@@ -5816,7 +5818,20 @@ fn default_shell() -> Option<OsString> {
 
 #[cfg(windows)]
 fn default_shell() -> Option<OsString> {
-    std::env::var_os("COMSPEC")
+    default_windows_shell(
+        std::env::var_os("SHELL"),
+        std::env::var_os("COMSPEC"),
+        crate::platform::resolve_windows_executable,
+    )
+}
+
+#[cfg(windows)]
+fn default_windows_shell(
+    shell: Option<OsString>,
+    comspec: Option<OsString>,
+    mut resolve: impl FnMut(&std::ffi::OsStr) -> Option<OsString>,
+) -> Option<OsString> {
+    shell.and_then(|shell| resolve(&shell)).or(comspec)
 }
 
 #[cfg(unix)]
@@ -6470,6 +6485,35 @@ fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prefers_a_resolvable_inherited_shell_over_comspec() {
+        let selected = default_windows_shell(
+            Some(OsString::from("pwsh.exe")),
+            Some(OsString::from(r"C:\Windows\System32\cmd.exe")),
+            |shell| {
+                (shell == std::ffi::OsStr::new("pwsh.exe"))
+                    .then(|| OsString::from(r"C:\Program Files\PowerShell\7\pwsh.exe"))
+            },
+        );
+        assert_eq!(
+            selected,
+            Some(OsString::from(r"C:\Program Files\PowerShell\7\pwsh.exe"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ignores_an_inherited_shell_that_is_not_a_native_executable() {
+        let comspec = OsString::from(r"C:\Windows\System32\cmd.exe");
+        let selected = default_windows_shell(
+            Some(OsString::from("/bin/bash")),
+            Some(comspec.clone()),
+            |_| None,
+        );
+        assert_eq!(selected, Some(comspec));
+    }
 
     #[test]
     fn media_wakeups_coalesce_until_the_actor_clears_pending_work() {

@@ -28,8 +28,10 @@ transition/testing and are not the primary public release path.
 When the terminfo entry cannot be found, pane shells use `TERM=xterm-256color`. They always receive
 `TERM_PROGRAM=vvmux` and `COLORTERM=truecolor`.
 
-On Windows, the configured `[general].shell` is used first, then `%COMSPEC%`, then the system
-`cmd.exe`. The default config is `%APPDATA%\vvmux\config.toml`; owner-only runtime registries live
+On Windows, the configured `[general].shell` is used first, then a native executable advertised by
+`%SHELL%`, then `%COMSPEC%`, then the system `cmd.exe`. Vivido sets `%SHELL%` to the program selected
+with `-e`, so a vvmux session opened from `vivido -e pwsh.exe` creates PowerShell panes. The default
+config is `%APPDATA%\vvmux\config.toml`; owner-only runtime registries live
 below `%LOCALAPPDATA%\vvmux\runtime`. Pane shells receive an exact `127.0.0.1` virtual Vivid endpoint
 and `VIVID_ANCHOR_TRANSPORT=conpty`. Remote Unix applications may still need the supplied
 `terminfo/vvmux.info` installed on the remote host.
