@@ -333,7 +333,7 @@ impl ClientTerminal {
         };
         if let Err(error) = output
             .write_all(
-                b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h",
+                b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h",
             )
             .and_then(|()| output.flush())
         {
@@ -419,7 +419,7 @@ fn require_interactive_terminal() -> io::Result<()> {
 impl Drop for ClientTerminal {
     fn drop(&mut self) {
         let _ = self.output.write_all(
-            b"\x1b[0m\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l",
+            b"\x1b[0m\x1b[=0u\x1b[?2004l\x1b[?1004l\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?25h\x1b[?1049l",
         );
         let _ = self.output.flush();
         unsafe {

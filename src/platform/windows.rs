@@ -72,9 +72,9 @@ pub type SessionEndpoint = String;
 pub type VirtualPresenterEndpoint = PathBuf;
 
 const ENTER_TERMINAL: &[u8] =
-    b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004l";
+    b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004l";
 const LEAVE_TERMINAL: &[u8] =
-    b"\x1b[0m\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l";
+    b"\x1b[0m\x1b[=0u\x1b[?2004l\x1b[?1004l\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?25h\x1b[?1049l";
 const DEFAULT_CELL_WIDTH_PX: u16 = 10;
 const DEFAULT_CELL_HEIGHT_PX: u16 = 20;
 

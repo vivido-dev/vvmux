@@ -16,11 +16,12 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Bumped to 11 for host focus reporting; 10 was the Vivid 1.5 surface/track/channel cutover.
+/// Bumped to 12 for pixel mouse input, focused-pane Kitty keyboard modes, and authoritative live
+/// media/active-slot projection; 11 added host focus reporting.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 11;
+pub const VERSION: u16 = 12;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -389,6 +390,9 @@ pub enum ClientMessage {
     Kill,
     Ping,
     Automation(AutomationRequest),
+    /// SGR-Pixels mouse input. Coordinates are zero-based physical pixels in the attached
+    /// terminal, unlike [`Self::Mouse`], whose coordinates are zero-based cells.
+    PixelMouse(MouseEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -443,6 +447,12 @@ pub enum ServerMessage {
         index: u32,
         last: bool,
         base64: String,
+    },
+    /// Kitty keyboard flags requested by the focused pane. The native client applies these to
+    /// its host terminal so key encodings survive a nested terminal boundary.
+    InputMode {
+        keyboard_flags: u8,
+        sgr_pixels: bool,
     },
 }
 

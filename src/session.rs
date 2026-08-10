@@ -676,6 +676,8 @@ struct SessionActor {
     /// Whether the attached client's host terminal currently holds focus. Assumed true until the
     /// client reports otherwise, because a client attaches into a focused window.
     client_focused: bool,
+    /// Last focused-pane keyboard and mouse coordinate modes sent to the attached host terminal.
+    reported_input_mode: Option<(u8, bool)>,
     last_display: DisplayMetrics,
     next_pane_id: PaneId,
     next_tab_id: u64,
@@ -822,6 +824,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         active_tab: 0,
         attached: None,
         client_focused: true,
+        reported_input_mode: None,
         last_display,
         next_pane_id: 1,
         next_tab_id: 1,
@@ -1031,6 +1034,7 @@ impl SessionActor {
                     self.cancel_pointer_drag(true);
                     self.invalidate_mouse_selection_state();
                     self.attached = None;
+                    self.reported_input_mode = None;
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
                     self.pending_media_projections.clear();
@@ -1180,6 +1184,7 @@ impl SessionActor {
         // Attachment, pane focus, tab switching, pane teardown, and a program enabling the mode
         // all move focus, so reconcile once here rather than at each of those call sites.
         self.sync_pane_focus();
+        self.sync_client_input_mode();
         Ok(())
     }
 
@@ -1246,6 +1251,7 @@ impl SessionActor {
                     rendered_session_sequence: 0,
                     frame_sequences: VecDeque::new(),
                 });
+                self.reported_input_mode = None;
                 self.fragment_assignments.clear();
                 self.last_projection_warning = None;
                 // Detached tabs retain their rectangles. Clamp them against the attaching host
@@ -1284,7 +1290,12 @@ impl SessionActor {
             }
             ClientMessage::Mouse(mouse) => {
                 if self.client_is(id) {
-                    self.mouse(mouse);
+                    self.mouse(mouse, false);
+                }
+            }
+            ClientMessage::PixelMouse(mouse) => {
+                if self.client_is(id) {
+                    self.mouse(mouse, true);
                 }
             }
             ClientMessage::Focus(focused) => {
@@ -1559,6 +1570,7 @@ impl SessionActor {
                         },
                     )?;
                     self.attached = None;
+                    self.reported_input_mode = None;
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
                     self.pending_media_projections.clear();
@@ -3043,7 +3055,12 @@ impl SessionActor {
         self.schedule_render();
     }
 
-    fn mouse(&mut self, mouse: MouseEvent) {
+    fn mouse(&mut self, mut mouse: MouseEvent, pixel_coordinates: bool) {
+        let display = self.layout_display();
+        let pixels = pixel_coordinates.then_some((mouse.x, mouse.y));
+        if pixel_coordinates {
+            mouse = pixel_mouse_to_cells(mouse, display);
+        }
         if self.mouse_selection_drag.is_some() {
             match mouse.kind {
                 MouseKind::Move if mouse.button == 0 => {
@@ -3077,6 +3094,7 @@ impl SessionActor {
             }
         }
         if matches!(mouse.kind, MouseKind::Move | MouseKind::Release) {
+            self.forward_application_mouse(mouse, pixels, display);
             return;
         }
         if mouse.kind == MouseKind::Wheel && self.invalidate_mouse_selection_state() {
@@ -3226,11 +3244,14 @@ impl SessionActor {
                 } else {
                     'M'
                 };
-                translated = Some(format!(
-                    "\x1b[<{button};{};{}{terminator}",
-                    mouse.x - content.x + 1,
-                    mouse.y - content.y + 1
-                ));
+                let (x, y) = application_mouse_coordinates(
+                    mouse,
+                    pixels,
+                    content,
+                    display,
+                    modes.sgr_pixels,
+                );
+                translated = Some(format!("\x1b[<{button};{x};{y}{terminator}"));
             } else if mouse.kind == MouseKind::Wheel {
                 copy_view_render = true;
                 let previous_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
@@ -3263,6 +3284,58 @@ impl SessionActor {
         if let Some(translated) = translated {
             self.send_pane_input(pane_id, translated.as_bytes());
         }
+    }
+
+    /// Forward motion/release reports without changing pane focus. These used to return before
+    /// application mouse handling, so even a pane in DEC 1003 mode could never hover, drag, or
+    /// release a button.
+    fn forward_application_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        pixels: Option<(u16, u16)>,
+        display: DisplayMetrics,
+    ) {
+        let area = self.content_area();
+        let Some(projection) = self.active_tab().and_then(|tab| {
+            visible_projections(tab, area)
+                .into_iter()
+                .rev()
+                .find(|projection| projection.outer.contains(mouse.x, mouse.y))
+        }) else {
+            return;
+        };
+        let content = projection.outer.content();
+        if !content.contains(mouse.x, mouse.y) {
+            return;
+        }
+        let pane_id = projection.pane_id;
+        let Some(modes) = self.panes.get(&pane_id).map(|pane| pane.terminal.modes()) else {
+            return;
+        };
+        let application_mouse = !mouse.shift
+            && match mouse.kind {
+                MouseKind::Move => modes.mouse_motion,
+                MouseKind::Release => modes.mouse_clicks,
+                _ => false,
+            };
+        if !application_mouse {
+            return;
+        }
+        let mut button = u16::from(mouse.button);
+        if mouse.kind == MouseKind::Move {
+            button |= 32;
+        }
+        let terminator = if mouse.kind == MouseKind::Release {
+            'm'
+        } else {
+            'M'
+        };
+        let (x, y) =
+            application_mouse_coordinates(mouse, pixels, content, display, modes.sgr_pixels);
+        self.send_pane_input(
+            pane_id,
+            format!("\x1b[<{button};{x};{y}{terminator}").as_bytes(),
+        );
     }
 
     fn update_pointer_drag(&mut self, mouse: MouseEvent) {
@@ -4436,6 +4509,7 @@ impl SessionActor {
                 },
             );
             self.attached = None;
+            self.reported_input_mode = None;
             self.last_screen = None;
             #[cfg(windows)]
             {
@@ -4560,6 +4634,8 @@ impl SessionActor {
                     &source.descriptor,
                     source.raster_delta_operation_limit,
                 ),
+                live: source.live,
+                active: source.active,
                 audio_gain: source.audio_gain.map(|gain| gain.raw()),
                 capture_policy: source.capture_policy,
                 descriptor: source.semantic_descriptor.as_ref().map(|descriptor| {
@@ -4947,6 +5023,33 @@ impl SessionActor {
         }
         for (pane_id, failure) in failures {
             self.report_input_failure(pane_id, Some(failure));
+        }
+    }
+
+    /// Mirror the focused pane's Kitty keyboard and SGR-Pixels modes into the attached host
+    /// terminal. Without this hop, a nested application can request enhanced key events and pixel
+    /// coordinates while the physical presenter continues sending legacy keys and cell positions.
+    fn sync_client_input_mode(&mut self) {
+        let (keyboard_flags, sgr_pixels) = self
+            .active_tab()
+            .and_then(|tab| self.panes.get(&tab.focused))
+            .map_or((0, false), |pane| {
+                let modes = pane.terminal.modes();
+                (modes.keyboard_flags, modes.sgr_pixels)
+            });
+        let input_mode = (keyboard_flags, sgr_pixels);
+        if self.attached.is_none() || self.reported_input_mode == Some(input_mode) {
+            return;
+        }
+        self.reported_input_mode = Some(input_mode);
+        if let Some(client) = &self.attached {
+            let _ = crate::ipc::send(
+                &client.writer,
+                &ServerMessage::InputMode {
+                    keyboard_flags,
+                    sgr_pixels,
+                },
+            );
         }
     }
 
@@ -5505,6 +5608,12 @@ fn terminal_mode_names(modes: TerminalModes) -> Vec<&'static str> {
     }
     if modes.sgr_mouse {
         names.push("sgr_mouse");
+    }
+    if modes.sgr_pixels {
+        names.push("sgr_pixels");
+    }
+    if modes.keyboard_flags != 0 {
+        names.push("kitty_keyboard");
     }
     if modes.focus_reporting {
         names.push("focus_reporting");
@@ -6232,6 +6341,61 @@ fn normalized_display(display: DisplayMetrics, status_visible: bool) -> DisplayM
     }
 }
 
+fn pixel_mouse_to_cells(mut mouse: MouseEvent, display: DisplayMetrics) -> MouseEvent {
+    let cell_width = display.cell_width.max(1);
+    let cell_height = display.cell_height.max(1);
+    mouse.x = mouse
+        .x
+        .checked_div(cell_width)
+        .unwrap_or(0)
+        .min(display.columns.saturating_sub(1));
+    mouse.y = mouse
+        .y
+        .checked_div(cell_height)
+        .unwrap_or(0)
+        .min(display.rows.saturating_sub(1));
+    mouse
+}
+
+/// Coordinates for a pane's SGR mouse report. Cell input remains cell-based unless the pane asks
+/// for DEC 1016, in which case the cell center is the best available fallback. Native input keeps
+/// the original physical pixel so nested raster applications retain precise pointer placement.
+fn application_mouse_coordinates(
+    mouse: MouseEvent,
+    pixels: Option<(u16, u16)>,
+    content: Rect,
+    display: DisplayMetrics,
+    sgr_pixels: bool,
+) -> (u32, u32) {
+    if !sgr_pixels {
+        return (
+            u32::from(mouse.x.saturating_sub(content.x)) + 1,
+            u32::from(mouse.y.saturating_sub(content.y)) + 1,
+        );
+    }
+
+    let cell_width = u32::from(display.cell_width.max(1));
+    let cell_height = u32::from(display.cell_height.max(1));
+    let origin_x = u32::from(content.x).saturating_mul(cell_width);
+    let origin_y = u32::from(content.y).saturating_mul(cell_height);
+    match pixels {
+        Some((x, y)) => (
+            u32::from(x).saturating_sub(origin_x) + 1,
+            u32::from(y).saturating_sub(origin_y) + 1,
+        ),
+        None => (
+            u32::from(mouse.x.saturating_sub(content.x))
+                .saturating_mul(cell_width)
+                .saturating_add(cell_width / 2)
+                + 1,
+            u32::from(mouse.y.saturating_sub(content.y))
+                .saturating_mul(cell_height)
+                .saturating_add(cell_height / 2)
+                + 1,
+        ),
+    }
+}
+
 /// Whether a reported display is a real resize rather than a repeat of the current one.
 ///
 /// Browser presenters report every dimension re-measurement, not only genuine resizes, so an
@@ -6740,6 +6904,48 @@ mod tests {
         assert_eq!((with_status.columns, with_status.rows), (10, 5));
         let without_status = normalized_display(DisplayMetrics::default(), false);
         assert_eq!((without_status.columns, without_status.rows), (10, 4));
+    }
+
+    #[test]
+    fn pixel_mouse_is_hit_tested_in_cells_but_forwarded_in_local_pixels() {
+        let display = DisplayMetrics {
+            columns: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let pixel_mouse = MouseEvent {
+            button: 0,
+            x: 155,
+            y: 130,
+            kind: MouseKind::Press,
+            shift: false,
+        };
+        let cell_mouse = pixel_mouse_to_cells(pixel_mouse, display);
+        assert_eq!((cell_mouse.x, cell_mouse.y), (15, 6));
+
+        let content = Rect {
+            x: 4,
+            y: 2,
+            width: 30,
+            height: 10,
+        };
+        assert_eq!(
+            application_mouse_coordinates(
+                cell_mouse,
+                Some((pixel_mouse.x, pixel_mouse.y)),
+                content,
+                display,
+                true,
+            ),
+            (116, 91),
+            "pane-local SGR-Pixels coordinates stay one-based and preserve sub-cell position"
+        );
+        assert_eq!(
+            application_mouse_coordinates(cell_mouse, None, content, display, false),
+            (12, 5),
+            "cell-coordinate clients keep the existing SGR cell report"
+        );
     }
 
     fn tab_with_floats() -> Tab {

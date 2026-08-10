@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::ipc::{Action, Axis, Direction, FloatingEditCommand, MouseEvent, MouseKind};
@@ -7,10 +7,16 @@ use crate::ipc::{Action, Axis, Direction, FloatingEditCommand, MouseEvent, Mouse
 pub(crate) enum ParsedInput {
     Input(Vec<u8>),
     Action(Action),
-    Mouse(MouseEvent),
+    Mouse(MouseEvent, MouseCoordinates),
     /// The host terminal gained or lost focus.
     Focus(bool),
     Detach,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MouseCoordinates {
+    Cells,
+    Pixels,
 }
 
 /// How long a lone ESC may be held while the parser waits to see whether it begins a longer
@@ -135,6 +141,9 @@ pub(crate) struct PrefixParser {
     escape_sequence: Vec<u8>,
     escape_since: Option<Instant>,
     confirm_close: bool,
+    mouse_coordinates: MouseCoordinates,
+    keyboard_flags: u8,
+    suppressed_kitty_releases: HashSet<(u32, u8)>,
 }
 
 impl Default for PrefixParser {
@@ -162,6 +171,20 @@ impl PrefixParser {
             escape_sequence: Vec::new(),
             escape_since: None,
             confirm_close: false,
+            mouse_coordinates: MouseCoordinates::Cells,
+            keyboard_flags: 0,
+            suppressed_kitty_releases: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn set_mouse_coordinates(&mut self, coordinates: MouseCoordinates) {
+        self.mouse_coordinates = coordinates;
+    }
+
+    pub(crate) fn set_keyboard_flags(&mut self, flags: u8) {
+        self.keyboard_flags = flags;
+        if flags == 0 {
+            self.suppressed_kitty_releases.clear();
         }
     }
 
@@ -192,7 +215,7 @@ impl PrefixParser {
         let mut output = Vec::new();
         let mut ordinary = Vec::new();
         for &byte in bytes {
-            if self.confirm_close {
+            if self.confirm_close && self.keyboard_flags == 0 {
                 self.confirm_close = false;
                 if matches!(byte, b'y' | b'Y') {
                     output.push(ParsedInput::Action(Action::ClosePane));
@@ -212,6 +235,43 @@ impl PrefixParser {
                     output.push(ParsedInput::Action(command));
                     self.sequence.clear();
                     self.prefix = false;
+                } else if self.keyboard_flags != 0 && self.sequence.starts_with(b"\x1b[") {
+                    let final_byte = self.sequence.len() >= 3 && (0x40..=0x7e).contains(&byte);
+                    if final_byte {
+                        let sequence = std::mem::take(&mut self.sequence);
+                        if byte == b'u'
+                            && let Some(key) = parse_kitty_key(&sequence)
+                        {
+                            let identity = (key.codepoint, key.modifiers);
+                            if key.kind == KittyKeyKind::Release
+                                && self.suppressed_kitty_releases.remove(&identity)
+                            {
+                                // The prefix remains pending after its physical key is released.
+                            } else if key.kind == KittyKeyKind::Repeat
+                                && self.suppressed_kitty_releases.contains(&identity)
+                            {
+                                // Keep consuming a held prefix/command key.
+                            } else if (57441..=57452).contains(&key.codepoint) {
+                                // Modifier reports surround a Kitty-encoded Ctrl+prefix chord but
+                                // are not themselves the following vvmux command. Forward them so
+                                // a modifier press sent before the prefix still receives its keyup.
+                                output.push(ParsedInput::Input(sequence));
+                            } else if let Some(command_byte) = key.command_byte() {
+                                let literal_prefix = command_byte == self.prefix_byte;
+                                self.handle_prefix_byte(command_byte, &sequence, &mut output);
+                                if !literal_prefix {
+                                    self.suppressed_kitty_releases.insert(identity);
+                                }
+                            } else {
+                                self.prefix = false;
+                            }
+                        } else {
+                            self.prefix = false;
+                        }
+                    } else if self.sequence.len() >= 64 {
+                        self.sequence.clear();
+                        self.prefix = false;
+                    }
                 } else if self.sequence.len() >= 7 {
                     self.sequence.clear();
                     self.prefix = false;
@@ -229,24 +289,66 @@ impl PrefixParser {
                         self.clear_escape();
                         continue;
                     }
-                    let valid_prefix = match self.escape_sequence.len() {
-                        2 => self.escape_sequence == b"\x1b[",
-                        3 => self.escape_sequence == b"\x1b[<",
-                        _ => true,
-                    };
-                    if !valid_prefix {
+                    let csi = self.escape_sequence.starts_with(b"\x1b[");
+                    if self.escape_sequence.len() == 2 && !csi {
                         ordinary.extend_from_slice(&self.escape_sequence);
                         self.clear_escape();
-                    } else if matches!(byte, b'M' | b'm') {
+                    } else if self.escape_sequence.starts_with(b"\x1b[<")
+                        && matches!(byte, b'M' | b'm')
+                    {
                         if !ordinary.is_empty() {
                             output.push(ParsedInput::Input(std::mem::take(&mut ordinary)));
                         }
                         if let Some(mouse) = parse_sgr_mouse(&self.escape_sequence) {
-                            output.push(ParsedInput::Mouse(mouse));
+                            output.push(ParsedInput::Mouse(mouse, self.mouse_coordinates));
                         } else {
                             ordinary.extend_from_slice(&self.escape_sequence);
                         }
                         self.clear_escape();
+                    } else if csi
+                        && self.escape_sequence.len() >= 3
+                        && (0x40..=0x7e).contains(&byte)
+                    {
+                        let sequence = std::mem::take(&mut self.escape_sequence);
+                        self.escape_since = None;
+                        if byte == b'u'
+                            && self.keyboard_flags != 0
+                            && let Some(key) = parse_kitty_key(&sequence)
+                        {
+                            let identity = (key.codepoint, key.modifiers);
+                            if key.kind == KittyKeyKind::Release {
+                                if !self.suppressed_kitty_releases.remove(&identity) {
+                                    ordinary.extend_from_slice(&sequence);
+                                }
+                            } else if key.kind == KittyKeyKind::Repeat
+                                && self.suppressed_kitty_releases.contains(&identity)
+                            {
+                                // A held vvmux command key remains consumed until its release.
+                            } else if let Some(command_byte) = key.command_byte() {
+                                if self.confirm_close
+                                    || self.prefix
+                                    || command_byte == self.prefix_byte
+                                {
+                                    if !ordinary.is_empty() {
+                                        output.push(ParsedInput::Input(std::mem::take(
+                                            &mut ordinary,
+                                        )));
+                                    }
+                                    let literal_prefix =
+                                        self.prefix && command_byte == self.prefix_byte;
+                                    self.handle_prefix_byte(command_byte, &sequence, &mut output);
+                                    if !literal_prefix {
+                                        self.suppressed_kitty_releases.insert(identity);
+                                    }
+                                } else {
+                                    ordinary.extend_from_slice(&sequence);
+                                }
+                            } else {
+                                ordinary.extend_from_slice(&sequence);
+                            }
+                        } else {
+                            ordinary.extend_from_slice(&sequence);
+                        }
                     } else if self.escape_sequence.len() >= 64 {
                         ordinary.extend_from_slice(&self.escape_sequence);
                         self.clear_escape();
@@ -268,46 +370,60 @@ impl PrefixParser {
                 }
                 continue;
             }
-            if let Some(action) = self.bindings.get(&byte).cloned() {
-                output.push(ParsedInput::Action(action));
-                self.prefix = false;
-                continue;
-            }
-            match byte {
-                value if value == self.prefix_byte => {
-                    output.push(ParsedInput::Input(vec![self.prefix_byte]))
-                }
-                b'%' => output.push(ParsedInput::Action(Action::Split(Axis::Vertical))),
-                b'"' => output.push(ParsedInput::Action(Action::Split(Axis::Horizontal))),
-                b'c' => output.push(ParsedInput::Action(Action::NewTab)),
-                b'n' => output.push(ParsedInput::Action(Action::NextTab)),
-                b'p' => output.push(ParsedInput::Action(Action::PreviousTab)),
-                b'z' => output.push(ParsedInput::Action(Action::ToggleZoom)),
-                b'S' => output.push(ParsedInput::Action(Action::ToggleSyncInput)),
-                b'f' => output.push(ParsedInput::Action(Action::NewFloatingPane)),
-                b'F' => output.push(ParsedInput::Action(Action::ToggleFloatingPanes)),
-                b'P' => output.push(ParsedInput::Action(Action::TogglePanePinned)),
-                b'm' => output.push(ParsedInput::Action(Action::EnterFloatingMoveMode)),
-                b'r' => output.push(ParsedInput::Action(Action::EnterFloatingResizeMode)),
-                b'd' => output.push(ParsedInput::Detach),
-                b'[' => output.push(ParsedInput::Action(Action::EnterCopyMode)),
-                b']' => output.push(ParsedInput::Action(Action::Paste)),
-                b'x' => self.confirm_close = true,
-                b'0'..=b'9' => output.push(ParsedInput::Action(Action::SelectTab(
-                    (byte - b'0') as usize,
-                ))),
-                0x1b => {
-                    self.sequence.push(byte);
-                    continue;
-                }
-                _ => {}
-            }
-            self.prefix = false;
+            self.handle_prefix_byte(byte, &[self.prefix_byte], &mut output);
         }
         if !ordinary.is_empty() {
             output.push(ParsedInput::Input(ordinary));
         }
         output
+    }
+
+    fn handle_prefix_byte(&mut self, byte: u8, literal: &[u8], output: &mut Vec<ParsedInput>) {
+        if self.confirm_close {
+            self.confirm_close = false;
+            if matches!(byte, b'y' | b'Y') {
+                output.push(ParsedInput::Action(Action::ClosePane));
+            }
+            return;
+        }
+        if !self.prefix {
+            debug_assert_eq!(byte, self.prefix_byte);
+            self.prefix = true;
+            return;
+        }
+        if let Some(action) = self.bindings.get(&byte).cloned() {
+            output.push(ParsedInput::Action(action));
+            self.prefix = false;
+            return;
+        }
+        match byte {
+            value if value == self.prefix_byte => output.push(ParsedInput::Input(literal.to_vec())),
+            b'%' => output.push(ParsedInput::Action(Action::Split(Axis::Vertical))),
+            b'"' => output.push(ParsedInput::Action(Action::Split(Axis::Horizontal))),
+            b'c' => output.push(ParsedInput::Action(Action::NewTab)),
+            b'n' => output.push(ParsedInput::Action(Action::NextTab)),
+            b'p' => output.push(ParsedInput::Action(Action::PreviousTab)),
+            b'z' => output.push(ParsedInput::Action(Action::ToggleZoom)),
+            b'S' => output.push(ParsedInput::Action(Action::ToggleSyncInput)),
+            b'f' => output.push(ParsedInput::Action(Action::NewFloatingPane)),
+            b'F' => output.push(ParsedInput::Action(Action::ToggleFloatingPanes)),
+            b'P' => output.push(ParsedInput::Action(Action::TogglePanePinned)),
+            b'm' => output.push(ParsedInput::Action(Action::EnterFloatingMoveMode)),
+            b'r' => output.push(ParsedInput::Action(Action::EnterFloatingResizeMode)),
+            b'd' => output.push(ParsedInput::Detach),
+            b'[' => output.push(ParsedInput::Action(Action::EnterCopyMode)),
+            b']' => output.push(ParsedInput::Action(Action::Paste)),
+            b'x' => self.confirm_close = true,
+            b'0'..=b'9' => output.push(ParsedInput::Action(Action::SelectTab(
+                (byte - b'0') as usize,
+            ))),
+            0x1b => {
+                self.sequence.push(byte);
+                return;
+            }
+            _ => {}
+        }
+        self.prefix = false;
     }
 }
 
@@ -338,6 +454,75 @@ pub(crate) fn parse_configured_action(action: &str) -> Option<Action> {
         "enter-floating-resize-mode" => Some(Action::EnterFloatingResizeMode),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KittyKeyKind {
+    Press,
+    Repeat,
+    Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KittyKey {
+    codepoint: u32,
+    shifted_codepoint: Option<u32>,
+    modifiers: u8,
+    kind: KittyKeyKind,
+}
+
+impl KittyKey {
+    /// Map a Kitty key report to the one-byte language used by vvmux's prefix chords. The raw
+    /// report is still forwarded byte-for-byte for every key which is not a vvmux command.
+    fn command_byte(self) -> Option<u8> {
+        let shift = self.modifiers & 1 != 0;
+        let control = self.modifiers & 4 != 0;
+        let mut codepoint = if shift {
+            self.shifted_codepoint.unwrap_or(self.codepoint)
+        } else {
+            self.codepoint
+        };
+        if shift
+            && self.shifted_codepoint.is_none()
+            && let Some(character) = char::from_u32(codepoint)
+        {
+            codepoint = u32::from(character.to_ascii_uppercase());
+        }
+        let byte = u8::try_from(codepoint).ok()?;
+        if control {
+            match byte {
+                b'@'..=b'_' | b'`'..=b'~' => Some(byte & 0x1f),
+                b'?' => Some(0x7f),
+                _ => None,
+            }
+        } else {
+            Some(byte)
+        }
+    }
+}
+
+fn parse_kitty_key(sequence: &[u8]) -> Option<KittyKey> {
+    let text = std::str::from_utf8(sequence).ok()?;
+    let body = text.strip_prefix("\x1b[")?.strip_suffix('u')?;
+    let mut fields = body.split(';');
+    let mut codepoints = fields.next()?.split(':');
+    let codepoint = codepoints.next()?.parse().ok()?;
+    let shifted_codepoint = codepoints.next().and_then(|value| value.parse().ok());
+    let mut modifiers_and_kind = fields.next().unwrap_or("1").split(':');
+    let encoded_modifiers = modifiers_and_kind.next()?.parse::<u16>().ok()?;
+    let modifiers = u8::try_from(encoded_modifiers.saturating_sub(1)).ok()?;
+    let kind = match modifiers_and_kind.next().unwrap_or("1") {
+        "1" => KittyKeyKind::Press,
+        "2" => KittyKeyKind::Repeat,
+        "3" => KittyKeyKind::Release,
+        _ => return None,
+    };
+    Some(KittyKey {
+        codepoint,
+        shifted_codepoint,
+        modifiers,
+        kind,
+    })
 }
 
 fn parse_sgr_mouse(sequence: &[u8]) -> Option<MouseEvent> {
@@ -418,13 +603,16 @@ mod tests {
 
         assert_eq!(
             parser.feed(b"\x1b[<64;5;7M"),
-            [ParsedInput::Mouse(MouseEvent {
-                button: 0,
-                x: 4,
-                y: 6,
-                kind: MouseKind::Wheel,
-                shift: false,
-            })]
+            [ParsedInput::Mouse(
+                MouseEvent {
+                    button: 0,
+                    x: 4,
+                    y: 6,
+                    kind: MouseKind::Wheel,
+                    shift: false,
+                },
+                MouseCoordinates::Cells
+            )]
         );
     }
 
@@ -455,6 +643,46 @@ mod tests {
             parser.feed(b"z"),
             [ParsedInput::Action(Action::ToggleZoom)],
             "a focus report must not consume the pending prefix"
+        );
+    }
+
+    #[test]
+    fn pixel_mouse_reports_keep_their_coordinate_model() {
+        let mut parser = PrefixParser::default();
+        parser.set_mouse_coordinates(MouseCoordinates::Pixels);
+        assert!(matches!(
+            parser.feed(b"\x1b[<0;121;81M").as_slice(),
+            [ParsedInput::Mouse(
+                MouseEvent { x: 120, y: 80, .. },
+                MouseCoordinates::Pixels
+            )]
+        ));
+    }
+
+    #[test]
+    fn kitty_backspace_is_forwarded_byte_exact_across_fragments() {
+        let mut parser = PrefixParser::default();
+        parser.set_keyboard_flags(31);
+        assert!(parser.feed(b"\x1b[127;1").is_empty());
+        assert_eq!(
+            parser.feed(b"u\x1b[127;1:3u"),
+            [ParsedInput::Input(b"\x1b[127;1u\x1b[127;1:3u".to_vec())]
+        );
+    }
+
+    #[test]
+    fn kitty_control_prefix_still_runs_vvmux_commands() {
+        let mut parser = PrefixParser::default();
+        parser.set_keyboard_flags(31);
+        assert!(parser.feed(b"\x1b[98;5u").is_empty());
+        assert!(parser.feed(b"\x1b[98;5:3u").is_empty());
+        assert_eq!(
+            parser.feed(b"\x1b[99u"),
+            [ParsedInput::Action(Action::NewTab)]
+        );
+        assert!(
+            parser.feed(b"\x1b[99;1:3u").is_empty(),
+            "the release for a consumed command must not leak into the pane"
         );
     }
 

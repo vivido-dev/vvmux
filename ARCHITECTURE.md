@@ -95,14 +95,18 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 11 is a hard cutover. Its binary media header carries complete track identity
+Private VVMX version 12 is a hard cutover. Its binary media header carries complete track identity
 and bounded binary render/media records,
 pane-scoped sanitized media status and waits, bridge-instance correlation, and metadata-only media
-traces. Host terminal focus is its own client message, so it reaches only a pane whose program
-enabled focus reporting. Mixed VVMX versions are rejected with restart guidance.
+traces. Host terminal focus, pixel mouse input, and focused-pane Kitty keyboard flags retain their
+coordinate and mode semantics across the nested terminal boundary. Focus reaches only a pane whose
+program enabled focus reporting. Media snapshots also preserve each inner track's live/timed mode
+and whether the authoritative surface slot map currently activates it, so live raster/audio groups
+are reactivated without inventing a PLAY transition. Mixed VVMX versions are rejected with restart
+guidance.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 11 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 12 → outer vvmux producer → Vivido
 ```
 
 The inner presenter accepts Control and Track only, verifies root and channel authentication,
