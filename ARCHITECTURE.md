@@ -95,7 +95,7 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 13 is a hard cutover. Its binary media header carries complete track identity
+Private VVMX version 14 is a hard cutover. Its binary media header carries complete track identity
 and bounded binary render/media records,
 pane-scoped sanitized media status and waits, bridge-instance correlation, and metadata-only media
 traces. Host terminal focus, pixel mouse input, and focused-pane Kitty keyboard flags retain their
@@ -106,7 +106,7 @@ are reactivated without inventing a PLAY transition. Mixed VVMX versions are rej
 guidance.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 13 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 14 → outer vvmux producer → Vivido
 ```
 
 ## Plugin boundary

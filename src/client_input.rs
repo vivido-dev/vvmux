@@ -410,6 +410,7 @@ impl PrefixParser {
             b'P' => output.push(ParsedInput::Action(Action::TogglePanePinned)),
             b'm' => output.push(ParsedInput::Action(Action::EnterFloatingMoveMode)),
             b'r' => output.push(ParsedInput::Action(Action::EnterFloatingResizeMode)),
+            b'a' => output.push(ParsedInput::Action(Action::ToggleAgentNavigator)),
             b'd' => output.push(ParsedInput::Detach),
             b'[' => output.push(ParsedInput::Action(Action::EnterCopyMode)),
             b']' => output.push(ParsedInput::Action(Action::Paste)),
@@ -455,6 +456,7 @@ pub(crate) fn parse_configured_action(action: &str) -> Option<Action> {
         "toggle-pane-pinned" => Some(Action::TogglePanePinned),
         "enter-floating-move-mode" => Some(Action::EnterFloatingMoveMode),
         "enter-floating-resize-mode" => Some(Action::EnterFloatingResizeMode),
+        "agent-navigator" => Some(Action::ToggleAgentNavigator),
         _ => None,
     }
 }
@@ -602,6 +604,10 @@ mod tests {
         assert_eq!(
             parser.feed(b"\x02S"),
             [ParsedInput::Action(Action::ToggleSyncInput)]
+        );
+        assert_eq!(
+            parser.feed(b"\x02a"),
+            [ParsedInput::Action(Action::ToggleAgentNavigator)]
         );
 
         assert_eq!(

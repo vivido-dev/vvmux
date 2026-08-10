@@ -2246,6 +2246,7 @@ mod tests {
             (b"\x02P", Action::TogglePanePinned),
             (b"\x02m", Action::EnterFloatingMoveMode),
             (b"\x02r", Action::EnterFloatingResizeMode),
+            (b"\x02a", Action::ToggleAgentNavigator),
         ] {
             let commands = parser.feed(byte);
             assert_eq!(commands.len(), 1, "one action per chord");
@@ -2264,6 +2265,7 @@ mod tests {
             "toggle-pane-pinned",
             "enter-floating-move-mode",
             "enter-floating-resize-mode",
+            "agent-navigator",
         ] {
             assert!(parse_configured_action(name).is_some());
         }

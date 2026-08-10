@@ -16,11 +16,12 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Bumped to 13 for generic automation actions and the plugin control family.
+/// Bumped to 14 when the independently developed VVMX 13 plugin-control and agent-state
+/// vocabularies were merged. The combined encoding must not alias either branch's version 13.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 13;
+pub const VERSION: u16 = 14;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -76,6 +77,16 @@ pub struct AutomationRequest {
 pub enum AutomationMethod {
     Capabilities,
     ListPanes,
+    ReportAgent {
+        agent: crate::agent::AgentKind,
+        state: crate::agent::AgentState,
+        source: String,
+        sequence: u64,
+    },
+    ClearAgentReport {
+        source: String,
+        sequence: u64,
+    },
     Inspect,
     InspectMedia,
     TraceMedia {
@@ -290,6 +301,7 @@ pub enum Action {
     EnterFloatingResizeMode,
     /// Invoke a configured plugin action. The host resolves and validates this reference.
     Plugin(String),
+    ToggleAgentNavigator,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

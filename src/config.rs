@@ -385,6 +385,7 @@ mod tests {
             "toggle-pane-pinned",
             "enter-floating-move-mode",
             "enter-floating-resize-mode",
+            "agent-navigator",
         ];
         const DOCUMENTED_COPY_ACTIONS: &[&str] = &[
             "up",

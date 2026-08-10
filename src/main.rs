@@ -1,3 +1,4 @@
+mod agent;
 mod automation;
 mod bridge;
 mod client;
@@ -6,6 +7,7 @@ mod config;
 mod config_watch;
 #[cfg(feature = "server-capability")]
 mod gateway;
+mod integration;
 mod ipc;
 mod layout;
 mod layout_file;
@@ -80,6 +82,11 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         command: plugin::PluginCommand,
+    },
+    /// Manage optional AI-agent lifecycle integrations.
+    Integration {
+        #[command(subcommand)]
+        command: integration::IntegrationCommand,
     },
     /// Run the authenticated loopback VVWS/1 session gateway, or connect mode
     /// (`--connect`) which opens no listener and serves through a VVTUN/1 tunnel.
@@ -224,6 +231,7 @@ fn run(cli: Cli) -> io::Result<()> {
         }
         Some(Command::Msg { target, command }) => automation::run(target.as_deref(), command),
         Some(Command::Plugin { command }) => plugin::run(command),
+        Some(Command::Integration { command }) => integration::run(command),
         #[cfg(feature = "server-capability")]
         Some(Command::Serve {
             listen,
@@ -372,6 +380,56 @@ mod tests {
                 .is_ok()
         );
         assert!(Cli::try_parse_from(["vvmux", "--skill"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "vvmux",
+                "msg",
+                "report-agent",
+                "--agent",
+                "opencode",
+                "--state",
+                "working",
+                "--source",
+                "opencode-plugin",
+                "--sequence",
+                "42",
+                "--pane-id",
+                "7",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vvmux",
+                "msg",
+                "report-agent",
+                "--agent",
+                "opencode",
+                "--state",
+                "done",
+                "--source",
+                "opencode-plugin",
+                "--sequence",
+                "42",
+                "--pane-id",
+                "7",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vvmux",
+                "msg",
+                "clear-agent-report",
+                "--source",
+                "opencode-plugin",
+                "--sequence",
+                "43",
+                "--pane-id",
+                "7",
+            ])
+            .is_ok()
+        );
         assert!(
             Cli::try_parse_from([
                 "vvmux",
