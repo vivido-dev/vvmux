@@ -1,0 +1,934 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+use jsonschema::{Draft, Validator};
+use semver::{Version, VersionReq};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+pub const MAX_SCHEMA_BYTES: u64 = 64 * 1024;
+pub const MAX_SCHEMA_DEPTH: usize = 32;
+pub const MAX_WORKFLOW_STEPS: usize = 32;
+
+#[derive(Debug)]
+pub enum ManifestError {
+    Io(std::io::Error),
+    Toml(toml::de::Error),
+    Invalid(String),
+    Schema { path: PathBuf, message: String },
+}
+
+impl fmt::Display for ManifestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "{error}"),
+            Self::Toml(error) => write!(formatter, "{error}"),
+            Self::Invalid(message) => formatter.write_str(message),
+            Self::Schema { path, message } => {
+                write!(formatter, "schema {}: {message}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ManifestError {}
+
+impl From<std::io::Error> for ManifestError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<toml::de::Error> for ManifestError {
+    fn from(value: toml::de::Error) -> Self {
+        Self::Toml(value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Manifest {
+    pub manifest_version: u16,
+    pub plugin: Plugin,
+    #[serde(default)]
+    pub runtime: Option<Runtime>,
+    #[serde(default)]
+    pub actions: Vec<Action>,
+    #[serde(default)]
+    pub events: Vec<EventHook>,
+    #[serde(default)]
+    pub panes: Vec<Pane>,
+    #[serde(default)]
+    pub dependencies: Vec<Dependency>,
+    #[serde(default)]
+    pub workflows: Vec<Workflow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Plugin {
+    pub id: String,
+    pub name: String,
+    pub version: Version,
+    pub min_vvmux_version: Version,
+    pub description: String,
+    pub platforms: Vec<String>,
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    #[serde(rename = "session.read")]
+    SessionRead,
+    #[serde(rename = "pane.read")]
+    PaneRead,
+    #[serde(rename = "pane.input")]
+    PaneInput,
+    #[serde(rename = "pane.create")]
+    PaneCreate,
+    #[serde(rename = "pane.manage_own")]
+    PaneManageOwn,
+    #[serde(rename = "pane.manage_any")]
+    PaneManageAny,
+    #[serde(rename = "layout.read")]
+    LayoutRead,
+    #[serde(rename = "layout.write")]
+    LayoutWrite,
+    #[serde(rename = "events.subscribe")]
+    EventsSubscribe,
+    #[serde(rename = "plugin.invoke")]
+    PluginInvoke,
+    #[serde(rename = "clipboard.write")]
+    ClipboardWrite,
+    #[serde(rename = "media.produce")]
+    MediaProduce,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Runtime {
+    pub kind: RuntimeKind,
+    #[serde(default)]
+    pub artifact: Option<PathBuf>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(default = "default_activation")]
+    pub activation: Activation,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeKind {
+    Component,
+    Process,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Activation {
+    OnDemand,
+    Session,
+}
+
+fn default_activation() -> Activation {
+    Activation::OnDemand
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Action {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub handler: Option<String>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    pub input_schema: PathBuf,
+    pub output_schema: PathBuf,
+    #[serde(default)]
+    pub agent_visible: bool,
+    #[serde(default = "default_action_timeout")]
+    pub timeout_ms: u64,
+}
+
+fn default_action_timeout() -> u64 {
+    30_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EventHook {
+    pub on: String,
+    #[serde(default)]
+    pub handler: Option<String>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_self: bool,
+    #[serde(default = "default_event_timeout")]
+    pub timeout_ms: u64,
+}
+
+fn default_event_timeout() -> u64 {
+    10_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Pane {
+    pub id: String,
+    pub title: String,
+    pub placement: Placement,
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub hold_on_exit: bool,
+    #[serde(default)]
+    pub accept_sync_input: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Placement {
+    Split,
+    Float,
+    Tab,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Dependency {
+    pub alias: String,
+    pub id: String,
+    pub version: VersionReq,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Workflow {
+    pub id: String,
+    pub title: String,
+    #[serde(default = "manual_trigger")]
+    pub trigger: String,
+    #[serde(default)]
+    pub agent_visible: bool,
+    pub output: Value,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
+}
+
+fn manual_trigger() -> String {
+    "manual".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStep {
+    pub id: String,
+    pub uses: String,
+    #[serde(default, rename = "with")]
+    pub input: Value,
+    #[serde(default)]
+    pub needs: Vec<String>,
+}
+
+pub struct SchemaDocument {
+    pub path: PathBuf,
+    pub value: Value,
+    validator: Validator,
+}
+
+impl fmt::Debug for SchemaDocument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchemaDocument")
+            .field("path", &self.path)
+            .field("value", &self.value)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SchemaDocument {
+    pub fn validate(&self, instance: &Value) -> Result<(), Vec<String>> {
+        let errors = self
+            .validator
+            .iter_errors(instance)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LoadedManifest {
+    pub root: PathBuf,
+    pub manifest: Manifest,
+    pub schemas: BTreeMap<PathBuf, SchemaDocument>,
+    pub warnings: Vec<String>,
+}
+
+impl LoadedManifest {
+    pub fn load(root: impl AsRef<Path>) -> Result<Self, ManifestError> {
+        let root = root.as_ref();
+        let manifest_path = root.join("vvmux-plugin.toml");
+        let metadata = fs::metadata(&manifest_path)?;
+        if metadata.len() > MAX_MANIFEST_BYTES {
+            return Err(ManifestError::Invalid("manifest exceeds 1 MiB".into()));
+        }
+        let source = fs::read_to_string(&manifest_path)?;
+        let manifest: Manifest = toml::from_str(&source)?;
+        manifest.validate()?;
+        if let Some(artifact) = manifest
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.artifact.as_deref())
+        {
+            let resolved = root.join(artifact);
+            ensure_package_file(root, &resolved, artifact)?;
+            if fs::metadata(&resolved)?.len() > 32 * 1024 * 1024 {
+                return Err(ManifestError::Invalid(
+                    "WebAssembly component artifact exceeds 32 MiB".into(),
+                ));
+            }
+        }
+
+        let mut schemas = BTreeMap::new();
+        for path in manifest
+            .actions
+            .iter()
+            .flat_map(|action| [&action.input_schema, &action.output_schema])
+        {
+            if schemas.contains_key(path) {
+                continue;
+            }
+            validate_relative_path(path, "schema")?;
+            let resolved = root.join(path);
+            ensure_package_file(root, &resolved, path)?;
+            let bytes = fs::read(&resolved)?;
+            if bytes.len() as u64 > MAX_SCHEMA_BYTES {
+                return Err(ManifestError::Schema {
+                    path: path.clone(),
+                    message: "document exceeds 64 KiB".into(),
+                });
+            }
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(|error| ManifestError::Schema {
+                    path: path.clone(),
+                    message: error.to_string(),
+                })?;
+            inspect_schema(&value, 0, path)?;
+            let validator = jsonschema::options()
+                .with_draft(Draft::Draft202012)
+                .should_validate_formats(false)
+                .build(&value)
+                .map_err(|error| ManifestError::Schema {
+                    path: path.clone(),
+                    message: error.to_string(),
+                })?;
+            schemas.insert(
+                path.clone(),
+                SchemaDocument {
+                    path: path.clone(),
+                    value,
+                    validator,
+                },
+            );
+        }
+
+        let known_events = [
+            "pane.opened",
+            "pane.exited",
+            "pane.closed",
+            "pane.screen_changed",
+            "layout.changed",
+            "focus.changed",
+            "config.changed",
+            "media.changed",
+            "plugin.job_completed",
+            "plugin.runtime_crashed",
+        ];
+        let warnings = manifest
+            .events
+            .iter()
+            .filter(|hook| !known_events.contains(&hook.on.as_str()))
+            .map(|hook| format!("unknown event `{}` is inactive", hook.on))
+            .collect();
+        Ok(Self {
+            root: root.to_path_buf(),
+            manifest,
+            schemas,
+            warnings,
+        })
+    }
+
+    pub fn action(&self, id: &str) -> Option<&Action> {
+        self.manifest.actions.iter().find(|action| action.id == id)
+    }
+
+    pub fn validate_input(&self, action: &Action, value: &Value) -> Result<(), Vec<String>> {
+        self.schemas[&action.input_schema].validate(value)
+    }
+
+    pub fn validate_output(&self, action: &Action, value: &Value) -> Result<(), Vec<String>> {
+        self.schemas[&action.output_schema].validate(value)
+    }
+}
+
+impl Manifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.manifest_version != 1 {
+            return invalid("unsupported manifest_version (expected 1)");
+        }
+        validate_plugin_id(&self.plugin.id)?;
+        if self.plugin.name.is_empty() || self.plugin.name.len() > 128 {
+            return invalid("plugin name must contain 1 through 128 bytes");
+        }
+        if self.plugin.description.len() > 4096 {
+            return invalid("plugin description exceeds 4096 bytes");
+        }
+        if self.plugin.platforms.is_empty()
+            || self
+                .plugin
+                .platforms
+                .iter()
+                .any(|value| !matches!(value.as_str(), "linux" | "macos" | "windows"))
+        {
+            return invalid("platforms must contain linux, macos, or windows");
+        }
+        let unique_permissions = self.plugin.permissions.iter().collect::<BTreeSet<_>>();
+        if unique_permissions.len() != self.plugin.permissions.len() {
+            return invalid("plugin permissions contain duplicates");
+        }
+        match &self.runtime {
+            Some(runtime) => runtime.validate()?,
+            None if self.actions.iter().any(|action| action.handler.is_some())
+                || self.events.iter().any(|event| event.handler.is_some()) =>
+            {
+                return invalid("handler entrypoints require a runtime");
+            }
+            None => {}
+        }
+
+        let mut ids = BTreeSet::new();
+        for action in &self.actions {
+            validate_local_id(&action.id, "action")?;
+            if !ids.insert((&action.id, "action")) {
+                return invalid(format!("duplicate action id `{}`", action.id));
+            }
+            exactly_one(&action.handler, &action.command, "action", &action.id)?;
+            if let Some(handler) = &action.handler {
+                validate_local_id(handler, "action handler")?;
+            }
+            validate_argv(action.command.as_deref(), "action", &action.id)?;
+            if !(1..=24 * 60 * 60 * 1000).contains(&action.timeout_ms) {
+                return invalid(format!("action `{}` has an invalid timeout", action.id));
+            }
+        }
+        for event in &self.events {
+            exactly_one(&event.handler, &event.command, "event", &event.on)?;
+            if let Some(handler) = &event.handler {
+                validate_local_id(handler, "event handler")?;
+            }
+            validate_argv(event.command.as_deref(), "event", &event.on)?;
+            if !(1..=24 * 60 * 60 * 1000).contains(&event.timeout_ms) {
+                return invalid(format!("event `{}` has an invalid timeout", event.on));
+            }
+        }
+        for pane in &self.panes {
+            validate_local_id(&pane.id, "pane")?;
+            validate_argv(Some(&pane.command), "pane", &pane.id)?;
+        }
+        let mut aliases = BTreeSet::new();
+        for dependency in &self.dependencies {
+            validate_local_id(&dependency.alias, "dependency alias")?;
+            validate_plugin_id(&dependency.id)?;
+            if !aliases.insert(dependency.alias.as_str()) {
+                return invalid(format!("duplicate dependency alias `{}`", dependency.alias));
+            }
+            if !dependency.source.starts_with("https://") {
+                return invalid(format!(
+                    "dependency `{}` source must be HTTPS",
+                    dependency.alias
+                ));
+            }
+        }
+        validate_workflows(&self.workflows, &aliases)?;
+        Ok(())
+    }
+}
+
+impl Runtime {
+    fn validate(&self) -> Result<(), ManifestError> {
+        match self.kind {
+            RuntimeKind::Component => {
+                if self.command.is_some() || self.artifact.is_none() {
+                    return invalid("component runtime requires artifact and forbids command");
+                }
+                validate_relative_path(self.artifact.as_ref().unwrap(), "runtime artifact")?;
+            }
+            RuntimeKind::Process => {
+                if self.artifact.is_some() || self.command.is_none() {
+                    return invalid("process runtime requires command and forbids artifact");
+                }
+                validate_argv(self.command.as_deref(), "runtime", "process")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_workflows(
+    workflows: &[Workflow],
+    aliases: &BTreeSet<&str>,
+) -> Result<(), ManifestError> {
+    let mut workflow_ids = BTreeSet::new();
+    for workflow in workflows {
+        validate_local_id(&workflow.id, "workflow")?;
+        if !workflow_ids.insert(workflow.id.as_str()) {
+            return invalid(format!("duplicate workflow id `{}`", workflow.id));
+        }
+        if workflow.steps.len() > MAX_WORKFLOW_STEPS {
+            return invalid(format!("workflow `{}` exceeds 32 steps", workflow.id));
+        }
+        let mut step_ids = BTreeSet::new();
+        let mut resolved = workflow.clone();
+        for step in &workflow.steps {
+            validate_local_id(&step.id, "workflow step")?;
+            if !step_ids.insert(step.id.as_str()) {
+                return invalid(format!(
+                    "workflow `{}` has duplicate step `{}`",
+                    workflow.id, step.id
+                ));
+            }
+            let Some((alias, action)) = step.uses.split_once('/') else {
+                return invalid(format!(
+                    "workflow step `{}` uses must be dependency/action",
+                    step.id
+                ));
+            };
+            if !aliases.contains(alias) {
+                return invalid(format!(
+                    "workflow step `{}` references undeclared dependency `{alias}`",
+                    step.id
+                ));
+            }
+            validate_local_id(action, "dependency action")?;
+        }
+        for step in &mut resolved.steps {
+            for reference in substitution_steps(&step.input, &workflow.id)? {
+                if !step.needs.contains(&reference) {
+                    step.needs.push(reference);
+                }
+            }
+        }
+        let _ = substitution_steps(&workflow.output, &workflow.id)?;
+        for step in &resolved.steps {
+            for need in &step.needs {
+                if !step_ids.contains(need.as_str()) {
+                    return invalid(format!(
+                        "workflow step `{}` needs unknown step `{need}`",
+                        step.id
+                    ));
+                }
+            }
+        }
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        for id in &step_ids {
+            visit_step(id, &resolved, &mut visiting, &mut visited)?;
+        }
+    }
+    Ok(())
+}
+
+fn substitution_steps(value: &Value, workflow: &str) -> Result<Vec<String>, ManifestError> {
+    fn visit(value: &Value, workflow: &str, result: &mut Vec<String>) -> Result<(), ManifestError> {
+        match value {
+            Value::String(string) if string.contains("${") => {
+                let Some(inner) = string
+                    .strip_prefix("${")
+                    .and_then(|value| value.strip_suffix('}'))
+                else {
+                    return invalid(format!(
+                        "workflow `{workflow}` contains an ambiguous substitution"
+                    ));
+                };
+                if inner == "trigger" || inner.starts_with("trigger#/") {
+                    return Ok(());
+                }
+                let Some(rest) = inner.strip_prefix("steps.") else {
+                    return invalid(format!(
+                        "workflow `{workflow}` contains an unknown substitution root"
+                    ));
+                };
+                let Some((step, pointer)) = rest.split_once(".output") else {
+                    return invalid(format!(
+                        "workflow `{workflow}` step substitution must reference output"
+                    ));
+                };
+                validate_local_id(step, "substitution step")?;
+                if !pointer.is_empty() && !pointer.starts_with("#/") {
+                    return invalid(format!(
+                        "workflow `{workflow}` substitution uses an invalid JSON Pointer"
+                    ));
+                }
+                result.push(step.to_owned());
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, workflow, result)?;
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values() {
+                    visit(value, workflow, result)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut result = Vec::new();
+    visit(value, workflow, &mut result)?;
+    Ok(result)
+}
+
+fn visit_step<'a>(
+    id: &'a str,
+    workflow: &'a Workflow,
+    visiting: &mut BTreeSet<&'a str>,
+    visited: &mut BTreeSet<&'a str>,
+) -> Result<(), ManifestError> {
+    if visited.contains(id) {
+        return Ok(());
+    }
+    if !visiting.insert(id) {
+        return invalid(format!(
+            "workflow `{}` contains a cycle at `{id}`",
+            workflow.id
+        ));
+    }
+    let step = workflow.steps.iter().find(|step| step.id == id).unwrap();
+    for need in &step.needs {
+        visit_step(need, workflow, visiting, visited)?;
+    }
+    visiting.remove(id);
+    visited.insert(id);
+    Ok(())
+}
+
+fn exactly_one<T, U>(
+    left: &Option<T>,
+    right: &Option<U>,
+    kind: &str,
+    id: &str,
+) -> Result<(), ManifestError> {
+    if left.is_some() == right.is_some() {
+        return invalid(format!(
+            "{kind} `{id}` requires exactly one of handler or command"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_argv(argv: Option<&[String]>, kind: &str, id: &str) -> Result<(), ManifestError> {
+    let Some(argv) = argv else { return Ok(()) };
+    if argv.is_empty() || argv[0].is_empty() || argv.len() > 256 {
+        return invalid(format!("{kind} `{id}` has an invalid argv"));
+    }
+    if argv
+        .iter()
+        .any(|arg| arg.len() > 64 * 1024 || arg.contains('\0'))
+    {
+        return invalid(format!("{kind} `{id}` argv contains an invalid argument"));
+    }
+    Ok(())
+}
+
+fn validate_plugin_id(id: &str) -> Result<(), ManifestError> {
+    if id.len() < 3 || id.len() > 128 || !id.contains('.') {
+        return invalid("plugin id must be a reverse-domain name of 3 through 128 bytes");
+    }
+    if id.split('.').any(|part| !valid_segment(part)) {
+        return invalid(format!("invalid plugin id `{id}`"));
+    }
+    Ok(())
+}
+
+fn validate_local_id(id: &str, kind: &str) -> Result<(), ManifestError> {
+    if id.is_empty() || id.len() > 64 || id.contains('.') || !valid_segment(id) {
+        return invalid(format!("invalid {kind} id `{id}`"));
+    }
+    Ok(())
+}
+
+fn valid_segment(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn validate_relative_path(path: &Path, what: &str) -> Result<(), ManifestError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return invalid(format!("{what} must be a package-relative safe path"));
+    }
+    Ok(())
+}
+
+fn inspect_schema(value: &Value, depth: usize, path: &Path) -> Result<(), ManifestError> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(ManifestError::Schema {
+            path: path.to_path_buf(),
+            message: "document exceeds 32 levels".into(),
+        });
+    }
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::String(reference)) = object.get("$ref")
+                && (reference.contains("://") || !reference.starts_with('#'))
+            {
+                return Err(ManifestError::Schema {
+                    path: path.to_path_buf(),
+                    message: "only local fragment $ref values are allowed".into(),
+                });
+            }
+            for child in object.values() {
+                inspect_schema(child, depth + 1, path)?;
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                inspect_schema(child, depth + 1, path)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn ensure_package_file(root: &Path, resolved: &Path, display: &Path) -> Result<(), ManifestError> {
+    let metadata = fs::symlink_metadata(resolved).map_err(ManifestError::Io)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(ManifestError::Schema {
+            path: display.to_path_buf(),
+            message: "must be a regular package file, not a symlink".into(),
+        });
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_file = fs::canonicalize(resolved)?;
+    if !canonical_file.starts_with(canonical_root) {
+        return Err(ManifestError::Schema {
+            path: display.to_path_buf(),
+            message: "resolves outside the package".into(),
+        });
+    }
+    Ok(())
+}
+
+fn invalid<T>(message: impl Into<String>) -> Result<T, ManifestError> {
+    Err(ManifestError::Invalid(message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_manifest() -> Manifest {
+        Manifest {
+            manifest_version: 1,
+            plugin: Plugin {
+                id: "dev.example".into(),
+                name: "Example".into(),
+                version: Version::new(1, 0, 0),
+                min_vvmux_version: Version::new(0, 5, 0),
+                description: "test".into(),
+                platforms: vec!["linux".into()],
+                permissions: vec![Permission::PaneRead],
+            },
+            runtime: Some(Runtime {
+                kind: RuntimeKind::Process,
+                artifact: None,
+                command: Some(vec!["python".into(), "plugin.py".into()]),
+                activation: Activation::OnDemand,
+            }),
+            actions: vec![Action {
+                id: "read".into(),
+                title: "Read".into(),
+                description: "read".into(),
+                handler: Some("read".into()),
+                command: None,
+                input_schema: "in.json".into(),
+                output_schema: "out.json".into(),
+                agent_visible: true,
+                timeout_ms: 1000,
+            }],
+            events: Vec::new(),
+            panes: Vec::new(),
+            dependencies: Vec::new(),
+            workflows: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn validates_handler_runtime_and_ids() {
+        valid_manifest().validate().unwrap();
+        let mut manifest = valid_manifest();
+        manifest.runtime = None;
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("runtime")
+        );
+        let mut manifest = valid_manifest();
+        manifest.actions[0].id = "not.local".into();
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_workflow_cycles() {
+        let mut manifest = valid_manifest();
+        manifest.dependencies.push(Dependency {
+            alias: "dep".into(),
+            id: "dev.dependency".into(),
+            version: VersionReq::STAR,
+            source: "https://example.invalid/dep".into(),
+        });
+        manifest.workflows.push(Workflow {
+            id: "cycle".into(),
+            title: "cycle".into(),
+            trigger: "manual".into(),
+            agent_visible: false,
+            output: Value::Null,
+            steps: vec![
+                WorkflowStep {
+                    id: "a".into(),
+                    uses: "dep/run".into(),
+                    input: Value::Null,
+                    needs: vec!["b".into()],
+                },
+                WorkflowStep {
+                    id: "b".into(),
+                    uses: "dep/run".into(),
+                    input: Value::Null,
+                    needs: vec!["a".into()],
+                },
+            ],
+        });
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cycle")
+        );
+    }
+
+    #[test]
+    fn substitutions_add_edges_and_reject_unknown_steps() {
+        let mut manifest = valid_manifest();
+        manifest.dependencies.push(Dependency {
+            alias: "dep".into(),
+            id: "dev.dependency".into(),
+            version: VersionReq::STAR,
+            source: "https://example.invalid/dep".into(),
+        });
+        manifest.workflows.push(Workflow {
+            id: "derived".into(),
+            title: "derived".into(),
+            trigger: "manual".into(),
+            agent_visible: false,
+            output: Value::String("${steps.second.output#/value}".into()),
+            steps: vec![
+                WorkflowStep {
+                    id: "first".into(),
+                    uses: "dep/run".into(),
+                    input: Value::Null,
+                    needs: Vec::new(),
+                },
+                WorkflowStep {
+                    id: "second".into(),
+                    uses: "dep/run".into(),
+                    input: Value::String("${steps.first.output}".into()),
+                    needs: Vec::new(),
+                },
+            ],
+        });
+        manifest.validate().unwrap();
+        manifest.workflows[0].steps[1].input = Value::String("${steps.missing.output}".into());
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("unknown step")
+        );
+    }
+
+    #[test]
+    fn loads_and_validates_local_schemas() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("vvmux-plugin.toml"),
+            r#"
+manifest_version = 1
+[plugin]
+id = "dev.example"
+name = "Example"
+version = "1.0.0"
+min_vvmux_version = "0.5.0"
+description = "test"
+platforms = ["linux"]
+permissions = ["pane.read"]
+[runtime]
+kind = "process"
+command = ["python", "plugin.py"]
+[[actions]]
+id = "read"
+title = "Read"
+description = "read"
+handler = "read"
+input_schema = "in.json"
+output_schema = "out.json"
+agent_visible = true
+"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("in.json"),
+            r#"{"type":"object","additionalProperties":false}"#,
+        )
+        .unwrap();
+        fs::write(directory.path().join("out.json"), r#"{"type":"string"}"#).unwrap();
+        let loaded = LoadedManifest::load(directory.path()).unwrap();
+        let action = loaded.action("read").unwrap();
+        loaded
+            .validate_input(action, &serde_json::json!({}))
+            .unwrap();
+        assert!(loaded.validate_output(action, &Value::Null).is_err());
+    }
+}

@@ -13,6 +13,7 @@ mod media;
 mod media_trace;
 mod metrics;
 mod platform;
+mod plugin;
 mod region;
 mod runtime;
 mod screen;
@@ -35,6 +36,9 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Print the release-matched vvmux automation skill.
+    #[arg(long, global = true)]
+    skill: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -71,6 +75,11 @@ enum Command {
         target: Option<String>,
         #[command(subcommand)]
         command: automation::MsgCommand,
+    },
+    /// Install, inspect, and invoke user plugins.
+    Plugin {
+        #[command(subcommand)]
+        command: plugin::PluginCommand,
     },
     /// Run the authenticated loopback VVWS/1 session gateway, or connect mode
     /// (`--connect`) which opens no listener and serves through a VVTUN/1 tunnel.
@@ -173,6 +182,10 @@ fn main() {
 }
 
 fn run(cli: Cli) -> io::Result<()> {
+    if cli.skill {
+        print!("{}", include_str!("../skills/vvmux/SKILL.md"));
+        return Ok(());
+    }
     match cli.command {
         None => client::attach("default", false, true, cli.config.as_deref()),
         Some(Command::New {
@@ -210,6 +223,7 @@ fn run(cli: Cli) -> io::Result<()> {
             client::kill(&target)
         }
         Some(Command::Msg { target, command }) => automation::run(target.as_deref(), command),
+        Some(Command::Plugin { command }) => plugin::run(command),
         #[cfg(feature = "server-capability")]
         Some(Command::Serve {
             listen,
@@ -353,6 +367,11 @@ mod tests {
         assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input", "--off"]).is_ok());
         assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input"]).is_err());
         assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input", "--on", "--off"]).is_err());
+        assert!(
+            Cli::try_parse_from(["vvmux", "msg", "action", "toggle-zoom", "--pane-id", "7",])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["vvmux", "--skill"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "vvmux",

@@ -95,7 +95,7 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 12 is a hard cutover. Its binary media header carries complete track identity
+Private VVMX version 13 is a hard cutover. Its binary media header carries complete track identity
 and bounded binary render/media records,
 pane-scoped sanitized media status and waits, bridge-instance correlation, and metadata-only media
 traces. Host terminal focus, pixel mouse input, and focused-pane Kitty keyboard flags retain their
@@ -106,8 +106,21 @@ are reactivated without inventing a PLAY transition. Mixed VVMX versions are rej
 guidance.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 12 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 13 → outer vvmux producer → Vivido
 ```
+
+## Plugin boundary
+
+The stable extension contract lives in the separate `vvmux-plugin-api` workspace crate and is
+independently versioned from private VVMX. Strict manifests and self-contained action schemas are
+validated before registry mutation or execution. Native plugins use bounded length-prefixed JSON;
+component plugins use the WIT world shipped by that crate. Language SDKs never encode VVMX.
+
+Plugin process and schema work belongs outside the session actor. Only resolved, bounded commands
+may mutate session state, and the actor remains its sole writer. Exact argv PTY spawning keeps
+manifest commands out of shell parsing. Native plugins are trusted same-user code; only WebAssembly
+Components receive a sandbox claim. Plugin media continues through the existing pane-scoped Vivid
+capability path and never through terminal bytes.
 
 The inner presenter accepts Control and Track only, verifies root and channel authentication,
 consumes marker-v3 anchors, and grants cumulative flow per track. The outer producer allocates all

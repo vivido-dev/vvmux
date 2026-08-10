@@ -67,6 +67,7 @@ const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTOMATION_REPLY_LIMIT: usize = 16 * 1024 * 1024;
 /// A `run` command is one shell command line, not a script; this only has to be generous.
 const MAX_RUN_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_ACTIVE_PLUGIN_ACTIONS: usize = 16;
 #[cfg(windows)]
 const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
 #[cfg(windows)]
@@ -84,6 +85,14 @@ pub enum ActorEvent {
     PtyExit(PaneId, Option<PtyExitStatus>),
     AutomationInputComplete {
         reply: AutomationReplyTarget,
+        result: Result<(), String>,
+    },
+    PluginComplete {
+        reply: AutomationReplyTarget,
+        result: Result<serde_json::Value, AutomationError>,
+    },
+    PluginNotice {
+        reference: String,
         result: Result<(), String>,
     },
     /// A media event is waiting on the dedicated media receiver.
@@ -158,6 +167,8 @@ pub struct PaneSpawn {
     /// A shell command run with `-c`, not an argument vector: pipes and redirection are the
     /// caller's to write and the shell's to parse.
     pub command: Option<OsString>,
+    /// Exact program and arguments. This path never invokes a shell.
+    pub argv: Option<Vec<OsString>>,
     pub cwd: Option<PathBuf>,
     pub hold_on_exit: bool,
     /// Extra environment applied before the fixed pane identity, so it can never shadow it.
@@ -715,6 +726,7 @@ struct SessionActor {
     response_sender: mpsc::SyncSender<AutomationResponseJob>,
     automation_inflight: HashMap<u64, HashSet<u64>>,
     pending_actor_work: HashSet<(u64, u64)>,
+    active_plugin_actions: usize,
     automation_waiters: Vec<AutomationWaiter>,
     exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
@@ -860,6 +872,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         response_sender,
         automation_inflight: HashMap::new(),
         pending_actor_work: HashSet::new(),
+        active_plugin_actions: 0,
         automation_waiters: Vec::new(),
         exit_tombstones: VecDeque::new(),
         shutdown: shutdown.clone(),
@@ -1170,6 +1183,19 @@ impl SessionActor {
                     self.reply_automation_error(reply, AutomationError::new("pty_closed", message));
                 }
             },
+            ActorEvent::PluginComplete { reply, result } => {
+                self.complete_pending_actor_work(&reply);
+                match result {
+                    Ok(value) => self.reply_automation(reply, value),
+                    Err(error) => self.reply_automation_error(reply, error),
+                }
+            }
+            ActorEvent::PluginNotice { reference, result } => {
+                self.active_plugin_actions = self.active_plugin_actions.saturating_sub(1);
+                if let Err(error) = result {
+                    self.status(&format!("plugin action {reference} failed: {error}"));
+                }
+            }
             // The payload or retained-projection dirty bit is drained by the run loop.
             ActorEvent::MediaReady => {}
             ActorEvent::ConfigChanged => {
@@ -1920,6 +1946,68 @@ impl SessionActor {
                     }),
                 );
             }
+            AutomationMethod::Action(action) => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_action(pane_id, action) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::Plugin(crate::ipc::PluginMethod::Invoke {
+                reference,
+                input,
+                detach,
+            }) => {
+                if detach {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "runtime_unavailable",
+                            "detached plugin jobs are not enabled",
+                        ),
+                    );
+                    return;
+                }
+                if !self.register_pending_actor_work(&target) {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("busy", "session pending-work quota is exhausted"),
+                    );
+                    return;
+                }
+                let sender = self.sender.clone();
+                let session = self.name.clone();
+                let reply = target.clone();
+                if std::thread::Builder::new()
+                    .name(format!("vvmux-plugin-{}", target.request_id))
+                    .spawn(move || {
+                        let result = crate::plugin::invoke_for_session(&reference, &session, input)
+                            .map_err(plugin_automation_error);
+                        let _ = sender.send(ActorEvent::PluginComplete { reply, result });
+                    })
+                    .is_err()
+                {
+                    self.complete_pending_actor_work(&target);
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "runtime_unavailable",
+                            "could not start plugin worker",
+                        ),
+                    );
+                }
+            }
+            AutomationMethod::Plugin(crate::ipc::PluginMethod::Reload) => {
+                self.reply_automation(
+                    target,
+                    serde_json::json!({
+                        "applied": [],
+                        "deferred": [],
+                        "failed": [],
+                        "registry": "revalidated_on_next_invocation",
+                    }),
+                );
+            }
             AutomationMethod::WaitText {
                 text,
                 regex,
@@ -2206,6 +2294,7 @@ impl SessionActor {
             .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
         let spec = PaneSpawn {
             command: Some(OsString::from(command)),
+            argv: None,
             cwd: cwd.map(PathBuf::from),
             hold_on_exit: hold,
             extra_env: Vec::new(),
@@ -2308,6 +2397,25 @@ impl SessionActor {
         self.force_full = true;
         self.relayout();
         Ok(())
+    }
+
+    fn automation_action(
+        &mut self,
+        pane_id: PaneId,
+        action: Action,
+    ) -> Result<serde_json::Value, AutomationError> {
+        if matches!(action, Action::CopyInput(_)) {
+            return Err(AutomationError::new(
+                "unsupported",
+                "copy-mode input is not an automation action; use `vvmux msg key`",
+            ));
+        }
+        self.automation_focus(pane_id)?;
+        self.action(action);
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "session_sequence": self.session_sequence,
+        }))
     }
 
     fn automation_input(&mut self, target: AutomationReplyTarget, pane_id: PaneId, bytes: Vec<u8>) {
@@ -3578,7 +3686,44 @@ impl SessionActor {
             Action::TogglePanePinned => self.toggle_pin(),
             Action::EnterFloatingMoveMode => self.enter_float_mode(FloatingEditKind::Move),
             Action::EnterFloatingResizeMode => self.enter_float_mode(FloatingEditKind::Resize),
+            Action::Plugin(reference) => self.start_plugin_action(reference),
             _ => {}
+        }
+    }
+
+    fn start_plugin_action(&mut self, reference: String) {
+        if self.active_plugin_actions >= MAX_ACTIVE_PLUGIN_ACTIONS {
+            self.status("plugin action limit reached");
+            return;
+        }
+        let Some(invocation) = reference.strip_prefix("plugin:").map(ToOwned::to_owned) else {
+            self.status("invalid plugin action reference");
+            return;
+        };
+        if !valid_invocation_reference(&invocation) {
+            self.status("invalid plugin action reference");
+            return;
+        }
+        let sender = self.sender.clone();
+        let session = self.name.clone();
+        let display_reference = reference.clone();
+        self.active_plugin_actions += 1;
+        if std::thread::Builder::new()
+            .name("vvmux-plugin-key-action".into())
+            .spawn(move || {
+                let result =
+                    crate::plugin::invoke_for_session(&invocation, &session, serde_json::json!({}))
+                        .map(|_| ())
+                        .map_err(|error| error.to_string());
+                let _ = sender.send(ActorEvent::PluginNotice {
+                    reference: display_reference,
+                    result,
+                });
+            })
+            .is_err()
+        {
+            self.active_plugin_actions -= 1;
+            self.status("could not start plugin action");
         }
     }
 
@@ -4001,14 +4146,23 @@ impl SessionActor {
         environment.push(("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into()));
         // Every failure past `issue_pane_capability` must revoke it: the capability is already
         // minted, and leaving it live would let a dead pane's secret authenticate.
-        let parts =
-            match PtyProcess::spawn(&shell, spec.command.as_deref(), &cwd, 80, 22, &environment) {
-                Ok(parts) => parts,
-                Err(error) => {
-                    self.vivid.revoke_pane(pane_id);
-                    return Err(error);
-                }
-            };
+        let spawned = match spec.argv.as_deref() {
+            Some([program, arguments @ ..]) => {
+                PtyProcess::spawn_argv(program, arguments, &cwd, 80, 22, &environment)
+            }
+            Some([]) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pane argv must contain a program",
+            )),
+            None => PtyProcess::spawn(&shell, spec.command.as_deref(), &cwd, 80, 22, &environment),
+        };
+        let parts = match spawned {
+            Ok(parts) => parts,
+            Err(error) => {
+                self.vivid.revoke_pane(pane_id);
+                return Err(error);
+            }
+        };
         let reader_sender = self.sender.clone();
         let mut reader = parts.reader;
         std::thread::Builder::new()
@@ -5417,6 +5571,7 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
             | AutomationMethod::ListPanes
             | AutomationMethod::WaitRendered { .. }
             | AutomationMethod::ReloadConfig
+            | AutomationMethod::Plugin(_)
     )
 }
 
@@ -5435,6 +5590,28 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
         AutomationMethod::Run { command, .. } if command.trim().is_empty() => Err(
             AutomationError::new("invalid_params", "run requires a non-empty command"),
         ),
+        AutomationMethod::Action(Action::CopyInput(_)) => Err(AutomationError::new(
+            "unsupported",
+            "copy-mode input is not exposed through generic automation actions",
+        )),
+        AutomationMethod::Action(Action::Plugin(reference))
+            if !valid_plugin_reference(reference) =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "plugin action must be plugin:<plugin-id>/<action-id>",
+            ))
+        }
+        AutomationMethod::Plugin(crate::ipc::PluginMethod::Invoke {
+            reference, input, ..
+        }) if !valid_invocation_reference(reference)
+            || serde_json::to_vec(input).map_or(true, |body| body.len() > 1024 * 1024) =>
+        {
+            Err(AutomationError::new(
+                "limit_exceeded",
+                "plugin reference or input exceeds its limit",
+            ))
+        }
         AutomationMethod::Run { command, .. } if command.len() > MAX_RUN_COMMAND_BYTES => Err(
             AutomationError::new("limit_exceeded", "command exceeds 64 KiB"),
         ),
@@ -5543,6 +5720,22 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
     }
 }
 
+fn valid_invocation_reference(reference: &str) -> bool {
+    let Some((plugin, action)) = reference.split_once('/') else {
+        return false;
+    };
+    reference.len() <= 193
+        && plugin.contains('.')
+        && !plugin.is_empty()
+        && plugin
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        && !action.is_empty()
+        && action
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 fn automation_capabilities() -> serde_json::Value {
     serde_json::json!({
         "protocol": "VVMX",
@@ -5551,11 +5744,62 @@ fn automation_capabilities() -> serde_json::Value {
             "capabilities", "list_panes", "inspect", "inspect_media", "split", "focus", "close_pane",
             "typing", "key", "paste", "get_text", "get_grid", "search", "set_sync_input", "wait_text",
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
-            "trace_media", "reload_config", "run"
+            "trace_media", "reload_config", "run", "action"
         ],
         "limits": automation_limits(),
         "render_acknowledgment": "attached_client_write",
+        "plugins": {
+            "protocol_version": vvmux_plugin_api::PROTOCOL_VERSION,
+            "methods": ["invoke", "reload"],
+            "native_trust": "full_user_authority",
+            "component_sandbox": true,
+        },
     })
+}
+
+fn plugin_automation_error(error: io::Error) -> AutomationError {
+    let message = error.to_string();
+    let code = [
+        "plugin_not_found",
+        "plugin_disabled",
+        "action_not_found",
+        "schema_invalid",
+        "capability_denied",
+        "scope_denied",
+        "runtime_unavailable",
+        "runtime_crashed",
+        "busy",
+        "timeout",
+        "cancelled",
+        "event_gap",
+        "dependency_failed",
+        "output_invalid",
+        "protocol_error",
+    ]
+    .into_iter()
+    .find(|code| message.starts_with(code))
+    .unwrap_or("runtime_unavailable");
+    AutomationError::new(code, message)
+}
+
+fn valid_plugin_reference(reference: &str) -> bool {
+    let Some(value) = reference.strip_prefix("plugin:") else {
+        return false;
+    };
+    let Some((plugin, action)) = value.split_once('/') else {
+        return false;
+    };
+    !plugin.is_empty()
+        && plugin.len() <= 128
+        && plugin.contains('.')
+        && plugin
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        && !action.is_empty()
+        && action.len() <= 64
+        && action
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn automation_limits() -> serde_json::Value {
@@ -7440,6 +7684,22 @@ mod tests {
 
     #[test]
     fn automation_raw_request_limits_are_enforced() {
+        assert!(
+            validate_automation_method(&AutomationMethod::Action(Action::CopyInput(vec![b'q'])))
+                .is_err()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::Action(Action::Plugin(
+                "plugin:dev.example/run".into()
+            )))
+            .is_ok()
+        );
+        assert!(
+            validate_automation_method(&AutomationMethod::Action(Action::Plugin(
+                "dev.example/run".into()
+            )))
+            .is_err()
+        );
         assert!(
             validate_automation_method(&AutomationMethod::Key {
                 key: "x".into(),

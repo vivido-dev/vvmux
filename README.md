@@ -43,6 +43,7 @@ vvmux attach [-t NAME] [--replace] attach exactly by name
 vvmux list                         list live owner sessions
 vvmux kill-session -t NAME         terminate a session and its process groups
 vvmux msg [-t NAME] COMMAND        automate or inspect one pane directly
+vvmux plugin COMMAND               install, inspect, and invoke typed plugins
 vvmux token create [--rotate]      create/rotate the VVWS bearer token
 vvmux serve [OPTIONS]              run the loopback VVWS/1 session gateway
 vvmux --config PATH ...            use an explicit strict TOML config
@@ -196,7 +197,7 @@ to advance; when both
 
 Requests and input are limited to 1 MiB, decoded replies to 16 MiB, row requests and key repeats to
 1,000, and regular expressions to 8 KiB. The server bounds connections, in-flight requests,
-waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 12 is a hard
+waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 13 is a hard
 private-protocol cutover, so sessions created by older binaries must be restarted after upgrading.
 
 ## Network session gateway
@@ -433,11 +434,16 @@ fragment-aware pane media occlusion, static rehydration, timed-media headless se
 full-duplex outer control, linked A/V projection, bounded scrollback search, tab-local synchronized
 input, and optional bulk-media endpoint discovery.
 
-Intentionally absent: plugins, a bundled web UI, direct non-loopback/TLS serving,
+Intentionally absent: a plugin marketplace, a bundled web UI, direct non-loopback/TLS serving,
 arbitrary action sockets, stacked panes, pane-class conversion, multi-pane selection, scrollback
 editing, source transcoding, mirrored multi-client sessions, WinPTY, MSI/service installs,
 and machine-wide PATH changes. `run` and a layout `command` take one shell command line, passed to
-the shell with `-c`; configured shell argument vectors remain absent.
+the shell with `-c`; plugin panes and runtimes use exact argument vectors without a shell.
+
+Plugin packages use a strict `vvmux-plugin.toml` and JSON Schema Draft 2020-12 action contracts.
+Discover agent-visible actions with `vvmux plugin catalog --json`; `vvmux --skill` prints the
+release-matched automation guidance. WebAssembly Components are the sandboxed tier. Native process,
+one-shot, and PTY-pane plugins are trusted user code and run with the user's full OS authority.
 
 ## Windows troubleshooting
 

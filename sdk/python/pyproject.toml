@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vvmux-plugin"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "Native protocol SDK for vvmux plugins"
+license = "Apache-2.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

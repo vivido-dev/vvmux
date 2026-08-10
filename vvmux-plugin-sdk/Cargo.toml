@@ -1,0 +1,11 @@
+[package]
+name = "vvmux-plugin-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Rust SDK helpers for vvmux plugins"
+
+[dependencies]
+serde_json = "1"
+vvmux-plugin-api = { path = "../vvmux-plugin-api" }

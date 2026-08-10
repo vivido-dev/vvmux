@@ -109,6 +109,7 @@ pub(crate) enum WireAction {
     TogglePanePinned,
     EnterFloatingMoveMode,
     EnterFloatingResizeMode,
+    Plugin { reference: String },
 }
 
 impl WireAction {
@@ -138,6 +139,15 @@ impl WireAction {
             Self::TogglePanePinned => Ok(Action::TogglePanePinned),
             Self::EnterFloatingMoveMode => Ok(Action::EnterFloatingMoveMode),
             Self::EnterFloatingResizeMode => Ok(Action::EnterFloatingResizeMode),
+            Self::Plugin { reference }
+                if reference.len() <= 256 && reference.starts_with("plugin:") =>
+            {
+                Ok(Action::Plugin(reference))
+            }
+            Self::Plugin { .. } => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plugin action reference is invalid",
+            )),
         }
     }
 }
@@ -323,6 +333,14 @@ mod tests {
             }
             .into_ipc()
             .is_err()
+        );
+        assert_eq!(
+            WireAction::Plugin {
+                reference: "plugin:dev.example/run".into(),
+            }
+            .into_ipc()
+            .unwrap(),
+            Action::Plugin("plugin:dev.example/run".into())
         );
     }
 

@@ -172,6 +172,25 @@ impl PtyProcess {
             windows::spawn(shell, command, cwd, columns, rows, environment)
         }
     }
+
+    /// Start a pane process from an exact program and argument vector, without a shell.
+    pub fn spawn_argv(
+        program: &OsStr,
+        arguments: &[impl AsRef<OsStr>],
+        cwd: &Path,
+        columns: u16,
+        rows: u16,
+        environment: &[(String, String)],
+    ) -> io::Result<PtyParts> {
+        #[cfg(unix)]
+        {
+            unix::spawn_argv(program, arguments, cwd, columns, rows, environment)
+        }
+        #[cfg(windows)]
+        {
+            windows::spawn_argv(program, arguments, cwd, columns, rows, environment)
+        }
+    }
 }
 
 fn input(writer: File) -> io::Result<PtyInput> {
@@ -234,6 +253,36 @@ mod tests {
         );
         let status = parts.waiter.wait().unwrap();
         assert!(status.success, "a completed command should exit cleanly");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn argv_pane_does_not_shell_interpret_arguments() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut parts = PtyProcess::spawn_argv(
+            std::ffi::OsStr::new("/bin/printf"),
+            &[
+                std::ffi::OsStr::new("%s"),
+                std::ffi::OsStr::new("$HOME;echo BAD"),
+            ],
+            directory.path(),
+            80,
+            24,
+            &[],
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while let Ok(read) = parts.reader.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..read]);
+        }
+        assert_eq!(output, b"$HOME;echo BAD");
+        assert!(parts.waiter.wait().unwrap().success);
     }
 
     /// The default path must remain an interactive shell that outlives any single command.

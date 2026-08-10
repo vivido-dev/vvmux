@@ -16,12 +16,11 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Bumped to 12 for pixel mouse input, focused-pane Kitty keyboard modes, and authoritative live
-/// media/active-slot projection; 11 added host focus reporting.
+/// Bumped to 13 for generic automation actions and the plugin control family.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 12;
+pub const VERSION: u16 = 13;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -120,6 +119,9 @@ pub enum AutomationMethod {
     SetSyncInput {
         enabled: bool,
     },
+    /// Apply one ordinary user action to an explicitly resolved pane context.
+    Action(Action),
+    Plugin(PluginMethod),
     WaitText {
         text: String,
         regex: bool,
@@ -159,6 +161,17 @@ pub enum AutomationMethod {
         after_outer_revision: Option<u64>,
         timeout_ms: u64,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum PluginMethod {
+    Invoke {
+        reference: String,
+        input: Value,
+        detach: bool,
+    },
+    Reload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -275,6 +288,8 @@ pub enum Action {
     TogglePanePinned,
     EnterFloatingMoveMode,
     EnterFloatingResizeMode,
+    /// Invoke a configured plugin action. The host resolves and validates this reference.
+    Plugin(String),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
