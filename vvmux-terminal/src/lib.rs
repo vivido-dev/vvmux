@@ -13,6 +13,128 @@ use vte::ansi::{
 };
 
 const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = 4096;
+const AGENT_OSC_MAX_CHARS: usize = 256;
+
+#[derive(Debug, Default)]
+struct AgentOscTracker {
+    state: OscState,
+    body: Vec<u8>,
+    title: Option<String>,
+    progress: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum OscState {
+    #[default]
+    Ground,
+    Escape,
+    Body,
+    BodyEscape,
+    Ignoring,
+    IgnoringEscape,
+    Discarding,
+    DiscardingEscape,
+}
+
+impl AgentOscTracker {
+    const MAX_BODY_BYTES: usize = 4096;
+
+    fn observe(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match self.state {
+                OscState::Ground => {
+                    if byte == 0x1b {
+                        self.state = OscState::Escape;
+                    }
+                }
+                OscState::Escape => match byte {
+                    b']' => {
+                        self.body.clear();
+                        self.state = OscState::Body;
+                    }
+                    b'P' | b'_' | b'^' | b'X' => self.state = OscState::Ignoring,
+                    0x1b => {}
+                    _ => self.state = OscState::Ground,
+                },
+                OscState::Body => match byte {
+                    0x07 => self.finish(),
+                    0x1b => self.state = OscState::BodyEscape,
+                    _ => self.push(byte),
+                },
+                OscState::BodyEscape => match byte {
+                    b'\\' => self.finish(),
+                    0x1b => self.push(0x1b),
+                    byte => {
+                        self.push(0x1b);
+                        if matches!(self.state, OscState::Body) {
+                            self.push(byte);
+                        }
+                    }
+                },
+                OscState::Ignoring => {
+                    if byte == 0x1b {
+                        self.state = OscState::IgnoringEscape;
+                    }
+                }
+                OscState::IgnoringEscape => {
+                    self.state = match byte {
+                        b'\\' => OscState::Ground,
+                        0x1b => OscState::IgnoringEscape,
+                        _ => OscState::Ignoring,
+                    };
+                }
+                OscState::Discarding => match byte {
+                    0x07 => self.state = OscState::Ground,
+                    0x1b => self.state = OscState::DiscardingEscape,
+                    _ => {}
+                },
+                OscState::DiscardingEscape => {
+                    self.state = match byte {
+                        b'\\' => OscState::Ground,
+                        0x1b => OscState::DiscardingEscape,
+                        _ => OscState::Discarding,
+                    };
+                }
+            }
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.body.push(byte);
+        if self.body.len() > Self::MAX_BODY_BYTES {
+            self.body.clear();
+            self.state = OscState::Discarding;
+        } else {
+            self.state = OscState::Body;
+        }
+    }
+
+    fn finish(&mut self) {
+        let Some(separator) = self.body.iter().position(|byte| *byte == b';') else {
+            self.body.clear();
+            self.state = OscState::Ground;
+            return;
+        };
+        let command = &self.body[..separator];
+        let payload = &self.body[separator + 1..];
+        let value = sanitize_agent_osc(payload);
+        match command {
+            b"0" | b"2" => self.title = (!value.is_empty()).then_some(value),
+            b"9" => self.progress = Some(value),
+            _ => {}
+        }
+        self.body.clear();
+        self.state = OscState::Ground;
+    }
+}
+
+fn sanitize_agent_osc(payload: &[u8]) -> String {
+    String::from_utf8_lossy(payload)
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(AGENT_OSC_MAX_CHARS)
+        .collect()
+}
 
 pub mod pty;
 
@@ -144,6 +266,7 @@ pub struct Terminal {
     tab_stops: Vec<bool>,
     tab_stops_customized: bool,
     marker_scanner: VividMarkerScanner,
+    agent_osc: AgentOscTracker,
     keyboard_mode_stack: Vec<KeyboardModes>,
     inactive_keyboard_mode_stack: Vec<KeyboardModes>,
 }
@@ -180,14 +303,32 @@ impl Terminal {
             tab_stops: default_tab_stops(cols, 8),
             tab_stops_customized: false,
             marker_scanner: VividMarkerScanner::default(),
+            agent_osc: AgentOscTracker::default(),
             keyboard_mode_stack: Vec::new(),
             inactive_keyboard_mode_stack: Vec::new(),
         }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<TerminalEvent> {
+        self.agent_osc.observe(bytes);
         let chunks = self.marker_scanner.push(bytes);
         self.process_chunks(chunks, !bytes.is_empty())
+    }
+
+    /// Latest bounded OSC 0/2 title retained for passive agent detection.
+    pub fn agent_osc_title(&self) -> &str {
+        self.agent_osc.title.as_deref().unwrap_or("")
+    }
+
+    /// Latest bounded OSC 9 payload retained for passive agent detection.
+    pub fn agent_osc_progress(&self) -> &str {
+        self.agent_osc.progress.as_deref().unwrap_or("")
+    }
+
+    /// Prevent a replacement foreground process from inheriting stale OSC evidence.
+    pub fn clear_agent_osc(&mut self) {
+        self.agent_osc.title = None;
+        self.agent_osc.progress = None;
     }
 
     /// Flush bytes held only because they could have been a fragmented marker.
@@ -1474,5 +1615,26 @@ mod tests {
         assert!(edge.cells()[0][3].leading_wide_spacer);
         assert_eq!(edge.line_wrapped(0), Some(true));
         assert_eq!(edge.visible_text(0), "abc界");
+    }
+
+    #[test]
+    fn agent_osc_is_fragment_safe_bounded_and_clearable() {
+        let sequence = b"\x1b]9;4;3;\x1b\\\x1b]2;\xe2\x9a\xa0 Action Required\x07";
+        for split in 0..=sequence.len() {
+            let mut terminal = Terminal::new(2, 20, 0);
+            terminal.feed(&sequence[..split]);
+            terminal.feed(&sequence[split..]);
+            assert_eq!(terminal.agent_osc_progress(), "4;3;");
+            assert_eq!(terminal.agent_osc_title(), "⚠ Action Required");
+        }
+
+        let mut terminal = Terminal::new(2, 20, 0);
+        let oversized = format!("\x1b]9;{}\x07", "x".repeat(5000));
+        terminal.feed(oversized.as_bytes());
+        assert_eq!(terminal.agent_osc_progress(), "");
+        terminal.feed(b"\x1b]9;4;0;\x07");
+        assert_eq!(terminal.agent_osc_progress(), "4;0;");
+        terminal.clear_agent_osc();
+        assert_eq!(terminal.agent_osc_progress(), "");
     }
 }

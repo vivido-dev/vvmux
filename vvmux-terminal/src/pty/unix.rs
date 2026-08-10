@@ -34,6 +34,11 @@ pub struct PtyExitStatus {
 }
 
 impl PtyControl {
+    pub fn foreground_process_group_id(&self) -> Option<u32> {
+        let group = unsafe { libc::tcgetpgrp(self.inner.resize.as_raw_fd()) };
+        u32::try_from(group).ok().filter(|group| *group != 0)
+    }
+
     pub fn resize(&self, columns: u16, rows: u16) -> io::Result<()> {
         if columns == 0 || rows == 0 {
             return Err(io::Error::new(
@@ -190,6 +195,7 @@ pub(super) fn spawn(
     let reader = master_file.try_clone()?;
     let resize = master_file.try_clone()?;
     Ok(PtyParts {
+        child_pid: process_group as u32,
         reader,
         input: input(master_file)?,
         control: PtyControl {

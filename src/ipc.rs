@@ -21,7 +21,7 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 12;
+pub const VERSION: u16 = 13;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -77,6 +77,16 @@ pub struct AutomationRequest {
 pub enum AutomationMethod {
     Capabilities,
     ListPanes,
+    ReportAgent {
+        agent: crate::agent::AgentKind,
+        state: crate::agent::AgentState,
+        source: String,
+        sequence: u64,
+    },
+    ClearAgentReport {
+        source: String,
+        sequence: u64,
+    },
     Inspect,
     InspectMedia,
     TraceMedia {
@@ -275,6 +285,7 @@ pub enum Action {
     TogglePanePinned,
     EnterFloatingMoveMode,
     EnterFloatingResizeMode,
+    ToggleAgentNavigator,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

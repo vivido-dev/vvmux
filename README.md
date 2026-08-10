@@ -81,6 +81,8 @@ Available commands are:
 capabilities
 reload-config
 list-panes
+report-agent --agent claude|codex|opencode|hermes --state idle|working|blocked --source ID --sequence N [--pane-id ID]
+clear-agent-report --source ID --sequence N [--pane-id ID]
 inspect [--pane-id ID]
 inspect-media [--pane-id ID]
 split vertical|horizontal [--pane-id ID]
@@ -121,6 +123,23 @@ By default the pane closes when the command exits. `--hold` keeps it open with a
 note in the pane and an `[exited]` marker in its frame, so short-lived output stays readable;
 `wait exit` resolves either way. Typing into an exited held pane closes it, because its PTY input
 queue is no longer available.
+
+Agent reports are authoritative for their pane until cleared or the foreground process group
+changes. They require an explicit pane ID or a same-session `VVMUX_PANE_ID`; they never guess the
+focused pane. Sequence numbers are monotonic per pane and source, and `done` is derived by vvmux
+rather than accepted from reporters. `list-panes` and `inspect` expose the effective agent state.
+
+OpenCode can report lifecycle events directly through the managed optional plugin:
+
+```sh
+vvmux integration install opencode
+vvmux integration status opencode
+vvmux integration uninstall opencode
+```
+
+The installer owns only `~/.config/opencode/plugins/vvmux-agent-state.js` and refuses to replace
+or remove a file without the vvmux ownership marker. Claude Code, Codex CLI, and Hermes need no
+installation; vvmux identifies their foreground processes and terminal UI signals passively.
 
 ## Startup layouts
 
@@ -273,11 +292,17 @@ The prefix is `Ctrl-b`.
 | `Ctrl-b x`, then `y` | Close the focused pane |
 | `Ctrl-b z` | Toggle zoom |
 | `Ctrl-b S` | Toggle synchronized input for the active tab |
+| `Ctrl-b a` | Open or close the AI-agent navigator |
 | `Ctrl-b f` / `Ctrl-b F` | Create a floating pane / show or hide ordinary floats |
 | `Ctrl-b P` | Pin or unpin the focused floating pane |
 | `Ctrl-b m` / `Ctrl-b r` | Enter floating move / resize mode |
 | `Ctrl-b d` | Detach |
 | `Ctrl-b [` / `Ctrl-b ]` | Copy mode / paste copy buffer |
+
+The agent navigator includes detected agents from every tab and orders them blocked, done,
+working, then idle. Arrows or `j`/`k` select, Home/End and Page Up/Down scroll, Enter jumps to the
+pane, and `q` or Escape closes it. Mouse wheel and row clicks are supported. The popup is a
+transient compositor overlay, not a shell pane, so it never changes layout or media ownership.
 
 Copy mode accepts arrows, Page Up/Down, Space to start selection, Enter to copy, and `q` or Escape
 to cancel. `/` and `?` open forward and backward smart-case regular-expression search; `n` repeats

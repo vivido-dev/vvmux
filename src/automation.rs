@@ -72,6 +72,28 @@ pub enum MsgCommand {
     ReloadConfig,
     /// List every pane in deterministic pane-ID order.
     ListPanes,
+    /// Report authoritative AI-agent state for one pane.
+    ReportAgent {
+        #[arg(long, value_enum)]
+        agent: crate::agent::AgentKind,
+        #[arg(long, value_enum)]
+        state: crate::agent::AgentState,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        sequence: u64,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Clear one source's authoritative AI-agent report.
+    ClearAgentReport {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        sequence: u64,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Inspect one pane.
     Inspect(PaneTarget),
     /// Inspect sanitized Vivid media state owned by one pane.
@@ -291,10 +313,16 @@ pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()>
         .flatten();
     let (method, explicit_pane, allow_focused, output) = build_request(command)?;
     let pane_id = explicit_pane.or(inherited_pane);
-    if matches!(&method, AutomationMethod::ClosePane) && pane_id.is_none() {
+    if matches!(
+        &method,
+        AutomationMethod::ClosePane
+            | AutomationMethod::ReportAgent { .. }
+            | AutomationMethod::ClearAgentReport { .. }
+    ) && pane_id.is_none()
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "close-pane requires --pane-id or a same-session VVMUX_PANE_ID",
+            "command requires --pane-id or a same-session VVMUX_PANE_ID",
         ));
     }
     let request = AutomationRequest {
@@ -411,6 +439,33 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
         MsgCommand::Capabilities => (AutomationMethod::Capabilities, None, false, Output::Json),
         MsgCommand::ReloadConfig => (AutomationMethod::ReloadConfig, None, false, Output::Json),
         MsgCommand::ListPanes => (AutomationMethod::ListPanes, None, false, Output::Json),
+        MsgCommand::ReportAgent {
+            agent,
+            state,
+            source,
+            sequence,
+            pane_id,
+        } => (
+            AutomationMethod::ReportAgent {
+                agent,
+                state,
+                source,
+                sequence,
+            },
+            pane_id,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::ClearAgentReport {
+            source,
+            sequence,
+            pane_id,
+        } => (
+            AutomationMethod::ClearAgentReport { source, sequence },
+            pane_id,
+            false,
+            Output::Json,
+        ),
         MsgCommand::Inspect(target) => (
             AutomationMethod::Inspect,
             target.pane_id,
