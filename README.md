@@ -474,6 +474,13 @@ authority. Native service SDKs expose scoped host calls for session inspection, 
 and pane input. These calls enforce the manifest's `session.read`, `pane.read`, and `pane.input`
 declarations; service and Component broker tokens provide attribution and revocation, not an OS
 security boundary. One-shot actions receive no broker token.
+
+Rust Component authors implement `vvmux_plugin_sdk::component::Guest` and export it with the SDK's
+generated `component::export!` macro. Build those crates for `wasm32-wasip2`; the SDK owns the
+release-matched WIT bindings and JSON/host-call/storage/log helpers. The full vvmux test gate builds
+the real Rust conformance guest, so development environments need
+`rustup target add wasm32-wasip2` once.
+
 `vvmux plugin invoke ID/ACTION --target SESSION --detach` returns a session-bound job ID. Use
 `vvmux plugin job status JOB`, `cancel JOB`, and `logs JOB` to inspect or stop it. Sessions retain
 the newest 200 detached completions and at most 256 KiB each of result/error log text; detached work

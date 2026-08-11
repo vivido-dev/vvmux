@@ -956,6 +956,13 @@ pub(crate) struct SessionPluginRuntime {
     component: Option<crate::plugin_component::ComponentRuntime>,
     consecutive_crashes: u32,
     retry_at: Option<Instant>,
+    last_logs: RuntimeLogs,
+}
+
+#[derive(Default)]
+pub(crate) struct RuntimeLogs {
+    pub(crate) stderr: String,
+    pub(crate) stderr_truncated: bool,
 }
 
 impl SessionPluginRuntime {
@@ -982,6 +989,7 @@ impl SessionPluginRuntime {
             component: None,
             consecutive_crashes: 0,
             retry_at: None,
+            last_logs: RuntimeLogs::default(),
         })
     }
 
@@ -991,6 +999,7 @@ impl SessionPluginRuntime {
         input: Value,
         cancel: Arc<AtomicBool>,
     ) -> io::Result<Value> {
+        self.last_logs = RuntimeLogs::default();
         if cancel.load(Ordering::Acquire) {
             return Err(invalid("cancelled: plugin invocation was cancelled"));
         }
@@ -1114,6 +1123,11 @@ impl SessionPluginRuntime {
                         cancel,
                         deadline,
                     );
+                    let (stderr, stderr_truncated) = self.component.as_mut().unwrap().take_logs();
+                    self.last_logs = RuntimeLogs {
+                        stderr,
+                        stderr_truncated,
+                    };
                     match result {
                         Ok(output) => {
                             self.consecutive_crashes = 0;
@@ -1143,6 +1157,10 @@ impl SessionPluginRuntime {
             .validate_output(&action, &output)
             .map_err(|errors| invalid(format!("output_invalid: {}", errors.join("; "))))?;
         Ok(output)
+    }
+
+    pub(crate) fn take_logs(&mut self) -> RuntimeLogs {
+        std::mem::take(&mut self.last_logs)
     }
 
     fn note_crash(&mut self) {

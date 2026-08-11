@@ -312,6 +312,27 @@ impl JobStore {
         }
     }
 
+    fn finish_with_logs(
+        &mut self,
+        job: &Job,
+        result: &io::Result<Value>,
+        logs: crate::plugin::RuntimeLogs,
+    ) {
+        self.finish(job, result);
+        if !matches!(job.completion, Completion::Detached) || logs.stderr.is_empty() {
+            return;
+        }
+        let record = self
+            .records
+            .get_mut(&job.public_id)
+            .expect("detached jobs retain a record after completion");
+        let mut combined = logs.stderr;
+        combined.push_str(&record.stderr);
+        let (stderr, truncated) = truncate_log(combined, MAX_RETAINED_LOG_BYTES);
+        record.stderr = stderr;
+        record.stderr_truncated |= logs.stderr_truncated || truncated;
+    }
+
     fn status(&self, job_id: &str) -> Result<Value, AutomationError> {
         let record = self.records.get(job_id).ok_or_else(job_not_found)?;
         serde_json::to_value(record).map_err(|error| {
@@ -368,6 +389,7 @@ enum Message {
     Complete {
         job: Job,
         result: io::Result<Value>,
+        logs: crate::plugin::RuntimeLogs,
     },
     JobStatus {
         job_id: String,
@@ -733,11 +755,11 @@ fn run_manager(inputs: ManagerInputs) {
                 }
                 active.insert(job_id, active_job);
             }
-            Message::Complete { job, result } => {
+            Message::Complete { job, result, logs } => {
                 if let Some(active_job) = active.remove(&job.id) {
                     accounting.complete(&active_job.plugin_id);
                 }
-                retained.finish(&job, &result);
+                retained.finish_with_logs(&job, &result, logs);
                 deliver(&actor, job.completion, result);
                 request_worker_stop_if_drained(&job.plugin_id, &active, &transitions, &mut workers);
             }
@@ -955,7 +977,11 @@ fn spawn_worker(
                     WorkerMessage::Invoke(job) => {
                         let result =
                             runtime.invoke(&job.reference, job.input.clone(), job.cancel.clone());
-                        if manager.send(Message::Complete { job, result }).is_err() {
+                        let logs = runtime.take_logs();
+                        if manager
+                            .send(Message::Complete { job, result, logs })
+                            .is_err()
+                        {
                             break;
                         }
                     }

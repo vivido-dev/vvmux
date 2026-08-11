@@ -141,6 +141,14 @@ typed `SessionCommand`/`CallerContext` authorization before serving `session.ins
 `pane.get_text`, or `pane.input`. Native code remains trusted because it can bypass this broker as
 the same OS user.
 
+The Rust SDK owns the guest-side WIT bindings used to build `wasm32-wasip2` Components. Component
+invocations reset a private log accumulator before entering guest code; host log imports sanitize
+line breaks, serialize bounded JSON entries, and retain explicit truncation metadata with detached
+jobs instead of writing guest-controlled text directly to the host's stderr. Component storage,
+cache, config, and data paths use independent plugin-ID-derived components. Cache deserialization
+requires the complete engine/host/artifact key and serialized payload digest; a mismatch recompiles
+the pinned source artifact.
+
 The inner presenter accepts Control and Track only, verifies root and channel authentication,
 consumes marker-v3 anchors, and grants cumulative flow per track. The outer producer allocates all
 of its own identities and re-encodes portable media headers. Per-track bridge queues are

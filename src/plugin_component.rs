@@ -26,7 +26,11 @@ const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TABLE_ELEMENTS: usize = 100_000;
 const MAX_STORAGE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
-const FUEL_PER_CALL: u64 = 10_000_000;
+const MAX_LOG_BYTES: usize = 256 * 1024;
+// Epoch interruption is the primary deadline/cancellation mechanism. Keep a generous independent
+// fuel ceiling as a deterministic backstop without letting a valid call exhaust before the
+// supervisor can deliver a cancellation from another process.
+const FUEL_PER_CALL: u64 = 1_000_000_000;
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 const CACHE_MAGIC: &[u8; 8] = b"VVCWASM1";
 const CACHE_KEY_VERSION: &str = "vvmux-component-cache-v1";
@@ -51,7 +55,8 @@ struct ComponentState {
     storage: PathBuf,
     deadline: Instant,
     cancel: Arc<AtomicBool>,
-    logged: usize,
+    invocation_logs: String,
+    logs_truncated: bool,
 }
 
 impl WasiView for ComponentState {
@@ -101,19 +106,38 @@ impl bindings::vivido::vvmux_plugin::host::Host for ComponentState {
     }
 
     fn log(&mut self, level: String, message: String) {
-        const MAX_LOG_BYTES: usize = 256 * 1024;
-        if self.logged >= MAX_LOG_BYTES {
+        if self.invocation_logs.len() >= MAX_LOG_BYTES {
+            self.logs_truncated = true;
             return;
         }
-        let remaining = MAX_LOG_BYTES - self.logged;
+        let level = match level.as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" => level,
+            _ => "info".to_owned(),
+        };
         let mut safe = message.replace(['\r', '\n'], " ");
-        let mut end = remaining.min(safe.len());
-        while !safe.is_char_boundary(end) {
-            end -= 1;
+        let mut entry = component_log_entry(&level, &safe, false);
+        entry.push('\n');
+        let remaining = MAX_LOG_BYTES - self.invocation_logs.len();
+        if entry.len() > remaining {
+            self.logs_truncated = true;
+            loop {
+                entry = component_log_entry(&level, &safe, true);
+                entry.push('\n');
+                if entry.len() <= remaining {
+                    break;
+                }
+                if safe.is_empty() {
+                    return;
+                }
+                let excess = entry.len() - remaining;
+                let mut end = safe.len().saturating_sub(excess.max(1));
+                while !safe.is_char_boundary(end) {
+                    end -= 1;
+                }
+                safe.truncate(end);
+            }
         }
-        safe.truncate(end);
-        self.logged += safe.len();
-        eprintln!("vvmux component [{level}]: {safe}");
+        self.invocation_logs.push_str(&entry);
     }
 
     fn storage_get(
@@ -154,6 +178,19 @@ impl bindings::vivido::vvmux_plugin::host::Host for ComponentState {
         }
         Ok(())
     }
+}
+
+fn component_log_entry(level: &str, message: &str, truncated: bool) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "runtime": "component",
+        "level": level,
+        "message": message,
+        "truncated": truncated,
+    }))
+    .unwrap_or_else(|_| {
+        r#"{"runtime":"component","level":"error","message":"log serialization failed","truncated":true}"#
+            .to_owned()
+    })
 }
 
 impl ComponentRuntime {
@@ -226,7 +263,8 @@ impl ComponentRuntime {
             storage: paths.storage,
             deadline,
             cancel,
-            logged: 0,
+            invocation_logs: String::new(),
+            logs_truncated: false,
         };
         let mut store = Store::new(engine, state);
         store.limiter(|state| &mut state.limits);
@@ -255,6 +293,8 @@ impl ComponentRuntime {
         cancel: Arc<AtomicBool>,
         deadline: Instant,
     ) -> io::Result<Value> {
+        self.store.data_mut().invocation_logs.clear();
+        self.store.data_mut().logs_truncated = false;
         let input = serde_json::to_vec(input).map_err(io::Error::other)?;
         let context = serde_json::to_vec(context).map_err(io::Error::other)?;
         if input.len() > MAX_PAYLOAD_BYTES || context.len() > MAX_PAYLOAD_BYTES {
@@ -295,6 +335,14 @@ impl ComponentRuntime {
                 "output_invalid: component returned invalid JSON: {error}"
             ))
         })
+    }
+
+    pub(crate) fn take_logs(&mut self) -> (String, bool) {
+        let state = self.store.data_mut();
+        (
+            std::mem::take(&mut state.invocation_logs),
+            std::mem::take(&mut state.logs_truncated),
+        )
     }
 }
 
@@ -692,7 +740,8 @@ mod tests {
             storage: tempfile::tempdir().unwrap().keep(),
             deadline,
             cancel,
-            logged: 0,
+            invocation_logs: String::new(),
+            logs_truncated: false,
         }
     }
 
