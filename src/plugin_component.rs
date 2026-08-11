@@ -337,6 +337,48 @@ impl ComponentRuntime {
         })
     }
 
+    pub(crate) fn on_event(
+        &mut self,
+        name: &str,
+        payload: &Value,
+        context: &vvmux_plugin_api::InvocationContext,
+        cancel: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.store.data_mut().invocation_logs.clear();
+        self.store.data_mut().logs_truncated = false;
+        let payload = serde_json::to_vec(payload).map_err(io::Error::other)?;
+        let _cause = self
+            .store
+            .data()
+            .broker
+            .as_ref()
+            .map(|lease| lease.enter_event(context));
+        let context = serde_json::to_vec(context).map_err(io::Error::other)?;
+        if payload.len() > MAX_PAYLOAD_BYTES || context.len() > MAX_PAYLOAD_BYTES {
+            return Err(invalid("schema_invalid: component event exceeds 1 MiB"));
+        }
+        self.store.data_mut().cancel = cancel;
+        self.store.data_mut().deadline = deadline;
+        configure_call(&mut self.store, deadline)?;
+        let call = self.guest.vivido_vvmux_plugin_guest().call_on_event(
+            &mut self.store,
+            name,
+            &payload,
+            &context,
+        );
+        match call {
+            Ok(result) => result.map_err(guest_error),
+            Err(_error) if self.store.data().cancel.load(Ordering::Acquire) => {
+                Err(invalid("cancelled: component event was cancelled"))
+            }
+            Err(error) if Instant::now() >= self.store.data().deadline => Err(invalid(format!(
+                "timeout: component event expired: {error}"
+            ))),
+            Err(error) => Err(component_trap(error)),
+        }
+    }
+
     pub(crate) fn take_logs(&mut self) -> (String, bool) {
         let state = self.store.data_mut();
         (

@@ -17,7 +17,7 @@ pub struct Hello {
     pub features: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InvocationContext {
     pub correlation_id: String,

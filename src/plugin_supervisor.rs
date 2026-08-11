@@ -13,13 +13,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::Value;
-use vvmux_plugin_api::{HostCall, Permission};
+use vvmux_plugin_api::{Activation, Event, EventHook, HostCall, Permission};
 
-use crate::ipc::AutomationError;
+use crate::ipc::{AutomationError, PluginEventEnvelope};
 use crate::session::{ActorEvent, AutomationReplyTarget};
 
 const COMMAND_QUEUE: usize = 32;
-const PLUGIN_QUEUE: usize = 4;
+const PLUGIN_QUEUE: usize = 128;
 const MAX_SESSION_JOBS: usize = 16;
 const MAX_PLUGIN_JOBS: usize = 4;
 const MAX_RETAINED_JOBS: usize = 200;
@@ -31,6 +31,7 @@ pub(crate) struct PluginSupervisor {
     next_job_id: Arc<AtomicU64>,
     reload_requested: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    event_gap: Arc<Mutex<Option<(u64, u64)>>>,
     session_name: String,
     session_instance: String,
 }
@@ -47,14 +48,31 @@ pub(crate) struct RuntimeScope {
 pub(crate) struct HostBroker {
     actor: mpsc::SyncSender<ActorEvent>,
     session_instance: String,
-    tokens: Arc<Mutex<HashMap<String, RuntimeScope>>>,
+    tokens: Arc<Mutex<HashMap<String, BrokerIdentity>>>,
 }
 
 pub(crate) struct BrokerLease {
     token: String,
     scope: RuntimeScope,
+    cause: Arc<Mutex<Option<PluginCause>>>,
     broker: HostBroker,
 }
+
+#[derive(Debug, Clone)]
+struct BrokerIdentity {
+    scope: RuntimeScope,
+    cause: Arc<Mutex<Option<PluginCause>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PluginCause {
+    pub(crate) source: String,
+    pub(crate) correlation_id: String,
+    pub(crate) causation_id: String,
+    pub(crate) causation_depth: u8,
+}
+
+pub(crate) struct CauseReset(Arc<Mutex<Option<PluginCause>>>);
 
 impl HostBroker {
     pub(crate) fn issue(
@@ -70,13 +88,21 @@ impl HostBroker {
             plugin_instance: plugin_instance.to_owned(),
             permissions: permissions.to_vec(),
         };
+        let cause = Arc::new(Mutex::new(None));
         self.tokens
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(token.clone(), scope.clone());
+            .insert(
+                token.clone(),
+                BrokerIdentity {
+                    scope: scope.clone(),
+                    cause: cause.clone(),
+                },
+            );
         Ok(BrokerLease {
             token,
             scope,
+            cause,
             broker: self.clone(),
         })
     }
@@ -88,22 +114,30 @@ impl HostBroker {
         call: HostCall,
         deadline: Instant,
     ) -> io::Result<Value> {
-        let valid = self
+        let cause = self
             .tokens
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(token)
-            .is_some_and(|registered| registered == scope);
-        if !valid {
+            .filter(|registered| registered.scope == *scope)
+            .map(|registered| {
+                registered
+                    .cause
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            });
+        let Some(cause) = cause else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "scope_denied: stale plugin broker token",
             ));
-        }
+        };
         let (sender, receiver) = mpsc::sync_channel(1);
         self.actor
             .try_send(ActorEvent::PluginHostCall {
                 scope: scope.clone(),
+                cause,
                 call,
                 reply: sender,
             })
@@ -139,6 +173,31 @@ impl BrokerLease {
 
     pub(crate) fn call(&self, call: HostCall, deadline: Instant) -> io::Result<Value> {
         self.broker.call(&self.token, &self.scope, call, deadline)
+    }
+
+    pub(crate) fn enter_event(&self, context: &vvmux_plugin_api::InvocationContext) -> CauseReset {
+        *self
+            .cause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PluginCause {
+            source: format!(
+                "plugin:{}:{}",
+                self.scope.plugin_id, self.scope.plugin_instance
+            ),
+            correlation_id: context.correlation_id.clone(),
+            causation_id: context.causation_id.clone(),
+            causation_depth: context.causation_depth,
+        });
+        CauseReset(self.cause.clone())
+    }
+}
+
+impl Drop for CauseReset {
+    fn drop(&mut self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
@@ -178,6 +237,7 @@ struct ActiveJob {
 
 struct WorkerHandle {
     sender: mpsc::SyncSender<WorkerMessage>,
+    shutdown: Arc<AtomicBool>,
     plugin: crate::plugin::RuntimePlugin,
     stopping: bool,
 }
@@ -421,12 +481,19 @@ enum Message {
         plugin_id: String,
         digest: String,
     },
+    PublishEvent(PluginEventEnvelope),
+    RuntimeCrashed {
+        plugin_id: String,
+        context: Option<vvmux_plugin_api::InvocationContext>,
+    },
     CancelClient(u64),
     Shutdown,
 }
 
 enum WorkerMessage {
     Invoke(Job),
+    Activate,
+    Event { hook: EventHook, event: Event },
     Shutdown,
 }
 
@@ -449,6 +516,7 @@ impl PluginSupervisor {
         let manager_shutdown_requested = shutdown_requested.clone();
         let manager_session_name = session_name.clone();
         let manager_session_instance = session_instance.clone();
+        let event_gap = Arc::new(Mutex::new(None));
         thread::Builder::new()
             .name(format!("vvmux-plugin-supervisor-{session_name}"))
             .spawn(move || {
@@ -470,6 +538,7 @@ impl PluginSupervisor {
             shutdown_requested,
             session_name,
             session_instance,
+            event_gap,
         })
     }
 
@@ -623,6 +692,44 @@ impl PluginSupervisor {
         let _ = self.sender.try_send(Message::CancelClient(client_id));
     }
 
+    pub(crate) fn publish_event(&self, event: PluginEventEnvelope) {
+        let sequence = match &event {
+            PluginEventEnvelope::Event { sequence, .. } => *sequence,
+            PluginEventEnvelope::Gap { to_sequence, .. } => *to_sequence,
+        };
+        let pending_gap = self
+            .event_gap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some((from_sequence, to_sequence)) = pending_gap
+            && self
+                .sender
+                .try_send(Message::PublishEvent(PluginEventEnvelope::Gap {
+                    from_sequence,
+                    to_sequence,
+                }))
+                .is_err()
+        {
+            *self
+                .event_gap
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((from_sequence, sequence));
+            return;
+        }
+        if self.sender.try_send(Message::PublishEvent(event)).is_err() {
+            let mut gap = self
+                .event_gap
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(gap) = gap.as_mut() {
+                gap.1 = sequence;
+            } else {
+                *gap = Some((sequence, sequence));
+            }
+        }
+    }
+
     pub(crate) fn shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
         let _ = self.sender.try_send(Message::Shutdown);
@@ -667,6 +774,15 @@ fn run_manager(inputs: ManagerInputs) {
     let mut reload_waiters = Vec::<ReloadWaiter>::new();
     let mut reload_loading = false;
     let mut queued_reloads = Vec::<ReloadCompletion>::new();
+    let mut event_gaps = HashMap::<String, (u64, u64)>::new();
+    activate_session_plugins(
+        &registry,
+        &mut workers,
+        &session_name,
+        &session_instance,
+        &broker,
+        &sender,
+    );
     while let Ok(message) = receiver.recv() {
         match message {
             Message::Invoke(job) => {
@@ -716,11 +832,12 @@ fn run_manager(inputs: ManagerInputs) {
                         broker.clone(),
                         sender.clone(),
                     ) {
-                        Ok(worker) => {
+                        Ok((worker, shutdown)) => {
                             workers.insert(
                                 job.plugin_id.clone(),
                                 WorkerHandle {
                                     sender: worker.clone(),
+                                    shutdown,
                                     plugin,
                                     stopping: false,
                                 },
@@ -748,19 +865,31 @@ fn run_manager(inputs: ManagerInputs) {
                 };
                 let job_id = job.id;
                 if let Err(error) = worker.try_send(WorkerMessage::Invoke(job)) {
-                    let job = match error {
-                        mpsc::TrySendError::Full(WorkerMessage::Invoke(job))
-                        | mpsc::TrySendError::Disconnected(WorkerMessage::Invoke(job)) => job,
-                        mpsc::TrySendError::Full(WorkerMessage::Shutdown)
-                        | mpsc::TrySendError::Disconnected(WorkerMessage::Shutdown) => {
+                    let (job, disconnected) = match error {
+                        mpsc::TrySendError::Full(WorkerMessage::Invoke(job)) => (job, false),
+                        mpsc::TrySendError::Disconnected(WorkerMessage::Invoke(job)) => (job, true),
+                        mpsc::TrySendError::Full(
+                            WorkerMessage::Shutdown | WorkerMessage::Activate,
+                        )
+                        | mpsc::TrySendError::Disconnected(
+                            WorkerMessage::Shutdown | WorkerMessage::Activate,
+                        )
+                        | mpsc::TrySendError::Full(WorkerMessage::Event { .. })
+                        | mpsc::TrySendError::Disconnected(WorkerMessage::Event { .. }) => {
                             unreachable!("the supervisor only submits invocation messages here")
                         }
                     };
-                    workers.remove(&active_job.plugin_id);
+                    if disconnected {
+                        workers.remove(&active_job.plugin_id);
+                    }
                     accounting.complete(&active_job.plugin_id);
-                    let result = Err(io::Error::other(
-                        "runtime_unavailable: plugin worker stopped",
-                    ));
+                    let result = if disconnected {
+                        Err(io::Error::other(
+                            "runtime_unavailable: plugin worker stopped",
+                        ))
+                    } else {
+                        Err(io::Error::other("busy: plugin event queue is full"))
+                    };
                     retained.finish(&job, &result);
                     deliver(&actor, job.completion, result);
                     continue;
@@ -772,6 +901,32 @@ fn run_manager(inputs: ManagerInputs) {
                     accounting.complete(&active_job.plugin_id);
                 }
                 retained.finish_with_logs(&job, &result, logs);
+                let status = match &result {
+                    Ok(_) => "succeeded",
+                    Err(error) if error.to_string().starts_with("cancelled") => "cancelled",
+                    Err(error) if error.to_string().starts_with("timeout") => "timed_out",
+                    Err(_) => "failed",
+                };
+                let _ = actor.try_send(ActorEvent::PluginLifecycle {
+                    name: "plugin.job_completed".into(),
+                    payload: serde_json::json!({
+                        "job_id": &job.public_id,
+                        "plugin_id": &job.plugin_id,
+                        "action": &job.reference,
+                        "status": status,
+                    }),
+                    context: None,
+                });
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().starts_with("runtime_crashed"))
+                {
+                    let _ = actor.try_send(ActorEvent::PluginLifecycle {
+                        name: "plugin.runtime_crashed".into(),
+                        payload: serde_json::json!({"plugin_id": &job.plugin_id}),
+                        context: None,
+                    });
+                }
                 deliver(&actor, job.completion, result);
                 request_worker_stop_if_drained(&job.plugin_id, &active, &transitions, &mut workers);
             }
@@ -821,7 +976,7 @@ fn run_manager(inputs: ManagerInputs) {
                     "protocol_version": vvmux_plugin_api::PROTOCOL_VERSION,
                     "session_instance": session_instance,
                     "applied_generation": registry.generation,
-                    "methods": ["catalog", "invoke", "job_status", "job_cancel", "job_logs", "pane_open", "reload"],
+                    "methods": ["catalog", "invoke", "job_status", "job_cancel", "job_logs", "pane_open", "event_subscribe", "event_unsubscribe", "reload"],
                     "native_trust": "full_user_authority",
                     "component_sandbox": true,
                     "enforceable_capabilities": crate::session::plugin_enforceable_capabilities(),
@@ -875,6 +1030,14 @@ fn run_manager(inputs: ManagerInputs) {
                             &mut workers,
                             &mut transitions,
                             &actor,
+                        );
+                        activate_session_plugins(
+                            &registry,
+                            &mut workers,
+                            &session_name,
+                            &session_instance,
+                            &broker,
+                            &sender,
                         );
                         let pending = transitions.clone();
                         for completion in completions {
@@ -931,7 +1094,168 @@ fn run_manager(inputs: ManagerInputs) {
                         waiter.pending.remove(&plugin_id);
                     }
                     finish_ready_reload_waiters(&actor, &mut reload_waiters);
+                    activate_session_plugins(
+                        &registry,
+                        &mut workers,
+                        &session_name,
+                        &session_instance,
+                        &broker,
+                        &sender,
+                    );
                 }
+            }
+            Message::PublishEvent(envelope) => {
+                if let PluginEventEnvelope::Gap {
+                    from_sequence,
+                    to_sequence,
+                } = &envelope
+                {
+                    for plugin in registry.plugins.values().filter(|plugin| {
+                        plugin.enabled
+                            && !plugin.events.is_empty()
+                            && plugin.permissions.contains(&Permission::EventsSubscribe)
+                    }) {
+                        event_gaps
+                            .entry(plugin.id.clone())
+                            .and_modify(|gap| gap.1 = *to_sequence)
+                            .or_insert((*from_sequence, *to_sequence));
+                    }
+                    continue;
+                }
+                let PluginEventEnvelope::Event {
+                    sequence,
+                    name,
+                    payload,
+                    context,
+                } = envelope
+                else {
+                    continue;
+                };
+                if context.causation_depth >= 8 {
+                    continue;
+                }
+                let plugin_ids = registry.plugins.keys().cloned().collect::<Vec<_>>();
+                for plugin_id in plugin_ids {
+                    let Some(plugin) = registry.plugins.get(&plugin_id).cloned() else {
+                        continue;
+                    };
+                    if !plugin.enabled || transitions.contains(&plugin_id) {
+                        continue;
+                    }
+                    if !plugin.permissions.contains(&Permission::EventsSubscribe) {
+                        continue;
+                    }
+                    let hooks = plugin
+                        .events
+                        .iter()
+                        .filter(|hook| hook.on == name)
+                        .filter(|hook| hook_accepts_event(&plugin_id, hook, &context))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if hooks.is_empty() {
+                        continue;
+                    }
+                    let worker = if let Some(worker) = workers.get(&plugin_id) {
+                        worker.sender.clone()
+                    } else {
+                        match spawn_worker(
+                            plugin.clone(),
+                            &session_name,
+                            &session_instance,
+                            broker.clone(),
+                            sender.clone(),
+                        ) {
+                            Ok((worker, shutdown)) => {
+                                workers.insert(
+                                    plugin_id.clone(),
+                                    WorkerHandle {
+                                        sender: worker.clone(),
+                                        shutdown,
+                                        plugin,
+                                        stopping: false,
+                                    },
+                                );
+                                worker
+                            }
+                            Err(_) => continue,
+                        }
+                    };
+                    for hook in hooks {
+                        let mut event_context = context.clone();
+                        event_context.causation_depth =
+                            event_context.causation_depth.saturating_add(1);
+                        event_context.deadline_unix_ms = now_ms()
+                            .saturating_add(u128::from(hook.timeout_ms))
+                            .min(u128::from(u64::MAX))
+                            as u64;
+                        if let Some((from_sequence, to_sequence)) = event_gaps.remove(&plugin_id) {
+                            let gap = Event {
+                                request_id: 0,
+                                sequence: to_sequence,
+                                name: "vvmux.event_gap".into(),
+                                payload: serde_json::json!({
+                                    "from_sequence": from_sequence,
+                                    "to_sequence": to_sequence,
+                                }),
+                                context: event_context.clone(),
+                            };
+                            if worker
+                                .try_send(WorkerMessage::Event {
+                                    hook: hook.clone(),
+                                    event: gap,
+                                })
+                                .is_err()
+                            {
+                                event_gaps.insert(plugin_id.clone(), (from_sequence, sequence));
+                                break;
+                            }
+                        }
+                        let event = Event {
+                            request_id: 0,
+                            sequence,
+                            name: name.clone(),
+                            payload: payload.clone(),
+                            context: event_context,
+                        };
+                        if worker
+                            .try_send(WorkerMessage::Event { hook, event })
+                            .is_err()
+                        {
+                            event_gaps
+                                .entry(plugin_id.clone())
+                                .and_modify(|gap| gap.1 = sequence)
+                                .or_insert((sequence, sequence));
+                            break;
+                        }
+                    }
+                }
+            }
+            Message::RuntimeCrashed {
+                plugin_id,
+                mut context,
+            } => {
+                if context.is_none() {
+                    let correlation_id =
+                        random_identity().unwrap_or_else(|_| format!("runtime-crash-{}", now_ms()));
+                    context = Some(vvmux_plugin_api::InvocationContext {
+                        correlation_id: correlation_id.clone(),
+                        causation_id: correlation_id,
+                        causation_depth: 0,
+                        source: format!("plugin:{plugin_id}:runtime"),
+                        session_instance: session_instance.clone(),
+                        pane_id: None,
+                        tab_id: None,
+                        deadline_unix_ms: 0,
+                    });
+                }
+                if let Some(context) = &mut context {
+                    context.source = format!("plugin:{plugin_id}:runtime");
+                }
+                let _ = actor.try_send(ActorEvent::PluginLifecycle {
+                    name: "plugin.runtime_crashed".into(),
+                    payload: serde_json::json!({"plugin_id": plugin_id}),
+                    context,
+                });
             }
             Message::CancelClient(client_id) => {
                 for job in active
@@ -946,6 +1270,7 @@ fn run_manager(inputs: ManagerInputs) {
                     job.cancel.store(true, Ordering::Release);
                 }
                 for worker in workers.values() {
+                    worker.shutdown.store(true, Ordering::Release);
                     let _ = worker.sender.try_send(WorkerMessage::Shutdown);
                 }
                 break;
@@ -971,11 +1296,21 @@ fn run_manager(inputs: ManagerInputs) {
                 job.cancel.store(true, Ordering::Release);
             }
             for worker in workers.values() {
+                worker.shutdown.store(true, Ordering::Release);
                 let _ = worker.sender.try_send(WorkerMessage::Shutdown);
             }
             break;
         }
     }
+}
+
+fn hook_accepts_event(
+    plugin_id: &str,
+    hook: &EventHook,
+    context: &vvmux_plugin_api::InvocationContext,
+) -> bool {
+    context.causation_depth < 8
+        && (hook.include_self || !context.source.starts_with(&format!("plugin:{plugin_id}:")))
 }
 
 fn spawn_worker(
@@ -984,8 +1319,10 @@ fn spawn_worker(
     session_instance: &str,
     broker: HostBroker,
     manager: mpsc::SyncSender<Message>,
-) -> io::Result<mpsc::SyncSender<WorkerMessage>> {
+) -> io::Result<(mpsc::SyncSender<WorkerMessage>, Arc<AtomicBool>)> {
     let (sender, receiver) = mpsc::sync_channel(PLUGIN_QUEUE);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = shutdown.clone();
     let plugin_id = plugin.id.clone();
     let digest = plugin.digest.clone();
     let session_name = session_name.to_owned();
@@ -996,6 +1333,9 @@ fn spawn_worker(
         .name(format!("vvmux-plugin-{plugin_id}"))
         .spawn(move || {
             while let Ok(message) = receiver.recv() {
+                if worker_shutdown.load(Ordering::Acquire) {
+                    break;
+                }
                 match message {
                     WorkerMessage::Invoke(job) => {
                         let result =
@@ -1008,13 +1348,74 @@ fn spawn_worker(
                             break;
                         }
                     }
+                    WorkerMessage::Activate => {
+                        if runtime.activate().is_err() {
+                            let _ = manager.send(Message::RuntimeCrashed {
+                                plugin_id: plugin_id.clone(),
+                                context: None,
+                            });
+                        }
+                    }
+                    WorkerMessage::Event { hook, event } => {
+                        let context = event.context.clone();
+                        if runtime
+                            .on_event(&hook, event, worker_shutdown.clone())
+                            .is_err_and(|error| error.to_string().starts_with("runtime_crashed"))
+                        {
+                            let _ = manager.send(Message::RuntimeCrashed {
+                                plugin_id: plugin_id.clone(),
+                                context: Some(context),
+                            });
+                        }
+                    }
                     WorkerMessage::Shutdown => break,
                 }
             }
             drop(runtime);
             let _ = manager.send(Message::WorkerStopped { plugin_id, digest });
         })?;
-    Ok(sender)
+    Ok((sender, shutdown))
+}
+
+fn activate_session_plugins(
+    registry: &AppliedRegistry,
+    workers: &mut HashMap<String, WorkerHandle>,
+    session_name: &str,
+    session_instance: &str,
+    broker: &HostBroker,
+    manager: &mpsc::SyncSender<Message>,
+) {
+    let plugins = registry
+        .plugins
+        .values()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.activation == Activation::Session
+                && !workers.contains_key(&plugin.id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for plugin in plugins {
+        let Ok((sender, shutdown)) = spawn_worker(
+            plugin.clone(),
+            session_name,
+            session_instance,
+            broker.clone(),
+            manager.clone(),
+        ) else {
+            continue;
+        };
+        let _ = sender.try_send(WorkerMessage::Activate);
+        workers.insert(
+            plugin.id.clone(),
+            WorkerHandle {
+                sender,
+                shutdown,
+                plugin,
+                stopping: false,
+            },
+        );
+    }
 }
 
 fn spawn_registry_load(
@@ -1207,6 +1608,7 @@ fn request_worker_stop_if_drained(
         && !worker.stopping
     {
         worker.stopping = true;
+        worker.shutdown.store(true, Ordering::Release);
         if worker.sender.try_send(WorkerMessage::Shutdown).is_err() {
             // A disconnected worker will have already queued WorkerStopped. A full queue cannot
             // occur after every accounted invocation completed, but leaving the transition set
@@ -1342,10 +1744,10 @@ mod tests {
             .unwrap();
         assert_eq!(lease.token().len(), 64);
         let registered = tokens.lock().unwrap().get(lease.token()).cloned().unwrap();
-        assert_eq!(registered.session_instance, "session-a");
-        assert_eq!(registered.plugin_id, "dev.example");
-        assert_eq!(registered.plugin_instance, "instance-a");
-        assert_eq!(registered.permissions, vec![Permission::PaneRead]);
+        assert_eq!(registered.scope.session_instance, "session-a");
+        assert_eq!(registered.scope.plugin_id, "dev.example");
+        assert_eq!(registered.scope.plugin_instance, "instance-a");
+        assert_eq!(registered.scope.permissions, vec![Permission::PaneRead]);
         let token = lease.token().to_owned();
         drop(lease);
         assert!(!tokens.lock().unwrap().contains_key(&token));
@@ -1357,6 +1759,36 @@ mod tests {
         assert_eq!(MAX_PLUGIN_JOBS, 4);
         assert_eq!(MAX_RETAINED_JOBS, 200);
         assert_eq!(MAX_RETAINED_LOG_BYTES, 256 * 1024);
+    }
+
+    #[test]
+    fn event_hooks_suppress_self_and_stop_at_depth_eight() {
+        let hook = EventHook {
+            on: "pane.screen_changed".into(),
+            handler: Some("screen".into()),
+            command: None,
+            include_self: false,
+            timeout_ms: 10_000,
+        };
+        let mut context = vvmux_plugin_api::InvocationContext {
+            correlation_id: "correlation".into(),
+            causation_id: "cause".into(),
+            causation_depth: 1,
+            source: "plugin:dev.example:instance-a".into(),
+            session_instance: "session-a".into(),
+            pane_id: Some(1),
+            tab_id: Some(1),
+            deadline_unix_ms: 0,
+        };
+        assert!(!hook_accepts_event("dev.example", &hook, &context));
+        assert!(hook_accepts_event("dev.peer", &hook, &context));
+        let include_self = EventHook {
+            include_self: true,
+            ..hook
+        };
+        assert!(hook_accepts_event("dev.example", &include_self, &context));
+        context.causation_depth = 8;
+        assert!(!hook_accepts_event("dev.peer", &include_self, &context));
     }
 
     #[test]
@@ -1376,6 +1808,8 @@ mod tests {
                 hold_on_exit: true,
                 accept_sync_input: false,
             }],
+            activation: Activation::OnDemand,
+            events: Vec::new(),
         };
         let registry = AppliedRegistry {
             generation: 1,

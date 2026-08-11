@@ -16,8 +16,8 @@ use crate::ipc::{
     Action, AutomationError, AutomationMethod, AutomationRequest, AutomationResponse, Axis,
     BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceDescriptor,
     BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey, ClientMessage, Direction,
-    DisplayMetrics, FloatingEditCommand, FloatingEditKind, MouseEvent, MouseKind, ServerMessage,
-    SharedWriter,
+    DisplayMetrics, FloatingEditCommand, FloatingEditKind, MouseEvent, MouseKind,
+    PluginEventEnvelope, ServerMessage, SharedWriter,
 };
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
@@ -64,6 +64,9 @@ const MAX_UNACKNOWLEDGED_FRAMES: u64 = 8;
 const AUTOMATION_RESPONSE_QUEUE: usize = 8;
 const SCREEN_CHANGE_HISTORY: usize = 1024;
 const EXIT_TOMBSTONES: usize = 128;
+const PLUGIN_EVENT_JOURNAL: usize = 1024;
+const PLUGIN_EVENT_SUBSCRIPTIONS: usize = 16;
+const PLUGIN_EVENT_STREAM_QUEUE: usize = 64;
 const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTOMATION_REPLY_LIMIT: usize = 16 * 1024 * 1024;
 /// A `run` command is one shell command line, not a script; this only has to be generous.
@@ -143,6 +146,7 @@ pub enum ActorEvent {
     },
     PluginHostCall {
         scope: crate::plugin_supervisor::RuntimeScope,
+        cause: Option<crate::plugin_supervisor::PluginCause>,
         call: vvmux_plugin_api::HostCall,
         reply: mpsc::SyncSender<Result<serde_json::Value, AutomationError>>,
     },
@@ -156,6 +160,11 @@ pub enum ActorEvent {
     },
     PluginReloaded {
         result: Result<serde_json::Value, AutomationError>,
+    },
+    PluginLifecycle {
+        name: String,
+        payload: serde_json::Value,
+        context: Option<vvmux_plugin_api::InvocationContext>,
     },
     /// A media event is waiting on the dedicated media receiver.
     ///
@@ -191,6 +200,23 @@ struct AutomationResponseJob {
     writer: SharedWriter,
     response: AutomationResponse,
 }
+
+struct PluginEventSubscription {
+    client_id: u64,
+    sender: mpsc::SyncSender<PluginStreamMessage>,
+    cancel: crate::platform::ConnectionCancel,
+}
+
+enum PluginStreamMessage {
+    Response(AutomationResponse),
+    Event(PluginEventEnvelope),
+}
+
+type PendingPluginStateEvent = (
+    serde_json::Value,
+    Option<PaneId>,
+    Option<crate::plugin_supervisor::PluginCause>,
+);
 
 #[derive(Clone)]
 pub struct ActorHandle {
@@ -918,6 +944,15 @@ struct SessionActor {
     automation_inflight: HashMap<u64, HashSet<u64>>,
     pending_actor_work: HashSet<(u64, u64)>,
     plugin_supervisor: Option<crate::plugin_supervisor::PluginSupervisor>,
+    plugin_event_sequence: u64,
+    plugin_event_journal: VecDeque<PluginEventEnvelope>,
+    pending_plugin_state_events: BTreeMap<(String, String), PendingPluginStateEvent>,
+    plugin_event_subscriptions: HashMap<String, PluginEventSubscription>,
+    next_plugin_subscription: u64,
+    active_plugin_cause: Option<crate::plugin_supervisor::PluginCause>,
+    pending_pane_plugin_causes: HashMap<PaneId, crate::plugin_supervisor::PluginCause>,
+    last_plugin_focus: Option<(bool, Option<u64>, Option<PaneId>)>,
+    last_plugin_media_revision: u64,
     automation_waiters: Vec<AutomationWaiter>,
     exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
@@ -1098,6 +1133,15 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         automation_inflight: HashMap::new(),
         pending_actor_work: HashSet::new(),
         plugin_supervisor,
+        plugin_event_sequence: 0,
+        plugin_event_journal: VecDeque::new(),
+        pending_plugin_state_events: BTreeMap::new(),
+        plugin_event_subscriptions: HashMap::new(),
+        next_plugin_subscription: 1,
+        active_plugin_cause: None,
+        pending_pane_plugin_causes: HashMap::new(),
+        last_plugin_focus: None,
+        last_plugin_media_revision: 0,
         automation_waiters: Vec::new(),
         exit_tombstones: VecDeque::new(),
         shutdown: shutdown.clone(),
@@ -1277,6 +1321,8 @@ impl SessionActor {
                     .retain(|(client_id, _)| *client_id != id);
                 self.automation_waiters
                     .retain(|waiter| waiter.reply.client_id != id);
+                self.plugin_event_subscriptions
+                    .retain(|_, subscription| subscription.client_id != id);
                 if self.attached.as_ref().is_some_and(|client| client.id == id) {
                     self.record_media_trace(
                         None,
@@ -1311,6 +1357,7 @@ impl SessionActor {
                 let mut bell = false;
                 let mut input_warning = false;
                 let mut input_closed = false;
+                let mut changed_screen_sequence = None;
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
                     let old_cells = pane.terminal.cells().to_vec();
                     let old_cursor = pane.terminal.cursor();
@@ -1367,6 +1414,7 @@ impl SessionActor {
                         while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
                             pane.screen_changes.pop_front();
                         }
+                        changed_screen_sequence = Some(pane.screen_sequence);
                         self.session_sequence = self.session_sequence.wrapping_add(1);
                     }
                     if let Some(client) = &self.attached {
@@ -1382,6 +1430,21 @@ impl SessionActor {
                     }
                     self.schedule_render();
                 }
+                if let Some(screen_sequence) = changed_screen_sequence {
+                    let pending_cause = self.pending_pane_plugin_causes.remove(&pane_id);
+                    let previous_cause =
+                        std::mem::replace(&mut self.active_plugin_cause, pending_cause);
+                    self.queue_plugin_state_event(
+                        "pane.screen_changed",
+                        pane_id.to_string(),
+                        serde_json::json!({
+                            "pane_id": pane_id,
+                            "screen_sequence": screen_sequence,
+                        }),
+                        Some(pane_id),
+                    );
+                    self.active_plugin_cause = previous_cause;
+                }
                 if input_warning {
                     self.status(&format!("pane {pane_id} input queue is unavailable"));
                 }
@@ -1390,6 +1453,15 @@ impl SessionActor {
                 }
             }
             ActorEvent::PtyExit(pane_id, status) => {
+                self.publish_plugin_event(
+                    "pane.exited",
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "status": status.map(|status| status.code),
+                    }),
+                    Some(pane_id),
+                    None,
+                );
                 // Waiters and the tombstone are recorded whichever way the pane goes: `wait exit`
                 // must resolve for a held pane exactly as it does for one that closes.
                 self.complete_exit_waiters(pane_id, status);
@@ -1457,8 +1529,15 @@ impl SessionActor {
                     self.status(&format!("plugin action {reference} failed: {error}"));
                 }
             }
-            ActorEvent::PluginHostCall { scope, call, reply } => {
+            ActorEvent::PluginHostCall {
+                scope,
+                cause,
+                call,
+                reply,
+            } => {
+                let previous_cause = std::mem::replace(&mut self.active_plugin_cause, cause);
                 let result = self.handle_plugin_host_call(&scope, &call.method, call.params);
+                self.active_plugin_cause = previous_cause;
                 let _ = reply.try_send(result);
             }
             ActorEvent::PluginPaneOpen { launch, reply } => {
@@ -1498,6 +1577,13 @@ impl SessionActor {
                     self.status(&format!("plugin registry reload failed: {}", error.message))
                 }
             },
+            ActorEvent::PluginLifecycle {
+                name,
+                payload,
+                context,
+            } => {
+                self.publish_plugin_event(&name, payload, None, context);
+            }
             // The payload or retained-projection dirty bit is drained by the run loop.
             ActorEvent::MediaReady => {}
             ActorEvent::ConfigChanged => {
@@ -2436,6 +2522,37 @@ impl SessionActor {
                     self.reply_automation_error(target, error);
                 }
             }
+            AutomationMethod::Plugin(crate::ipc::PluginMethod::EventSubscribe {
+                after_sequence,
+            }) => {
+                self.subscribe_plugin_events(target, after_sequence);
+            }
+            AutomationMethod::Plugin(crate::ipc::PluginMethod::EventUnsubscribe {
+                subscription_id,
+            }) => {
+                let removed = self
+                    .plugin_event_subscriptions
+                    .get(&subscription_id)
+                    .is_some_and(|subscription| subscription.client_id == client_id)
+                    && self
+                        .plugin_event_subscriptions
+                        .remove(&subscription_id)
+                        .is_some();
+                if removed {
+                    self.reply_automation(
+                        target,
+                        serde_json::json!({"subscription_id": subscription_id, "subscribed": false}),
+                    );
+                } else {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "scope_denied",
+                            "event subscription is not owned by this client",
+                        ),
+                    );
+                }
+            }
             AutomationMethod::Plugin(crate::ipc::PluginMethod::Reload) => {
                 let Some(supervisor) = self.plugin_supervisor.clone() else {
                     self.reply_automation(
@@ -2660,6 +2777,183 @@ impl SessionActor {
                 error: Some(error),
             },
         );
+    }
+
+    fn subscribe_plugin_events(
+        &mut self,
+        target: AutomationReplyTarget,
+        after_sequence: Option<u64>,
+    ) {
+        if self.plugin_supervisor.is_none() {
+            self.reply_automation_error(target, plugin_disabled_error());
+            return;
+        }
+        if self.plugin_event_subscriptions.len() >= PLUGIN_EVENT_SUBSCRIPTIONS {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("busy", "plugin event subscription limit reached"),
+            );
+            return;
+        }
+        let subscription_id = format!(
+            "{}/events-{:016x}",
+            self.session_instance, self.next_plugin_subscription
+        );
+        self.next_plugin_subscription = self.next_plugin_subscription.wrapping_add(1).max(1);
+        let (sender, receiver) = mpsc::sync_channel(PLUGIN_EVENT_STREAM_QUEUE);
+        let writer = target.writer.clone();
+        let cancel = target.cancel.clone();
+        let stream_subscription_id = subscription_id.clone();
+        if std::thread::Builder::new()
+            .name("vvmux-plugin-event-stream".into())
+            .spawn(move || {
+                while let Ok(message) = receiver.recv() {
+                    let message = match message {
+                        PluginStreamMessage::Response(response) => {
+                            ServerMessage::Automation(response)
+                        }
+                        PluginStreamMessage::Event(envelope) => ServerMessage::PluginEvent {
+                            subscription_id: stream_subscription_id.clone(),
+                            envelope: Box::new(envelope),
+                        },
+                    };
+                    if crate::ipc::send(&writer, &message).is_err() {
+                        cancel.cancel();
+                        break;
+                    }
+                }
+            })
+            .is_err()
+        {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("runtime_unavailable", "could not start event stream"),
+            );
+            return;
+        }
+        self.finish_automation_request(target.client_id, target.request_id);
+        let response = AutomationResponse::success(
+            target.request_id,
+            serde_json::json!({
+                "subscription_id": subscription_id,
+                "after_sequence": after_sequence,
+                "latest_sequence": self.plugin_event_sequence,
+            }),
+        );
+        if sender
+            .try_send(PluginStreamMessage::Response(response))
+            .is_err()
+        {
+            target.cancel.cancel();
+            return;
+        }
+        if let Some(after) = after_sequence {
+            if let Some(first) = self.plugin_event_journal.front().and_then(event_sequence)
+                && after.saturating_add(1) < first
+            {
+                let _ = sender.try_send(PluginStreamMessage::Event(PluginEventEnvelope::Gap {
+                    from_sequence: after.saturating_add(1),
+                    to_sequence: first.saturating_sub(1),
+                }));
+            }
+            for envelope in self.plugin_event_journal.iter().filter(|envelope| {
+                event_sequence(envelope).is_some_and(|sequence| sequence > after)
+            }) {
+                if sender
+                    .try_send(PluginStreamMessage::Event(envelope.clone()))
+                    .is_err()
+                {
+                    target.cancel.cancel();
+                    return;
+                }
+            }
+        }
+        self.plugin_event_subscriptions.insert(
+            subscription_id,
+            PluginEventSubscription {
+                client_id: target.client_id,
+                sender,
+                cancel: target.cancel,
+            },
+        );
+    }
+
+    fn queue_plugin_state_event(
+        &mut self,
+        name: &str,
+        key: String,
+        payload: serde_json::Value,
+        pane_id: Option<PaneId>,
+    ) {
+        self.pending_plugin_state_events.insert(
+            (name.to_owned(), key),
+            (payload, pane_id, self.active_plugin_cause.clone()),
+        );
+    }
+
+    fn flush_plugin_state_events(&mut self) {
+        let events = std::mem::take(&mut self.pending_plugin_state_events);
+        for ((name, _), (payload, pane_id, cause)) in events {
+            let previous_cause = std::mem::replace(&mut self.active_plugin_cause, cause);
+            self.publish_plugin_event(&name, payload, pane_id, None);
+            self.active_plugin_cause = previous_cause;
+        }
+    }
+
+    fn publish_plugin_event(
+        &mut self,
+        name: &str,
+        payload: serde_json::Value,
+        pane_id: Option<PaneId>,
+        context: Option<vvmux_plugin_api::InvocationContext>,
+    ) {
+        self.plugin_event_sequence = self.plugin_event_sequence.saturating_add(1);
+        let sequence = self.plugin_event_sequence;
+        let cause = self.active_plugin_cause.clone();
+        let context = context.unwrap_or_else(|| vvmux_plugin_api::InvocationContext {
+            correlation_id: cause.as_ref().map_or_else(
+                || format!("{}-event-{sequence:016x}", self.session_instance),
+                |cause| cause.correlation_id.clone(),
+            ),
+            causation_id: cause.as_ref().map_or_else(
+                || format!("{}-event-{sequence:016x}", self.session_instance),
+                |cause| cause.causation_id.clone(),
+            ),
+            causation_depth: cause.as_ref().map_or(0, |cause| cause.causation_depth),
+            source: cause.map_or_else(|| "session".into(), |cause| cause.source),
+            session_instance: self.session_instance.clone(),
+            pane_id,
+            tab_id: pane_id.and_then(|pane_id| {
+                self.tabs
+                    .iter()
+                    .find(|tab| tab.contains(pane_id))
+                    .map(|tab| tab.id)
+            }),
+            deadline_unix_ms: 0,
+        });
+        let envelope = PluginEventEnvelope::Event {
+            sequence,
+            name: name.to_owned(),
+            payload,
+            context,
+        };
+        self.plugin_event_journal.push_back(envelope.clone());
+        while self.plugin_event_journal.len() > PLUGIN_EVENT_JOURNAL {
+            self.plugin_event_journal.pop_front();
+        }
+        self.plugin_event_subscriptions.retain(|_, subscription| {
+            let sent = subscription
+                .sender
+                .try_send(PluginStreamMessage::Event(envelope.clone()))
+                .is_ok();
+            if !sent {
+                subscription.cancel.cancel();
+            }
+            sent
+        });
+        if let Some(supervisor) = &self.plugin_supervisor {
+            supervisor.publish_event(envelope);
+        }
     }
 
     fn send_automation_response(
@@ -3477,7 +3771,17 @@ impl SessionActor {
         while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
             pane.screen_changes.pop_front();
         }
+        let screen_sequence = pane.screen_sequence;
         self.session_sequence = self.session_sequence.wrapping_add(1);
+        self.queue_plugin_state_event(
+            "pane.screen_changed",
+            pane_id.to_string(),
+            serde_json::json!({
+                "pane_id": pane_id,
+                "screen_sequence": screen_sequence,
+            }),
+            Some(pane_id),
+        );
     }
 
     fn refresh_agent_detector_targets(&self) {
@@ -4323,6 +4627,9 @@ impl SessionActor {
                 pane.input.send(&bytes).map_err(|error| {
                     AutomationError::new("runtime_unavailable", error.to_string())
                 })?;
+                if let Some(cause) = self.active_plugin_cause.clone() {
+                    self.pending_pane_plugin_causes.insert(pane_id, cause);
+                }
                 Ok(serde_json::Value::Null)
             }
             SessionCommand::OpenPluginPane { launch } => {
@@ -5294,6 +5601,12 @@ impl SessionActor {
             },
         );
         self.refresh_agent_detector_targets();
+        self.publish_plugin_event(
+            "pane.opened",
+            serde_json::json!({"pane_id": pane_id, "tab_id": tab_id}),
+            Some(pane_id),
+            None,
+        );
         Ok(())
     }
 
@@ -5307,6 +5620,11 @@ impl SessionActor {
             // but restores the entry rectangle.
             self.end_float_mode(modal.pane != pane_id);
         }
+        let tab_id = self
+            .tabs
+            .iter()
+            .find(|tab| tab.contains(pane_id))
+            .map(|tab| tab.id);
         if let Some(pane) = self.panes.remove(&pane_id) {
             pane.control.terminate();
         }
@@ -5336,6 +5654,12 @@ impl SessionActor {
         }
         self.force_full = true;
         self.relayout();
+        self.publish_plugin_event(
+            "pane.closed",
+            serde_json::json!({"pane_id": pane_id, "tab_id": tab_id}),
+            Some(pane_id),
+            None,
+        );
     }
 
     fn close_plugin_panes(&mut self, plugin_id: &str, package_digest: &str) {
@@ -5407,6 +5731,9 @@ impl SessionActor {
         self.close_all_plugin_panes();
         if let Some(supervisor) = self.plugin_supervisor.take() {
             supervisor.shutdown();
+        }
+        for (_, subscription) in self.plugin_event_subscriptions.drain() {
+            subscription.cancel.cancel();
         }
     }
 
@@ -5516,6 +5843,12 @@ impl SessionActor {
             self.force_full = true;
             self.schedule_render();
         }
+        self.queue_plugin_state_event(
+            "config.changed",
+            "config".into(),
+            serde_json::json!({"path": report.path}),
+            None,
+        );
         Ok(report)
     }
 
@@ -5524,6 +5857,12 @@ impl SessionActor {
         self.layout_revision = self.layout_revision.wrapping_add(1);
         self.session_sequence = self.session_sequence.wrapping_add(1);
         self.resize_all();
+        self.queue_plugin_state_event(
+            "layout.changed",
+            "layout".into(),
+            serde_json::json!({"layout_revision": self.layout_revision}),
+            None,
+        );
         self.schedule_render();
     }
 
@@ -5602,6 +5941,7 @@ impl SessionActor {
     }
 
     fn render(&mut self) {
+        self.flush_plugin_state_events();
         // Frames the client has queued but not yet displayed. Producing more of them cannot make
         // the terminal any more current, and the extra bytes compete with media on the same
         // connection, so hold off and keep the render pending.
@@ -5876,6 +6216,17 @@ impl SessionActor {
         force: bool,
         live_delivery_source: Option<crate::media::SourceKey>,
     ) {
+        let media_revision = self.vivid.revision();
+        if media_revision != self.last_plugin_media_revision {
+            self.last_plugin_media_revision = media_revision;
+            self.queue_plugin_state_event(
+                "media.changed",
+                "media".into(),
+                serde_json::json!({"media_revision": media_revision}),
+                None,
+            );
+            self.schedule_render();
+        }
         let Some(client) = &self.attached else {
             self.pending_media_projections.clear();
             self.record_projection_sources(&HashSet::new(), self.vivid.revision());
@@ -6366,6 +6717,30 @@ impl SessionActor {
         for (pane_id, failure) in failures {
             self.report_input_failure(pane_id, Some(failure));
         }
+        let focus_state = (
+            self.client_focused && self.attached.is_some(),
+            focused.and_then(|pane_id| {
+                self.tabs
+                    .iter()
+                    .find(|tab| tab.contains(pane_id))
+                    .map(|tab| tab.id)
+            }),
+            focused,
+        );
+        if self.last_plugin_focus != Some(focus_state) {
+            self.last_plugin_focus = Some(focus_state);
+            self.queue_plugin_state_event(
+                "focus.changed",
+                "focus".into(),
+                serde_json::json!({
+                    "client_focused": focus_state.0,
+                    "tab_id": focus_state.1,
+                    "pane_id": focus_state.2,
+                }),
+                focus_state.2,
+            );
+            self.schedule_render();
+        }
     }
 
     /// Mirror the focused pane's Kitty keyboard and SGR-Pixels modes into the attached host
@@ -6763,6 +7138,13 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
     )
 }
 
+fn event_sequence(envelope: &PluginEventEnvelope) -> Option<u64> {
+    match envelope {
+        PluginEventEnvelope::Event { sequence, .. } => Some(*sequence),
+        PluginEventEnvelope::Gap { .. } => None,
+    }
+}
+
 fn validate_automation_method(method: &AutomationMethod) -> Result<(), AutomationError> {
     let input = match method {
         AutomationMethod::Typing { text } | AutomationMethod::Paste { text } => Some(text.len()),
@@ -6825,6 +7207,11 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
             "invalid_params",
             "plugin job ID is invalid",
         )),
+        AutomationMethod::Plugin(crate::ipc::PluginMethod::EventUnsubscribe {
+            subscription_id,
+        }) if subscription_id.is_empty() || subscription_id.len() > 256 => Err(
+            AutomationError::new("invalid_params", "plugin event subscription ID is invalid"),
+        ),
         AutomationMethod::Run { command, .. } if command.len() > MAX_RUN_COMMAND_BYTES => Err(
             AutomationError::new("limit_exceeded", "command exceeds 64 KiB"),
         ),
@@ -6971,7 +7358,7 @@ fn disabled_plugin_capabilities(session_instance: &str) -> serde_json::Value {
         "protocol_version": vvmux_plugin_api::PROTOCOL_VERSION,
         "session_instance": session_instance,
         "applied_generation": null,
-        "methods": ["catalog", "invoke", "job_status", "job_cancel", "job_logs", "pane_open", "reload"],
+        "methods": ["catalog", "invoke", "job_status", "job_cancel", "job_logs", "pane_open", "event_subscribe", "event_unsubscribe", "reload"],
         "native_trust": "full_user_authority",
         "component_sandbox": true,
         "enforceable_capabilities": plugin_enforceable_capabilities(),
@@ -7071,7 +7458,7 @@ fn authorize_session_scope(
     }
 }
 
-pub(crate) fn plugin_enforceable_permissions() -> [vvmux_plugin_api::Permission; 7] {
+pub(crate) fn plugin_enforceable_permissions() -> [vvmux_plugin_api::Permission; 8] {
     use vvmux_plugin_api::Permission;
     [
         Permission::SessionRead,
@@ -7080,6 +7467,7 @@ pub(crate) fn plugin_enforceable_permissions() -> [vvmux_plugin_api::Permission;
         Permission::PaneCreate,
         Permission::PaneManageOwn,
         Permission::PaneManageAny,
+        Permission::EventsSubscribe,
         Permission::MediaProduce,
     ]
 }
@@ -8343,6 +8731,7 @@ mod tests {
                 "pane.create",
                 "pane.manage_own",
                 "pane.manage_any",
+                "events.subscribe",
                 "media.produce",
             ]
         );

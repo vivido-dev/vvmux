@@ -1,4 +1,6 @@
 import io
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -7,6 +9,7 @@ from vvmux_plugin import (
     NativeHost,
     ProtocolError,
     read_frame,
+    serve_with_events,
     write_frame,
 )
 
@@ -43,3 +46,37 @@ def test_native_host_emits_and_correlates_broker_call() -> None:
         "method": "session.inspect",
         "params": {},
     }
+
+
+def test_service_dispatches_event_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    incoming = io.BytesIO()
+    write_frame(incoming, {"type": "initialize", "request_id": 1})
+    write_frame(
+        incoming,
+        {
+            "type": "event",
+            "request_id": 2,
+            "sequence": 7,
+            "name": "pane-exited",
+            "payload": {"pane_id": 3},
+            "context": {"causation_depth": 1},
+        },
+    )
+    write_frame(incoming, {"type": "shutdown", "request_id": 3})
+    incoming.seek(0)
+    outgoing = io.BytesIO()
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=incoming))
+    monkeypatch.setattr(sys, "stdout", SimpleNamespace(buffer=outgoing))
+    seen: list[tuple[str, object, dict[str, object]]] = []
+    serve_with_events(
+        "dev.events",
+        "instance-a",
+        lambda _action, _value, _context: {},
+        lambda name, value, context: seen.append((name, value, context)),
+    )
+    outgoing.seek(0)
+    assert read_frame(outgoing)["type"] == "hello"
+    assert read_frame(outgoing) == {"type": "ready", "request_id": 1}
+    assert read_frame(outgoing) == {"type": "ready", "request_id": 2}
+    assert read_frame(outgoing) == {"type": "ready", "request_id": 3}
+    assert seen == [("pane-exited", {"pane_id": 3}, {"causation_depth": 1})]

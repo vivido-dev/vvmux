@@ -149,6 +149,16 @@ pane-scoped Vivid capability; held exit revokes it before displaying a core diag
 change, disable, removal, kill switch, and shutdown reuse the ordinary pane close path, so teardown
 never matches only a numeric pane ID.
 
+The actor also owns the monotonic plugin-event sequence and a bounded metadata-only replay journal.
+Screen, layout, focus, configuration, and media revisions coalesce at the existing render boundary;
+pane and plugin lifecycle entries remain individually ordered. Persistent VVMX subscribers use a
+dedicated bounded writer and consume neither automation-waiter nor job slots. The actor only uses
+`try_send` toward subscribers and the supervisor, so a stalled client or runtime cannot delay PTY,
+render, or media work; overflow becomes an explicit sequence gap. The supervisor permission-checks
+manifest hooks, activates `session` runtimes, and dispatches native protocol events or Component
+`on-event` calls on bounded per-plugin workers. Broker-triggered mutations retain correlation and
+causation identity, hooks exclude self-caused events by default, and dispatch stops at depth eight.
+
 The Rust SDK owns the guest-side WIT bindings used to build `wasm32-wasip2` Components. Component
 invocations reset a private log accumulator before entering guest code; host log imports sanitize
 line breaks, serialize bounded JSON entries, and retain explicit truncation metadata with detached

@@ -13,14 +13,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use vvmux_plugin_api::{
-    ErrorCode, Hello, HostCallResult, Invocation, InvocationContext, LoadedManifest, NativeMessage,
-    NativeReply, PROTOCOL_VERSION, Permission, PluginError, RuntimeKind, read_frame, write_frame,
+    Activation, ErrorCode, Event, EventHook, Hello, HostCallResult, Invocation, InvocationContext,
+    LoadedManifest, NativeMessage, NativeReply, PROTOCOL_VERSION, Permission, PluginError,
+    RuntimeKind, read_frame, write_frame,
 };
 
 const REGISTRY_SCHEMA: u16 = 1;
 const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
 const MAX_ACTION_OUTPUT: usize = 1024 * 1024;
 const MAX_LOG_OUTPUT: usize = 256 * 1024;
+
+fn known_plugin_event(name: &str) -> bool {
+    matches!(
+        name,
+        "pane.opened"
+            | "pane.exited"
+            | "pane.closed"
+            | "pane.screen_changed"
+            | "layout.changed"
+            | "focus.changed"
+            | "config.changed"
+            | "media.changed"
+            | "plugin.job_completed"
+            | "plugin.runtime_crashed"
+    )
+}
 
 #[derive(Debug, Subcommand)]
 pub enum PluginCommand {
@@ -83,6 +100,13 @@ pub enum PluginCommand {
     Pane {
         #[command(subcommand)]
         command: PluginPaneCommand,
+    },
+    /// Stream bounded, sanitized session plugin events as newline-delimited JSON.
+    Events {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        after: Option<u64>,
     },
     /// Verify dependency constraints and write the reproducible lock.
     Resolve {
@@ -194,7 +218,7 @@ struct PluginPaths {
     lock: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RuntimePlugin {
     pub(crate) id: String,
     pub(crate) root: PathBuf,
@@ -203,6 +227,8 @@ pub(crate) struct RuntimePlugin {
     pub(crate) enabled: bool,
     pub(crate) permissions: Vec<Permission>,
     pub(crate) panes: Vec<vvmux_plugin_api::Pane>,
+    pub(crate) activation: Activation,
+    pub(crate) events: Vec<EventHook>,
 }
 
 #[derive(Debug)]
@@ -241,6 +267,7 @@ pub fn run(command: PluginCommand) -> io::Result<()> {
         PluginCommand::Invoke(args) => invoke(&paths, args),
         PluginCommand::Job { command } => job(command),
         PluginCommand::Pane { command } => pane(command),
+        PluginCommand::Events { target, after } => events(&target, after),
         PluginCommand::Resolve { frozen } => resolve(&paths, frozen),
     }
 }
@@ -299,6 +326,8 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
                     enabled: false,
                     permissions: Vec::new(),
                     panes: Vec::new(),
+                    activation: Activation::OnDemand,
+                    events: Vec::new(),
                 },
             );
             continue;
@@ -367,6 +396,18 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
                     enabled: true,
                     permissions: runtime_permissions,
                     panes: loaded.manifest.panes.clone(),
+                    activation: loaded
+                        .manifest
+                        .runtime
+                        .as_ref()
+                        .map_or(Activation::OnDemand, |runtime| runtime.activation),
+                    events: loaded
+                        .manifest
+                        .events
+                        .iter()
+                        .filter(|hook| known_plugin_event(&hook.on))
+                        .cloned()
+                        .collect(),
                 },
                 actions,
             ))
@@ -959,6 +1000,40 @@ fn pane(command: PluginPaneCommand) -> io::Result<()> {
     print_json(&plugin_session_request(&target, operation)?)
 }
 
+fn events(target: &str, after_sequence: Option<u64>) -> io::Result<()> {
+    use crate::ipc::{
+        AutomationMethod, AutomationRequest, ClientMessage, PluginMethod, ServerMessage,
+    };
+
+    crate::runtime::validate_session_name(target)?;
+    let (mut reader, writer) = crate::server::connect(target)?;
+    writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .send(&ClientMessage::Automation(AutomationRequest {
+            id: 1,
+            pane_id: None,
+            allow_focused: false,
+            method: AutomationMethod::Plugin(PluginMethod::EventSubscribe { after_sequence }),
+        }))?;
+    let mut subscribed = false;
+    loop {
+        match reader.recv_server()? {
+            ServerMessage::Automation(response) if response.id == 1 => {
+                crate::automation::response_result(response)?;
+                subscribed = true;
+            }
+            ServerMessage::PluginEvent { envelope, .. } if subscribed => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&envelope).map_err(io::Error::other)?
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 fn job_target(job_id: &str) -> io::Result<&str> {
     let (target, _) = job_id
         .split_once('/')
@@ -1213,6 +1288,125 @@ impl SessionPluginRuntime {
         Ok(output)
     }
 
+    pub(crate) fn activate(&mut self) -> io::Result<()> {
+        let Some(runtime) = self.loaded.manifest.runtime.clone() else {
+            return Ok(());
+        };
+        let timeout = Duration::from_secs(10);
+        match runtime.kind {
+            RuntimeKind::Process if self.service.is_none() => {
+                self.service = Some(NativeService::start(
+                    &self.loaded.root,
+                    runtime.command.as_deref().unwrap(),
+                    timeout,
+                    NativeServiceContext {
+                        plugin_id: &self.plugin.id,
+                        session: Some(&self.session_name),
+                        session_instance: &self.session_instance,
+                        broker: Some(&self.broker),
+                        permissions: &self.loaded.manifest.plugin.permissions,
+                    },
+                )?);
+            }
+            RuntimeKind::Component if self.component.is_none() => {
+                let deadline = Instant::now() + timeout;
+                self.component = Some(crate::plugin_component::ComponentRuntime::start(
+                    &self.loaded.root,
+                    runtime.artifact.as_deref().unwrap(),
+                    &self.plugin.id,
+                    Some(&self.session_instance),
+                    Some(&self.broker),
+                    &self.loaded.manifest.plugin.permissions,
+                    &runtime.preopens,
+                    Arc::new(AtomicBool::new(false)),
+                    deadline,
+                )?);
+            }
+            RuntimeKind::Process | RuntimeKind::Component => {}
+        }
+        self.consecutive_crashes = 0;
+        self.retry_at = None;
+        Ok(())
+    }
+
+    pub(crate) fn on_event(
+        &mut self,
+        hook: &EventHook,
+        event: Event,
+        cancel: Arc<AtomicBool>,
+    ) -> io::Result<()> {
+        self.last_logs = RuntimeLogs::default();
+        let timeout = Duration::from_millis(hook.timeout_ms);
+        if cancel.load(Ordering::Acquire) {
+            return Err(invalid("cancelled: plugin event was cancelled"));
+        }
+        if let Some(argv) = hook.command.as_deref() {
+            let input = serde_json::to_value(&event).map_err(io::Error::other)?;
+            let _ = run_one_shot(
+                &self.loaded.root,
+                argv,
+                &input,
+                timeout,
+                OneShotContext {
+                    session: Some(&self.session_name),
+                    plugin_id: &self.plugin.id,
+                    cancel: Some(&cancel),
+                    session_instance: Some(&self.session_instance),
+                },
+            )?;
+            return Ok(());
+        }
+        let handler = hook
+            .handler
+            .as_deref()
+            .ok_or_else(|| invalid("runtime_unavailable: event hook has no handler"))?;
+        self.activate()?;
+        match self
+            .loaded
+            .manifest
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.kind)
+        {
+            Some(RuntimeKind::Process) => {
+                let result = self
+                    .service
+                    .as_mut()
+                    .expect("activation starts native service")
+                    .on_event(handler, event, timeout, &cancel);
+                if !self.service.as_ref().unwrap().healthy {
+                    self.service.take();
+                    self.note_crash();
+                }
+                result
+            }
+            Some(RuntimeKind::Component) => {
+                let deadline = Instant::now() + timeout;
+                let payload = serde_json::json!({
+                    "event": event.name,
+                    "sequence": event.sequence,
+                    "payload": event.payload,
+                });
+                let result = self
+                    .component
+                    .as_mut()
+                    .expect("activation starts component")
+                    .on_event(handler, &payload, &event.context, cancel, deadline);
+                let (stderr, stderr_truncated) = self.component.as_mut().unwrap().take_logs();
+                self.last_logs = RuntimeLogs {
+                    stderr,
+                    stderr_truncated,
+                };
+                if result.is_err() {
+                    self.component.take();
+                    self.note_crash();
+                }
+                result
+            }
+            None => Err(invalid("runtime_unavailable: event handler has no runtime")),
+        }
+    }
+
     pub(crate) fn take_logs(&mut self) -> RuntimeLogs {
         std::mem::take(&mut self.last_logs)
     }
@@ -1421,6 +1615,98 @@ impl NativeService {
                     self.healthy = false;
                     return Err(invalid("runtime_crashed: native plugin protocol closed"));
                 }
+            }
+        }
+    }
+
+    fn on_event(
+        &mut self,
+        handler: &str,
+        mut event: Event,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        if !self.healthy || self.child.try_wait()?.is_some() {
+            self.healthy = false;
+            return Err(invalid("runtime_crashed: native plugin process exited"));
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(2);
+        event.request_id = request_id;
+        event.payload = serde_json::json!({
+            "event": event.name,
+            "payload": event.payload,
+        });
+        event.name = handler.to_owned();
+        let _cause = self
+            .broker_lease
+            .as_ref()
+            .map(|lease| lease.enter_event(&event.context));
+        self.write(&NativeMessage::Event(event))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                let _ = self.cancel(request_id, "cancelled: plugin event was cancelled");
+                return Err(invalid("cancelled: plugin event was cancelled"));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = self.cancel(request_id, "timeout: plugin event exceeded its deadline");
+                return Err(invalid("timeout: plugin event exceeded its deadline"));
+            }
+            match self
+                .receiver
+                .recv_timeout(remaining.min(Duration::from_millis(20)))
+            {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.healthy = false;
+                    return Err(invalid("runtime_crashed: native plugin protocol closed"));
+                }
+                Ok(Err(error)) => {
+                    self.healthy = false;
+                    return Err(error);
+                }
+                Ok(Ok(reply)) => match reply {
+                    NativeReply::Ready {
+                        request_id: reply_id,
+                    } if reply_id == request_id => return Ok(()),
+                    NativeReply::Error(error) if error.request_id == request_id => {
+                        return Err(invalid(format!(
+                            "{}: {}",
+                            serde_json::to_value(error.code).unwrap().as_str().unwrap(),
+                            error.message
+                        )));
+                    }
+                    NativeReply::HostCall(call) => {
+                        let host_request_id = call.request_id;
+                        let reply = match &self.broker_lease {
+                            Some(lease) => match lease.call(call, deadline) {
+                                Ok(result) => NativeMessage::HostCallResult(HostCallResult {
+                                    request_id: host_request_id,
+                                    result,
+                                }),
+                                Err(error) => NativeMessage::HostCallError(plugin_error_from_io(
+                                    host_request_id,
+                                    &error,
+                                )),
+                            },
+                            None => NativeMessage::HostCallError(PluginError {
+                                request_id: host_request_id,
+                                code: ErrorCode::CapabilityDenied,
+                                message: "host calls require a live session plugin supervisor"
+                                    .into(),
+                            }),
+                        };
+                        self.write(&reply)?;
+                    }
+                    _ => {
+                        self.healthy = false;
+                        return Err(invalid(
+                            "protocol_error: unexpected native plugin event reply",
+                        ));
+                    }
+                },
             }
         }
     }

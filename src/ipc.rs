@@ -194,7 +194,28 @@ pub enum PluginMethod {
     PaneOpen {
         reference: String,
     },
+    EventSubscribe {
+        after_sequence: Option<u64>,
+    },
+    EventUnsubscribe {
+        subscription_id: String,
+    },
     Reload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginEventEnvelope {
+    Event {
+        sequence: u64,
+        name: String,
+        payload: Value,
+        context: vvmux_plugin_api::InvocationContext,
+    },
+    Gap {
+        from_sequence: u64,
+        to_sequence: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -486,6 +507,10 @@ pub enum ServerMessage {
         index: u32,
         last: bool,
         base64: String,
+    },
+    PluginEvent {
+        subscription_id: String,
+        envelope: Box<PluginEventEnvelope>,
     },
     /// Kitty keyboard flags requested by the focused pane. The native client applies these to
     /// its host terminal so key encodings survive a nested terminal boundary.
@@ -975,6 +1000,25 @@ mod tests {
             serde_json::from_value::<PluginMethod>(encoded).unwrap(),
             method
         );
+    }
+
+    #[test]
+    fn plugin_event_subscription_and_gap_are_typed_vvmx_operations() {
+        let method = PluginMethod::EventSubscribe {
+            after_sequence: Some(41),
+        };
+        let encoded = serde_json::to_value(&method).unwrap();
+        assert_eq!(encoded["operation"], "event_subscribe");
+        assert_eq!(encoded["after_sequence"], 41);
+        assert_eq!(
+            serde_json::from_value::<PluginMethod>(encoded).unwrap(),
+            method
+        );
+        let gap = PluginEventEnvelope::Gap {
+            from_sequence: 42,
+            to_sequence: 99,
+        };
+        assert_eq!(serde_json::to_value(&gap).unwrap()["type"], "gap");
     }
 
     #[test]

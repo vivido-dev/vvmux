@@ -208,6 +208,9 @@ fn message_size(message: &ServerMessage) -> usize {
             | ServerMessage::Status(value)
             | ServerMessage::Error(value) => value.len(),
             ServerMessage::Detached { reason } => reason.len(),
+            ServerMessage::PluginEvent { envelope, .. } => {
+                serde_json::to_vec(envelope).map_or(OVERHEAD, |body| body.len())
+            }
             ServerMessage::MediaSnapshot {
                 surfaces,
                 tracks,

@@ -78,6 +78,19 @@ pub fn serve(
     serve_with_host(hello, move |invocation, _host| handler(invocation))
 }
 
+/// Run a native service with serialized action and event handlers.
+pub fn serve_with_events(
+    hello: Hello,
+    mut handler: impl FnMut(Invocation) -> Result<serde_json::Value, PluginError>,
+    mut event_handler: impl FnMut(Event) -> Result<(), PluginError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    serve_with_host_and_events(
+        hello,
+        move |invocation, _host| handler(invocation),
+        move |event, _host| event_handler(event),
+    )
+}
+
 /// A scoped client for brokered calls back into the owning vvmux session.
 pub struct NativeHost<'a> {
     reader: &'a mut dyn Read,
@@ -128,7 +141,16 @@ impl NativeHost<'_> {
 /// Serve serialized invocations whose handlers may make brokered host calls.
 pub fn serve_with_host(
     hello: Hello,
+    handler: impl FnMut(Invocation, &mut NativeHost<'_>) -> Result<serde_json::Value, PluginError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    serve_with_host_and_events(hello, handler, |_event, _host| Ok(()))
+}
+
+/// Serve serialized actions and events whose handlers may make brokered host calls.
+pub fn serve_with_host_and_events(
+    hello: Hello,
     mut handler: impl FnMut(Invocation, &mut NativeHost<'_>) -> Result<serde_json::Value, PluginError>,
+    mut event_handler: impl FnMut(Event, &mut NativeHost<'_>) -> Result<(), PluginError>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -153,6 +175,19 @@ pub fn serve_with_host(
                 };
                 write_frame(&mut writer, &reply)?;
             }
+            NativeMessage::Event(event) => {
+                let request_id = event.request_id;
+                let mut host = NativeHost {
+                    reader: &mut reader,
+                    writer: &mut writer,
+                    next_request_id: 1,
+                };
+                let reply = match event_handler(event, &mut host) {
+                    Ok(()) => NativeReply::Ready { request_id },
+                    Err(error) => NativeReply::Error(error),
+                };
+                write_frame(&mut writer, &reply)?;
+            }
             NativeMessage::Cancel { request_id } => {
                 write_frame(&mut writer, &NativeReply::Cancelled { request_id })?;
             }
@@ -161,7 +196,6 @@ pub fn serve_with_host(
                 return Ok(());
             }
             NativeMessage::Hello(_)
-            | NativeMessage::Event(_)
             | NativeMessage::HostCall(_)
             | NativeMessage::HostCallResult(_)
             | NativeMessage::HostCallError(_) => {

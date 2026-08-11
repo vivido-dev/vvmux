@@ -232,7 +232,9 @@ pub fn attach(
                     }
                     ServerMessage::Detached { .. } | ServerMessage::Error(_) => break,
                     ServerMessage::Pong => {}
-                    ServerMessage::Automation(_) | ServerMessage::AutomationChunk { .. } => break,
+                    ServerMessage::Automation(_)
+                    | ServerMessage::AutomationChunk { .. }
+                    | ServerMessage::PluginEvent { .. } => break,
                 }
             }
             output_thread.stop();

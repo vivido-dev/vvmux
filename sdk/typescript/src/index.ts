@@ -89,6 +89,19 @@ export type HostHandler = (
   host: NativeHost,
 ) => unknown | Promise<unknown>;
 
+export type EventHandler = (
+  name: string,
+  payload: unknown,
+  context: Record<string, unknown>,
+) => void | Promise<void>;
+
+export type HostEventHandler = (
+  name: string,
+  payload: unknown,
+  context: Record<string, unknown>,
+  host: NativeHost,
+) => void | Promise<void>;
+
 export async function serve(
   pluginId: string,
   instanceId: string,
@@ -109,6 +122,42 @@ export async function serveWithHost(
   pluginId: string,
   instanceId: string,
   handler: HostHandler,
+  input: Readable = process.stdin,
+  output: Writable = process.stdout,
+): Promise<void> {
+  return serveWithHostAndEvents(
+    pluginId,
+    instanceId,
+    handler,
+    async () => {},
+    input,
+    output,
+  );
+}
+
+export async function serveWithEvents(
+  pluginId: string,
+  instanceId: string,
+  handler: Handler,
+  eventHandler: EventHandler,
+  input: Readable = process.stdin,
+  output: Writable = process.stdout,
+): Promise<void> {
+  return serveWithHostAndEvents(
+    pluginId,
+    instanceId,
+    (action, value, context) => handler(action, value, context),
+    (name, payload, context) => eventHandler(name, payload, context),
+    input,
+    output,
+  );
+}
+
+export async function serveWithHostAndEvents(
+  pluginId: string,
+  instanceId: string,
+  handler: HostHandler,
+  eventHandler: HostEventHandler,
   input: Readable = process.stdin,
   output: Writable = process.stdout,
 ): Promise<void> {
@@ -135,6 +184,24 @@ export async function serveWithHost(
             new NativeHost(input, output),
           );
           await writeFrame(output, { type: "result", request_id: requestId, result });
+        } catch (error) {
+          await writeFrame(output, {
+            type: "error",
+            request_id: requestId,
+            code: error instanceof HostCallError ? error.code : "runtime_crashed",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        break;
+      case "event":
+        try {
+          await eventHandler(
+            message.name as string,
+            message.payload,
+            message.context as Record<string, unknown>,
+            new NativeHost(input, output),
+          );
+          await writeFrame(output, { type: "ready", request_id: requestId });
         } catch (error) {
           await writeFrame(output, {
             type: "error",

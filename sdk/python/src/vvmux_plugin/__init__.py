@@ -102,6 +102,35 @@ def serve_with_host(
 ) -> None:
     """Serve serialized invocations with access to scoped brokered host calls."""
 
+    serve_with_host_and_events(
+        plugin_id, instance_id, handler, lambda _name, _value, _context, _host: None
+    )
+
+
+def serve_with_events(
+    plugin_id: str,
+    instance_id: str,
+    handler: Callable[[str, Any, dict[str, Any]], Any],
+    event_handler: Callable[[str, Any, dict[str, Any]], None],
+) -> None:
+    """Serve serialized invocations and manifest event hooks."""
+
+    serve_with_host_and_events(
+        plugin_id,
+        instance_id,
+        lambda action, value, context, _host: handler(action, value, context),
+        lambda name, value, context, _host: event_handler(name, value, context),
+    )
+
+
+def serve_with_host_and_events(
+    plugin_id: str,
+    instance_id: str,
+    handler: Callable[[str, Any, dict[str, Any], NativeHost], Any],
+    event_handler: Callable[[str, Any, dict[str, Any], NativeHost], None],
+) -> None:
+    """Serve actions and events with access to scoped brokered host calls."""
+
     reader = sys.stdin.buffer
     writer = sys.stdout.buffer
     write_frame(
@@ -144,6 +173,30 @@ def serve_with_host(
                             "message": str(error),
                         },
                     )
+            case "event":
+                try:
+                    host = NativeHost(reader, writer)
+                    event_handler(
+                        str(message["name"]),
+                        message["payload"],
+                        message["context"],
+                        host,
+                    )
+                    write_frame(writer, {"type": "ready", "request_id": request_id})
+                except Exception as error:  # noqa: BLE001 - plugin errors cross as typed data
+                    write_frame(
+                        writer,
+                        {
+                            "type": "error",
+                            "request_id": request_id,
+                            "code": (
+                                error.code
+                                if isinstance(error, HostCallError)
+                                else "runtime_crashed"
+                            ),
+                            "message": str(error),
+                        },
+                    )
             case "cancel":
                 write_frame(writer, {"type": "cancelled", "request_id": request_id})
             case "shutdown":
@@ -161,6 +214,8 @@ __all__ = [
     "ProtocolError",
     "read_frame",
     "serve",
+    "serve_with_events",
     "serve_with_host",
+    "serve_with_host_and_events",
     "write_frame",
 ]
