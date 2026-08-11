@@ -93,6 +93,10 @@ unsafe impl Send for ControlInner {}
 unsafe impl Sync for ControlInner {}
 
 impl PtyControl {
+    pub fn foreground_process_group_id(&self) -> Option<u32> {
+        None
+    }
+
     pub fn resize(&self, columns: u16, rows: u16) -> io::Result<()> {
         if columns == 0 || rows == 0 {
             return Err(io::Error::new(
@@ -299,6 +303,7 @@ pub(super) fn spawn(
     let reader = output_reader.into_file();
     let writer = input_writer.into_file();
     Ok(PtyParts {
+        child_pid: process_info.dwProcessId,
         reader,
         input: input(writer)?,
         control,

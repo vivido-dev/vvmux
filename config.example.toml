@@ -68,6 +68,7 @@ max_connections = 32
 outbound_queue_bytes = 4194304
 
 [keys.prefix]
+a = "agent-navigator"
 S = "toggle-sync-input"
 f = "new-floating-pane"
 F = "toggle-floating-panes"

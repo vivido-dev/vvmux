@@ -1033,6 +1033,9 @@ async fn handle_session_message(
                 },
             )?;
         }
+        // Browser input is already normalized by the web client and does not use the host TTY's
+        // Kitty keyboard encoder.
+        ServerMessage::InputMode { .. } => {}
         ServerMessage::Detached { reason } => {
             writer.send(Frame::Binary(Payload::from_static(TERMINAL_LEAVE)))?;
             send_control(writer, &ServerControl::Detached { reason })?;
@@ -1142,7 +1145,7 @@ fn dispatch_parsed(adapter: &SessionAdapter, parsed: Vec<ParsedInput>) -> io::Re
         let message = match command {
             ParsedInput::Input(bytes) => ClientMessage::Input(bytes),
             ParsedInput::Action(action) => ClientMessage::Action(action),
-            ParsedInput::Mouse(mouse) => ClientMessage::Mouse(mouse),
+            ParsedInput::Mouse(mouse, _) => ClientMessage::Mouse(mouse),
             ParsedInput::Focus(focused) => ClientMessage::Focus(focused),
             ParsedInput::Detach => ClientMessage::Detach,
         };

@@ -122,6 +122,118 @@ done
             .collect::<Vec<_>>(),
         [1, 2, 3, 4]
     );
+    assert!(listed["panes"][0]["agent"].is_null());
+
+    let reported = json(command(
+        binary,
+        &name,
+        &[
+            "report-agent",
+            "--agent",
+            "opencode",
+            "--state",
+            "working",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "1",
+            "--pane-id",
+            "2",
+        ],
+    ));
+    assert_eq!(reported["pane_id"], 2);
+    assert_eq!(reported["agent"]["kind"], "opencode");
+    assert_eq!(reported["agent"]["state"], "working");
+    assert_eq!(reported["agent"]["status"], "working");
+    assert_eq!(reported["agent"]["source"], "report");
+
+    let after_report = json(command(binary, &name, &["list-panes"]));
+    let panes = after_report["panes"].as_array().unwrap();
+    assert!(panes.iter().find(|pane| pane["pane_id"] == 1).unwrap()["agent"].is_null());
+    assert_eq!(
+        panes.iter().find(|pane| pane["pane_id"] == 2).unwrap()["agent"]["status"],
+        "working"
+    );
+    let inspected = json(command(binary, &name, &["inspect", "--pane-id", "2"]));
+    assert_eq!(inspected["pane"]["agent"]["kind"], "opencode");
+    assert_eq!(inspected["pane"]["agent"]["source"], "report");
+
+    let stale_report = command(
+        binary,
+        &name,
+        &[
+            "report-agent",
+            "--agent",
+            "opencode",
+            "--state",
+            "blocked",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "1",
+            "--pane-id",
+            "2",
+        ],
+    );
+    assert!(!stale_report.status.success());
+    assert!(String::from_utf8_lossy(&stale_report.stderr).contains("invalid_agent_report"));
+
+    let done = json(command(
+        binary,
+        &name,
+        &[
+            "report-agent",
+            "--agent",
+            "opencode",
+            "--state",
+            "idle",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "2",
+            "--pane-id",
+            "2",
+        ],
+    ));
+    assert_eq!(done["agent"]["state"], "idle");
+    assert_eq!(done["agent"]["status"], "done");
+
+    assert_success(&command(
+        binary,
+        &name,
+        &[
+            "clear-agent-report",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "3",
+            "--pane-id",
+            "2",
+        ],
+    ));
+
+    let missing_target = Command::new(binary)
+        .args([
+            "msg",
+            "--target",
+            &name,
+            "report-agent",
+            "--agent",
+            "codex",
+            "--state",
+            "idle",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "1",
+        ])
+        .env_remove("VVMUX_SESSION")
+        .env_remove("VVMUX_PANE_ID")
+        .output()
+        .unwrap();
+    assert!(!missing_target.status.success());
+    assert!(String::from_utf8_lossy(&missing_target.stderr).contains("requires --pane-id"));
+
     let focused = text(command(binary, &name, &["get-text"]));
     assert!(focused.contains("READY pane=4 tab=1"));
     let inherited = Command::new(binary)

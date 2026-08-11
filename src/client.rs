@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 
 #[cfg(test)]
 use crate::client_input::parse_configured_action;
-use crate::client_input::{self, FloatEditScanner, ParsedInput, PrefixParser};
+use crate::client_input::{self, FloatEditScanner, MouseCoordinates, ParsedInput, PrefixParser};
 #[cfg(all(test, unix))]
 use crate::ipc::DisplayMetrics;
 #[cfg(test)]
@@ -76,6 +76,7 @@ pub fn attach(
     // Authoritative float-edit mode state travels from the reader thread to the input loop
     // through this bounded channel; edit keys are parsed only while a confirmed mode is active.
     let (mode_sender, mode_receiver) = mpsc::sync_channel::<(u64, bool)>(8);
+    let (input_mode_sender, input_mode_receiver) = mpsc::sync_channel::<(u8, MouseCoordinates)>(8);
     let output = terminal.output()?;
     let output = Arc::new(Mutex::new(output));
     let output_thread = TerminalOutput::spawn(output, writer.clone())?;
@@ -211,6 +212,24 @@ pub fn attach(
                         // stale edit mode.
                         let _ = mode_sender.send((mode_id, pane.is_some()));
                     }
+                    ServerMessage::InputMode {
+                        keyboard_flags,
+                        sgr_pixels,
+                    } => {
+                        // Apply the mode to the host before accepting its new encoding. The input
+                        // parser understands Kitty reports as vvmux prefix chords while passing
+                        // every non-command report through byte-for-byte to the pane.
+                        let pixel_mode = if sgr_pixels { 'h' } else { 'l' };
+                        output_thread.enqueue_control(
+                            format!("\x1b[={keyboard_flags}u\x1b[?1016{pixel_mode}").into_bytes(),
+                        );
+                        let coordinates = if sgr_pixels {
+                            MouseCoordinates::Pixels
+                        } else {
+                            MouseCoordinates::Cells
+                        };
+                        let _ = input_mode_sender.send((keyboard_flags, coordinates));
+                    }
                     ServerMessage::Detached { .. } | ServerMessage::Error(_) => break,
                     ServerMessage::Pong => {}
                     ServerMessage::Automation(_) | ServerMessage::AutomationChunk { .. } => break,
@@ -330,6 +349,10 @@ pub fn attach(
                     }
                 }
             }
+            while let Ok((flags, coordinates)) = input_mode_receiver.try_recv() {
+                parser.set_keyboard_flags(flags);
+                parser.set_mouse_coordinates(coordinates);
+            }
             let mut bytes = [0_u8; 4096];
             // A held bare Escape has to reach the pane on its own timescale, not on the idle poll
             // interval, or a modal editor appears to swallow the first press.
@@ -370,8 +393,12 @@ pub fn attach(
                         ParsedInput::Action(action) => {
                             send_client(&writer, &ClientMessage::Action(action))?
                         }
-                        ParsedInput::Mouse(mouse) => {
-                            send_client(&writer, &ClientMessage::Mouse(mouse))?
+                        ParsedInput::Mouse(mouse, coordinates) => {
+                            let message = match coordinates {
+                                MouseCoordinates::Cells => ClientMessage::Mouse(mouse),
+                                MouseCoordinates::Pixels => ClientMessage::PixelMouse(mouse),
+                            };
+                            send_client(&writer, &message)?
                         }
                         ParsedInput::Focus(focused) => {
                             send_client(&writer, &ClientMessage::Focus(focused))?
@@ -1377,7 +1404,7 @@ fn recreated_source_keys(
                 || previous
                     .iter()
                     .find(|old| old.key == source.key)
-                    .is_none_or(|old| old.kind != source.kind)
+                    .is_none_or(|old| old.kind != source.kind || old.live != source.live)
         })
         .map(|source| source.key)
         .collect::<HashSet<_>>();
@@ -1413,9 +1440,11 @@ fn compare_projection(
             .all(|previous| current_surfaces.contains(previous));
     let sources_unchanged = previous_sources.len() == current_sources.len()
         && previous_sources.iter().all(|previous| {
-            current_sources
-                .iter()
-                .any(|current| previous.key == current.key && previous.kind == current.kind)
+            current_sources.iter().any(|current| {
+                previous.key == current.key
+                    && previous.kind == current.kind
+                    && previous.live == current.live
+            })
         });
     if !surfaces_unchanged || !sources_unchanged {
         return ProjectionChange::Sources;
@@ -1567,7 +1596,7 @@ fn recreated_playing_video_sources(
                 && previous
                     .iter()
                     .find(|old| old.key == source.key)
-                    .is_none_or(|old| old.kind != source.kind)
+                    .is_none_or(|old| old.kind != source.kind || old.live != source.live)
         })
         .map(|source| source.key)
         .collect()
@@ -2107,6 +2136,8 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1024,
             },
+            live: false,
+            active: true,
             audio_gain: None,
             capture_policy: 0,
             descriptor: None,
@@ -2182,13 +2213,16 @@ mod tests {
         let commands = parser.feed(b"\x1b[<68;12;7M");
         assert!(matches!(
             commands.as_slice(),
-            [ParsedInput::Mouse(MouseEvent {
-                button: 0,
-                x: 11,
-                y: 6,
-                kind: MouseKind::Wheel,
-                shift: true,
-            })]
+            [ParsedInput::Mouse(
+                MouseEvent {
+                    button: 0,
+                    x: 11,
+                    y: 6,
+                    kind: MouseKind::Wheel,
+                    shift: true,
+                },
+                MouseCoordinates::Cells
+            )]
         ));
     }
 
@@ -2212,6 +2246,7 @@ mod tests {
             (b"\x02P", Action::TogglePanePinned),
             (b"\x02m", Action::EnterFloatingMoveMode),
             (b"\x02r", Action::EnterFloatingResizeMode),
+            (b"\x02a", Action::ToggleAgentNavigator),
         ] {
             let commands = parser.feed(byte);
             assert_eq!(commands.len(), 1, "one action per chord");
@@ -2230,6 +2265,7 @@ mod tests {
             "toggle-pane-pinned",
             "enter-floating-move-mode",
             "enter-floating-resize-mode",
+            "agent-navigator",
         ] {
             assert!(parse_configured_action(name).is_some());
         }
@@ -2616,6 +2652,8 @@ mod tests {
                 compression_mode: 1,
                 delta_operation_limit: None,
             },
+            live: true,
+            active: true,
             audio_gain: None,
             capture_policy: 0,
             descriptor: None,
@@ -2738,6 +2776,8 @@ mod tests {
                 compression_mode: 1,
                 delta_operation_limit: Some(PAGE_DELTA_OPERATIONS),
             },
+            live: true,
+            active: true,
             audio_gain: None,
             capture_policy: 0,
             descriptor: None,
@@ -3008,6 +3048,8 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1024,
             },
+            live: false,
+            active: true,
             audio_gain: None,
             capture_policy: 0,
             descriptor: None,
@@ -3038,6 +3080,8 @@ mod tests {
                 bitrate: 0,
                 max_access_unit_bytes: 1024,
             },
+            live: false,
+            active: true,
             audio_gain: Some(vivid_sdk::AudioGain::UNITY.raw()),
             capture_policy: 0,
             descriptor: None,
@@ -3599,6 +3643,8 @@ mod tests {
                     sar_den: 1,
                     max_access_unit_bytes: 1024,
                 },
+                live: false,
+                active: true,
                 audio_gain: None,
                 capture_policy: 0,
                 descriptor: None,
@@ -3621,6 +3667,8 @@ mod tests {
                     bitrate: 0,
                     max_access_unit_bytes: 1024,
                 },
+                live: false,
+                active: true,
                 audio_gain: Some(vivid_sdk::AudioGain::UNITY.raw()),
                 capture_policy: 0,
                 descriptor: None,
@@ -3853,6 +3901,8 @@ mod tests {
                     encoded_length: u32::try_from(encoded.len()).unwrap(),
                     sha256: None,
                 },
+                live: true,
+                active: true,
                 audio_gain: None,
                 capture_policy: 0,
                 descriptor: None,
@@ -4263,6 +4313,8 @@ mod tests {
                 sar_den: 1,
                 max_access_unit_bytes: 1_048_576,
             },
+            live: false,
+            active: true,
             audio_gain: None,
             capture_policy: 0,
             descriptor: None,
@@ -4293,6 +4345,8 @@ mod tests {
                 bitrate: 128_000,
                 max_access_unit_bytes: 4096,
             },
+            live: false,
+            active: true,
             audio_gain: Some(vivid_sdk::AudioGain::UNITY.raw()),
             capture_policy: 0,
             descriptor: None,
@@ -4406,6 +4460,8 @@ mod tests {
                 encoded_length: 32,
                 sha256: None,
             },
+            live: true,
+            active: true,
             audio_gain: None,
             capture_policy: 0,
             descriptor: None,

@@ -10,6 +10,7 @@ use vvmux_terminal::TerminalHyperlink;
 use vvmux_terminal::pty::{PtyControl, PtyExitStatus, PtyInput, PtyProcess};
 use vvmux_terminal::{Cell, Terminal, TerminalColor, TerminalEvent, TerminalModes, UnderlineStyle};
 
+use crate::agent::{AgentRuntime, AgentSnapshot, DetectorHandle, ProbeTarget, ProcessUpdate};
 use crate::config::Config;
 use crate::ipc::{
     Action, AutomationError, AutomationMethod, AutomationRequest, AutomationResponse, Axis,
@@ -96,6 +97,8 @@ pub enum ActorEvent {
     /// Carries no payload: the actor re-reads the file itself, so the watcher, SIGUSR1, and
     /// `msg reload-config` all converge on one parse-validate-apply path.
     ConfigChanged,
+    /// Foreground process identity changes discovered by the bounded agent worker.
+    AgentProcesses(Vec<ProcessUpdate>),
 }
 
 #[derive(Clone)]
@@ -169,6 +172,8 @@ struct Pane {
     terminal: Terminal,
     input: PtyInput,
     control: PtyControl,
+    child_pid: u32,
+    agent: AgentRuntime,
     copy: Option<CopyState>,
     mouse_selection: Option<MouseSelection>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
@@ -342,6 +347,34 @@ struct Tab {
     last_focused_tiled: Option<PaneId>,
     zoomed: Option<PaneId>,
     sync_input: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentNavigator {
+    selected: Option<PaneId>,
+    selected_index: usize,
+    scroll: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AgentNavigatorRow {
+    pane_id: PaneId,
+    tab_index: usize,
+    tab_label: String,
+    title: String,
+    agent: AgentSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentNavigatorKey {
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Activate,
+    Close,
 }
 
 impl Tab {
@@ -669,6 +702,7 @@ struct SessionActor {
     #[allow(dead_code)]
     config_path: Option<PathBuf>,
     sender: mpsc::SyncSender<ActorEvent>,
+    agent_detector: DetectorHandle,
     panes: BTreeMap<PaneId, Pane>,
     tabs: Vec<Tab>,
     active_tab: usize,
@@ -676,6 +710,8 @@ struct SessionActor {
     /// Whether the attached client's host terminal currently holds focus. Assumed true until the
     /// client reports otherwise, because a client attaches into a focused window.
     client_focused: bool,
+    /// Last focused-pane keyboard and mouse coordinate modes sent to the attached host terminal.
+    reported_input_mode: Option<(u8, bool)>,
     last_display: DisplayMetrics,
     next_pane_id: PaneId,
     next_tab_id: u64,
@@ -708,6 +744,7 @@ struct SessionActor {
     mouse_selection_drag: Option<MouseSelectionDrag>,
     mouse_click_tracker: Option<MouseClickTracker>,
     float_modal: Option<FloatModal>,
+    agent_navigator: Option<AgentNavigator>,
     next_float_mode: u64,
     session_sequence: u64,
     response_sender: mpsc::SyncSender<AutomationResponseJob>,
@@ -812,16 +849,22 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         },
         config.general.status_visible,
     );
+    let detector_sender = sender.clone();
+    let agent_detector = crate::agent::start_detector(move |updates| {
+        let _ = detector_sender.send(ActorEvent::AgentProcesses(updates));
+    })?;
     let mut actor = SessionActor {
         name,
         config,
         config_path,
         sender: sender.clone(),
+        agent_detector,
         panes: BTreeMap::new(),
         tabs: Vec::new(),
         active_tab: 0,
         attached: None,
         client_focused: true,
+        reported_input_mode: None,
         last_display,
         next_pane_id: 1,
         next_tab_id: 1,
@@ -852,6 +895,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         mouse_selection_drag: None,
         mouse_click_tracker: None,
         float_modal: None,
+        agent_navigator: None,
         next_float_mode: 0,
         session_sequence: 1,
         response_sender,
@@ -893,6 +937,7 @@ impl SessionActor {
                 Duration::from_secs(1)
             };
             timeout = timeout.min(self.next_automation_deadline());
+            timeout = timeout.min(self.next_agent_evaluation_delay());
             // Give ready media low-latency service, but force a general-queue turn after a bounded
             // batch. A bounded channel is not a bounded drain when its producer can refill it.
             if self.drain_media(&media_receiver) {
@@ -914,6 +959,7 @@ impl SessionActor {
                         render_at = Instant::now() + interval;
                     }
                     self.check_automation_waiters();
+                    self.evaluate_agent_states();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.drain_media(&media_receiver);
@@ -924,6 +970,7 @@ impl SessionActor {
                     }
                     self.sync_media(false);
                     self.check_automation_waiters();
+                    self.evaluate_agent_states();
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -1031,6 +1078,7 @@ impl SessionActor {
                     self.cancel_pointer_drag(true);
                     self.invalidate_mouse_selection_state();
                     self.attached = None;
+                    self.reported_input_mode = None;
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
                     self.pending_media_projections.clear();
@@ -1043,6 +1091,7 @@ impl SessionActor {
                     }
                     self.force_full = true;
                     self.end_float_mode(true);
+                    self.agent_navigator = None;
                     self.vivid.deactivate_bridge();
                 }
             }
@@ -1148,6 +1197,8 @@ impl SessionActor {
                     let note = format!("\r\n[{}]\r\n", describe_exit(status));
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         pane.exit_status = status;
+                        pane.agent.observe_process(None, None);
+                        pane.terminal.clear_agent_osc();
                         pane.terminal.feed(note.as_bytes());
                     }
                     self.mark_pane_screen_change(pane_id, None);
@@ -1176,10 +1227,23 @@ impl SessionActor {
                     self.status(&format!("config reload failed: {error}"));
                 }
             }
+            ActorEvent::AgentProcesses(updates) => {
+                for update in updates {
+                    if let Some(pane) = self.panes.get_mut(&update.pane_id)
+                        && pane
+                            .agent
+                            .observe_process(update.process_group, update.kind)
+                    {
+                        pane.terminal.clear_agent_osc();
+                    }
+                }
+                self.evaluate_agent_states();
+            }
         }
         // Attachment, pane focus, tab switching, pane teardown, and a program enabling the mode
         // all move focus, so reconcile once here rather than at each of those call sites.
         self.sync_pane_focus();
+        self.sync_client_input_mode();
         Ok(())
     }
 
@@ -1213,6 +1277,7 @@ impl SessionActor {
                 self.cancel_pointer_drag(true);
                 self.invalidate_mouse_selection_state();
                 self.end_float_mode(true);
+                self.agent_navigator = None;
                 // Even a clean client replacement owns a different physical presenter and fresh
                 // decoder/audio devices. Park timed ingress until that client applies its first
                 // authoritative projection.
@@ -1246,6 +1311,7 @@ impl SessionActor {
                     rendered_session_sequence: 0,
                     frame_sequences: VecDeque::new(),
                 });
+                self.reported_input_mode = None;
                 self.fragment_assignments.clear();
                 self.last_projection_warning = None;
                 // Detached tabs retain their rectangles. Clamp them against the attaching host
@@ -1284,7 +1350,12 @@ impl SessionActor {
             }
             ClientMessage::Mouse(mouse) => {
                 if self.client_is(id) {
-                    self.mouse(mouse);
+                    self.mouse(mouse, false);
+                }
+            }
+            ClientMessage::PixelMouse(mouse) => {
+                if self.client_is(id) {
+                    self.mouse(mouse, true);
                 }
             }
             ClientMessage::Focus(focused) => {
@@ -1308,6 +1379,7 @@ impl SessionActor {
                         self.cancel_pointer_drag(true);
                         self.invalidate_mouse_selection_state();
                         self.end_float_mode(true);
+                        self.agent_navigator = None;
                         if let Some(client) = &mut self.attached {
                             client.display = display;
                             self.last_display = client.display;
@@ -1559,6 +1631,7 @@ impl SessionActor {
                         },
                     )?;
                     self.attached = None;
+                    self.reported_input_mode = None;
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
                     self.pending_media_projections.clear();
@@ -1686,6 +1759,59 @@ impl SessionActor {
                         "panes": panes,
                     }),
                 );
+            }
+            AutomationMethod::ReportAgent {
+                agent,
+                state,
+                source,
+                sequence,
+            } => {
+                let pane_id = pane_id.unwrap();
+                let visible = self.pane_is_visibly_present(pane_id);
+                let result = self
+                    .panes
+                    .get_mut(&pane_id)
+                    .ok_or("pane no longer exists")
+                    .and_then(|pane| pane.agent.report(agent, state, source, sequence, visible));
+                match result {
+                    Ok(()) => {
+                        self.session_sequence = self.session_sequence.wrapping_add(1);
+                        self.schedule_render();
+                        let agent = self.panes[&pane_id].agent.snapshot().map(agent_json);
+                        self.reply_automation(
+                            target,
+                            serde_json::json!({"pane_id": pane_id, "agent": agent}),
+                        );
+                    }
+                    Err(message) => self.reply_automation_error(
+                        target,
+                        AutomationError::new("invalid_agent_report", message),
+                    ),
+                }
+            }
+            AutomationMethod::ClearAgentReport { source, sequence } => {
+                let pane_id = pane_id.unwrap();
+                let result = self
+                    .panes
+                    .get_mut(&pane_id)
+                    .ok_or("pane no longer exists")
+                    .and_then(|pane| pane.agent.clear_report(&source, sequence));
+                match result {
+                    Ok(()) => {
+                        self.evaluate_agent_states();
+                        self.session_sequence = self.session_sequence.wrapping_add(1);
+                        self.schedule_render();
+                        let agent = self.panes[&pane_id].agent.snapshot().map(agent_json);
+                        self.reply_automation(
+                            target,
+                            serde_json::json!({"pane_id": pane_id, "agent": agent}),
+                        );
+                    }
+                    Err(message) => self.reply_automation_error(
+                        target,
+                        AutomationError::new("invalid_agent_report", message),
+                    ),
+                }
             }
             AutomationMethod::Inspect => {
                 let pane_id = pane_id.unwrap();
@@ -2421,6 +2547,7 @@ impl SessionActor {
             "zoomed": tab.zoomed == Some(pane_id),
             "sync_input": tab.sync_input,
             "title": pane.terminal.title(),
+            "agent": pane.agent.snapshot().map(agent_json),
             "geometry": rect_json(outer),
             "content_geometry": rect_json(outer.content()),
             "columns": pane.terminal.cols(),
@@ -2876,7 +3003,64 @@ impl SessionActor {
         self.session_sequence = self.session_sequence.wrapping_add(1);
     }
 
+    fn refresh_agent_detector_targets(&self) {
+        self.agent_detector.replace_targets(
+            self.panes
+                .values()
+                .filter(|pane| pane.exit_status.is_none())
+                .map(|pane| ProbeTarget {
+                    pane_id: pane.id,
+                    child_pid: pane.child_pid,
+                    control: pane.control.clone(),
+                })
+                .collect(),
+        );
+    }
+
+    fn evaluate_agent_states(&mut self) {
+        let visible = if self.attached.is_some() && self.client_focused {
+            let area = self.content_area();
+            self.active_tab()
+                .map(|tab| {
+                    visible_projections(tab, area)
+                        .into_iter()
+                        .map(|projection| projection.pane_id)
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        let now = Instant::now();
+        let mut changed = false;
+        for pane in self.panes.values_mut() {
+            let before = pane.agent.snapshot();
+            pane.agent
+                .evaluate_terminal(&pane.terminal, visible.contains(&pane.id), now);
+            changed |= before != pane.agent.snapshot();
+        }
+        if changed {
+            self.session_sequence = self.session_sequence.wrapping_add(1);
+            if self.agent_navigator.is_some() {
+                self.schedule_render();
+            }
+        }
+    }
+
+    fn next_agent_evaluation_delay(&self) -> Duration {
+        let now = Instant::now();
+        self.panes
+            .values()
+            .filter_map(|pane| pane.agent.next_evaluation_delay(now))
+            .min()
+            .unwrap_or(Duration::from_secs(1))
+    }
+
     fn input(&mut self, bytes: Vec<u8>) {
+        if self.agent_navigator.is_some() {
+            self.agent_navigator_input(&bytes);
+            return;
+        }
         if self.invalidate_mouse_selection_state() {
             self.schedule_render();
         }
@@ -3043,7 +3227,16 @@ impl SessionActor {
         self.schedule_render();
     }
 
-    fn mouse(&mut self, mouse: MouseEvent) {
+    fn mouse(&mut self, mut mouse: MouseEvent, pixel_coordinates: bool) {
+        let display = self.layout_display();
+        let pixels = pixel_coordinates.then_some((mouse.x, mouse.y));
+        if pixel_coordinates {
+            mouse = pixel_mouse_to_cells(mouse, display);
+        }
+        if self.agent_navigator.is_some() {
+            self.agent_navigator_mouse(mouse);
+            return;
+        }
         if self.mouse_selection_drag.is_some() {
             match mouse.kind {
                 MouseKind::Move if mouse.button == 0 => {
@@ -3077,6 +3270,7 @@ impl SessionActor {
             }
         }
         if matches!(mouse.kind, MouseKind::Move | MouseKind::Release) {
+            self.forward_application_mouse(mouse, pixels, display);
             return;
         }
         if mouse.kind == MouseKind::Wheel && self.invalidate_mouse_selection_state() {
@@ -3226,11 +3420,14 @@ impl SessionActor {
                 } else {
                     'M'
                 };
-                translated = Some(format!(
-                    "\x1b[<{button};{};{}{terminator}",
-                    mouse.x - content.x + 1,
-                    mouse.y - content.y + 1
-                ));
+                let (x, y) = application_mouse_coordinates(
+                    mouse,
+                    pixels,
+                    content,
+                    display,
+                    modes.sgr_pixels,
+                );
+                translated = Some(format!("\x1b[<{button};{x};{y}{terminator}"));
             } else if mouse.kind == MouseKind::Wheel {
                 copy_view_render = true;
                 let previous_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
@@ -3263,6 +3460,58 @@ impl SessionActor {
         if let Some(translated) = translated {
             self.send_pane_input(pane_id, translated.as_bytes());
         }
+    }
+
+    /// Forward motion/release reports without changing pane focus. These used to return before
+    /// application mouse handling, so even a pane in DEC 1003 mode could never hover, drag, or
+    /// release a button.
+    fn forward_application_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        pixels: Option<(u16, u16)>,
+        display: DisplayMetrics,
+    ) {
+        let area = self.content_area();
+        let Some(projection) = self.active_tab().and_then(|tab| {
+            visible_projections(tab, area)
+                .into_iter()
+                .rev()
+                .find(|projection| projection.outer.contains(mouse.x, mouse.y))
+        }) else {
+            return;
+        };
+        let content = projection.outer.content();
+        if !content.contains(mouse.x, mouse.y) {
+            return;
+        }
+        let pane_id = projection.pane_id;
+        let Some(modes) = self.panes.get(&pane_id).map(|pane| pane.terminal.modes()) else {
+            return;
+        };
+        let application_mouse = !mouse.shift
+            && match mouse.kind {
+                MouseKind::Move => modes.mouse_motion,
+                MouseKind::Release => modes.mouse_clicks,
+                _ => false,
+            };
+        if !application_mouse {
+            return;
+        }
+        let mut button = u16::from(mouse.button);
+        if mouse.kind == MouseKind::Move {
+            button |= 32;
+        }
+        let terminator = if mouse.kind == MouseKind::Release {
+            'm'
+        } else {
+            'M'
+        };
+        let (x, y) =
+            application_mouse_coordinates(mouse, pixels, content, display, modes.sgr_pixels);
+        self.send_pane_input(
+            pane_id,
+            format!("\x1b[<{button};{x};{y}{terminator}").as_bytes(),
+        );
     }
 
     fn update_pointer_drag(&mut self, mouse: MouseEvent) {
@@ -3422,6 +3671,9 @@ impl SessionActor {
     }
 
     fn action(&mut self, action: Action) {
+        if self.agent_navigator.is_some() && !matches!(action, Action::ToggleAgentNavigator) {
+            return;
+        }
         self.cancel_pointer_drag(true);
         if self.invalidate_mouse_selection_state() {
             self.schedule_render();
@@ -3505,8 +3757,263 @@ impl SessionActor {
             Action::TogglePanePinned => self.toggle_pin(),
             Action::EnterFloatingMoveMode => self.enter_float_mode(FloatingEditKind::Move),
             Action::EnterFloatingResizeMode => self.enter_float_mode(FloatingEditKind::Resize),
+            Action::ToggleAgentNavigator => self.toggle_agent_navigator(),
             _ => {}
         }
+    }
+
+    fn agent_navigator_rows(&self) -> Vec<AgentNavigatorRow> {
+        let mut rows = Vec::new();
+        for (tab_index, tab) in self.tabs.iter().enumerate() {
+            let tab_label = tab
+                .name
+                .as_ref()
+                .map(|name| format!("tab {} {name}", tab_index + 1))
+                .unwrap_or_else(|| format!("tab {}", tab_index + 1));
+            let mut pane_ids = tab.tree.as_ref().map_or_else(Vec::new, TiledNode::pane_ids);
+            pane_ids.extend(tab.floating.pane_ids());
+            pane_ids.sort_unstable();
+            pane_ids.dedup();
+            for pane_id in pane_ids {
+                let Some(pane) = self.panes.get(&pane_id) else {
+                    continue;
+                };
+                let Some(agent) = pane.agent.snapshot() else {
+                    continue;
+                };
+                rows.push(AgentNavigatorRow {
+                    pane_id,
+                    tab_index,
+                    tab_label: tab_label.clone(),
+                    title: pane
+                        .terminal
+                        .title()
+                        .map_or_else(|| format!("pane {pane_id}"), ToOwned::to_owned),
+                    agent,
+                });
+            }
+        }
+        rows.sort_by_key(|row| (row.agent.status.urgency(), row.tab_index, row.pane_id));
+        rows
+    }
+
+    fn toggle_agent_navigator(&mut self) {
+        if self.agent_navigator.take().is_some() {
+            self.schedule_render();
+            return;
+        }
+        let rows = self.agent_navigator_rows();
+        let focused = self.active_tab().map(|tab| tab.focused);
+        let selected = focused
+            .filter(|pane| rows.iter().any(|row| row.pane_id == *pane))
+            .or_else(|| rows.first().map(|row| row.pane_id));
+        let selected_index = selected
+            .and_then(|pane| rows.iter().position(|row| row.pane_id == pane))
+            .unwrap_or(0);
+        self.agent_navigator = Some(AgentNavigator {
+            selected,
+            selected_index,
+            scroll: 0,
+        });
+        self.force_full = true;
+        self.schedule_render();
+    }
+
+    fn agent_navigator_input(&mut self, bytes: &[u8]) {
+        let mut offset = 0;
+        while offset < bytes.len() && self.agent_navigator.is_some() {
+            let (consumed, key) = decode_agent_navigator_key(&bytes[offset..]);
+            offset += consumed;
+            match key {
+                Some(AgentNavigatorKey::Up) => self.move_agent_navigator(-1),
+                Some(AgentNavigatorKey::Down) => self.move_agent_navigator(1),
+                Some(AgentNavigatorKey::Home) => self.move_agent_navigator_to(false),
+                Some(AgentNavigatorKey::End) => self.move_agent_navigator_to(true),
+                Some(AgentNavigatorKey::PageUp) => self.page_agent_navigator(false),
+                Some(AgentNavigatorKey::PageDown) => self.page_agent_navigator(true),
+                Some(AgentNavigatorKey::Activate) => self.activate_agent_navigator(),
+                Some(AgentNavigatorKey::Close) => {
+                    self.agent_navigator = None;
+                    self.force_full = true;
+                    self.schedule_render();
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn move_agent_navigator(&mut self, delta: isize) {
+        let rows = self.agent_navigator_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let current = self
+            .agent_navigator
+            .and_then(|navigator| navigator.selected)
+            .and_then(|pane| rows.iter().position(|row| row.pane_id == pane))
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(rows.len().saturating_sub(1));
+        if let Some(navigator) = &mut self.agent_navigator {
+            navigator.selected = Some(rows[next].pane_id);
+            navigator.selected_index = next;
+        }
+        self.reveal_agent_navigator_selection(rows.len(), next);
+    }
+
+    fn move_agent_navigator_to(&mut self, end: bool) {
+        let rows = self.agent_navigator_rows();
+        let Some(index) = (!rows.is_empty()).then(|| if end { rows.len() - 1 } else { 0 }) else {
+            return;
+        };
+        if let Some(navigator) = &mut self.agent_navigator {
+            navigator.selected = Some(rows[index].pane_id);
+            navigator.selected_index = index;
+        }
+        self.reveal_agent_navigator_selection(rows.len(), index);
+    }
+
+    fn page_agent_navigator(&mut self, down: bool) {
+        let page = agent_navigator_rect(self.content_area(), self.agent_navigator_rows().len())
+            .map_or(1, |rect| usize::from(rect.height.saturating_sub(2)).max(1));
+        self.move_agent_navigator(if down {
+            page as isize
+        } else {
+            -(page as isize)
+        });
+    }
+
+    fn reveal_agent_navigator_selection(&mut self, row_count: usize, index: usize) {
+        let page = agent_navigator_rect(self.content_area(), row_count)
+            .map_or(1, |rect| usize::from(rect.height.saturating_sub(2)).max(1));
+        if let Some(navigator) = &mut self.agent_navigator {
+            if index < navigator.scroll {
+                navigator.scroll = index;
+            } else if index >= navigator.scroll.saturating_add(page) {
+                navigator.scroll = index + 1 - page;
+            }
+            navigator.scroll = navigator.scroll.min(row_count.saturating_sub(page));
+        }
+        self.schedule_render();
+    }
+
+    fn activate_agent_navigator(&mut self) {
+        let selected = self
+            .agent_navigator
+            .and_then(|navigator| navigator.selected);
+        self.agent_navigator = None;
+        let Some(pane_id) = selected else {
+            self.force_full = true;
+            self.schedule_render();
+            return;
+        };
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.agent.mark_seen();
+        }
+        if let Err(error) = self.automation_focus(pane_id) {
+            self.status(&error.message);
+        }
+        self.force_full = true;
+        self.schedule_render();
+    }
+
+    fn agent_navigator_mouse(&mut self, mouse: MouseEvent) {
+        let rows = self.agent_navigator_rows();
+        let Some(rect) = agent_navigator_rect(self.content_area(), rows.len()) else {
+            self.agent_navigator = None;
+            return;
+        };
+        if mouse.kind == MouseKind::Wheel {
+            self.move_agent_navigator(if mouse.button == 0 { -1 } else { 1 });
+            return;
+        }
+        if mouse.kind != MouseKind::Press || mouse.button != 0 {
+            return;
+        }
+        if !rect.contains(mouse.x, mouse.y) {
+            self.agent_navigator = None;
+            self.force_full = true;
+            self.schedule_render();
+            return;
+        }
+        if mouse.y <= rect.y || mouse.y + 1 >= rect.y + rect.height {
+            return;
+        }
+        let scroll = self.agent_navigator.map_or(0, |navigator| navigator.scroll);
+        let index = scroll + usize::from(mouse.y - rect.y - 1);
+        let Some(row) = rows.get(index) else { return };
+        if let Some(navigator) = &mut self.agent_navigator {
+            navigator.selected = Some(row.pane_id);
+            navigator.selected_index = index;
+        }
+        self.activate_agent_navigator();
+    }
+
+    fn draw_agent_navigator(
+        &mut self,
+        screen: &mut ScreenBuffer,
+        theme: crate::theme::ResolvedTheme,
+    ) {
+        let rows = self.agent_navigator_rows();
+        let Some(rect) = agent_navigator_rect(self.content_area(), rows.len()) else {
+            self.agent_navigator = None;
+            return;
+        };
+        let page = usize::from(rect.height.saturating_sub(2)).max(1);
+        let selected_index = self.agent_navigator.and_then(|navigator| {
+            navigator
+                .selected
+                .and_then(|pane| rows.iter().position(|row| row.pane_id == pane))
+                .or_else(|| {
+                    (!rows.is_empty()).then_some(navigator.selected_index.min(rows.len() - 1))
+                })
+        });
+        if let Some(navigator) = &mut self.agent_navigator {
+            navigator.selected = selected_index.map(|index| rows[index].pane_id);
+            navigator.selected_index = selected_index.unwrap_or(0);
+            navigator.scroll = navigator.scroll.min(rows.len().saturating_sub(page));
+            if let Some(index) = selected_index {
+                if index < navigator.scroll {
+                    navigator.scroll = index;
+                } else if index >= navigator.scroll + page {
+                    navigator.scroll = index + 1 - page;
+                }
+            }
+        }
+        screen.draw_frame(rect, " Agents ", theme.frame(true));
+        let style = theme.status();
+        let inner_width = usize::from(rect.width.saturating_sub(2));
+        let blank = " ".repeat(inner_width);
+        for offset in 0..page {
+            let y = rect.y + 1 + offset as u16;
+            screen.draw_text(rect.x + 1, y, &blank, style);
+        }
+        if rows.is_empty() {
+            screen.draw_text(rect.x + 2, rect.y + 1, "No detected AI agent panes", style);
+        } else {
+            let scroll = self.agent_navigator.map_or(0, |navigator| navigator.scroll);
+            for (offset, row) in rows.iter().skip(scroll).take(page).enumerate() {
+                let text = format!(
+                    "[{:<7}] {:<8} {} · pane {} · {}",
+                    row.agent.status.label().to_ascii_uppercase(),
+                    row.agent.kind.label(),
+                    single_line(&row.tab_label),
+                    row.pane_id,
+                    single_line(&row.title),
+                );
+                let y = rect.y + 1 + offset as u16;
+                screen.draw_text(rect.x + 1, y, &text, style);
+                if self
+                    .agent_navigator
+                    .and_then(|navigator| navigator.selected)
+                    == Some(row.pane_id)
+                {
+                    screen.invert(rect.x + 1, y, rect.width.saturating_sub(2));
+                }
+            }
+        }
+        screen.cursor = None;
     }
 
     fn enter_float_mode(&mut self, kind: FloatingEditKind) {
@@ -3910,6 +4417,7 @@ impl SessionActor {
         } else {
             "xterm-256color"
         };
+        let vvmux_bin = std::env::current_exe()?.to_string_lossy().into_owned();
         // The caller's extras go first so the fixed pane identity below always wins: nothing a
         // layout file or `run` supplies may shadow VIVID_ROOT_SECRET or VVMUX_PANE_ID.
         let mut environment: Vec<(String, String)> = spec.extra_env.clone();
@@ -3920,6 +4428,7 @@ impl SessionActor {
             ("VVMUX_SESSION".into(), self.name.clone()),
             ("VVMUX_TAB_ID".into(), tab_id.to_string()),
             ("VVMUX_PANE_ID".into(), pane_id.to_string()),
+            ("VVMUX_BIN".into(), vvmux_bin),
             ("VIVID_ENDPOINT_CONTROL".into(), self.vivid.endpoint()),
             (
                 "VIVID_ROOT_SECRET".into(),
@@ -3938,6 +4447,7 @@ impl SessionActor {
                     return Err(error);
                 }
             };
+        let child_pid = parts.child_pid;
         let reader_sender = self.sender.clone();
         let mut reader = parts.reader;
         std::thread::Builder::new()
@@ -3975,6 +4485,8 @@ impl SessionActor {
                 terminal: Terminal::new(22, 80, self.config.general.scrollback_lines),
                 input: parts.input,
                 control: parts.control,
+                child_pid,
+                agent: AgentRuntime::new(),
                 copy: None,
                 mouse_selection: None,
                 vivid_metrics: None,
@@ -3987,6 +4499,7 @@ impl SessionActor {
                 screen_changes: VecDeque::new(),
             },
         );
+        self.refresh_agent_detector_targets();
         Ok(())
     }
 
@@ -4003,6 +4516,7 @@ impl SessionActor {
         if let Some(pane) = self.panes.remove(&pane_id) {
             pane.control.terminate();
         }
+        self.refresh_agent_detector_targets();
         self.vivid.revoke_pane(pane_id);
         let Some(tab_index) = self.tabs.iter().position(|tab| tab.contains(pane_id)) else {
             return;
@@ -4344,6 +4858,9 @@ impl SessionActor {
                     .then_some((x, y))
             });
         }
+        if self.agent_navigator.is_some() {
+            self.draw_agent_navigator(&mut screen, theme);
+        }
         if self.config.general.status_visible && screen.rows > 0 {
             let tab_number = self.active_tab + 1;
             let tab_id = self.active_tab().map_or(0, |tab| tab.id);
@@ -4397,7 +4914,9 @@ impl SessionActor {
                 let start = status.chars().count().saturating_sub(5);
                 screen.restyle(start as u16, row, 4, theme.sync_indicator());
             }
-            if status.starts_with('/') || status.starts_with('?') {
+            if self.agent_navigator.is_none()
+                && (status.starts_with('/') || status.starts_with('?'))
+            {
                 screen.cursor = Some((
                     status.chars().count().min(usize::from(screen.columns - 1)) as u16,
                     row,
@@ -4438,6 +4957,7 @@ impl SessionActor {
                 },
             );
             self.attached = None;
+            self.reported_input_mode = None;
             self.last_screen = None;
             #[cfg(windows)]
             {
@@ -4562,6 +5082,8 @@ impl SessionActor {
                     &source.descriptor,
                     source.raster_delta_operation_limit,
                 ),
+                live: source.live,
+                active: source.active,
                 audio_gain: source.audio_gain.map(|gain| gain.raw()),
                 capture_policy: source.capture_policy,
                 descriptor: source.semantic_descriptor.as_ref().map(|descriptor| {
@@ -4903,6 +5425,18 @@ impl SessionActor {
         self.tabs.get_mut(self.active_tab)
     }
 
+    fn pane_is_visibly_present(&self, pane_id: PaneId) -> bool {
+        if self.attached.is_none() || !self.client_focused {
+            return false;
+        }
+        let area = self.content_area();
+        self.active_tab().is_some_and(|tab| {
+            visible_projections(tab, area)
+                .iter()
+                .any(|projection| projection.pane_id == pane_id)
+        })
+    }
+
     fn status(&self, message: &str) {
         if let Some(client) = &self.attached {
             let _ = crate::ipc::send(&client.writer, &ServerMessage::Status(message.into()));
@@ -4949,6 +5483,33 @@ impl SessionActor {
         }
         for (pane_id, failure) in failures {
             self.report_input_failure(pane_id, Some(failure));
+        }
+    }
+
+    /// Mirror the focused pane's Kitty keyboard and SGR-Pixels modes into the attached host
+    /// terminal. Without this hop, a nested application can request enhanced key events and pixel
+    /// coordinates while the physical presenter continues sending legacy keys and cell positions.
+    fn sync_client_input_mode(&mut self) {
+        let (keyboard_flags, sgr_pixels) = self
+            .active_tab()
+            .and_then(|tab| self.panes.get(&tab.focused))
+            .map_or((0, false), |pane| {
+                let modes = pane.terminal.modes();
+                (modes.keyboard_flags, modes.sgr_pixels)
+            });
+        let input_mode = (keyboard_flags, sgr_pixels);
+        if self.attached.is_none() || self.reported_input_mode == Some(input_mode) {
+            return;
+        }
+        self.reported_input_mode = Some(input_mode);
+        if let Some(client) = &self.attached {
+            let _ = crate::ipc::send(
+                &client.writer,
+                &ServerMessage::InputMode {
+                    keyboard_flags,
+                    sgr_pixels,
+                },
+            );
         }
     }
 
@@ -5331,6 +5892,15 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
         ));
     }
     match method {
+        AutomationMethod::ReportAgent { source, .. }
+        | AutomationMethod::ClearAgentReport { source, .. }
+            if source.is_empty() || source.len() > crate::agent::MAX_REPORT_SOURCE_BYTES =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "agent report source must contain 1..=128 bytes",
+            ))
+        }
         AutomationMethod::Run { command, .. } if command.trim().is_empty() => Err(
             AutomationError::new("invalid_params", "run requires a non-empty command"),
         ),
@@ -5451,6 +6021,7 @@ fn automation_capabilities() -> serde_json::Value {
             "typing", "key", "paste", "get_text", "get_grid", "search", "set_sync_input", "wait_text",
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
             "trace_media", "reload_config", "run"
+            , "report_agent", "clear_agent_report"
         ],
         "limits": automation_limits(),
         "render_acknowledgment": "attached_client_write",
@@ -5467,6 +6038,7 @@ fn automation_limits() -> serde_json::Value {
         "search_results": 1000,
         "search_scan_lines": crate::search::MAX_SEARCH_SCAN_LINES,
         "command_bytes": MAX_RUN_COMMAND_BYTES,
+        "agent_report_source_bytes": crate::agent::MAX_REPORT_SOURCE_BYTES,
         "media_trace_events": crate::media_trace::MAX_MEDIA_TRACE_EVENTS,
         "media_trace_bytes": crate::media_trace::MAX_MEDIA_TRACE_BYTES,
         "media_trace_query_events": crate::media_trace::MAX_MEDIA_TRACE_QUERY_EVENTS,
@@ -5485,6 +6057,15 @@ fn rect_json(rect: Rect) -> serde_json::Value {
         "y": rect.y,
         "width": rect.width,
         "height": rect.height,
+    })
+}
+
+fn agent_json(agent: AgentSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "kind": agent.kind,
+        "state": agent.state,
+        "status": agent.status,
+        "source": agent.source,
     })
 }
 
@@ -5507,6 +6088,12 @@ fn terminal_mode_names(modes: TerminalModes) -> Vec<&'static str> {
     }
     if modes.sgr_mouse {
         names.push("sgr_mouse");
+    }
+    if modes.sgr_pixels {
+        names.push("sgr_pixels");
+    }
+    if modes.keyboard_flags != 0 {
+        names.push("kitty_keyboard");
     }
     if modes.focus_reporting {
         names.push("focus_reporting");
@@ -6247,6 +6834,61 @@ fn normalized_display(display: DisplayMetrics, status_visible: bool) -> DisplayM
     }
 }
 
+fn pixel_mouse_to_cells(mut mouse: MouseEvent, display: DisplayMetrics) -> MouseEvent {
+    let cell_width = display.cell_width.max(1);
+    let cell_height = display.cell_height.max(1);
+    mouse.x = mouse
+        .x
+        .checked_div(cell_width)
+        .unwrap_or(0)
+        .min(display.columns.saturating_sub(1));
+    mouse.y = mouse
+        .y
+        .checked_div(cell_height)
+        .unwrap_or(0)
+        .min(display.rows.saturating_sub(1));
+    mouse
+}
+
+/// Coordinates for a pane's SGR mouse report. Cell input remains cell-based unless the pane asks
+/// for DEC 1016, in which case the cell center is the best available fallback. Native input keeps
+/// the original physical pixel so nested raster applications retain precise pointer placement.
+fn application_mouse_coordinates(
+    mouse: MouseEvent,
+    pixels: Option<(u16, u16)>,
+    content: Rect,
+    display: DisplayMetrics,
+    sgr_pixels: bool,
+) -> (u32, u32) {
+    if !sgr_pixels {
+        return (
+            u32::from(mouse.x.saturating_sub(content.x)) + 1,
+            u32::from(mouse.y.saturating_sub(content.y)) + 1,
+        );
+    }
+
+    let cell_width = u32::from(display.cell_width.max(1));
+    let cell_height = u32::from(display.cell_height.max(1));
+    let origin_x = u32::from(content.x).saturating_mul(cell_width);
+    let origin_y = u32::from(content.y).saturating_mul(cell_height);
+    match pixels {
+        Some((x, y)) => (
+            u32::from(x).saturating_sub(origin_x) + 1,
+            u32::from(y).saturating_sub(origin_y) + 1,
+        ),
+        None => (
+            u32::from(mouse.x.saturating_sub(content.x))
+                .saturating_mul(cell_width)
+                .saturating_add(cell_width / 2)
+                + 1,
+            u32::from(mouse.y.saturating_sub(content.y))
+                .saturating_mul(cell_height)
+                .saturating_add(cell_height / 2)
+                + 1,
+        ),
+    }
+}
+
 /// Whether a reported display is a real resize rather than a repeat of the current one.
 ///
 /// Browser presenters report every dimension re-measurement, not only genuine resizes, so an
@@ -6359,6 +7001,66 @@ fn mouse_selection_runs(
         runs.push((row as usize, first, last - first + 1));
     }
     runs
+}
+
+fn agent_navigator_rect(area: Rect, row_count: usize) -> Option<Rect> {
+    if area.width < 20 || area.height < 3 {
+        return None;
+    }
+    let width = area.width.clamp(20, 100);
+    let desired_height = u16::try_from(row_count.saturating_add(2)).unwrap_or(u16::MAX);
+    let height = desired_height.clamp(3, area.height.min(18));
+    Some(Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    })
+}
+
+fn decode_agent_navigator_key(input: &[u8]) -> (usize, Option<AgentNavigatorKey>) {
+    const SEQUENCES: &[(&[u8], AgentNavigatorKey)] = &[
+        (b"\x1b[A", AgentNavigatorKey::Up),
+        (b"\x1bOA", AgentNavigatorKey::Up),
+        (b"\x1b[B", AgentNavigatorKey::Down),
+        (b"\x1bOB", AgentNavigatorKey::Down),
+        (b"\x1b[H", AgentNavigatorKey::Home),
+        (b"\x1bOH", AgentNavigatorKey::Home),
+        (b"\x1b[1~", AgentNavigatorKey::Home),
+        (b"\x1b[7~", AgentNavigatorKey::Home),
+        (b"\x1b[F", AgentNavigatorKey::End),
+        (b"\x1bOF", AgentNavigatorKey::End),
+        (b"\x1b[4~", AgentNavigatorKey::End),
+        (b"\x1b[8~", AgentNavigatorKey::End),
+        (b"\x1b[5~", AgentNavigatorKey::PageUp),
+        (b"\x1b[6~", AgentNavigatorKey::PageDown),
+    ];
+    for (sequence, key) in SEQUENCES {
+        if input.starts_with(sequence) {
+            return (sequence.len(), Some(*key));
+        }
+    }
+    let key = match input.first().copied() {
+        Some(b'k') => Some(AgentNavigatorKey::Up),
+        Some(b'j') => Some(AgentNavigatorKey::Down),
+        Some(b'\r' | b'\n') => Some(AgentNavigatorKey::Activate),
+        Some(b'q' | 0x1b) => Some(AgentNavigatorKey::Close),
+        Some(_) => None,
+        None => return (0, None),
+    };
+    (1, key)
+}
+
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn extract_selection_row(
@@ -6513,6 +7215,65 @@ mod tests {
             |_| None,
         );
         assert_eq!(selected, Some(comspec));
+    }
+
+    #[test]
+    fn agent_navigator_geometry_is_centered_and_bounded() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        assert_eq!(
+            agent_navigator_rect(area, 100),
+            Some(Rect {
+                x: 10,
+                y: 11,
+                width: 100,
+                height: 18,
+            })
+        );
+        assert!(
+            agent_navigator_rect(
+                Rect {
+                    width: 19,
+                    height: 10,
+                    ..Rect::default()
+                },
+                1
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn agent_navigator_keys_decode_coalesced_input_without_pty_residue() {
+        let mut input = b"\x1b[A\x1b[6~j\r".as_slice();
+        let mut keys = Vec::new();
+        while !input.is_empty() {
+            let (consumed, key) = decode_agent_navigator_key(input);
+            assert!(consumed > 0);
+            input = &input[consumed..];
+            keys.extend(key);
+        }
+        assert_eq!(
+            keys,
+            [
+                AgentNavigatorKey::Up,
+                AgentNavigatorKey::PageDown,
+                AgentNavigatorKey::Down,
+                AgentNavigatorKey::Activate,
+            ]
+        );
+        assert_eq!(
+            decode_agent_navigator_key(b"\x1b[7~"),
+            (4, Some(AgentNavigatorKey::Home))
+        );
+        assert_eq!(
+            decode_agent_navigator_key(b"\x1b[8~"),
+            (4, Some(AgentNavigatorKey::End))
+        );
     }
 
     #[test]
@@ -6784,6 +7545,48 @@ mod tests {
         assert_eq!((with_status.columns, with_status.rows), (10, 5));
         let without_status = normalized_display(DisplayMetrics::default(), false);
         assert_eq!((without_status.columns, without_status.rows), (10, 4));
+    }
+
+    #[test]
+    fn pixel_mouse_is_hit_tested_in_cells_but_forwarded_in_local_pixels() {
+        let display = DisplayMetrics {
+            columns: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let pixel_mouse = MouseEvent {
+            button: 0,
+            x: 155,
+            y: 130,
+            kind: MouseKind::Press,
+            shift: false,
+        };
+        let cell_mouse = pixel_mouse_to_cells(pixel_mouse, display);
+        assert_eq!((cell_mouse.x, cell_mouse.y), (15, 6));
+
+        let content = Rect {
+            x: 4,
+            y: 2,
+            width: 30,
+            height: 10,
+        };
+        assert_eq!(
+            application_mouse_coordinates(
+                cell_mouse,
+                Some((pixel_mouse.x, pixel_mouse.y)),
+                content,
+                display,
+                true,
+            ),
+            (116, 91),
+            "pane-local SGR-Pixels coordinates stay one-based and preserve sub-cell position"
+        );
+        assert_eq!(
+            application_mouse_coordinates(cell_mouse, None, content, display, false),
+            (12, 5),
+            "cell-coordinate clients keep the existing SGR cell report"
+        );
     }
 
     fn tab_with_floats() -> Tab {

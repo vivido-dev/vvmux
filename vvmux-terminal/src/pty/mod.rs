@@ -21,6 +21,7 @@ const INPUT_QUEUE_BYTES: usize = 1024 * 1024;
 pub struct PtyProcess;
 
 pub struct PtyParts {
+    pub child_pid: u32,
     pub reader: File,
     pub input: PtyInput,
     pub control: PtyControl,
