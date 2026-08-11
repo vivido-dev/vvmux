@@ -16,12 +16,12 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Bumped to 12 for pixel mouse input, focused-pane Kitty keyboard modes, and authoritative live
-/// media/active-slot projection; 11 added host focus reporting.
+/// Bumped to 14 when the independently developed VVMX 13 plugin-control and agent-state
+/// vocabularies were merged. The combined encoding must not alias either branch's version 13.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 13;
+pub const VERSION: u16 = 15;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -130,6 +130,9 @@ pub enum AutomationMethod {
     SetSyncInput {
         enabled: bool,
     },
+    /// Apply one ordinary user action to an explicitly resolved pane context.
+    Action(Action),
+    Plugin(PluginMethod),
     WaitText {
         text: String,
         regex: bool,
@@ -168,6 +171,50 @@ pub enum AutomationMethod {
         after_virtual_revision: Option<u64>,
         after_outer_revision: Option<u64>,
         timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum PluginMethod {
+    Invoke {
+        reference: String,
+        input: Value,
+        detach: bool,
+    },
+    JobStatus {
+        job_id: String,
+    },
+    JobCancel {
+        job_id: String,
+    },
+    JobLogs {
+        job_id: String,
+    },
+    PaneOpen {
+        reference: String,
+    },
+    EventSubscribe {
+        after_sequence: Option<u64>,
+    },
+    EventUnsubscribe {
+        subscription_id: String,
+    },
+    Reload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginEventEnvelope {
+    Event {
+        sequence: u64,
+        name: String,
+        payload: Value,
+        context: vvmux_plugin_api::InvocationContext,
+    },
+    Gap {
+        from_sequence: u64,
+        to_sequence: u64,
     },
 }
 
@@ -285,6 +332,8 @@ pub enum Action {
     TogglePanePinned,
     EnterFloatingMoveMode,
     EnterFloatingResizeMode,
+    /// Invoke a configured plugin action. The host resolves and validates this reference.
+    Plugin(String),
     ToggleAgentNavigator,
 }
 
@@ -458,6 +507,10 @@ pub enum ServerMessage {
         index: u32,
         last: bool,
         base64: String,
+    },
+    PluginEvent {
+        subscription_id: String,
+        envelope: Box<PluginEventEnvelope>,
     },
     /// Kitty keyboard flags requested by the focused pane. The native client applies these to
     /// its host terminal so key encodings survive a nested terminal boundary.
@@ -933,6 +986,39 @@ mod tests {
         preface[4..6].copy_from_slice(&VERSION.wrapping_add(1).to_be_bytes());
         let error = decode_preface(&preface).unwrap_err();
         assert!(error.to_string().contains("restart"));
+    }
+
+    #[test]
+    fn plugin_pane_open_has_a_typed_vvmx_operation() {
+        let method = PluginMethod::PaneOpen {
+            reference: "dev.example/dashboard".into(),
+        };
+        let encoded = serde_json::to_value(&method).unwrap();
+        assert_eq!(encoded["operation"], "pane_open");
+        assert_eq!(encoded["reference"], "dev.example/dashboard");
+        assert_eq!(
+            serde_json::from_value::<PluginMethod>(encoded).unwrap(),
+            method
+        );
+    }
+
+    #[test]
+    fn plugin_event_subscription_and_gap_are_typed_vvmx_operations() {
+        let method = PluginMethod::EventSubscribe {
+            after_sequence: Some(41),
+        };
+        let encoded = serde_json::to_value(&method).unwrap();
+        assert_eq!(encoded["operation"], "event_subscribe");
+        assert_eq!(encoded["after_sequence"], 41);
+        assert_eq!(
+            serde_json::from_value::<PluginMethod>(encoded).unwrap(),
+            method
+        );
+        let gap = PluginEventEnvelope::Gap {
+            from_sequence: 42,
+            to_sequence: 99,
+        };
+        assert_eq!(serde_json::to_value(&gap).unwrap()["type"], "gap");
     }
 
     #[test]

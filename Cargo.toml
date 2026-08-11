@@ -8,6 +8,10 @@ license = "Apache-2.0"
 repository = "https://github.com/vivido-dev/vvmux"
 description = "A detachable Vivid-aware terminal multiplexer"
 
+[workspace]
+members = [".", "vvmux-plugin-api", "vvmux-plugin-sdk"]
+resolver = "2"
+
 [lib]
 name = "vvmux_terminal"
 path = "vvmux-terminal/src/lib.rs"
@@ -33,11 +37,19 @@ regex = { version = "1", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+semver = { version = "1", features = ["serde"] }
 subtle = { version = "2.6", optional = true }
-ed25519-dalek = { version = "2", features = ["signature", "digest", "std", "zeroize"], optional = true }
+ed25519-dalek = { version = "2", features = [
+  "signature",
+  "digest",
+  "std",
+  "zeroize",
+], optional = true }
 httpdate = { version = "1", optional = true }
 rpassword = { version = "7", optional = true }
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"], optional = true }
+tokio-tungstenite = { version = "0.30", features = [
+  "rustls-tls-native-roots",
+], optional = true }
 wtransport = { version = "0.7.1", optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
@@ -50,11 +62,21 @@ tokio = { version = "1", features = [
   "time",
 ], optional = true }
 unicode-width = "0.2"
-vivid_gateway = { path = "../vivid_gateway" }
+vivid_gateway = { version = "1.5", path = "../vivid_gateway" }
 vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
 zeroize = { version = "1.9", features = ["serde"] }
+vvmux-plugin-api = { path = "vvmux-plugin-api" }
+# 38.0.4 was the original design pin but now has applicable RustSec sandbox/WASI advisories.
+# 36.0.13 is the fully patched maintenance line that still supports this workspace's Rust 1.88.
+wasmtime = { version = "=36.0.13", default-features = false, features = [
+  "component-model",
+  "cranelift",
+  "runtime",
+  "std",
+] }
+wasmtime-wasi = { version = "=36.0.13", default-features = false }
 
 [features]
 default = ["server-capability"]
@@ -105,7 +127,10 @@ windows-sys = { version = "0.61.2", features = [
 [dev-dependencies]
 rcgen = "0.13"
 tempfile = "3"
+wat = "1"
 tokio-rustls = "0.26"
 tokio-tungstenite = "0.30"
 # The gateway's test-support API (wait_for_retained_media) is gated behind its testing feature.
-vivid_gateway = { path = "../vivid_gateway", features = ["testing"] }
+vivid_gateway = { version = "1.5", path = "../vivid_gateway", features = [
+  "testing",
+] }

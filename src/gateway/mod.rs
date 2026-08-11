@@ -1105,7 +1105,9 @@ async fn handle_session_message(
                 "session sent a duplicate attachment reply",
             ));
         }
-        ServerMessage::Automation(_) | ServerMessage::AutomationChunk { .. } => {
+        ServerMessage::Automation(_)
+        | ServerMessage::AutomationChunk { .. }
+        | ServerMessage::PluginEvent { .. } => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "session sent automation data to an attached gateway",

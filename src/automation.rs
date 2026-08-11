@@ -7,8 +7,8 @@ use base64::Engine;
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::ipc::{
-    AutomationMethod, AutomationRequest, AutomationResponse, Axis, ClientMessage, RunPlacement,
-    ServerMessage,
+    Action, AutomationMethod, AutomationRequest, AutomationResponse, Axis, ClientMessage,
+    Direction, PluginMethod, RunPlacement, ServerMessage,
 };
 use crate::media_trace::{
     MAX_MEDIA_TRACE_QUERY_EVENTS, MediaTraceBatch, MediaTraceCategory, MediaTraceFilter,
@@ -38,6 +38,81 @@ pub enum RunPlacementArg {
 pub enum SearchDirectionArg {
     Forward,
     Backward,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum DirectionArg {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl From<DirectionArg> for Direction {
+    fn from(direction: DirectionArg) -> Self {
+        match direction {
+            DirectionArg::Left => Self::Left,
+            DirectionArg::Right => Self::Right,
+            DirectionArg::Up => Self::Up,
+            DirectionArg::Down => Self::Down,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ActionCommand {
+    Split {
+        #[arg(value_enum)]
+        axis: SplitAxis,
+    },
+    Focus {
+        #[arg(value_enum)]
+        direction: DirectionArg,
+    },
+    Resize {
+        #[arg(value_enum)]
+        direction: DirectionArg,
+    },
+    NewTab,
+    NextTab,
+    PreviousTab,
+    SelectTab {
+        index: usize,
+    },
+    ClosePane,
+    ToggleZoom,
+    ToggleSyncInput,
+    EnterCopyMode,
+    Paste,
+    NewFloatingPane,
+    ToggleFloatingPanes,
+    TogglePanePinned,
+    EnterFloatingMoveMode,
+    EnterFloatingResizeMode,
+}
+
+impl From<ActionCommand> for Action {
+    fn from(action: ActionCommand) -> Self {
+        match action {
+            ActionCommand::Split { axis } => Self::Split(axis.into()),
+            ActionCommand::Focus { direction } => Self::Focus(direction.into()),
+            ActionCommand::Resize { direction } => Self::Resize(direction.into()),
+            ActionCommand::NewTab => Self::NewTab,
+            ActionCommand::NextTab => Self::NextTab,
+            ActionCommand::PreviousTab => Self::PreviousTab,
+            ActionCommand::SelectTab { index } => Self::SelectTab(index),
+            ActionCommand::ClosePane => Self::ClosePane,
+            ActionCommand::ToggleZoom => Self::ToggleZoom,
+            ActionCommand::ToggleSyncInput => Self::ToggleSyncInput,
+            ActionCommand::EnterCopyMode => Self::EnterCopyMode,
+            ActionCommand::Paste => Self::Paste,
+            ActionCommand::NewFloatingPane => Self::NewFloatingPane,
+            ActionCommand::ToggleFloatingPanes => Self::ToggleFloatingPanes,
+            ActionCommand::TogglePanePinned => Self::TogglePanePinned,
+            ActionCommand::EnterFloatingMoveMode => Self::EnterFloatingMoveMode,
+            ActionCommand::EnterFloatingResizeMode => Self::EnterFloatingResizeMode,
+        }
+    }
 }
 
 impl From<SearchDirectionArg> for SearchDirection {
@@ -70,6 +145,15 @@ pub enum MsgCommand {
     Capabilities,
     /// Re-read the session's config file now, without waiting for the watcher.
     ReloadConfig,
+    /// Revalidate the plugin registry immediately.
+    ReloadPlugins,
+    /// Apply an ordinary interactive action through the automation service.
+    Action {
+        #[command(subcommand)]
+        action: ActionCommand,
+        #[arg(long, global = true)]
+        pane_id: Option<u64>,
+    },
     /// List every pane in deterministic pane-ID order.
     ListPanes,
     /// Report authoritative AI-agent state for one pane.
@@ -367,7 +451,7 @@ fn send_automation_request(
         .send(&ClientMessage::Automation(request))
 }
 
-fn response_result(response: AutomationResponse) -> io::Result<serde_json::Value> {
+pub(crate) fn response_result(response: AutomationResponse) -> io::Result<serde_json::Value> {
     if !response.ok {
         let error = response
             .error
@@ -438,6 +522,18 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
     let tuple = match command {
         MsgCommand::Capabilities => (AutomationMethod::Capabilities, None, false, Output::Json),
         MsgCommand::ReloadConfig => (AutomationMethod::ReloadConfig, None, false, Output::Json),
+        MsgCommand::ReloadPlugins => (
+            AutomationMethod::Plugin(PluginMethod::Reload),
+            None,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::Action { action, pane_id } => (
+            AutomationMethod::Action(action.into()),
+            pane_id,
+            true,
+            Output::Json,
+        ),
         MsgCommand::ListPanes => (AutomationMethod::ListPanes, None, false, Output::Json),
         MsgCommand::ReportAgent {
             agent,
@@ -748,7 +844,7 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
     Ok(tuple)
 }
 
-fn receive_response(
+pub(crate) fn receive_response(
     reader: &mut crate::ipc::RecordReader,
     id: u64,
 ) -> io::Result<AutomationResponse> {

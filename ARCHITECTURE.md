@@ -95,7 +95,7 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 12 is a hard cutover. Its binary media header carries complete track identity
+Private VVMX version 15 is a hard cutover. Its binary media header carries complete track identity
 and bounded binary render/media records,
 pane-scoped sanitized media status and waits, bridge-instance correlation, and metadata-only media
 traces. Host terminal focus, pixel mouse input, and focused-pane Kitty keyboard flags retain their
@@ -106,8 +106,66 @@ are reactivated without inventing a PLAY transition. Mixed VVMX versions are rej
 guidance.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 12 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 15 → outer vvmux producer → Vivido
 ```
+
+## Plugin boundary
+
+The stable extension contract lives in the separate `vvmux-plugin-api` workspace crate and is
+independently versioned from private VVMX. Strict manifests and self-contained action schemas are
+validated before registry mutation or execution. Native plugins use bounded length-prefixed JSON;
+component plugins use the WIT world shipped by that crate. Language SDKs never encode VVMX.
+
+Plugin process and schema work belongs outside the session actor. Only resolved, bounded commands
+may mutate session state, and the actor remains its sole writer. Exact argv PTY spawning keeps
+manifest commands out of shell parsing. Native plugins are trusted same-user code; only WebAssembly
+Components receive a sandbox claim. Plugin media continues through the existing pane-scoped Vivid
+capability path and never through terminal bytes.
+
+The session owns its collision-resistant instance identity independently of plugin enablement. When
+`plugins.enabled` is false, it starts neither a plugin supervisor nor a registry watcher; disabling
+plugins in a live session immediately removes the supervisor from the actor's acceptance path,
+cancels its jobs, revokes runtime identities, and stops its watcher. Enabling plugins creates those
+workers without replacing the session identity. The disabled and no-package paths therefore add no
+plugin-originated actor wakeups.
+
+When enabled, each session owns one bounded plugin supervisor outside the actor. Catalog and
+capability discovery come from that supervisor's applied registry snapshot, carry its generation,
+and include only actions currently invocable in the exact target session. Native services and
+Components receive an exact session/plugin-instance identity and a short-lived broker token through
+their scrubbed environment; the token is revoked when that runtime stops and is never an argv value
+or protocol payload. Native protocol handlers may issue correlated `host_call` replies. One-shot
+actions receive no broker token and expose no typed host-call transport. The supervisor validates a
+live service or Component token, and the actor lowers both automation and broker requests through
+typed `SessionCommand`/`CallerContext` authorization before serving `session.inspect`,
+`pane.get_text`, or `pane.input`. Native code remains trusted because it can bypass this broker as
+the same OS user.
+
+Manifest PTY panes are resolved by the supervisor, then lowered as exact-argv `pane.create` commands
+through the same actor service. The actor attaches complete session/plugin-instance/package
+generation ownership before spawn and alone commits split, float, or tab placement. Sync keyboard
+and paste share the manifest opt-in predicate. `media.produce` gates issuance of the existing
+pane-scoped Vivid capability; held exit revokes it before displaying a core diagnostic. Generation
+change, disable, removal, kill switch, and shutdown reuse the ordinary pane close path, so teardown
+never matches only a numeric pane ID.
+
+The actor also owns the monotonic plugin-event sequence and a bounded metadata-only replay journal.
+Screen, layout, focus, configuration, and media revisions coalesce at the existing render boundary;
+pane and plugin lifecycle entries remain individually ordered. Persistent VVMX subscribers use a
+dedicated bounded writer and consume neither automation-waiter nor job slots. The actor only uses
+`try_send` toward subscribers and the supervisor, so a stalled client or runtime cannot delay PTY,
+render, or media work; overflow becomes an explicit sequence gap. The supervisor permission-checks
+manifest hooks, activates `session` runtimes, and dispatches native protocol events or Component
+`on-event` calls on bounded per-plugin workers. Broker-triggered mutations retain correlation and
+causation identity, hooks exclude self-caused events by default, and dispatch stops at depth eight.
+
+The Rust SDK owns the guest-side WIT bindings used to build `wasm32-wasip2` Components. Component
+invocations reset a private log accumulator before entering guest code; host log imports sanitize
+line breaks, serialize bounded JSON entries, and retain explicit truncation metadata with detached
+jobs instead of writing guest-controlled text directly to the host's stderr. Component storage,
+cache, config, and data paths use independent plugin-ID-derived components. Cache deserialization
+requires the complete engine/host/artifact key and serialized payload digest; a mismatch recompiles
+the pinned source artifact.
 
 The inner presenter accepts Control and Track only, verifies root and channel authentication,
 consumes marker-v3 anchors, and grants cumulative flow per track. The outer producer allocates all

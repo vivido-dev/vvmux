@@ -324,11 +324,14 @@ fn spawn(
 ) -> io::Result<PaneSpawn> {
     Ok(PaneSpawn {
         command: command.map(OsString::from),
+        argv: None,
         cwd: cwd
             .map(|cwd| expand_home(&cwd, home, tab, label))
             .transpose()?,
         hold_on_exit: hold,
         extra_env: Vec::new(),
+        role: crate::session::PaneRole::Core,
+        vivid_capability: true,
     })
 }
 

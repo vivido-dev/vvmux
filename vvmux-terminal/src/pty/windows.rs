@@ -188,13 +188,47 @@ pub(super) fn spawn(
     rows: u16,
     environment: &[(String, String)],
 ) -> io::Result<PtyParts> {
+    spawn_prepared(
+        shell,
+        build_command_line(shell, command),
+        cwd,
+        columns,
+        rows,
+        environment,
+    )
+}
+
+pub(super) fn spawn_argv(
+    program: &OsStr,
+    arguments: &[impl AsRef<OsStr>],
+    cwd: &Path,
+    columns: u16,
+    rows: u16,
+    environment: &[(String, String)],
+) -> io::Result<PtyParts> {
+    let mut command_line = quote_argument(&program.to_string_lossy());
+    for argument in arguments {
+        command_line.push(' ');
+        command_line.push_str(&quote_argument(&argument.as_ref().to_string_lossy()));
+    }
+    spawn_prepared(program, command_line, cwd, columns, rows, environment)
+}
+
+fn spawn_prepared(
+    program: &OsStr,
+    command_line: String,
+    cwd: &Path,
+    columns: u16,
+    rows: u16,
+    environment: &[(String, String)],
+) -> io::Result<PtyParts> {
     if columns == 0 || rows == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "ConPTY dimensions must be nonzero",
         ));
     }
-    if !cwd.is_absolute() || !Path::new(shell).is_absolute() {
+    if !cwd.is_absolute() || !Path::new(program).is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Windows shell and working directory paths must be absolute",
@@ -244,8 +278,8 @@ pub(super) fn spawn(
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.lpAttributeList = attributes.pointer();
 
-    let application = wide(shell)?;
-    let mut command_line = wide(OsStr::new(&build_command_line(shell, command)))?;
+    let application = wide(program)?;
+    let mut command_line = wide(OsStr::new(&command_line))?;
     let cwd = wide(cwd.as_os_str())?;
     let environment = environment_block(environment)?;
 
@@ -707,6 +741,25 @@ mod tests {
                 Some(OsStr::new("printf 'a b'"))
             ),
             r#""C:\Program Files\Git\bin\bash.exe" -c "printf 'a b'""#
+        );
+    }
+
+    #[test]
+    fn argv_command_line_quotes_each_argument_independently() {
+        let program = OsStr::new(r"C:\Program Files\tool.exe");
+        let arguments = [
+            OsStr::new("plain"),
+            OsStr::new("two words"),
+            OsStr::new(r#"a\"b"#),
+        ];
+        let mut line = quote_argument(&program.to_string_lossy());
+        for argument in arguments {
+            line.push(' ');
+            line.push_str(&quote_argument(&argument.to_string_lossy()));
+        }
+        assert_eq!(
+            line,
+            r#""C:\Program Files\tool.exe" plain "two words" "a\\\"b""#
         );
     }
 

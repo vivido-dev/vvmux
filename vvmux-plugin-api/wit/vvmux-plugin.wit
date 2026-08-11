@@ -1,0 +1,26 @@
+package vivido:vvmux-plugin@1.0.0;
+
+interface host {
+  record plugin-error {
+    code: string,
+    message: string,
+  }
+
+  call: func(method: string, params-json: list<u8>) -> result<list<u8>, plugin-error>;
+  log: func(level: string, message: string);
+  storage-get: func(key: string) -> result<option<list<u8>>, plugin-error>;
+  storage-set: func(key: string, value: list<u8>) -> result<_, plugin-error>;
+}
+
+interface guest {
+  use host.{plugin-error};
+  initialize: func(context-json: list<u8>) -> result<_, plugin-error>;
+  invoke: func(action: string, input-json: list<u8>, context-json: list<u8>) -> result<list<u8>, plugin-error>;
+  on-event: func(name: string, event-json: list<u8>, context-json: list<u8>) -> result<_, plugin-error>;
+  shutdown: func() -> result<_, plugin-error>;
+}
+
+world plugin {
+  import host;
+  export guest;
+}

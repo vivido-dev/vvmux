@@ -1,0 +1,30 @@
+manifest_version = 1
+
+[plugin]
+id = "dev.vivido.reference.agent"
+name = "TypeScript Agent Utility"
+version = "0.1.0"
+min_vvmux_version = "0.4.0"
+description = "Trusted argv-based test execution and failure summarization"
+platforms = ["linux", "macos", "windows"]
+permissions = []
+
+[[actions]]
+id = "test"
+title = "Run test argv"
+description = "Run one bounded test command without a shell"
+command = ["node", "agent-utility.mjs", "run-tests"]
+input_schema = "schemas/test-input.json"
+output_schema = "schemas/test-output.json"
+agent_visible = true
+timeout_ms = 35000
+
+[[actions]]
+id = "summarize"
+title = "Summarize test result"
+description = "Produce a bounded failure summary and duration series"
+command = ["node", "agent-utility.mjs", "summarize"]
+input_schema = "schemas/summarize-input.json"
+output_schema = "schemas/summarize-output.json"
+agent_visible = true
+timeout_ms = 5000

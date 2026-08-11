@@ -429,6 +429,9 @@ impl PrefixParser {
 }
 
 pub(crate) fn parse_configured_action(action: &str) -> Option<Action> {
+    if action.starts_with("plugin:") {
+        return Some(Action::Plugin(action.to_owned()));
+    }
     match action {
         "split-horizontal" => Some(Action::Split(Axis::Horizontal)),
         "split-vertical" => Some(Action::Split(Axis::Vertical)),

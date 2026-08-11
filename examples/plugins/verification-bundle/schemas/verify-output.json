@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["title", "lines"],
+  "properties": {
+    "title": { "type": "string" },
+    "lines": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 1024 } }
+  },
+  "additionalProperties": false
+}

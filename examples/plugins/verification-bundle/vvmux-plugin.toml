@@ -1,0 +1,64 @@
+manifest_version = 1
+
+[plugin]
+id = "dev.vivido.reference.verify"
+name = "Verification Workflow Bundle"
+version = "0.1.0"
+min_vvmux_version = "0.4.0"
+description = "A TOML-only test, summary, chart, and dashboard DAG"
+platforms = ["linux", "macos", "windows"]
+permissions = ["plugin.invoke"]
+
+[[dependencies]]
+alias = "runner"
+id = "dev.vivido.reference.agent"
+version = "^0.1"
+source = "https://github.com/vivido-dev/vvmux-reference-agent"
+
+[[dependencies]]
+alias = "review"
+id = "dev.vivido.reference.agent"
+version = "^0.1"
+source = "https://github.com/vivido-dev/vvmux-reference-agent"
+
+[[dependencies]]
+alias = "chart"
+id = "dev.vivido.reference.chart"
+version = "^0.1"
+source = "https://github.com/vivido-dev/vvmux-reference-chart"
+
+[[dependencies]]
+alias = "dashboard"
+id = "dev.vivido.reference.dashboard"
+version = "^0.1"
+source = "https://github.com/vivido-dev/vvmux-reference-dashboard"
+
+[[workflows]]
+id = "verify"
+title = "Run checks and summarize failures"
+trigger = "manual"
+agent_visible = true
+input_schema = "schemas/verify-input.json"
+output_schema = "schemas/verify-output.json"
+timeout_ms = 60000
+output = "${steps.dashboard.output}"
+
+[[workflows.steps]]
+id = "tests"
+uses = "runner/test"
+with = "${trigger}"
+
+[[workflows.steps]]
+id = "summary"
+uses = "review/summarize"
+with = { result = "${steps.tests.output}" }
+
+[[workflows.steps]]
+id = "chart"
+uses = "chart/statistics"
+with = { values = "${steps.summary.output#/durations}" }
+
+[[workflows.steps]]
+id = "dashboard"
+uses = "dashboard/model"
+with = { summary = "${steps.summary.output#/summary}", chart = "${steps.chart.output}" }

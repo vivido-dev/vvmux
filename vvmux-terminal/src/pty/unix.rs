@@ -113,6 +113,39 @@ pub(super) fn spawn(
     rows: u16,
     environment: &[(String, String)],
 ) -> io::Result<PtyParts> {
+    let mut builder = Command::new(shell);
+    // `-c <command>` runs one command and exits; `-l` is the ordinary interactive login shell.
+    match command {
+        Some(command) => {
+            builder.arg("-c").arg(command);
+        }
+        None => {
+            builder.arg("-l");
+        }
+    }
+    spawn_command(builder, cwd, columns, rows, environment)
+}
+
+pub(super) fn spawn_argv(
+    program: &OsStr,
+    arguments: &[impl AsRef<OsStr>],
+    cwd: &Path,
+    columns: u16,
+    rows: u16,
+    environment: &[(String, String)],
+) -> io::Result<PtyParts> {
+    let mut builder = Command::new(program);
+    builder.args(arguments.iter().map(AsRef::as_ref));
+    spawn_command(builder, cwd, columns, rows, environment)
+}
+
+fn spawn_command(
+    mut builder: Command,
+    cwd: &Path,
+    columns: u16,
+    rows: u16,
+    environment: &[(String, String)],
+) -> io::Result<PtyParts> {
     if columns == 0 || rows == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -150,16 +183,6 @@ pub(super) fn spawn(
     let stdout = slave_file.try_clone()?;
     let slave_fd = slave_file.as_raw_fd();
 
-    let mut builder = Command::new(shell);
-    // `-c <command>` runs one command and exits; `-l` is the ordinary interactive login shell.
-    match command {
-        Some(command) => {
-            builder.arg("-c").arg(command);
-        }
-        None => {
-            builder.arg("-l");
-        }
-    }
     builder
         .current_dir(cwd)
         .stdin(Stdio::from(stdin))
@@ -167,7 +190,10 @@ pub(super) fn spawn(
         .stderr(Stdio::from(slave_file));
     builder.env_remove("VIVID_ENDPOINT");
     builder.env_remove("VIVID_ENDPOINT_BULK");
+    builder.env_remove("VIVID_ENDPOINT_CONTROL");
     builder.env_remove("VIVID_TOKEN");
+    builder.env_remove("VIVID_ROOT_SECRET");
+    builder.env_remove("VIVID_ANCHOR_TRANSPORT");
     builder.env_remove("VIVID_SSH_ENDPOINT");
     builder.env_remove("VIVID_SSH_TOKEN");
     for (key, value) in environment {

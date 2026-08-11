@@ -16,6 +16,7 @@ pub struct Config {
     pub media: Media,
     pub keys: Keys,
     pub floating: Floating,
+    pub plugins: Plugins,
     pub server: Server,
 }
 
@@ -62,6 +63,19 @@ pub struct Floating {
     pub default_width_percent: u16,
     pub default_height_percent: u16,
     pub border_drag_margin: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Plugins {
+    /// Global live-session kill switch. Individual packages retain their registry enable state.
+    pub enabled: bool,
+}
+
+impl Default for Plugins {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,7 +328,15 @@ mod tests {
         let config = Config::default();
         config.validate().unwrap();
         assert_eq!(config.media.aggregate_retained_bytes, 256 * 1024 * 1024);
+        assert!(config.plugins.enabled);
         assert_eq!(config.server.listen, "127.0.0.1:7880");
+    }
+
+    #[test]
+    fn plugin_kill_switch_is_strict_and_can_be_disabled() {
+        let config: Config = toml::from_str("[plugins]\nenabled = false").unwrap();
+        assert!(!config.plugins.enabled);
+        assert!(toml::from_str::<Config>("[plugins]\nunknown = true").is_err());
     }
 
     #[test]

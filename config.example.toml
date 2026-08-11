@@ -59,6 +59,10 @@ default_width_percent = 60
 default_height_percent = 60
 border_drag_margin = 1
 
+[plugins]
+# Live global kill switch. Disabling stops runtimes and the registry watcher for this session.
+enabled = true
+
 [server]
 listen = "127.0.0.1:7880"
 # Browser WebSocket origins are matched exactly; at least one is required by `vvmux serve`.
