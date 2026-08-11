@@ -21,7 +21,7 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 14;
+pub const VERSION: u16 = 15;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -190,6 +190,9 @@ pub enum PluginMethod {
     },
     JobLogs {
         job_id: String,
+    },
+    PaneOpen {
+        reference: String,
     },
     Reload,
 }
@@ -958,6 +961,20 @@ mod tests {
         preface[4..6].copy_from_slice(&VERSION.wrapping_add(1).to_be_bytes());
         let error = decode_preface(&preface).unwrap_err();
         assert!(error.to_string().contains("restart"));
+    }
+
+    #[test]
+    fn plugin_pane_open_has_a_typed_vvmx_operation() {
+        let method = PluginMethod::PaneOpen {
+            reference: "dev.example/dashboard".into(),
+        };
+        let encoded = serde_json::to_value(&method).unwrap();
+        assert_eq!(encoded["operation"], "pane_open");
+        assert_eq!(encoded["reference"], "dev.example/dashboard");
+        assert_eq!(
+            serde_json::from_value::<PluginMethod>(encoded).unwrap(),
+            method
+        );
     }
 
     #[test]

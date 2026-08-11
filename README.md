@@ -216,7 +216,7 @@ to advance; when both
 
 Requests and input are limited to 1 MiB, decoded replies to 16 MiB, row requests and key repeats to
 1,000, and regular expressions to 8 KiB. The server bounds connections, in-flight requests,
-waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 14 is a hard
+waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 15 is a hard
 private-protocol cutover, so sessions created by older binaries must be restarted after upgrading.
 
 ## Network session gateway
@@ -471,9 +471,10 @@ Discover agent-visible actions with `vvmux plugin catalog --target SESSION --jso
 prints the release-matched automation guidance. WebAssembly Components are the sandboxed tier.
 Native process, one-shot, and PTY-pane plugins are trusted user code and run with the user's full OS
 authority. Native service SDKs expose scoped host calls for session inspection, bounded pane text,
-and pane input. These calls enforce the manifest's `session.read`, `pane.read`, and `pane.input`
-declarations; service and Component broker tokens provide attribution and revocation, not an OS
-security boundary. One-shot actions receive no broker token.
+pane input, and capability-checked pane close. These calls enforce the manifest's `session.read`,
+`pane.read`, `pane.input`, `pane.manage_own`, and `pane.manage_any` declarations; service and
+Component broker tokens provide attribution and revocation, not an OS security boundary. One-shot
+actions receive no broker token.
 
 Rust Component authors implement `vvmux_plugin_sdk::component::Guest` and export it with the SDK's
 generated `component::export!` macro. Build those crates for `wasm32-wasip2`; the SDK owns the
@@ -485,6 +486,15 @@ the real Rust conformance guest, so development environments need
 `vvmux plugin job status JOB`, `cancel JOB`, and `logs JOB` to inspect or stop it. Sessions retain
 the newest 200 detached completions and at most 256 KiB each of result/error log text; detached work
 survives the invoking CLI client, while synchronous work remains client-scoped.
+
+`vvmux plugin pane open ID/PANE --target SESSION` resolves the pane from that session's applied
+registry generation and starts its exact argv in a real PTY. Manifest placement selects a vertical
+split, float, or named tab. Plugin panes default to held exit and exclusion from synchronized
+keyboard and paste fan-out; `accept_sync_input = true` opts in. `pane.create` authorizes opening,
+while `media.produce` controls whether the process receives a fresh pane-scoped Vivid capability.
+Held crashes show a core-authored plugin/entrypoint/exit diagnostic. Close, plugin disable/removal,
+artifact change, global kill switch, and session shutdown all use the same owner-scoped pane and
+Vivid teardown path.
 
 The global plugin registry carries a monotonic generation and is watched by every plugin-enabled
 live session.

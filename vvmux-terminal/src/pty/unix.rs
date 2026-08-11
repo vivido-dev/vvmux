@@ -190,7 +190,10 @@ fn spawn_command(
         .stderr(Stdio::from(slave_file));
     builder.env_remove("VIVID_ENDPOINT");
     builder.env_remove("VIVID_ENDPOINT_BULK");
+    builder.env_remove("VIVID_ENDPOINT_CONTROL");
     builder.env_remove("VIVID_TOKEN");
+    builder.env_remove("VIVID_ROOT_SECRET");
+    builder.env_remove("VIVID_ANCHOR_TRANSPORT");
     builder.env_remove("VIVID_SSH_ENDPOINT");
     builder.env_remove("VIVID_SSH_TOKEN");
     for (key, value) in environment {

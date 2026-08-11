@@ -193,17 +193,21 @@ fn default_event_timeout() -> u64 {
     10_000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Pane {
     pub id: String,
     pub title: String,
     pub placement: Placement,
     pub command: Vec<String>,
-    #[serde(default)]
+    #[serde(default = "default_pane_hold")]
     pub hold_on_exit: bool,
     #[serde(default)]
     pub accept_sync_input: bool,
+}
+
+fn default_pane_hold() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -460,6 +464,18 @@ impl Manifest {
         }
         for pane in &self.panes {
             validate_local_id(&pane.id, "pane")?;
+            if !ids.insert((&pane.id, "pane")) {
+                return invalid(format!("duplicate pane id `{}`", pane.id));
+            }
+            if pane.title.is_empty()
+                || pane.title.len() > 128
+                || pane.title.chars().any(char::is_control)
+            {
+                return invalid(format!(
+                    "pane `{}` title must contain 1 through 128 printable bytes",
+                    pane.id
+                ));
+            }
             validate_argv(Some(&pane.command), "pane", &pane.id)?;
         }
         let mut aliases = BTreeSet::new();
@@ -995,5 +1011,31 @@ agent_visible = true
             .validate_input(action, &serde_json::json!({}))
             .unwrap();
         assert!(loaded.validate_output(action, &Value::Null).is_err());
+    }
+
+    #[test]
+    fn plugin_panes_default_to_held_and_sync_input_opt_in() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+manifest_version = 1
+[plugin]
+id = "dev.example"
+name = "Example"
+version = "1.0.0"
+min_vvmux_version = "0.5.0"
+description = "test"
+platforms = ["linux"]
+permissions = ["pane.create"]
+[[panes]]
+id = "dashboard"
+title = "Dashboard"
+placement = "float"
+command = ["python", "dashboard.py"]
+"#,
+        )
+        .unwrap();
+        manifest.validate().unwrap();
+        assert!(manifest.panes[0].hold_on_exit);
+        assert!(!manifest.panes[0].accept_sync_input);
     }
 }

@@ -76,7 +76,15 @@ fn catalog_uses_the_live_session_generation_and_hides_unimplemented_workflows() 
     );
     assert_eq!(
         capabilities["plugins"]["enforceable_capabilities"],
-        serde_json::json!(["session.read", "pane.read", "pane.input"])
+        serde_json::json!([
+            "session.read",
+            "pane.read",
+            "pane.input",
+            "pane.create",
+            "pane.manage_own",
+            "pane.manage_any",
+            "media.produce"
+        ])
     );
 
     let invoked = command(binary, &runtime, &config_home)
@@ -228,6 +236,47 @@ fn disabled_and_enabled_empty_sessions_render_identical_terminal_grids() {
     );
     assert_eq!(disabled["grid"], enabled["grid"]);
     assert_eq!(disabled["rows"], enabled["rows"]);
+
+    let disabled_before = msg_json(
+        binary,
+        &runtime,
+        &config_home,
+        &disabled_name,
+        &["list-panes"],
+    )["actor_wakeups"]
+        .as_u64()
+        .unwrap();
+    let enabled_before = msg_json(
+        binary,
+        &runtime,
+        &config_home,
+        &enabled_name,
+        &["list-panes"],
+    )["actor_wakeups"]
+        .as_u64()
+        .unwrap();
+    let disabled_after = msg_json(
+        binary,
+        &runtime,
+        &config_home,
+        &disabled_name,
+        &["list-panes"],
+    )["actor_wakeups"]
+        .as_u64()
+        .unwrap();
+    let enabled_after = msg_json(
+        binary,
+        &runtime,
+        &config_home,
+        &enabled_name,
+        &["list-panes"],
+    )["actor_wakeups"]
+        .as_u64()
+        .unwrap();
+    let disabled_delta = disabled_after - disabled_before;
+    let enabled_delta = enabled_after - enabled_before;
+    assert!(disabled_delta >= 1);
+    assert_eq!(enabled_delta, disabled_delta);
 }
 
 fn write_package(root: &Path) -> PathBuf {

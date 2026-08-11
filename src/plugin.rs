@@ -79,6 +79,11 @@ pub enum PluginCommand {
         #[command(subcommand)]
         command: PluginJobCommand,
     },
+    /// Open a manifest-declared native PTY pane in a live session.
+    Pane {
+        #[command(subcommand)]
+        command: PluginPaneCommand,
+    },
     /// Verify dependency constraints and write the reproducible lock.
     Resolve {
         #[arg(long)]
@@ -115,6 +120,16 @@ pub enum PluginJobCommand {
     Cancel { job_id: String },
     /// Show bounded retained stdout and stderr.
     Logs { job_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PluginPaneCommand {
+    /// Open a pane entrypoint, identified as PLUGIN_ID/PANE_ID.
+    Open {
+        reference: String,
+        #[arg(long)]
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,6 +201,8 @@ pub(crate) struct RuntimePlugin {
     pub(crate) digest: String,
     pub(crate) manifest_digest: String,
     pub(crate) enabled: bool,
+    pub(crate) permissions: Vec<Permission>,
+    pub(crate) panes: Vec<vvmux_plugin_api::Pane>,
 }
 
 #[derive(Debug)]
@@ -223,6 +240,7 @@ pub fn run(command: PluginCommand) -> io::Result<()> {
         PluginCommand::Catalog(args) => catalog(&paths, args),
         PluginCommand::Invoke(args) => invoke(&paths, args),
         PluginCommand::Job { command } => job(command),
+        PluginCommand::Pane { command } => pane(command),
         PluginCommand::Resolve { frozen } => resolve(&paths, frozen),
     }
 }
@@ -279,6 +297,8 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
                     digest: entry.digest.clone(),
                     manifest_digest: entry.manifest_digest.clone(),
                     enabled: false,
+                    permissions: Vec::new(),
+                    panes: Vec::new(),
                 },
             );
             continue;
@@ -304,6 +324,17 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
                 .iter()
                 .filter(|permission| enforceable.contains(*permission))
                 .cloned()
+                .collect::<Vec<_>>();
+            let enforceable_permissions = crate::session::plugin_enforceable_permissions()
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let runtime_permissions = loaded
+                .manifest
+                .plugin
+                .permissions
+                .iter()
+                .filter(|permission| enforceable_permissions.contains(*permission))
+                .copied()
                 .collect::<Vec<_>>();
             let actions = loaded
                 .manifest
@@ -334,6 +365,8 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
                     digest: actual_digest,
                     manifest_digest: actual_manifest,
                     enabled: true,
+                    permissions: runtime_permissions,
+                    panes: loaded.manifest.panes.clone(),
                 },
                 actions,
             ))
@@ -732,6 +765,17 @@ fn inspect(paths: &PluginPaths, id: &str, json: bool) -> io::Result<()> {
         for action in &loaded.manifest.actions {
             println!("action: {}/{} — {}", entry.id, action.id, action.title);
         }
+        for pane in &loaded.manifest.panes {
+            println!(
+                "pane: {}/{} — {} ({:?}, hold={}, sync={})",
+                entry.id,
+                pane.id,
+                pane.title,
+                pane.placement,
+                pane.hold_on_exit,
+                pane.accept_sync_input
+            );
+        }
         for warning in loaded.warnings {
             println!("warning: {warning}");
         }
@@ -903,6 +947,16 @@ fn job(command: PluginJobCommand) -> io::Result<()> {
     };
     let target = job_target(&job_id)?;
     print_json(&plugin_session_request(target, operation)?)
+}
+
+fn pane(command: PluginPaneCommand) -> io::Result<()> {
+    let (target, operation) = match command {
+        PluginPaneCommand::Open { reference, target } => {
+            (target, crate::ipc::PluginMethod::PaneOpen { reference })
+        }
+    };
+    crate::runtime::validate_session_name(&target)?;
+    print_json(&plugin_session_request(&target, operation)?)
 }
 
 fn job_target(job_id: &str) -> io::Result<&str> {
@@ -1568,6 +1622,17 @@ fn preview(loaded: &LoadedManifest, source: &str) {
     }
     for action in &loaded.manifest.actions {
         println!("action: {} — {}", action.id, action.title);
+    }
+    for pane in &loaded.manifest.panes {
+        println!(
+            "pane: {} — {} ({:?}, hold={}, sync={}) argv={:?}",
+            pane.id,
+            pane.title,
+            pane.placement,
+            pane.hold_on_exit,
+            pane.accept_sync_input,
+            pane.command
+        );
     }
 }
 

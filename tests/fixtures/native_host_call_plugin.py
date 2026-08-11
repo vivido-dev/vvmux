@@ -77,6 +77,15 @@ while True:
         session = read_frame()
         write_frame(
             {
+                "type": "host_call",
+                "request_id": 44,
+                "method": "pane.close",
+                "params": {"pane_id": 1},
+            }
+        )
+        close_denial = read_frame()
+        write_frame(
+            {
                 "type": "result",
                 "request_id": request_id,
                 "result": {
@@ -86,6 +95,8 @@ while True:
                     "broker_token_present": bool(
                         os.environ.get("VVMUX_PLUGIN_BROKER_TOKEN")
                     ),
+                    "close_denied": close_denial.get("code")
+                    == "capability_denied",
                 },
             }
         )

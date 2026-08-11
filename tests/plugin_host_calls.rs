@@ -102,7 +102,7 @@ timeout_ms = 30000
     .unwrap();
     fs::write(
         package.join("schemas/output.json"),
-        r#"{"type":"object","required":["saw_ready","input_accepted","session","broker_token_present"]}"#,
+        r#"{"type":"object","required":["saw_ready","input_accepted","session","broker_token_present","close_denied"]}"#,
     )
     .unwrap();
 
@@ -160,6 +160,7 @@ timeout_ms = 30000
     assert_eq!(result["input_accepted"], true);
     assert_eq!(result["session"], name);
     assert_eq!(result["broker_token_present"], true);
+    assert_eq!(result["close_denied"], true);
 
     assert_success(
         &command(binary, &runtime, &config_home)

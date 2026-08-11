@@ -402,6 +402,22 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "vvmux",
+                "plugin",
+                "pane",
+                "open",
+                "dev.example/dashboard",
+                "--target",
+                "work",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["vvmux", "plugin", "pane", "open", "dev.example/dashboard",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vvmux",
                 "msg",
                 "report-agent",
                 "--agent",

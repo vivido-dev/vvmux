@@ -35,7 +35,7 @@ pub(crate) struct PluginSupervisor {
     session_instance: String,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeScope {
     pub(crate) session_instance: String,
     pub(crate) plugin_id: String,
@@ -403,6 +403,10 @@ enum Message {
         job_id: String,
         reply: AutomationReplyTarget,
     },
+    OpenPane {
+        reference: String,
+        reply: AutomationReplyTarget,
+    },
     Capabilities {
         reply: AutomationReplyTarget,
     },
@@ -517,6 +521,14 @@ impl PluginSupervisor {
         reply: AutomationReplyTarget,
     ) -> Result<(), AutomationError> {
         self.send_control(Message::JobLogs { job_id, reply })
+    }
+
+    pub(crate) fn open_pane(
+        &self,
+        reference: String,
+        reply: AutomationReplyTarget,
+    ) -> Result<(), AutomationError> {
+        self.send_control(Message::OpenPane { reference, reply })
     }
 
     pub(crate) fn capabilities(&self, reply: AutomationReplyTarget) -> Result<(), AutomationError> {
@@ -781,6 +793,16 @@ fn run_manager(inputs: ManagerInputs) {
             Message::JobLogs { job_id, reply } => {
                 deliver_query(&actor, reply, retained.logs(&job_id));
             }
+            Message::OpenPane { reference, reply } => {
+                let result =
+                    resolve_pane_launch(&registry, &transitions, &session_instance, &reference);
+                match result {
+                    Ok(launch) => {
+                        let _ = actor.send(ActorEvent::PluginPaneOpen { launch, reply });
+                    }
+                    Err(error) => deliver_query(&actor, reply, Err(error)),
+                }
+            }
             Message::Capabilities { reply } => {
                 let actions = registry
                     .catalog
@@ -799,7 +821,7 @@ fn run_manager(inputs: ManagerInputs) {
                     "protocol_version": vvmux_plugin_api::PROTOCOL_VERSION,
                     "session_instance": session_instance,
                     "applied_generation": registry.generation,
-                    "methods": ["catalog", "invoke", "job_status", "job_cancel", "job_logs", "reload"],
+                    "methods": ["catalog", "invoke", "job_status", "job_cancel", "job_logs", "pane_open", "reload"],
                     "native_trust": "full_user_authority",
                     "component_sandbox": true,
                     "enforceable_capabilities": crate::session::plugin_enforceable_capabilities(),
@@ -852,6 +874,7 @@ fn run_manager(inputs: ManagerInputs) {
                             &active,
                             &mut workers,
                             &mut transitions,
+                            &actor,
                         );
                         let pending = transitions.clone();
                         for completion in completions {
@@ -1037,6 +1060,7 @@ fn apply_registry_candidate(
     active: &HashMap<u64, ActiveJob>,
     workers: &mut HashMap<String, WorkerHandle>,
     transitions: &mut BTreeSet<String>,
+    actor: &mpsc::SyncSender<ActorEvent>,
 ) -> RegistryReloadReport {
     let mut ids = BTreeSet::new();
     ids.extend(registry.plugins.keys().cloned());
@@ -1055,6 +1079,15 @@ fn apply_registry_candidate(
         let previous = registry.plugins.get(&id);
         let next = candidate.plugins.get(&id);
         let changed = previous != next || registry.catalog.get(&id) != candidate.catalog.get(&id);
+        if changed
+            && let Some(previous) = previous
+            && previous.enabled
+        {
+            let _ = actor.send(ActorEvent::PluginPanesClose {
+                plugin_id: id.clone(),
+                package_digest: previous.digest.clone(),
+            });
+        }
         if changed {
             match next {
                 Some(plugin) => {
@@ -1090,6 +1123,75 @@ fn apply_registry_candidate(
     registry.generation = candidate.generation.max(registry.generation);
     registry.failures = candidate.failed;
     report
+}
+
+fn resolve_pane_launch(
+    registry: &AppliedRegistry,
+    transitions: &BTreeSet<String>,
+    session_instance: &str,
+    reference: &str,
+) -> Result<crate::session::PluginPaneLaunch, AutomationError> {
+    let (plugin_id, pane_id) = reference.split_once('/').ok_or_else(|| {
+        AutomationError::new("action_not_found", "plugin pane reference must be ID/PANE")
+    })?;
+    if plugin_id.is_empty() || pane_id.is_empty() || reference.len() > 256 {
+        return Err(AutomationError::new(
+            "action_not_found",
+            "plugin pane reference must be ID/PANE",
+        ));
+    }
+    let plugin = registry.plugins.get(plugin_id).ok_or_else(|| {
+        AutomationError::new(
+            "plugin_not_found",
+            format!("plugin `{plugin_id}` is not installed"),
+        )
+    })?;
+    if !plugin.enabled {
+        return Err(AutomationError::new(
+            "plugin_disabled",
+            format!("plugin `{plugin_id}` is disabled"),
+        ));
+    }
+    if transitions.contains(plugin_id) {
+        return Err(AutomationError::new(
+            "runtime_unavailable",
+            format!("plugin `{plugin_id}` is changing generations"),
+        ));
+    }
+    if !plugin.permissions.contains(&Permission::PaneCreate) {
+        return Err(AutomationError::new(
+            "capability_denied",
+            format!("plugin `{plugin_id}` lacks `pane.create` capability"),
+        ));
+    }
+    let pane = plugin
+        .panes
+        .iter()
+        .find(|pane| pane.id == pane_id)
+        .cloned()
+        .ok_or_else(|| {
+            AutomationError::new(
+                "action_not_found",
+                format!("plugin `{plugin_id}` has no pane `{pane_id}`"),
+            )
+        })?;
+    let plugin_instance = random_identity().map_err(|error| {
+        AutomationError::new(
+            "runtime_unavailable",
+            format!("could not allocate plugin pane identity: {error}"),
+        )
+    })?;
+    Ok(crate::session::PluginPaneLaunch {
+        scope: RuntimeScope {
+            session_instance: session_instance.to_owned(),
+            plugin_id: plugin_id.to_owned(),
+            plugin_instance,
+            permissions: plugin.permissions.clone(),
+        },
+        package_digest: plugin.digest.clone(),
+        package_root: plugin.root.clone(),
+        pane,
+    })
 }
 
 fn request_worker_stop_if_drained(
@@ -1201,7 +1303,6 @@ fn truncate_log(mut value: String, limit: usize) -> (String, bool) {
     (value, true)
 }
 
-#[cfg(test)]
 fn random_identity() -> io::Result<String> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(io::Error::other)?;
@@ -1256,6 +1357,63 @@ mod tests {
         assert_eq!(MAX_PLUGIN_JOBS, 4);
         assert_eq!(MAX_RETAINED_JOBS, 200);
         assert_eq!(MAX_RETAINED_LOG_BYTES, 256 * 1024);
+    }
+
+    #[test]
+    fn pane_launch_resolution_is_capability_scoped_and_allocates_exact_identity() {
+        let plugin = crate::plugin::RuntimePlugin {
+            id: "dev.example".into(),
+            root: "/package".into(),
+            digest: "digest-a".into(),
+            manifest_digest: "manifest-a".into(),
+            enabled: true,
+            permissions: vec![Permission::PaneCreate, Permission::MediaProduce],
+            panes: vec![vvmux_plugin_api::Pane {
+                id: "dashboard".into(),
+                title: "Dashboard".into(),
+                placement: vvmux_plugin_api::Placement::Float,
+                command: vec!["python".into(), "dashboard.py".into()],
+                hold_on_exit: true,
+                accept_sync_input: false,
+            }],
+        };
+        let registry = AppliedRegistry {
+            generation: 1,
+            plugins: [(plugin.id.clone(), plugin)].into_iter().collect(),
+            catalog: BTreeMap::new(),
+            failures: BTreeMap::new(),
+        };
+        let launch = resolve_pane_launch(
+            &registry,
+            &BTreeSet::new(),
+            "session-a",
+            "dev.example/dashboard",
+        )
+        .unwrap();
+        assert_eq!(launch.scope.session_instance, "session-a");
+        assert_eq!(launch.scope.plugin_id, "dev.example");
+        assert_eq!(launch.scope.plugin_instance.len(), 32);
+        assert_eq!(launch.package_digest, "digest-a");
+        assert_eq!(launch.pane.id, "dashboard");
+
+        let mut denied = registry;
+        denied
+            .plugins
+            .get_mut("dev.example")
+            .unwrap()
+            .permissions
+            .clear();
+        assert_eq!(
+            resolve_pane_launch(
+                &denied,
+                &BTreeSet::new(),
+                "session-a",
+                "dev.example/dashboard",
+            )
+            .unwrap_err()
+            .code,
+            "capability_denied"
+        );
     }
 
     #[test]

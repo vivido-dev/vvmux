@@ -330,6 +330,8 @@ fn spawn(
             .transpose()?,
         hold_on_exit: hold,
         extra_env: Vec::new(),
+        role: crate::session::PaneRole::Core,
+        vivid_capability: true,
     })
 }
 

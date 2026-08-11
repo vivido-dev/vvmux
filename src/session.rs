@@ -103,6 +103,20 @@ enum SessionCommand {
         pane_id: Option<PaneId>,
         bytes: Vec<u8>,
     },
+    OpenPluginPane {
+        launch: PluginPaneLaunch,
+    },
+    ClosePane {
+        pane_id: PaneId,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PluginPaneLaunch {
+    pub(crate) scope: crate::plugin_supervisor::RuntimeScope,
+    pub(crate) package_digest: String,
+    pub(crate) package_root: PathBuf,
+    pub(crate) pane: vvmux_plugin_api::Pane,
 }
 
 pub enum ActorEvent {
@@ -131,6 +145,14 @@ pub enum ActorEvent {
         scope: crate::plugin_supervisor::RuntimeScope,
         call: vvmux_plugin_api::HostCall,
         reply: mpsc::SyncSender<Result<serde_json::Value, AutomationError>>,
+    },
+    PluginPaneOpen {
+        launch: PluginPaneLaunch,
+        reply: AutomationReplyTarget,
+    },
+    PluginPanesClose {
+        plugin_id: String,
+        package_digest: String,
     },
     PluginReloaded {
         result: Result<serde_json::Value, AutomationError>,
@@ -218,7 +240,7 @@ struct AttachedClient {
 /// A shell pane is `PaneSpawn::default()`. A command pane carries the shell command string, an
 /// optional working directory, and whether the pane outlives the command so its output stays
 /// readable.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PaneSpawn {
     /// A shell command run with `-c`, not an argument vector: pipes and redirection are the
     /// caller's to write and the shell's to parse.
@@ -229,6 +251,43 @@ pub struct PaneSpawn {
     pub hold_on_exit: bool,
     /// Extra environment applied before the fixed pane identity, so it can never shadow it.
     pub extra_env: Vec<(String, String)>,
+    /// Core panes participate in all ordinary pane behavior. Plugin identity is attached here,
+    /// before spawn, and is never reconstructed from the child argv.
+    pub(crate) role: PaneRole,
+    /// Whether to mint the pane-scoped Vivid capability and expose its authenticated endpoint.
+    pub(crate) vivid_capability: bool,
+}
+
+impl Default for PaneSpawn {
+    fn default() -> Self {
+        Self {
+            command: None,
+            argv: None,
+            cwd: None,
+            hold_on_exit: false,
+            extra_env: Vec::new(),
+            role: PaneRole::Core,
+            vivid_capability: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum PaneRole {
+    #[default]
+    Core,
+    Plugin(PluginPaneIdentity),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PluginPaneIdentity {
+    session_instance: String,
+    plugin_id: String,
+    plugin_instance: String,
+    package_digest: String,
+    entrypoint_id: String,
+    title: String,
+    accept_sync_input: bool,
 }
 
 struct Pane {
@@ -254,6 +313,7 @@ struct Pane {
     screen_sequence: u64,
     last_screen_change: Instant,
     screen_changes: VecDeque<ScreenChange>,
+    role: PaneRole,
 }
 
 #[derive(Debug, Clone)]
@@ -476,11 +536,50 @@ impl Tab {
     }
 }
 
-fn sync_targets(tab: &Tab, in_copy_mode: &dyn Fn(PaneId) -> bool) -> Vec<PaneId> {
+fn sync_targets(tab: &Tab, excluded: &dyn Fn(PaneId) -> bool) -> Vec<PaneId> {
     let mut targets = tab.tree.as_ref().map_or_else(Vec::new, TiledNode::pane_ids);
     targets.extend(tab.floating.pane_ids());
-    targets.retain(|pane_id| !in_copy_mode(*pane_id));
+    targets.retain(|pane_id| !excluded(*pane_id));
     targets
+}
+
+fn pane_role_accepts_sync(role: &PaneRole) -> bool {
+    match role {
+        PaneRole::Core => true,
+        PaneRole::Plugin(owner) => owner.accept_sync_input,
+    }
+}
+
+fn caller_owns_plugin_pane(caller: &CallerContext, role: &PaneRole) -> bool {
+    match (&caller.origin, role) {
+        (
+            CallerOrigin::Plugin {
+                plugin_id,
+                plugin_instance,
+            },
+            PaneRole::Plugin(owner),
+        ) => {
+            owner.session_instance == caller.session_instance
+                && &owner.plugin_id == plugin_id
+                && &owner.plugin_instance == plugin_instance
+        }
+        _ => false,
+    }
+}
+
+fn plugin_pane_matches_generation(
+    role: &PaneRole,
+    session_instance: &str,
+    plugin_id: &str,
+    package_digest: &str,
+) -> bool {
+    matches!(
+        role,
+        PaneRole::Plugin(owner)
+            if owner.session_instance == session_instance
+                && owner.plugin_id == plugin_id
+                && owner.package_digest == package_digest
+    )
 }
 
 fn queue_input_targets(
@@ -813,6 +912,8 @@ struct SessionActor {
     agent_navigator: Option<AgentNavigator>,
     next_float_mode: u64,
     session_sequence: u64,
+    /// Direct count of general-queue actor wakeups for fairness/compatibility diagnostics.
+    actor_wakeups: u64,
     response_sender: mpsc::SyncSender<AutomationResponseJob>,
     automation_inflight: HashMap<u64, HashSet<u64>>,
     pending_actor_work: HashSet<(u64, u64)>,
@@ -992,6 +1093,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         agent_navigator: None,
         next_float_mode: 0,
         session_sequence: 1,
+        actor_wakeups: 0,
         response_sender,
         automation_inflight: HashMap::new(),
         pending_actor_work: HashSet::new(),
@@ -1042,6 +1144,7 @@ impl SessionActor {
             }
             match receiver.recv_timeout(timeout) {
                 Ok(event) => {
+                    self.actor_wakeups = self.actor_wakeups.saturating_add(1);
                     if self.handle_event(event).is_err() {
                         self.force_full = true;
                     }
@@ -1300,7 +1403,26 @@ impl SessionActor {
                     .get(&pane_id)
                     .is_some_and(|pane| pane.hold_on_exit && pane.exit_status.is_none());
                 if held {
-                    let note = format!("\r\n[{}]\r\n", describe_exit(status));
+                    let plugin = self.panes.get(&pane_id).and_then(|pane| match &pane.role {
+                        PaneRole::Plugin(owner) => Some(owner.clone()),
+                        PaneRole::Core => None,
+                    });
+                    if plugin.is_some() {
+                        // The held terminal is only a diagnostic surface after exit. Its process,
+                        // media authority, and exact runtime identity are already dead.
+                        self.vivid.revoke_pane(pane_id);
+                    }
+                    let note = plugin.map_or_else(
+                        || format!("\r\n[{}]\r\n", describe_exit(status)),
+                        |owner| {
+                            format!(
+                                "\r\n[plugin {}/{} {}]\r\n",
+                                owner.plugin_id,
+                                owner.entrypoint_id,
+                                describe_exit(status)
+                            )
+                        },
+                    );
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         pane.exit_status = status;
                         pane.agent.observe_process(None, None);
@@ -1339,6 +1461,28 @@ impl SessionActor {
                 let result = self.handle_plugin_host_call(&scope, &call.method, call.params);
                 let _ = reply.try_send(result);
             }
+            ActorEvent::PluginPaneOpen { launch, reply } => {
+                let caller = CallerContext {
+                    origin: CallerOrigin::Plugin {
+                        plugin_id: launch.scope.plugin_id.clone(),
+                        plugin_instance: launch.scope.plugin_instance.clone(),
+                    },
+                    session_instance: launch.scope.session_instance.clone(),
+                    focused_fallback: false,
+                    capabilities: launch.scope.permissions.iter().copied().collect(),
+                };
+                let result = self
+                    .execute_session_command(&caller, SessionCommand::OpenPluginPane { launch });
+                self.complete_pending_actor_work(&reply);
+                match result {
+                    Ok(value) => self.reply_automation(reply, value),
+                    Err(error) => self.reply_automation_error(reply, error),
+                }
+            }
+            ActorEvent::PluginPanesClose {
+                plugin_id,
+                package_digest,
+            } => self.close_plugin_panes(&plugin_id, &package_digest),
             ActorEvent::PluginReloaded { result } => match result {
                 Ok(report)
                     if report["failed"]
@@ -2275,6 +2419,23 @@ impl SessionActor {
                     self.reply_automation_error(target, error);
                 }
             }
+            AutomationMethod::Plugin(crate::ipc::PluginMethod::PaneOpen { reference }) => {
+                let Some(supervisor) = self.plugin_supervisor.clone() else {
+                    self.reply_automation_error(target, plugin_disabled_error());
+                    return;
+                };
+                if !self.register_pending_actor_work(&target) {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("busy", "session pending-work quota is exhausted"),
+                    );
+                    return;
+                }
+                if let Err(error) = supervisor.open_pane(reference, target.clone()) {
+                    self.complete_pending_actor_work(&target);
+                    self.reply_automation_error(target, error);
+                }
+            }
             AutomationMethod::Plugin(crate::ipc::PluginMethod::Reload) => {
                 let Some(supervisor) = self.plugin_supervisor.clone() else {
                     self.reply_automation(
@@ -2580,18 +2741,32 @@ impl SessionActor {
         hold: bool,
         focus: bool,
     ) -> Result<serde_json::Value, AutomationError> {
-        let tab_index = self
-            .tabs
-            .iter()
-            .position(|tab| tab.contains(anchor))
-            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
         let spec = PaneSpawn {
             command: Some(OsString::from(command)),
             argv: None,
             cwd: cwd.map(PathBuf::from),
             hold_on_exit: hold,
             extra_env: Vec::new(),
+            role: PaneRole::Core,
+            vivid_capability: true,
         };
+        self.place_pane(anchor, spec, placement, focus, None)
+    }
+
+    /// Validate placement before process creation, then commit one actor-owned pane mutation.
+    fn place_pane(
+        &mut self,
+        anchor: PaneId,
+        spec: PaneSpawn,
+        placement: crate::ipc::RunPlacement,
+        focus: bool,
+        tab_name: Option<String>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let tab_index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.contains(anchor))
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
         let new_pane_id = self.next_pane_id;
 
         let tab_id = match placement {
@@ -2637,7 +2812,7 @@ impl SessionActor {
                     .map_err(|error| AutomationError::new("spawn_failed", error.to_string()))?;
                 self.tabs.push(Tab {
                     id: tab_id,
-                    name: None,
+                    name: tab_name,
                     tree: Some(TiledNode::leaf(new_pane_id)),
                     floating: FloatingLayer::default(),
                     focused: new_pane_id,
@@ -2823,6 +2998,20 @@ impl SessionActor {
                 .iter()
                 .any(|projection| projection.pane_id == pane_id);
         let cursor = pane.terminal.cursor();
+        let plugin = match &pane.role {
+            PaneRole::Core => None,
+            PaneRole::Plugin(owner) => Some(serde_json::json!({
+                "plugin_id": owner.plugin_id,
+                "plugin_instance": owner.plugin_instance,
+                "package_digest": owner.package_digest,
+                "entrypoint_id": owner.entrypoint_id,
+                "accept_sync_input": owner.accept_sync_input,
+            })),
+        };
+        let title = pane.terminal.title().or(match &pane.role {
+            PaneRole::Plugin(owner) => Some(owner.title.as_str()),
+            PaneRole::Core => None,
+        });
         Some(serde_json::json!({
             "pane_id": pane_id,
             "tab_id": tab.id,
@@ -2833,7 +3022,8 @@ impl SessionActor {
             "layer": layer,
             "zoomed": tab.zoomed == Some(pane_id),
             "sync_input": tab.sync_input,
-            "title": pane.terminal.title(),
+            "title": title,
+            "plugin": plugin,
             "agent": pane.agent.snapshot().map(agent_json),
             "geometry": rect_json(outer),
             "content_geometry": rect_json(outer.content()),
@@ -2851,7 +3041,7 @@ impl SessionActor {
             "cursor": { "row": cursor.0, "column": cursor.1, "visible": pane.terminal.modes().cursor_visible },
             "modes": terminal_mode_names(pane.terminal.modes()),
             "screen": if pane.terminal.alternate_screen() { "alternate" } else { "primary" },
-            "process_state": "running",
+            "process_state": if pane.exit_status.is_some() { "exited" } else { "running" },
             "screen_sequence": pane.screen_sequence,
             "session_sequence": self.session_sequence,
         }))
@@ -3373,7 +3563,7 @@ impl SessionActor {
             sync_targets(tab, &|pane_id| {
                 self.panes
                     .get(&pane_id)
-                    .is_some_and(|pane| pane.copy.is_some())
+                    .is_some_and(|pane| pane.copy.is_some() || !pane_role_accepts_sync(&pane.role))
             })
         });
         let failures = queue_input_targets(&mut self.panes, &targets, bytes);
@@ -4087,6 +4277,7 @@ impl SessionActor {
                     "session": self.name,
                     "session_instance": self.session_instance,
                     "session_sequence": self.session_sequence,
+                    "actor_wakeups": self.actor_wakeups,
                     "layout_sequence": self.layout_revision,
                     "rendered_session_sequence": self.rendered_session_sequence(),
                     "panes": panes,
@@ -4134,6 +4325,116 @@ impl SessionActor {
                 })?;
                 Ok(serde_json::Value::Null)
             }
+            SessionCommand::OpenPluginPane { launch } => {
+                if !self.config.plugins.enabled || self.plugin_supervisor.is_none() {
+                    return Err(plugin_disabled_error());
+                }
+                authorize_session_capability(caller, vvmux_plugin_api::Permission::PaneCreate)?;
+                let (plugin_id, plugin_instance) = match &caller.origin {
+                    CallerOrigin::Plugin {
+                        plugin_id,
+                        plugin_instance,
+                    } => (plugin_id, plugin_instance),
+                    CallerOrigin::Automation { .. } => {
+                        return Err(AutomationError::new(
+                            "scope_denied",
+                            "plugin pane launch requires a broker-owned plugin identity",
+                        ));
+                    }
+                };
+                if plugin_id != &launch.scope.plugin_id
+                    || plugin_instance != &launch.scope.plugin_instance
+                    || caller.session_instance != launch.scope.session_instance
+                {
+                    return Err(AutomationError::new(
+                        "scope_denied",
+                        "plugin pane launch identity does not match its caller",
+                    ));
+                }
+                let anchor = self.active_tab().map(|tab| tab.focused).ok_or_else(|| {
+                    AutomationError::new("pane_not_found", "session has no pane to anchor launch")
+                })?;
+                let identity = PluginPaneIdentity {
+                    session_instance: caller.session_instance.clone(),
+                    plugin_id: plugin_id.clone(),
+                    plugin_instance: plugin_instance.clone(),
+                    package_digest: launch.package_digest.clone(),
+                    entrypoint_id: launch.pane.id.clone(),
+                    title: launch.pane.title.clone(),
+                    accept_sync_input: launch.pane.accept_sync_input,
+                };
+                let placement = match launch.pane.placement {
+                    vvmux_plugin_api::Placement::Split => crate::ipc::RunPlacement::Split {
+                        axis: crate::ipc::Axis::Vertical,
+                    },
+                    vvmux_plugin_api::Placement::Float => crate::ipc::RunPlacement::Float,
+                    vvmux_plugin_api::Placement::Tab => crate::ipc::RunPlacement::Tab,
+                };
+                let vivid_capability = caller
+                    .capabilities
+                    .contains(&vvmux_plugin_api::Permission::MediaProduce);
+                let spec = PaneSpawn {
+                    command: None,
+                    argv: Some(launch.pane.command.iter().map(OsString::from).collect()),
+                    cwd: Some(launch.package_root),
+                    hold_on_exit: launch.pane.hold_on_exit,
+                    extra_env: vec![
+                        ("VVMUX_PLUGIN_ID".into(), plugin_id.clone()),
+                        ("VVMUX_PLUGIN_INSTANCE".into(), plugin_instance.clone()),
+                        ("VVMUX_PLUGIN_PANE".into(), launch.pane.id.clone()),
+                    ],
+                    role: PaneRole::Plugin(identity),
+                    vivid_capability,
+                };
+                let mut result = self.place_pane(
+                    anchor,
+                    spec,
+                    placement,
+                    true,
+                    (launch.pane.placement == vvmux_plugin_api::Placement::Tab)
+                        .then(|| launch.pane.title.clone()),
+                )?;
+                if let Some(object) = result.as_object_mut() {
+                    object.insert(
+                        "plugin_id".into(),
+                        serde_json::Value::String(plugin_id.clone()),
+                    );
+                    object.insert(
+                        "plugin_instance".into(),
+                        serde_json::Value::String(plugin_instance.clone()),
+                    );
+                    object.insert(
+                        "entrypoint_id".into(),
+                        serde_json::Value::String(launch.pane.id),
+                    );
+                    object.insert("vivid".into(), serde_json::Value::Bool(vivid_capability));
+                }
+                Ok(result)
+            }
+            SessionCommand::ClosePane { pane_id } => {
+                let pane = self.panes.get(&pane_id).ok_or_else(|| {
+                    AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
+                })?;
+                let owns = caller_owns_plugin_pane(caller, &pane.role);
+                if owns {
+                    if !caller
+                        .capabilities
+                        .contains(&vvmux_plugin_api::Permission::PaneManageAny)
+                    {
+                        authorize_session_capability(
+                            caller,
+                            vvmux_plugin_api::Permission::PaneManageOwn,
+                        )?;
+                    }
+                } else {
+                    authorize_session_capability(
+                        caller,
+                        vvmux_plugin_api::Permission::PaneManageAny,
+                    )?;
+                }
+                self.close_pane(pane_id);
+                Ok(serde_json::Value::Null)
+            }
         }
     }
 
@@ -4175,13 +4476,15 @@ impl SessionActor {
             focused_fallback: false,
             capabilities: scope.permissions.iter().copied().collect(),
         };
-        let required = plugin_host_permission(method).ok_or_else(|| {
-            AutomationError::new(
-                "action_not_found",
-                format!("unknown plugin host call `{method}`"),
-            )
-        })?;
-        authorize_session_capability(&caller, required)?;
+        if method != "pane.close" {
+            let required = plugin_host_permission(method).ok_or_else(|| {
+                AutomationError::new(
+                    "action_not_found",
+                    format!("unknown plugin host call `{method}`"),
+                )
+            })?;
+            authorize_session_capability(&caller, required)?;
+        }
         match method {
             "session.inspect" => {
                 require_plugin_params(&params, &[])?;
@@ -4223,6 +4526,11 @@ impl SessionActor {
                         bytes: text.as_bytes().to_vec(),
                     },
                 )
+            }
+            "pane.close" => {
+                require_plugin_params(&params, &["pane_id"])?;
+                let pane_id = plugin_u64_param(&params, "pane_id")?;
+                self.execute_session_command(&caller, SessionCommand::ClosePane { pane_id })
             }
             _ => Err(AutomationError::new(
                 "action_not_found",
@@ -4896,14 +5204,21 @@ impl SessionActor {
             ("VVMUX_TAB_ID".into(), tab_id.to_string()),
             ("VVMUX_PANE_ID".into(), pane_id.to_string()),
             ("VVMUX_BIN".into(), vvmux_bin),
-            ("VIVID_ENDPOINT_CONTROL".into(), self.vivid.endpoint()),
-            (
-                "VIVID_ROOT_SECRET".into(),
-                self.vivid.issue_pane_capability(pane_id)?,
-            ),
         ]);
-        #[cfg(windows)]
-        environment.push(("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into()));
+        let vivid_capability = if spec.vivid_capability {
+            environment.extend([
+                ("VIVID_ENDPOINT_CONTROL".into(), self.vivid.endpoint()),
+                (
+                    "VIVID_ROOT_SECRET".into(),
+                    self.vivid.issue_pane_capability(pane_id)?,
+                ),
+            ]);
+            #[cfg(windows)]
+            environment.push(("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into()));
+            true
+        } else {
+            false
+        };
         // Every failure past `issue_pane_capability` must revoke it: the capability is already
         // minted, and leaving it live would let a dead pane's secret authenticate.
         let spawned = match spec.argv.as_deref() {
@@ -4919,7 +5234,9 @@ impl SessionActor {
         let parts = match spawned {
             Ok(parts) => parts,
             Err(error) => {
-                self.vivid.revoke_pane(pane_id);
+                if vivid_capability {
+                    self.vivid.revoke_pane(pane_id);
+                }
                 return Err(error);
             }
         };
@@ -4973,6 +5290,7 @@ impl SessionActor {
                 screen_sequence: 1,
                 last_screen_change: Instant::now(),
                 screen_changes: VecDeque::new(),
+                role: spec.role.clone(),
             },
         );
         self.refresh_agent_detector_targets();
@@ -5020,6 +5338,38 @@ impl SessionActor {
         self.relayout();
     }
 
+    fn close_plugin_panes(&mut self, plugin_id: &str, package_digest: &str) {
+        let panes = self
+            .panes
+            .iter()
+            .filter_map(|(pane_id, pane)| {
+                plugin_pane_matches_generation(
+                    &pane.role,
+                    &self.session_instance,
+                    plugin_id,
+                    package_digest,
+                )
+                .then_some(*pane_id)
+            })
+            .collect::<Vec<_>>();
+        for pane_id in panes {
+            self.close_pane(pane_id);
+        }
+    }
+
+    fn close_all_plugin_panes(&mut self) {
+        let panes = self
+            .panes
+            .iter()
+            .filter_map(|(pane_id, pane)| {
+                matches!(pane.role, PaneRole::Plugin(_)).then_some(*pane_id)
+            })
+            .collect::<Vec<_>>();
+        for pane_id in panes {
+            self.close_pane(pane_id);
+        }
+    }
+
     /// Start the session-scoped plugin machinery after a live false-to-true config transition.
     fn enable_plugin_runtime(&mut self) -> Result<(), String> {
         if self.plugin_supervisor.is_some() {
@@ -5054,6 +5404,7 @@ impl SessionActor {
             stop.store(true, Ordering::Release);
         }
         self.plugin_reload_pending.store(false, Ordering::Release);
+        self.close_all_plugin_panes();
         if let Some(supervisor) = self.plugin_supervisor.take() {
             supervisor.shutdown();
         }
@@ -6308,7 +6659,7 @@ impl SessionActor {
             sync_targets(tab, &|pane_id| {
                 self.panes
                     .get(&pane_id)
-                    .is_some_and(|pane| pane.copy.is_some())
+                    .is_some_and(|pane| pane.copy.is_some() || !pane_role_accepts_sync(&pane.role))
             })
         } else {
             vec![focused]
@@ -6456,6 +6807,14 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
             Err(AutomationError::new(
                 "limit_exceeded",
                 "plugin reference or input exceeds its limit",
+            ))
+        }
+        AutomationMethod::Plugin(crate::ipc::PluginMethod::PaneOpen { reference })
+            if !valid_invocation_reference(reference) =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "plugin pane reference must be ID/PANE",
             ))
         }
         AutomationMethod::Plugin(
@@ -6612,7 +6971,7 @@ fn disabled_plugin_capabilities(session_instance: &str) -> serde_json::Value {
         "protocol_version": vvmux_plugin_api::PROTOCOL_VERSION,
         "session_instance": session_instance,
         "applied_generation": null,
-        "methods": ["catalog", "invoke", "job_status", "job_cancel", "job_logs", "reload"],
+        "methods": ["catalog", "invoke", "job_status", "job_cancel", "job_logs", "pane_open", "reload"],
         "native_trust": "full_user_authority",
         "component_sandbox": true,
         "enforceable_capabilities": plugin_enforceable_capabilities(),
@@ -6712,12 +7071,16 @@ fn authorize_session_scope(
     }
 }
 
-pub(crate) fn plugin_enforceable_permissions() -> [vvmux_plugin_api::Permission; 3] {
+pub(crate) fn plugin_enforceable_permissions() -> [vvmux_plugin_api::Permission; 7] {
     use vvmux_plugin_api::Permission;
     [
         Permission::SessionRead,
         Permission::PaneRead,
         Permission::PaneInput,
+        Permission::PaneCreate,
+        Permission::PaneManageOwn,
+        Permission::PaneManageAny,
+        Permission::MediaProduce,
     ]
 }
 
@@ -7973,7 +8336,15 @@ mod tests {
         );
         assert_eq!(
             plugin_enforceable_capabilities(),
-            ["session.read", "pane.read", "pane.input"]
+            [
+                "session.read",
+                "pane.read",
+                "pane.input",
+                "pane.create",
+                "pane.manage_own",
+                "pane.manage_any",
+                "media.produce",
+            ]
         );
         assert!(require_plugin_params(&serde_json::json!({"pane_id": 1}), &["pane_id"]).is_ok());
         assert!(
@@ -7983,6 +8354,68 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn plugin_pane_identity_scopes_sync_management_and_generation_cleanup() {
+        use vvmux_plugin_api::Permission;
+
+        let owner = PluginPaneIdentity {
+            session_instance: "session-a".into(),
+            plugin_id: "dev.example".into(),
+            plugin_instance: "instance-a".into(),
+            package_digest: "digest-a".into(),
+            entrypoint_id: "dashboard".into(),
+            title: "Dashboard".into(),
+            accept_sync_input: false,
+        };
+        let role = PaneRole::Plugin(owner.clone());
+        let caller = CallerContext {
+            origin: CallerOrigin::Plugin {
+                plugin_id: owner.plugin_id.clone(),
+                plugin_instance: owner.plugin_instance.clone(),
+            },
+            session_instance: owner.session_instance.clone(),
+            focused_fallback: false,
+            capabilities: [Permission::PaneManageOwn].into_iter().collect(),
+        };
+        assert!(!pane_role_accepts_sync(&role));
+        let mut sync_owner = owner.clone();
+        sync_owner.accept_sync_input = true;
+        assert!(pane_role_accepts_sync(&PaneRole::Plugin(sync_owner)));
+        assert!(caller_owns_plugin_pane(&caller, &role));
+        assert!(plugin_pane_matches_generation(
+            &role,
+            "session-a",
+            "dev.example",
+            "digest-a"
+        ));
+
+        // Two owners may reuse the same numeric pane ID in separate session instances. Cleanup
+        // and management decisions use the complete identity, never that local number.
+        let reused_numeric_pane_id = 7_u64;
+        let other_role = PaneRole::Plugin(PluginPaneIdentity {
+            session_instance: "session-b".into(),
+            plugin_instance: "instance-b".into(),
+            ..owner.clone()
+        });
+        assert_eq!(reused_numeric_pane_id, 7);
+        assert!(!caller_owns_plugin_pane(&caller, &other_role));
+        assert!(!plugin_pane_matches_generation(
+            &other_role,
+            "session-a",
+            "dev.example",
+            "digest-a"
+        ));
+
+        let restarted = CallerContext {
+            origin: CallerOrigin::Plugin {
+                plugin_id: owner.plugin_id,
+                plugin_instance: "instance-restarted".into(),
+            },
+            ..caller
+        };
+        assert!(!caller_owns_plugin_pane(&restarted, &role));
     }
 
     #[test]

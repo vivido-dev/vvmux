@@ -95,7 +95,7 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 14 is a hard cutover. Its binary media header carries complete track identity
+Private VVMX version 15 is a hard cutover. Its binary media header carries complete track identity
 and bounded binary render/media records,
 pane-scoped sanitized media status and waits, bridge-instance correlation, and metadata-only media
 traces. Host terminal focus, pixel mouse input, and focused-pane Kitty keyboard flags retain their
@@ -106,7 +106,7 @@ are reactivated without inventing a PLAY transition. Mixed VVMX versions are rej
 guidance.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 14 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 15 → outer vvmux producer → Vivido
 ```
 
 ## Plugin boundary
@@ -140,6 +140,14 @@ live service or Component token, and the actor lowers both automation and broker
 typed `SessionCommand`/`CallerContext` authorization before serving `session.inspect`,
 `pane.get_text`, or `pane.input`. Native code remains trusted because it can bypass this broker as
 the same OS user.
+
+Manifest PTY panes are resolved by the supervisor, then lowered as exact-argv `pane.create` commands
+through the same actor service. The actor attaches complete session/plugin-instance/package
+generation ownership before spawn and alone commits split, float, or tab placement. Sync keyboard
+and paste share the manifest opt-in predicate. `media.produce` gates issuance of the existing
+pane-scoped Vivid capability; held exit revokes it before displaying a core diagnostic. Generation
+change, disable, removal, kill switch, and shutdown reuse the ordinary pane close path, so teardown
+never matches only a numeric pane ID.
 
 The Rust SDK owns the guest-side WIT bindings used to build `wasm32-wasip2` Components. Component
 invocations reset a private log accumulator before entering guest code; host log imports sanitize
