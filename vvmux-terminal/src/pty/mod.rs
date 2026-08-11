@@ -263,7 +263,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let mut parts = PtyProcess::spawn_argv(
-            std::ffi::OsStr::new("/bin/printf"),
+            std::ffi::OsStr::new("printf"),
             &[
                 std::ffi::OsStr::new("%s"),
                 std::ffi::OsStr::new("$HOME;echo BAD"),

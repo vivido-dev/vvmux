@@ -25,12 +25,15 @@ impl Drop for SessionGuard {
 #[test]
 fn plugin_panes_use_real_pty_placement_identity_vivid_and_owner_scoped_cleanup() {
     let binary = env!("CARGO_BIN_EXE_vvmux");
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("vpp-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let runtime = directory.path().join("runtime");
     let config_home = directory.path().join("config");
     private_directory(&runtime);
     private_directory(&config_home);
-    let vivi_helper = write_vivi_helper(directory.path());
+    let vivi_helper = write_vivi_helper(directory.path()).canonicalize().unwrap();
     let config = write_config(directory.path());
     let package = write_package(directory.path());
     assert_success(

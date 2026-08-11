@@ -27,7 +27,10 @@ impl Drop for SessionGuard {
 #[test]
 fn recursive_git_dependencies_and_bounded_workflows_execute_end_to_end() {
     let binary = env!("CARGO_BIN_EXE_vvmux");
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("vpw-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let runtime = directory.path().join("runtime");
     let config_home = directory.path().join("config");
     private_directory(&runtime);

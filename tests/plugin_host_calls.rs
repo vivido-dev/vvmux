@@ -27,7 +27,10 @@ impl Drop for SessionGuard {
 #[test]
 fn native_service_host_calls_are_scoped_capability_checked_and_actor_safe() {
     let binary = env!("CARGO_BIN_EXE_vvmux");
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("vph-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let runtime = directory.path().join("runtime");
     let config_home = directory.path().join("config");
     private_directory(&runtime);

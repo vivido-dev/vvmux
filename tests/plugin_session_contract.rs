@@ -25,7 +25,10 @@ impl Drop for SessionGuard {
 #[test]
 fn catalog_uses_the_live_session_generation_and_hides_unimplemented_workflows() {
     let binary = env!("CARGO_BIN_EXE_vvmux");
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("vpc-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let runtime = directory.path().join("runtime");
     let config_home = directory.path().join("config");
     private_directory(&runtime);
@@ -101,7 +104,10 @@ fn catalog_uses_the_live_session_generation_and_hides_unimplemented_workflows() 
 #[test]
 fn global_kill_switch_rejects_work_and_can_enable_and_disable_live() {
     let binary = env!("CARGO_BIN_EXE_vvmux");
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("vpc-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let runtime = directory.path().join("runtime");
     let config_home = directory.path().join("config");
     private_directory(&runtime);
@@ -183,7 +189,10 @@ fn global_kill_switch_rejects_work_and_can_enable_and_disable_live() {
 #[test]
 fn disabled_and_enabled_empty_sessions_render_identical_terminal_grids() {
     let binary = env!("CARGO_BIN_EXE_vvmux");
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("vpc-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let runtime = directory.path().join("runtime");
     let config_home = directory.path().join("config");
     private_directory(&runtime);

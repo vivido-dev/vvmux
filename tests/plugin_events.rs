@@ -27,7 +27,10 @@ impl Drop for SessionGuard {
 #[test]
 fn session_activation_hooks_and_bounded_replay_are_live() {
     let binary = env!("CARGO_BIN_EXE_vvmux");
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("vpe-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let runtime = directory.path().join("runtime");
     let config_home = directory.path().join("config");
     private_directory(&runtime);

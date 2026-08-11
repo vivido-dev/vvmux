@@ -27,7 +27,10 @@ impl Drop for SessionGuard {
 #[test]
 fn registry_generations_drain_restart_disable_and_watch_live_sessions() {
     let binary = env!("CARGO_BIN_EXE_vvmux");
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("vpr-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let runtime = directory.path().join("runtime");
     let config_home = directory.path().join("config");
     private_directory(&runtime);

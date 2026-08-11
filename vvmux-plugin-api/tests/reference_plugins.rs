@@ -50,7 +50,7 @@ fn component_reference_manifest_and_schemas_validate_before_build() {
 fn native_reference_actions_emit_schema_shaped_json() {
     let dashboard = run(
         &examples().join("python-dashboard"),
-        "python3",
+        Path::new("python3"),
         &["dashboard.py", "action"],
         r#"{"summary":"passed","chart":{"count":1,"minimum":2,"maximum":2}}"#,
     );
@@ -58,7 +58,7 @@ fn native_reference_actions_emit_schema_shaped_json() {
 
     let chart = run(
         &examples().join("vivid-chart"),
-        "python3",
+        Path::new("python3"),
         &["chart.py", "action"],
         r#"{"values":[2,4,8]}"#,
     );
@@ -67,16 +67,35 @@ fn native_reference_actions_emit_schema_shaped_json() {
         serde_json::json!({"count": 3, "minimum": 2.0, "maximum": 8.0})
     );
 
+    let node = working_program("node");
     let agent = run(
         &examples().join("typescript-agent"),
-        "node",
+        &node,
         &["agent-utility.mjs", "summarize"],
         r#"{"result":{"success":false,"status":1,"stdout":"","stderr":"failure","duration_ms":7}}"#,
     );
     assert_eq!(agent["durations"], serde_json::json!([7]));
 }
 
-fn run(root: &Path, program: &str, arguments: &[&str], input: &str) -> serde_json::Value {
+fn working_program(name: &str) -> PathBuf {
+    let executable = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let paths = std::env::var_os("PATH").expect("PATH must be set for reference action tests");
+    std::env::split_paths(&paths)
+        .map(|directory| directory.join(&executable))
+        .find(|candidate| {
+            candidate.is_file()
+                && Command::new(candidate)
+                    .arg("--version")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+        })
+        .unwrap_or_else(|| panic!("could not find a working {name} executable on PATH"))
+}
+
+fn run(root: &Path, program: &Path, arguments: &[&str], input: &str) -> serde_json::Value {
     use std::io::Write;
 
     let mut child = Command::new(program)
@@ -86,7 +105,7 @@ fn run(root: &Path, program: &str, arguments: &[&str], input: &str) -> serde_jso
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|error| panic!("could not start {program}: {error}"));
+        .unwrap_or_else(|error| panic!("could not start {}: {error}", program.display()));
     child
         .stdin
         .take()
@@ -96,7 +115,8 @@ fn run(root: &Path, program: &str, arguments: &[&str], input: &str) -> serde_jso
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
-        "{program} failed: {}",
+        "{} failed: {}",
+        program.display(),
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
