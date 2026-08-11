@@ -5,6 +5,7 @@ import json
 import os
 import struct
 import sys
+import time
 
 
 def read_frame():
@@ -37,6 +38,16 @@ while True:
     if message["type"] == "initialize":
         write_frame({"type": "ready", "request_id": request_id})
     elif message["type"] == "invoke":
+        if message["action"] == "slow":
+            time.sleep(30)
+            write_frame(
+                {
+                    "type": "result",
+                    "request_id": request_id,
+                    "result": {},
+                }
+            )
+            continue
         write_frame(
             {
                 "type": "host_call",

@@ -73,6 +73,11 @@ pub enum PluginCommand {
     Catalog(CatalogArgs),
     /// Invoke one schema-described action.
     Invoke(InvokeArgs),
+    /// Inspect or control a retained detached job.
+    Job {
+        #[command(subcommand)]
+        command: PluginJobCommand,
+    },
     /// Verify dependency constraints and write the reproducible lock.
     Resolve {
         #[arg(long)]
@@ -99,6 +104,16 @@ pub struct InvokeArgs {
     input: String,
     #[arg(long)]
     detach: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PluginJobCommand {
+    /// Show retained job state and result.
+    Status { job_id: String },
+    /// Cancel an active job; completed cancellation is idempotent.
+    Cancel { job_id: String },
+    /// Show bounded retained stdout and stderr.
+    Logs { job_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +200,7 @@ pub fn run(command: PluginCommand) -> io::Result<()> {
         PluginCommand::Permissions { id } => permissions(&paths, &id),
         PluginCommand::Catalog(args) => catalog(&paths, args),
         PluginCommand::Invoke(args) => invoke(&paths, args),
+        PluginCommand::Job { command } => job(command),
         PluginCommand::Resolve { frozen } => resolve(&paths, frozen),
     }
 }
@@ -619,21 +635,23 @@ fn catalog(paths: &PluginPaths, args: CatalogArgs) -> io::Result<()> {
 }
 
 fn invoke(paths: &PluginPaths, args: InvokeArgs) -> io::Result<()> {
-    if args.detach {
-        return Err(invalid(
-            "detached jobs require a live session plugin supervisor",
-        ));
-    }
     let input = read_json_input(&args.input)?;
     let output = if let Some(target) = args.target.as_deref() {
-        invoke_via_session(target, args.reference, input)?
+        invoke_via_session(target, args.reference, input, args.detach)?
+    } else if args.detach {
+        return Err(invalid("--detach requires --target SESSION"));
     } else {
         invoke_reference(paths, &args.reference, None, input)?
     };
     print_json(&output)
 }
 
-fn invoke_via_session(target: &str, reference: String, input: Value) -> io::Result<Value> {
+fn invoke_via_session(
+    target: &str,
+    reference: String,
+    input: Value,
+    detach: bool,
+) -> io::Result<Value> {
     use crate::ipc::{AutomationMethod, AutomationRequest, ClientMessage, PluginMethod};
 
     crate::runtime::validate_session_name(target)?;
@@ -648,8 +666,76 @@ fn invoke_via_session(target: &str, reference: String, input: Value) -> io::Resu
             method: AutomationMethod::Plugin(PluginMethod::Invoke {
                 reference,
                 input,
-                detach: false,
+                detach,
             }),
+        }))?;
+    crate::automation::response_result(crate::automation::receive_response(&mut reader, 1)?)
+}
+
+fn job(command: PluginJobCommand) -> io::Result<()> {
+    use crate::ipc::PluginMethod;
+
+    let (job_id, operation) = match command {
+        PluginJobCommand::Status { job_id } => {
+            let operation = PluginMethod::JobStatus {
+                job_id: job_id.clone(),
+            };
+            (job_id, operation)
+        }
+        PluginJobCommand::Cancel { job_id } => {
+            let operation = PluginMethod::JobCancel {
+                job_id: job_id.clone(),
+            };
+            (job_id, operation)
+        }
+        PluginJobCommand::Logs { job_id } => {
+            let operation = PluginMethod::JobLogs {
+                job_id: job_id.clone(),
+            };
+            (job_id, operation)
+        }
+    };
+    let target = job_target(&job_id)?;
+    print_json(&plugin_session_request(target, operation)?)
+}
+
+fn job_target(job_id: &str) -> io::Result<&str> {
+    let (target, _) = job_id
+        .split_once('/')
+        .ok_or_else(|| invalid("plugin job ID must include its target session"))?;
+    if !valid_job_id(job_id) {
+        return Err(invalid("invalid plugin job ID"));
+    }
+    Ok(target)
+}
+
+pub(crate) fn valid_job_id(job_id: &str) -> bool {
+    let Some((target, opaque)) = job_id.split_once('/') else {
+        return false;
+    };
+    let Some((instance, counter)) = opaque.split_once('-') else {
+        return false;
+    };
+    job_id.len() <= 256
+        && crate::runtime::validate_session_name(target).is_ok()
+        && instance.len() == 32
+        && instance.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && counter.len() == 16
+        && counter.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn plugin_session_request(target: &str, method: crate::ipc::PluginMethod) -> io::Result<Value> {
+    use crate::ipc::{AutomationMethod, AutomationRequest, ClientMessage};
+
+    let (mut reader, writer) = crate::server::connect(target)?;
+    writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .send(&ClientMessage::Automation(AutomationRequest {
+            id: 1,
+            pane_id: None,
+            allow_focused: false,
+            method: AutomationMethod::Plugin(method),
         }))?;
     crate::automation::response_result(crate::automation::receive_response(&mut reader, 1)?)
 }
@@ -1874,6 +1960,16 @@ agent_visible = true
         assert_eq!(crash_backoff(2), Duration::from_millis(200));
         assert_eq!(crash_backoff(9), Duration::from_millis(25_600));
         assert_eq!(crash_backoff(u32::MAX), Duration::from_millis(25_600));
+    }
+
+    #[test]
+    fn detached_job_ids_route_to_their_exact_session() {
+        let id = "work/0123456789abcdef0123456789abcdef-0000000000000001";
+        assert_eq!(job_target(id).unwrap(), "work");
+        assert!(job_target("missing-session-component").is_err());
+        assert!(job_target("../0123456789abcdef0123456789abcdef-0000000000000001").is_err());
+        assert!(job_target("work/").is_err());
+        assert!(job_target("work/0123456789abcdef-0000000000000001").is_err());
     }
 
     #[cfg(unix)]

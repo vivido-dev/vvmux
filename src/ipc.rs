@@ -182,6 +182,15 @@ pub enum PluginMethod {
         input: Value,
         detach: bool,
     },
+    JobStatus {
+        job_id: String,
+    },
+    JobCancel {
+        job_id: String,
+    },
+    JobLogs {
+        job_id: String,
+    },
     Reload,
 }
 

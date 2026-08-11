@@ -2090,13 +2090,13 @@ impl SessionActor {
                 detach,
             }) => {
                 if detach {
-                    self.reply_automation_error(
-                        target,
-                        AutomationError::new(
-                            "runtime_unavailable",
-                            "detached plugin jobs are not enabled",
+                    match self.plugin_supervisor.invoke_detached(reference, input) {
+                        Ok(job_id) => self.reply_automation(
+                            target,
+                            serde_json::json!({"job_id": job_id, "status": "queued"}),
                         ),
-                    );
+                        Err(error) => self.reply_automation_error(target, error),
+                    }
                     return;
                 }
                 if !self.register_pending_actor_work(&target) {
@@ -2110,6 +2110,45 @@ impl SessionActor {
                     self.plugin_supervisor
                         .invoke_automation(reference, input, target.clone())
                 {
+                    self.complete_pending_actor_work(&target);
+                    self.reply_automation_error(target, error);
+                }
+            }
+            AutomationMethod::Plugin(crate::ipc::PluginMethod::JobStatus { job_id }) => {
+                if !self.register_pending_actor_work(&target) {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("busy", "session pending-work quota is exhausted"),
+                    );
+                    return;
+                }
+                if let Err(error) = self.plugin_supervisor.job_status(job_id, target.clone()) {
+                    self.complete_pending_actor_work(&target);
+                    self.reply_automation_error(target, error);
+                }
+            }
+            AutomationMethod::Plugin(crate::ipc::PluginMethod::JobCancel { job_id }) => {
+                if !self.register_pending_actor_work(&target) {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("busy", "session pending-work quota is exhausted"),
+                    );
+                    return;
+                }
+                if let Err(error) = self.plugin_supervisor.job_cancel(job_id, target.clone()) {
+                    self.complete_pending_actor_work(&target);
+                    self.reply_automation_error(target, error);
+                }
+            }
+            AutomationMethod::Plugin(crate::ipc::PluginMethod::JobLogs { job_id }) => {
+                if !self.register_pending_actor_work(&target) {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("busy", "session pending-work quota is exhausted"),
+                    );
+                    return;
+                }
+                if let Err(error) = self.plugin_supervisor.job_logs(job_id, target.clone()) {
                     self.complete_pending_actor_work(&target);
                     self.reply_automation_error(target, error);
                 }
@@ -6143,6 +6182,14 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 "plugin reference or input exceeds its limit",
             ))
         }
+        AutomationMethod::Plugin(
+            crate::ipc::PluginMethod::JobStatus { job_id }
+            | crate::ipc::PluginMethod::JobCancel { job_id }
+            | crate::ipc::PluginMethod::JobLogs { job_id },
+        ) if !crate::plugin::valid_job_id(job_id) => Err(AutomationError::new(
+            "invalid_params",
+            "plugin job ID is invalid",
+        )),
         AutomationMethod::Run { command, .. } if command.len() > MAX_RUN_COMMAND_BYTES => Err(
             AutomationError::new("limit_exceeded", "command exceeds 64 KiB"),
         ),
@@ -6281,7 +6328,7 @@ fn automation_capabilities() -> serde_json::Value {
         "render_acknowledgment": "attached_client_write",
         "plugins": {
             "protocol_version": vvmux_plugin_api::PROTOCOL_VERSION,
-            "methods": ["invoke", "reload"],
+            "methods": ["invoke", "job_status", "job_cancel", "job_logs", "reload"],
             "native_trust": "full_user_authority",
             "component_sandbox": true,
         },
@@ -6306,6 +6353,7 @@ pub(crate) fn plugin_automation_error(error: io::Error) -> AutomationError {
         "dependency_failed",
         "output_invalid",
         "protocol_error",
+        "job_not_found",
     ]
     .into_iter()
     .find(|code| message.starts_with(code))

@@ -472,6 +472,10 @@ one-shot, and PTY-pane plugins are trusted user code and run with the user's ful
 Native service SDKs expose scoped host calls for session inspection, bounded pane text, and pane
 input. These calls enforce the manifest's `session.read`, `pane.read`, and `pane.input` declarations;
 their short-lived broker tokens provide attribution and revocation, not an OS security boundary.
+`vvmux plugin invoke ID/ACTION --target SESSION --detach` returns a session-bound job ID. Use
+`vvmux plugin job status JOB`, `cancel JOB`, and `logs JOB` to inspect or stop it. Sessions retain
+the newest 200 detached completions and at most 256 KiB each of result/error log text; detached work
+survives the invoking CLI client, while synchronous work remains client-scoped.
 
 ## Windows troubleshooting
 

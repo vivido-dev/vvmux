@@ -4,6 +4,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -82,6 +84,14 @@ handler = "exercise"
 input_schema = "schemas/input.json"
 output_schema = "schemas/output.json"
 timeout_ms = 5000
+[[actions]]
+id = "slow"
+title = "Slow action"
+description = "Wait until the supervisor cancels this action"
+handler = "slow"
+input_schema = "schemas/input.json"
+output_schema = "schemas/output.json"
+timeout_ms = 30000
 "#,
     )
     .unwrap();
@@ -168,6 +178,107 @@ timeout_ms = 5000
             .output()
             .unwrap(),
     );
+
+    let detached = command(binary, &runtime, &config_home)
+        .args([
+            "plugin",
+            "invoke",
+            "dev.broker/exercise",
+            "--target",
+            &name,
+            "--detach",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&detached);
+    let queued: Value = serde_json::from_slice(&detached.stdout).unwrap();
+    let job_id = queued["job_id"].as_str().unwrap();
+    assert!(job_id.starts_with(&format!("{name}/")));
+    let completed = wait_for_job(
+        binary,
+        &runtime,
+        &config_home,
+        job_id,
+        "succeeded",
+        Duration::from_secs(8),
+    );
+    assert_eq!(completed["result"]["session"], name);
+
+    let logs = command(binary, &runtime, &config_home)
+        .args(["plugin", "job", "logs", job_id])
+        .output()
+        .unwrap();
+    assert_success(&logs);
+    let logs: Value = serde_json::from_slice(&logs.stdout).unwrap();
+    assert_eq!(logs["status"], "succeeded");
+    assert!(logs["stdout"].as_str().unwrap().contains("saw_ready"));
+    assert_eq!(logs["stdout_truncated"], false);
+
+    let slow = command(binary, &runtime, &config_home)
+        .args([
+            "plugin",
+            "invoke",
+            "dev.broker/slow",
+            "--target",
+            &name,
+            "--detach",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&slow);
+    let slow: Value = serde_json::from_slice(&slow.stdout).unwrap();
+    let slow_job = slow["job_id"].as_str().unwrap();
+    let cancel = command(binary, &runtime, &config_home)
+        .args(["plugin", "job", "cancel", slow_job])
+        .output()
+        .unwrap();
+    assert_success(&cancel);
+    let cancel: Value = serde_json::from_slice(&cancel.stdout).unwrap();
+    assert_eq!(cancel["status"], "cancelling");
+    let cancelled = wait_for_job(
+        binary,
+        &runtime,
+        &config_home,
+        slow_job,
+        "cancelled",
+        Duration::from_secs(8),
+    );
+    assert_eq!(cancelled["status"], "cancelled");
+    let cancel_again = command(binary, &runtime, &config_home)
+        .args(["plugin", "job", "cancel", slow_job])
+        .output()
+        .unwrap();
+    assert_success(&cancel_again);
+    let cancel_again: Value = serde_json::from_slice(&cancel_again.stdout).unwrap();
+    assert_eq!(cancel_again["status"], "cancelled");
+}
+
+fn wait_for_job(
+    binary: &str,
+    runtime: &Path,
+    config_home: &Path,
+    job_id: &str,
+    expected: &str,
+    timeout: Duration,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = command(binary, runtime, config_home)
+            .args(["plugin", "job", "status", job_id])
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if status["status"] == expected {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "job {job_id} stayed in state {}",
+            status["status"]
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn command(binary: &str, runtime: &Path, config_home: &Path) -> Command {
