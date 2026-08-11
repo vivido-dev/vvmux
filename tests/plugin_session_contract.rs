@@ -84,6 +84,7 @@ fn catalog_uses_the_live_session_generation_and_hides_unimplemented_workflows() 
             "pane.manage_own",
             "pane.manage_any",
             "events.subscribe",
+            "plugin.invoke",
             "media.produce"
         ])
     );

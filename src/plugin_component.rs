@@ -290,12 +290,19 @@ impl ComponentRuntime {
         action: &str,
         input: &Value,
         context: &Value,
+        cause_context: &vvmux_plugin_api::InvocationContext,
         cancel: Arc<AtomicBool>,
         deadline: Instant,
     ) -> io::Result<Value> {
         self.store.data_mut().invocation_logs.clear();
         self.store.data_mut().logs_truncated = false;
         let input = serde_json::to_vec(input).map_err(io::Error::other)?;
+        let _cause = self
+            .store
+            .data()
+            .broker
+            .as_ref()
+            .map(|lease| lease.enter_event(cause_context));
         let context = serde_json::to_vec(context).map_err(io::Error::other)?;
         if input.len() > MAX_PAYLOAD_BYTES || context.len() > MAX_PAYLOAD_BYTES {
             return Err(invalid("schema_invalid: component request exceeds 1 MiB"));

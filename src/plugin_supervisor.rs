@@ -47,6 +47,7 @@ pub(crate) struct RuntimeScope {
 #[derive(Clone)]
 pub(crate) struct HostBroker {
     actor: mpsc::SyncSender<ActorEvent>,
+    manager: mpsc::SyncSender<Message>,
     session_instance: String,
     tokens: Arc<Mutex<HashMap<String, BrokerIdentity>>>,
 }
@@ -70,6 +71,8 @@ pub(crate) struct PluginCause {
     pub(crate) correlation_id: String,
     pub(crate) causation_id: String,
     pub(crate) causation_depth: u8,
+    pub(crate) pane_id: Option<u64>,
+    pub(crate) tab_id: Option<u64>,
 }
 
 pub(crate) struct CauseReset(Arc<Mutex<Option<PluginCause>>>);
@@ -133,6 +136,72 @@ impl HostBroker {
                 "scope_denied: stale plugin broker token",
             ));
         };
+        if call.method == "plugin.invoke" {
+            if !scope.permissions.contains(&Permission::PluginInvoke) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "capability_denied: plugin lacks `plugin.invoke`",
+                ));
+            }
+            let params = call
+                .params
+                .as_object()
+                .ok_or_else(|| io::Error::other("schema_invalid: params must be an object"))?;
+            if params
+                .keys()
+                .any(|key| key != "reference" && key != "input")
+            {
+                return Err(io::Error::other(
+                    "schema_invalid: plugin.invoke has unknown parameters",
+                ));
+            }
+            let reference = params
+                .get("reference")
+                .and_then(Value::as_str)
+                .filter(|reference| !reference.is_empty() && reference.len() <= 256)
+                .ok_or_else(|| {
+                    io::Error::other("schema_invalid: plugin.invoke requires reference")
+                })?
+                .to_owned();
+            let input = params
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if serde_json::to_vec(&input).map_or(true, |body| body.len() > 1024 * 1024) {
+                return Err(io::Error::other(
+                    "schema_invalid: plugin.invoke input exceeds 1 MiB",
+                ));
+            }
+            let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+            self.manager
+                .try_send(Message::DependencyInvoke {
+                    caller: scope.clone(),
+                    cause,
+                    reference,
+                    input,
+                    deadline,
+                    reply: reply_sender,
+                })
+                .map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => {
+                        io::Error::other("busy: plugin supervisor queue is full")
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        io::Error::other("runtime_unavailable: plugin supervisor stopped")
+                    }
+                })?;
+            return match reply_receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Err(io::Error::other("timeout: dependency invocation expired"))
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+                    "runtime_unavailable: dependency invocation reply dropped",
+                )),
+            };
+        }
         let (sender, receiver) = mpsc::sync_channel(1);
         self.actor
             .try_send(ActorEvent::PluginHostCall {
@@ -187,6 +256,8 @@ impl BrokerLease {
             correlation_id: context.correlation_id.clone(),
             causation_id: context.causation_id.clone(),
             causation_depth: context.causation_depth,
+            pane_id: context.pane_id,
+            tab_id: context.tab_id,
         });
         CauseReset(self.cause.clone())
     }
@@ -214,6 +285,7 @@ impl Drop for BrokerLease {
 enum Completion {
     Automation(AutomationReplyTarget),
     Notice(String),
+    Broker(mpsc::SyncSender<io::Result<Value>>),
     Detached,
 }
 
@@ -224,8 +296,38 @@ struct Job {
     plugin_id: String,
     reference: String,
     input: Value,
+    context: Option<vvmux_plugin_api::InvocationContext>,
     cancel: Arc<AtomicBool>,
     completion: Completion,
+}
+
+struct WorkflowStepJob {
+    run_id: u64,
+    step_id: String,
+    reference: String,
+    input: Value,
+    context: Option<vvmux_plugin_api::InvocationContext>,
+    cancel: Arc<AtomicBool>,
+    started_ms: u128,
+    plugin_id: String,
+    plugin_version: String,
+    plugin_digest: String,
+}
+
+struct RunningWorkflowStep {
+    plugin_id: String,
+}
+
+struct WorkflowRun {
+    job: Job,
+    workflow: crate::plugin::RuntimeWorkflow,
+    trigger: Value,
+    outputs: BTreeMap<String, Value>,
+    running: BTreeMap<String, RunningWorkflowStep>,
+    trace: Vec<Value>,
+    aggregate_bytes: usize,
+    deadline: Instant,
+    failure: Option<io::Error>,
 }
 
 struct ActiveJob {
@@ -293,6 +395,7 @@ struct RetainedJob {
     stderr: String,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    trace: Option<Value>,
 }
 
 #[derive(Default)]
@@ -321,6 +424,7 @@ impl JobStore {
                 stderr: String::new(),
                 stdout_truncated: false,
                 stderr_truncated: false,
+                trace: None,
             },
         );
     }
@@ -414,6 +518,12 @@ impl JobStore {
             "stderr_truncated": record.stderr_truncated,
         }))
     }
+
+    fn set_trace(&mut self, job_id: &str, trace: Value) {
+        if let Some(record) = self.records.get_mut(job_id) {
+            record.trace = Some(trace);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -446,11 +556,26 @@ impl JobAccounting {
 
 enum Message {
     Invoke(Job),
+    DependencyInvoke {
+        caller: RuntimeScope,
+        cause: Option<PluginCause>,
+        reference: String,
+        input: Value,
+        deadline: Instant,
+        reply: mpsc::SyncSender<io::Result<Value>>,
+    },
     Complete {
         job: Job,
         result: io::Result<Value>,
         logs: crate::plugin::RuntimeLogs,
     },
+    WorkflowStepComplete {
+        step: WorkflowStepJob,
+        result: io::Result<Value>,
+        logs: crate::plugin::RuntimeLogs,
+    },
+    WorkflowDeadline(u64),
+    WorkflowWake,
     JobStatus {
         job_id: String,
         reply: AutomationReplyTarget,
@@ -492,6 +617,7 @@ enum Message {
 
 enum WorkerMessage {
     Invoke(Job),
+    WorkflowStep(WorkflowStepJob),
     Activate,
     Event { hook: EventHook, event: Event },
     Shutdown,
@@ -503,12 +629,13 @@ impl PluginSupervisor {
         session_instance: String,
         actor: mpsc::SyncSender<ActorEvent>,
     ) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(COMMAND_QUEUE);
         let broker = HostBroker {
             actor: actor.clone(),
+            manager: sender.clone(),
             session_instance: session_instance.clone(),
             tokens: Arc::new(Mutex::new(HashMap::new())),
         };
-        let (sender, receiver) = mpsc::sync_channel(COMMAND_QUEUE);
         let manager_sender = sender.clone();
         let reload_requested = Arc::new(AtomicBool::new(false));
         let manager_reload_requested = reload_requested.clone();
@@ -661,6 +788,7 @@ impl PluginSupervisor {
             plugin_id,
             reference,
             input,
+            context: None,
             cancel: Arc::new(AtomicBool::new(false)),
             completion,
         };
@@ -775,6 +903,9 @@ fn run_manager(inputs: ManagerInputs) {
     let mut reload_loading = false;
     let mut queued_reloads = Vec::<ReloadCompletion>::new();
     let mut event_gaps = HashMap::<String, (u64, u64)>::new();
+    let mut workflows = HashMap::<u64, WorkflowRun>::new();
+    let mut next_dependency_job_id = 1_u64 << 62;
+    let mut next_event_workflow_id = 1_u64 << 63;
     activate_session_plugins(
         &registry,
         &mut workers,
@@ -785,6 +916,51 @@ fn run_manager(inputs: ManagerInputs) {
     );
     while let Ok(message) = receiver.recv() {
         match message {
+            Message::DependencyInvoke {
+                caller,
+                cause,
+                reference,
+                input,
+                deadline,
+                reply,
+            } => {
+                let result = resolve_dependency_invocation(
+                    &registry,
+                    &transitions,
+                    &session_instance,
+                    &caller,
+                    cause,
+                    &reference,
+                    input,
+                    deadline,
+                    next_dependency_job_id,
+                    &session_name,
+                    reply,
+                );
+                next_dependency_job_id =
+                    next_dependency_job_id.checked_add(1).unwrap_or(1_u64 << 62);
+                match result {
+                    Ok(job) => {
+                        if let Err(error) = sender.try_send(Message::Invoke(job)) {
+                            let job = match error {
+                                mpsc::TrySendError::Full(Message::Invoke(job))
+                                | mpsc::TrySendError::Disconnected(Message::Invoke(job)) => job,
+                                _ => unreachable!(
+                                    "dependency submission queues only invocation jobs"
+                                ),
+                            };
+                            deliver(
+                                &actor,
+                                job.completion,
+                                Err(io::Error::other("busy: plugin supervisor queue is full")),
+                            );
+                        }
+                    }
+                    Err((reply, error)) => {
+                        let _ = reply.try_send(Err(error));
+                    }
+                }
+            }
             Message::Invoke(job) => {
                 retained.start(&job);
                 let Some(plugin) = registry.plugins.get(&job.plugin_id).cloned() else {
@@ -814,6 +990,105 @@ fn run_manager(inputs: ManagerInputs) {
                     ));
                     retained.finish(&job, &result);
                     deliver(&actor, job.completion, result);
+                    continue;
+                }
+                let workflow = job
+                    .reference
+                    .split_once('/')
+                    .and_then(|(_, workflow_id)| {
+                        plugin
+                            .workflows
+                            .iter()
+                            .find(|workflow| workflow.id == workflow_id)
+                    })
+                    .cloned();
+                if let Some(workflow) = workflow {
+                    let validation = vvmux_plugin_api::validate_schema_instance(
+                        &workflow.input_schema,
+                        &job.input,
+                    );
+                    if let Err(errors) = validation {
+                        let result = Err(io::Error::other(format!(
+                            "schema_invalid: {}",
+                            errors.join("; ")
+                        )));
+                        retained.finish(&job, &result);
+                        deliver(&actor, job.completion, result);
+                        continue;
+                    }
+                    if !accounting.admit(&job.plugin_id) {
+                        let result = Err(io::Error::other("busy: plugin job limit reached"));
+                        retained.finish(&job, &result);
+                        deliver(&actor, job.completion, result);
+                        continue;
+                    }
+                    let client_id = match &job.completion {
+                        Completion::Automation(reply) => Some(reply.client_id()),
+                        Completion::Notice(_) | Completion::Broker(_) | Completion::Detached => {
+                            None
+                        }
+                    };
+                    let run_id = job.id;
+                    let public_id = job.public_id.clone();
+                    let cancel = job.cancel.clone();
+                    let mut timeout = std::time::Duration::from_millis(workflow.timeout_ms);
+                    if let Some(context_deadline) = job
+                        .context
+                        .as_ref()
+                        .map(|context| context.deadline_unix_ms)
+                        .filter(|deadline| *deadline != 0)
+                    {
+                        let now = now_ms().min(u128::from(u64::MAX)) as u64;
+                        timeout = timeout.min(std::time::Duration::from_millis(
+                            context_deadline.saturating_sub(now).max(1),
+                        ));
+                    }
+                    let deadline = Instant::now()
+                        .checked_add(timeout)
+                        .unwrap_or_else(Instant::now);
+                    active.insert(
+                        run_id,
+                        ActiveJob {
+                            plugin_id: job.plugin_id.clone(),
+                            client_id,
+                            cancel,
+                            public_id,
+                        },
+                    );
+                    workflows.insert(
+                        run_id,
+                        WorkflowRun {
+                            trigger: job.input.clone(),
+                            job,
+                            workflow,
+                            outputs: BTreeMap::new(),
+                            running: BTreeMap::new(),
+                            trace: Vec::new(),
+                            aggregate_bytes: 0,
+                            deadline,
+                            failure: None,
+                        },
+                    );
+                    let deadline_sender = sender.clone();
+                    thread::spawn(move || {
+                        thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                        let _ = deadline_sender.send(Message::WorkflowDeadline(run_id));
+                    });
+                    advance_workflow(
+                        run_id,
+                        &mut workflows,
+                        &registry,
+                        &transitions,
+                        &mut workers,
+                        &session_name,
+                        &session_instance,
+                        &broker,
+                        &sender,
+                        &mut active,
+                        &mut accounting,
+                        &mut retained,
+                        &actor,
+                    );
                     continue;
                 }
                 if !accounting.admit(&job.plugin_id) {
@@ -855,7 +1130,7 @@ fn run_manager(inputs: ManagerInputs) {
                 };
                 let client_id = match &job.completion {
                     Completion::Automation(reply) => Some(reply.client_id()),
-                    Completion::Notice(_) | Completion::Detached => None,
+                    Completion::Notice(_) | Completion::Broker(_) | Completion::Detached => None,
                 };
                 let active_job = ActiveJob {
                     plugin_id: job.plugin_id.clone(),
@@ -875,7 +1150,9 @@ fn run_manager(inputs: ManagerInputs) {
                             WorkerMessage::Shutdown | WorkerMessage::Activate,
                         )
                         | mpsc::TrySendError::Full(WorkerMessage::Event { .. })
-                        | mpsc::TrySendError::Disconnected(WorkerMessage::Event { .. }) => {
+                        | mpsc::TrySendError::Disconnected(WorkerMessage::Event { .. })
+                        | mpsc::TrySendError::Full(WorkerMessage::WorkflowStep(_))
+                        | mpsc::TrySendError::Disconnected(WorkerMessage::WorkflowStep(_)) => {
                             unreachable!("the supervisor only submits invocation messages here")
                         }
                     };
@@ -915,7 +1192,7 @@ fn run_manager(inputs: ManagerInputs) {
                         "action": &job.reference,
                         "status": status,
                     }),
-                    context: None,
+                    context: job_lifecycle_context(&job),
                 });
                 if result
                     .as_ref()
@@ -928,12 +1205,153 @@ fn run_manager(inputs: ManagerInputs) {
                     });
                 }
                 deliver(&actor, job.completion, result);
-                request_worker_stop_if_drained(&job.plugin_id, &active, &transitions, &mut workers);
+                request_worker_stop_if_drained(
+                    &job.plugin_id,
+                    &active,
+                    workflow_uses_plugin(&workflows, &job.plugin_id),
+                    &transitions,
+                    &mut workers,
+                );
+                advance_all_workflows(
+                    &mut workflows,
+                    &registry,
+                    &transitions,
+                    &mut workers,
+                    &session_name,
+                    &session_instance,
+                    &broker,
+                    &sender,
+                    &mut active,
+                    &mut accounting,
+                    &mut retained,
+                    &actor,
+                );
+            }
+            Message::WorkflowStepComplete { step, result, logs } => {
+                accounting.complete(&step.plugin_id);
+                if let Some(run) = workflows.get_mut(&step.run_id) {
+                    run.running.remove(&step.step_id);
+                    let finished_ms = now_ms();
+                    let status = match &result {
+                        Ok(_) => "succeeded",
+                        Err(error) if error.to_string().starts_with("cancelled") => "cancelled",
+                        Err(error) if error.to_string().starts_with("timeout") => "timed_out",
+                        Err(_) => "failed",
+                    };
+                    let error_code = result.as_ref().err().map(|error| {
+                        crate::session::plugin_automation_error(io::Error::new(
+                            error.kind(),
+                            error.to_string(),
+                        ))
+                        .code
+                    });
+                    run.trace.push(serde_json::json!({
+                        "step_id": &step.step_id,
+                        "action": &step.reference,
+                        "plugin_id": &step.plugin_id,
+                        "plugin_version": &step.plugin_version,
+                        "plugin_digest": &step.plugin_digest,
+                        "started_ms": step.started_ms,
+                        "finished_ms": finished_ms,
+                        "status": status,
+                        "error_code": error_code,
+                        "stderr_truncated": logs.stderr_truncated,
+                    }));
+                    match result {
+                        Ok(output) => {
+                            let size =
+                                serde_json::to_vec(&output).map_or(usize::MAX, |body| body.len());
+                            run.aggregate_bytes = run.aggregate_bytes.saturating_add(size);
+                            if run.aggregate_bytes > 1024 * 1024 {
+                                run.failure = Some(io::Error::other(
+                                    "output_invalid: workflow intermediates exceed 1 MiB",
+                                ));
+                                run.job.cancel.store(true, Ordering::Release);
+                            } else {
+                                run.outputs.insert(step.step_id, output);
+                            }
+                        }
+                        Err(error) => {
+                            if run.failure.is_none() {
+                                run.failure = Some(io::Error::other(format!(
+                                    "dependency_failed: workflow step failed: {error}"
+                                )));
+                            }
+                            run.job.cancel.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                request_worker_stop_if_drained(
+                    &step.plugin_id,
+                    &active,
+                    workflow_uses_plugin(&workflows, &step.plugin_id),
+                    &transitions,
+                    &mut workers,
+                );
+                advance_workflow(
+                    step.run_id,
+                    &mut workflows,
+                    &registry,
+                    &transitions,
+                    &mut workers,
+                    &session_name,
+                    &session_instance,
+                    &broker,
+                    &sender,
+                    &mut active,
+                    &mut accounting,
+                    &mut retained,
+                    &actor,
+                );
+            }
+            Message::WorkflowDeadline(run_id) => {
+                if let Some(run) = workflows.get_mut(&run_id)
+                    && Instant::now() >= run.deadline
+                    && run.failure.is_none()
+                {
+                    run.failure = Some(io::Error::other("timeout: workflow deadline expired"));
+                    run.job.cancel.store(true, Ordering::Release);
+                }
+                advance_workflow(
+                    run_id,
+                    &mut workflows,
+                    &registry,
+                    &transitions,
+                    &mut workers,
+                    &session_name,
+                    &session_instance,
+                    &broker,
+                    &sender,
+                    &mut active,
+                    &mut accounting,
+                    &mut retained,
+                    &actor,
+                );
+            }
+            Message::WorkflowWake => {
+                advance_all_workflows(
+                    &mut workflows,
+                    &registry,
+                    &transitions,
+                    &mut workers,
+                    &session_name,
+                    &session_instance,
+                    &broker,
+                    &sender,
+                    &mut active,
+                    &mut accounting,
+                    &mut retained,
+                    &actor,
+                );
             }
             Message::JobStatus { job_id, reply } => {
                 deliver_query(&actor, reply, retained.status(&job_id));
             }
             Message::JobCancel { job_id, reply } => {
+                let workflow = active
+                    .values()
+                    .find(|active_job| active_job.public_id == job_id)
+                    .map(|job| job.public_id.clone());
                 let result = if let Some(job) = active
                     .values()
                     .find(|active_job| active_job.public_id == job_id)
@@ -943,6 +1361,22 @@ fn run_manager(inputs: ManagerInputs) {
                 } else {
                     retained.status(&job_id)
                 };
+                if workflow.is_some() {
+                    advance_all_workflows(
+                        &mut workflows,
+                        &registry,
+                        &transitions,
+                        &mut workers,
+                        &session_name,
+                        &session_instance,
+                        &broker,
+                        &sender,
+                        &mut active,
+                        &mut accounting,
+                        &mut retained,
+                        &actor,
+                    );
+                }
                 deliver_query(&actor, reply, result);
             }
             Message::JobLogs { job_id, reply } => {
@@ -1027,6 +1461,7 @@ fn run_manager(inputs: ManagerInputs) {
                             candidate,
                             &mut registry,
                             &active,
+                            &workflows,
                             &mut workers,
                             &mut transitions,
                             &actor,
@@ -1229,6 +1664,53 @@ fn run_manager(inputs: ManagerInputs) {
                         }
                     }
                 }
+                let triggered = registry
+                    .plugins
+                    .values()
+                    .filter(|plugin| plugin.enabled && !transitions.contains(&plugin.id))
+                    .flat_map(|plugin| {
+                        plugin
+                            .workflows
+                            .iter()
+                            .filter(|workflow| workflow.trigger == name)
+                            .filter(|_| {
+                                !context
+                                    .source
+                                    .starts_with(&format!("plugin:{}:", plugin.id))
+                            })
+                            .map(|workflow| (plugin.id.clone(), workflow.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (plugin_id, workflow) in triggered {
+                    let id = next_event_workflow_id;
+                    next_event_workflow_id =
+                        next_event_workflow_id.checked_add(1).unwrap_or(1_u64 << 63);
+                    let mut workflow_context = context.clone();
+                    workflow_context.causation_depth =
+                        workflow_context.causation_depth.saturating_add(1);
+                    workflow_context.deadline_unix_ms = now_ms()
+                        .saturating_add(u128::from(workflow.timeout_ms))
+                        .min(u128::from(u64::MAX))
+                        as u64;
+                    let public_id = format!("{session_name}/{session_instance}-{id:016x}");
+                    let job = Job {
+                        id,
+                        public_id,
+                        created_ms: now_ms(),
+                        reference: format!("{plugin_id}/{}", workflow.id),
+                        plugin_id: plugin_id.clone(),
+                        input: payload.clone(),
+                        context: Some(workflow_context),
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        completion: Completion::Detached,
+                    };
+                    if sender.try_send(Message::Invoke(job)).is_err() {
+                        event_gaps
+                            .entry(plugin_id)
+                            .and_modify(|gap| gap.1 = sequence)
+                            .or_insert((sequence, sequence));
+                    }
+                }
             }
             Message::RuntimeCrashed {
                 plugin_id,
@@ -1264,6 +1746,20 @@ fn run_manager(inputs: ManagerInputs) {
                 {
                     job.cancel.store(true, Ordering::Release);
                 }
+                advance_all_workflows(
+                    &mut workflows,
+                    &registry,
+                    &transitions,
+                    &mut workers,
+                    &session_name,
+                    &session_instance,
+                    &broker,
+                    &sender,
+                    &mut active,
+                    &mut accounting,
+                    &mut retained,
+                    &actor,
+                );
             }
             Message::Shutdown => {
                 for job in active.values() {
@@ -1313,6 +1809,135 @@ fn hook_accepts_event(
         && (hook.include_self || !context.source.starts_with(&format!("plugin:{plugin_id}:")))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_dependency_invocation(
+    registry: &AppliedRegistry,
+    transitions: &BTreeSet<String>,
+    session_instance: &str,
+    caller: &RuntimeScope,
+    cause: Option<PluginCause>,
+    reference: &str,
+    input: Value,
+    deadline: Instant,
+    id: u64,
+    session_name: &str,
+    reply: mpsc::SyncSender<io::Result<Value>>,
+) -> Result<Job, (mpsc::SyncSender<io::Result<Value>>, io::Error)> {
+    let result = (|| -> io::Result<Job> {
+        if caller.session_instance != session_instance {
+            return Err(io::Error::other(
+                "scope_denied: plugin belongs to another session instance",
+            ));
+        }
+        if !caller.permissions.contains(&Permission::PluginInvoke) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "capability_denied: plugin lacks `plugin.invoke`",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other("timeout: dependency invocation expired"));
+        }
+        let (alias, action_id) = reference.split_once('/').ok_or_else(|| {
+            io::Error::other("action_not_found: dependency reference must be ALIAS/ACTION")
+        })?;
+        if alias.is_empty() || action_id.is_empty() || action_id.contains('/') {
+            return Err(io::Error::other(
+                "action_not_found: dependency reference must be ALIAS/ACTION",
+            ));
+        }
+        let owner = registry.plugins.get(&caller.plugin_id).ok_or_else(|| {
+            io::Error::other("plugin_not_found: invoking plugin is not installed")
+        })?;
+        if !owner.enabled || transitions.contains(&caller.plugin_id) {
+            return Err(io::Error::other(
+                "runtime_unavailable: invoking plugin is draining",
+            ));
+        }
+        let loaded = crate::plugin::load_package(&owner.root)?;
+        let dependency_id = loaded
+            .manifest
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.alias == alias)
+            .map(|dependency| dependency.id.as_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "scope_denied: plugin invocation requires a declared dependency alias",
+                )
+            })?;
+        let dependency = registry.plugins.get(dependency_id).ok_or_else(|| {
+            io::Error::other(format!(
+                "dependency_failed: plugin `{dependency_id}` is unavailable"
+            ))
+        })?;
+        if !dependency.enabled || transitions.contains(dependency_id) {
+            return Err(io::Error::other(format!(
+                "dependency_failed: plugin `{dependency_id}` is unavailable"
+            )));
+        }
+        let dependency_package = crate::plugin::load_package(&dependency.root)?;
+        if dependency_package.action(action_id).is_none()
+            && !dependency
+                .workflows
+                .iter()
+                .any(|workflow| workflow.id == action_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("action_not_found: `{dependency_id}/{action_id}` does not exist"),
+            ));
+        }
+        let causation_id = random_identity()?;
+        let (correlation_id, causation_depth, pane_id, tab_id) = cause.map_or_else(
+            || (causation_id.clone(), 1, None, None),
+            |cause| {
+                (
+                    cause.correlation_id,
+                    cause.causation_depth.saturating_add(1),
+                    cause.pane_id,
+                    cause.tab_id,
+                )
+            },
+        );
+        if causation_depth >= 8 {
+            return Err(io::Error::other(
+                "scope_denied: plugin causation depth reached 8",
+            ));
+        }
+        let deadline_unix_ms = now_ms()
+            .saturating_add(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .min(u128::from(u64::MAX)) as u64;
+        let public_id = format!("{session_name}/{session_instance}-{id:016x}");
+        Ok(Job {
+            id,
+            public_id,
+            created_ms: now_ms(),
+            plugin_id: dependency_id.to_owned(),
+            reference: format!("{dependency_id}/{action_id}"),
+            input,
+            context: Some(vvmux_plugin_api::InvocationContext {
+                correlation_id,
+                causation_id,
+                causation_depth,
+                source: format!("plugin:{}:{}", caller.plugin_id, caller.plugin_instance),
+                session_instance: session_instance.to_owned(),
+                pane_id,
+                tab_id,
+                deadline_unix_ms,
+            }),
+            cancel: Arc::new(AtomicBool::new(false)),
+            completion: Completion::Broker(reply.clone()),
+        })
+    })();
+    result.map_err(|error| (reply, error))
+}
+
 fn spawn_worker(
     plugin: crate::plugin::RuntimePlugin,
     session_name: &str,
@@ -1338,11 +1963,30 @@ fn spawn_worker(
                 }
                 match message {
                     WorkerMessage::Invoke(job) => {
-                        let result =
-                            runtime.invoke(&job.reference, job.input.clone(), job.cancel.clone());
+                        let result = runtime.invoke(
+                            &job.reference,
+                            job.input.clone(),
+                            job.cancel.clone(),
+                            job.context.clone(),
+                        );
                         let logs = runtime.take_logs();
                         if manager
                             .send(Message::Complete { job, result, logs })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    WorkerMessage::WorkflowStep(step) => {
+                        let result = runtime.invoke(
+                            &step.reference,
+                            step.input.clone(),
+                            step.cancel.clone(),
+                            step.context.clone(),
+                        );
+                        let logs = runtime.take_logs();
+                        if manager
+                            .send(Message::WorkflowStepComplete { step, result, logs })
                             .is_err()
                         {
                             break;
@@ -1367,6 +2011,7 @@ fn spawn_worker(
                                 context: Some(context),
                             });
                         }
+                        let _ = manager.try_send(Message::WorkflowWake);
                     }
                     WorkerMessage::Shutdown => break,
                 }
@@ -1375,6 +2020,271 @@ fn spawn_worker(
             let _ = manager.send(Message::WorkerStopped { plugin_id, digest });
         })?;
     Ok((sender, shutdown))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_all_workflows(
+    workflows: &mut HashMap<u64, WorkflowRun>,
+    registry: &AppliedRegistry,
+    transitions: &BTreeSet<String>,
+    workers: &mut HashMap<String, WorkerHandle>,
+    session_name: &str,
+    session_instance: &str,
+    broker: &HostBroker,
+    manager: &mpsc::SyncSender<Message>,
+    active: &mut HashMap<u64, ActiveJob>,
+    accounting: &mut JobAccounting,
+    retained: &mut JobStore,
+    actor: &mpsc::SyncSender<ActorEvent>,
+) {
+    let run_ids = workflows.keys().copied().collect::<Vec<_>>();
+    for run_id in run_ids {
+        advance_workflow(
+            run_id,
+            workflows,
+            registry,
+            transitions,
+            workers,
+            session_name,
+            session_instance,
+            broker,
+            manager,
+            active,
+            accounting,
+            retained,
+            actor,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_workflow(
+    run_id: u64,
+    workflows: &mut HashMap<u64, WorkflowRun>,
+    registry: &AppliedRegistry,
+    transitions: &BTreeSet<String>,
+    workers: &mut HashMap<String, WorkerHandle>,
+    session_name: &str,
+    session_instance: &str,
+    broker: &HostBroker,
+    manager: &mpsc::SyncSender<Message>,
+    active: &mut HashMap<u64, ActiveJob>,
+    accounting: &mut JobAccounting,
+    retained: &mut JobStore,
+    actor: &mpsc::SyncSender<ActorEvent>,
+) {
+    let Some(mut run) = workflows.remove(&run_id) else {
+        return;
+    };
+    if run.failure.is_none() && run.job.cancel.load(Ordering::Acquire) {
+        run.failure = Some(io::Error::other("cancelled: workflow was cancelled"));
+    }
+    if run.failure.is_none() && Instant::now() >= run.deadline {
+        run.failure = Some(io::Error::other("timeout: workflow deadline expired"));
+        run.job.cancel.store(true, Ordering::Release);
+    }
+    if run.failure.is_some() {
+        run.job.cancel.store(true, Ordering::Release);
+        if run.running.is_empty() {
+            finish_workflow(run, active, accounting, retained, actor);
+        } else {
+            workflows.insert(run_id, run);
+        }
+        return;
+    }
+    if run.outputs.len() == run.workflow.steps.len() {
+        let result = crate::plugin::resolve_workflow_template(
+            &run.workflow.output,
+            &run.trigger,
+            &run.outputs,
+        )
+        .and_then(|output| {
+            if serde_json::to_vec(&output).map_or(true, |body| body.len() > 1024 * 1024) {
+                return Err(io::Error::other(
+                    "output_invalid: workflow result exceeds 1 MiB",
+                ));
+            }
+            vvmux_plugin_api::validate_schema_instance(&run.workflow.output_schema, &output)
+                .map_err(|errors| {
+                    io::Error::other(format!("output_invalid: {}", errors.join("; ")))
+                })?;
+            Ok(output)
+        });
+        if let Err(error) = &result {
+            run.failure = Some(io::Error::new(error.kind(), error.to_string()));
+        }
+        finish_workflow_with_result(run, result, active, accounting, retained, actor);
+        return;
+    }
+
+    let mut admitted_any = false;
+    let ready = run
+        .workflow
+        .steps
+        .iter()
+        .filter(|step| !run.outputs.contains_key(&step.id) && !run.running.contains_key(&step.id))
+        .filter(|step| step.needs.iter().all(|need| run.outputs.contains_key(need)))
+        .take(8_usize.saturating_sub(run.running.len()))
+        .cloned()
+        .collect::<Vec<_>>();
+    for step in ready {
+        let input =
+            match crate::plugin::resolve_workflow_template(&step.input, &run.trigger, &run.outputs)
+            {
+                Ok(input) => input,
+                Err(error) => {
+                    run.failure = Some(error);
+                    break;
+                }
+            };
+        let Some((plugin_id, _)) = step.reference.split_once('/') else {
+            run.failure = Some(io::Error::other(
+                "dependency_failed: invalid step reference",
+            ));
+            break;
+        };
+        let Some(plugin) = registry.plugins.get(plugin_id).cloned() else {
+            run.failure = Some(io::Error::other(format!(
+                "dependency_failed: plugin `{plugin_id}` is unavailable"
+            )));
+            break;
+        };
+        if !plugin.enabled || transitions.contains(plugin_id) {
+            run.failure = Some(io::Error::other(format!(
+                "dependency_failed: plugin `{plugin_id}` is unavailable"
+            )));
+            break;
+        }
+        if !accounting.admit(plugin_id) {
+            continue;
+        }
+        let worker = if let Some(worker) = workers.get(plugin_id) {
+            worker.sender.clone()
+        } else {
+            match spawn_worker(
+                plugin.clone(),
+                session_name,
+                session_instance,
+                broker.clone(),
+                manager.clone(),
+            ) {
+                Ok((sender, shutdown)) => {
+                    workers.insert(
+                        plugin_id.to_owned(),
+                        WorkerHandle {
+                            sender: sender.clone(),
+                            shutdown,
+                            plugin: plugin.clone(),
+                            stopping: false,
+                        },
+                    );
+                    sender
+                }
+                Err(error) => {
+                    accounting.complete(plugin_id);
+                    run.failure = Some(error);
+                    break;
+                }
+            }
+        };
+        let started_ms = now_ms();
+        let workflow_step = WorkflowStepJob {
+            run_id,
+            step_id: step.id.clone(),
+            reference: step.reference.clone(),
+            input,
+            context: run.job.context.clone(),
+            cancel: run.job.cancel.clone(),
+            started_ms,
+            plugin_id: plugin_id.to_owned(),
+            plugin_version: plugin.version.clone(),
+            plugin_digest: plugin.digest.clone(),
+        };
+        match worker.try_send(WorkerMessage::WorkflowStep(workflow_step)) {
+            Ok(()) => {
+                admitted_any = true;
+                run.running.insert(
+                    step.id,
+                    RunningWorkflowStep {
+                        plugin_id: plugin_id.to_owned(),
+                    },
+                );
+            }
+            Err(mpsc::TrySendError::Full(WorkerMessage::WorkflowStep(_))) => {
+                accounting.complete(plugin_id);
+            }
+            Err(mpsc::TrySendError::Disconnected(WorkerMessage::WorkflowStep(_))) => {
+                accounting.complete(plugin_id);
+                workers.remove(plugin_id);
+                run.failure = Some(io::Error::other(format!(
+                    "runtime_unavailable: plugin `{plugin_id}` worker stopped"
+                )));
+                break;
+            }
+            Err(_) => unreachable!("only workflow steps are submitted here"),
+        }
+    }
+    if run.failure.is_some() {
+        run.job.cancel.store(true, Ordering::Release);
+    }
+    if run.failure.is_some() && run.running.is_empty() {
+        finish_workflow(run, active, accounting, retained, actor);
+    } else {
+        let _ = admitted_any;
+        workflows.insert(run_id, run);
+    }
+}
+
+fn finish_workflow(
+    mut run: WorkflowRun,
+    active: &mut HashMap<u64, ActiveJob>,
+    accounting: &mut JobAccounting,
+    retained: &mut JobStore,
+    actor: &mpsc::SyncSender<ActorEvent>,
+) {
+    let error = run
+        .failure
+        .take()
+        .unwrap_or_else(|| io::Error::other("dependency_failed: workflow failed"));
+    finish_workflow_with_result(run, Err(error), active, accounting, retained, actor);
+}
+
+fn finish_workflow_with_result(
+    run: WorkflowRun,
+    result: io::Result<Value>,
+    active: &mut HashMap<u64, ActiveJob>,
+    accounting: &mut JobAccounting,
+    retained: &mut JobStore,
+    actor: &mpsc::SyncSender<ActorEvent>,
+) {
+    let status = match &result {
+        Ok(_) => "succeeded",
+        Err(error) if error.to_string().starts_with("cancelled") => "cancelled",
+        Err(error) if error.to_string().starts_with("timeout") => "timed_out",
+        Err(_) => "failed",
+    };
+    active.remove(&run.job.id);
+    accounting.complete(&run.job.plugin_id);
+    retained.finish(&run.job, &result);
+    retained.set_trace(
+        &run.job.public_id,
+        serde_json::json!({
+            "workflow": run.workflow.id,
+            "status": status,
+            "steps": &run.trace,
+        }),
+    );
+    let _ = actor.try_send(ActorEvent::PluginLifecycle {
+        name: "plugin.job_completed".into(),
+        payload: serde_json::json!({
+            "job_id": &run.job.public_id,
+            "plugin_id": &run.job.plugin_id,
+            "action": &run.job.reference,
+            "status": status,
+        }),
+        context: job_lifecycle_context(&run.job),
+    });
+    deliver(actor, run.job.completion, result);
 }
 
 fn activate_session_plugins(
@@ -1459,6 +2369,7 @@ fn apply_registry_candidate(
     candidate: crate::plugin::RegistryCandidate,
     registry: &mut AppliedRegistry,
     active: &HashMap<u64, ActiveJob>,
+    workflows: &HashMap<u64, WorkflowRun>,
     workers: &mut HashMap<String, WorkerHandle>,
     transitions: &mut BTreeSet<String>,
     actor: &mpsc::SyncSender<ActorEvent>,
@@ -1514,8 +2425,20 @@ fn apply_registry_candidate(
                 for job in active.values().filter(|job| job.plugin_id == id) {
                     job.cancel.store(true, Ordering::Release);
                 }
+                for run in workflows
+                    .values()
+                    .filter(|run| run.job.plugin_id == id || workflow_run_uses_plugin(run, &id))
+                {
+                    run.job.cancel.store(true, Ordering::Release);
+                }
             }
-            request_worker_stop_if_drained(&id, active, transitions, workers);
+            request_worker_stop_if_drained(
+                &id,
+                active,
+                workflow_uses_plugin(workflows, &id),
+                transitions,
+                workers,
+            );
             report.deferred.push(id);
         } else if changed {
             report.applied.push(id);
@@ -1598,10 +2521,14 @@ fn resolve_pane_launch(
 fn request_worker_stop_if_drained(
     plugin_id: &str,
     active: &HashMap<u64, ActiveJob>,
+    workflow_in_use: bool,
     transitions: &BTreeSet<String>,
     workers: &mut HashMap<String, WorkerHandle>,
 ) {
-    if !transitions.contains(plugin_id) || active.values().any(|job| job.plugin_id == plugin_id) {
+    if !transitions.contains(plugin_id)
+        || workflow_in_use
+        || active.values().any(|job| job.plugin_id == plugin_id)
+    {
         return;
     }
     if let Some(worker) = workers.get_mut(plugin_id)
@@ -1616,6 +2543,16 @@ fn request_worker_stop_if_drained(
             worker.stopping = false;
         }
     }
+}
+
+fn workflow_uses_plugin(workflows: &HashMap<u64, WorkflowRun>, plugin_id: &str) -> bool {
+    workflows
+        .values()
+        .any(|run| workflow_run_uses_plugin(run, plugin_id))
+}
+
+fn workflow_run_uses_plugin(run: &WorkflowRun, plugin_id: &str) -> bool {
+    run.running.values().any(|step| step.plugin_id == plugin_id)
 }
 
 fn finish_ready_reload_waiters(
@@ -1669,6 +2606,10 @@ fn deliver(
             reference,
             result: result.map(|_| ()).map_err(|error| error.to_string()),
         },
+        Completion::Broker(reply) => {
+            let _ = reply.try_send(result);
+            return;
+        }
         Completion::Detached => return,
     };
     let _ = actor.send(event);
@@ -1680,6 +2621,13 @@ fn deliver_query(
     result: Result<Value, AutomationError>,
 ) {
     let _ = actor.send(ActorEvent::PluginComplete { reply, result });
+}
+
+fn job_lifecycle_context(job: &Job) -> Option<vvmux_plugin_api::InvocationContext> {
+    job.context.clone().map(|mut context| {
+        context.source = format!("plugin:{}:job-{:016x}", job.plugin_id, job.id);
+        context
+    })
 }
 
 fn job_not_found() -> AutomationError {
@@ -1736,6 +2684,10 @@ mod tests {
         let tokens = Arc::new(Mutex::new(HashMap::new()));
         let broker = HostBroker {
             actor,
+            manager: {
+                let (sender, _receiver) = mpsc::sync_channel(1);
+                sender
+            },
             session_instance: "session-a".into(),
             tokens: tokens.clone(),
         };
@@ -1795,6 +2747,8 @@ mod tests {
     fn pane_launch_resolution_is_capability_scoped_and_allocates_exact_identity() {
         let plugin = crate::plugin::RuntimePlugin {
             id: "dev.example".into(),
+            version: "1.0.0".into(),
+            source: "test".into(),
             root: "/package".into(),
             digest: "digest-a".into(),
             manifest_digest: "manifest-a".into(),
@@ -1810,6 +2764,7 @@ mod tests {
             }],
             activation: Activation::OnDemand,
             events: Vec::new(),
+            workflows: Vec::new(),
         };
         let registry = AppliedRegistry {
             generation: 1,
@@ -1885,6 +2840,7 @@ mod tests {
                 plugin_id: "dev.example".into(),
                 reference: "dev.example/action".into(),
                 input: serde_json::json!({}),
+                context: None,
                 cancel: Arc::new(AtomicBool::new(false)),
                 completion: Completion::Detached,
             };

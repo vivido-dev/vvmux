@@ -7458,7 +7458,7 @@ fn authorize_session_scope(
     }
 }
 
-pub(crate) fn plugin_enforceable_permissions() -> [vvmux_plugin_api::Permission; 8] {
+pub(crate) fn plugin_enforceable_permissions() -> [vvmux_plugin_api::Permission; 9] {
     use vvmux_plugin_api::Permission;
     [
         Permission::SessionRead,
@@ -7468,6 +7468,7 @@ pub(crate) fn plugin_enforceable_permissions() -> [vvmux_plugin_api::Permission;
         Permission::PaneManageOwn,
         Permission::PaneManageAny,
         Permission::EventsSubscribe,
+        Permission::PluginInvoke,
         Permission::MediaProduce,
     ]
 }
@@ -8732,6 +8733,7 @@ mod tests {
                 "pane.manage_own",
                 "pane.manage_any",
                 "events.subscribe",
+                "plugin.invoke",
                 "media.produce",
             ]
         );

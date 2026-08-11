@@ -236,6 +236,12 @@ pub struct Workflow {
     pub trigger: String,
     #[serde(default)]
     pub agent_visible: bool,
+    #[serde(default)]
+    pub input_schema: Option<PathBuf>,
+    #[serde(default)]
+    pub output_schema: Option<PathBuf>,
+    #[serde(default = "default_action_timeout")]
+    pub timeout_ms: u64,
     pub output: Value,
     #[serde(default)]
     pub steps: Vec<WorkflowStep>,
@@ -287,6 +293,23 @@ impl SchemaDocument {
     }
 }
 
+pub fn validate_schema_instance(schema: &Value, instance: &Value) -> Result<(), Vec<String>> {
+    let validator = jsonschema::options()
+        .with_draft(Draft::Draft202012)
+        .should_validate_formats(false)
+        .build(schema)
+        .map_err(|error| vec![error.to_string()])?;
+    let errors = validator
+        .iter_errors(instance)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 #[derive(Debug)]
 pub struct LoadedManifest {
     pub root: PathBuf,
@@ -325,6 +348,14 @@ impl LoadedManifest {
             .actions
             .iter()
             .flat_map(|action| [&action.input_schema, &action.output_schema])
+            .chain(manifest.workflows.iter().flat_map(|workflow| {
+                [
+                    workflow.input_schema.as_ref(),
+                    workflow.output_schema.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+            }))
         {
             if schemas.contains_key(path) {
                 continue;
@@ -492,7 +523,12 @@ impl Manifest {
                 ));
             }
         }
-        validate_workflows(&self.workflows, &aliases)?;
+        let action_ids = self
+            .actions
+            .iter()
+            .map(|action| action.id.as_str())
+            .collect::<BTreeSet<_>>();
+        validate_workflows(&self.workflows, &aliases, &action_ids)?;
         Ok(())
     }
 }
@@ -528,15 +564,31 @@ impl Runtime {
 fn validate_workflows(
     workflows: &[Workflow],
     aliases: &BTreeSet<&str>,
+    action_ids: &BTreeSet<&str>,
 ) -> Result<(), ManifestError> {
     let mut workflow_ids = BTreeSet::new();
     for workflow in workflows {
         validate_local_id(&workflow.id, "workflow")?;
+        if action_ids.contains(workflow.id.as_str()) {
+            return invalid(format!(
+                "workflow id `{}` conflicts with an action id",
+                workflow.id
+            ));
+        }
         if !workflow_ids.insert(workflow.id.as_str()) {
             return invalid(format!("duplicate workflow id `{}`", workflow.id));
         }
         if workflow.steps.len() > MAX_WORKFLOW_STEPS {
             return invalid(format!("workflow `{}` exceeds 32 steps", workflow.id));
+        }
+        if !(1..=24 * 60 * 60 * 1000).contains(&workflow.timeout_ms) {
+            return invalid(format!("workflow `{}` has an invalid timeout", workflow.id));
+        }
+        if let Some(path) = &workflow.input_schema {
+            validate_relative_path(path, "workflow input schema")?;
+        }
+        if let Some(path) = &workflow.output_schema {
+            validate_relative_path(path, "workflow output schema")?;
         }
         let mut step_ids = BTreeSet::new();
         let mut resolved = workflow.clone();
@@ -904,6 +956,9 @@ mod tests {
             title: "cycle".into(),
             trigger: "manual".into(),
             agent_visible: false,
+            input_schema: None,
+            output_schema: None,
+            timeout_ms: 30_000,
             output: Value::Null,
             steps: vec![
                 WorkflowStep {
@@ -943,6 +998,9 @@ mod tests {
             title: "derived".into(),
             trigger: "manual".into(),
             agent_visible: false,
+            input_schema: None,
+            output_schema: None,
+            timeout_ms: 30_000,
             output: Value::String("${steps.second.output#/value}".into()),
             steps: vec![
                 WorkflowStep {

@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -221,6 +221,8 @@ struct PluginPaths {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RuntimePlugin {
     pub(crate) id: String,
+    pub(crate) version: String,
+    pub(crate) source: String,
     pub(crate) root: PathBuf,
     pub(crate) digest: String,
     pub(crate) manifest_digest: String,
@@ -229,6 +231,28 @@ pub(crate) struct RuntimePlugin {
     pub(crate) panes: Vec<vvmux_plugin_api::Pane>,
     pub(crate) activation: Activation,
     pub(crate) events: Vec<EventHook>,
+    pub(crate) workflows: Vec<RuntimeWorkflow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RuntimeWorkflow {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) trigger: String,
+    pub(crate) agent_visible: bool,
+    pub(crate) input_schema: Value,
+    pub(crate) output_schema: Value,
+    pub(crate) timeout_ms: u64,
+    pub(crate) output: Value,
+    pub(crate) steps: Vec<RuntimeWorkflowStep>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RuntimeWorkflowStep {
+    pub(crate) id: String,
+    pub(crate) reference: String,
+    pub(crate) input: Value,
+    pub(crate) needs: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -311,6 +335,10 @@ pub(crate) fn registry_path() -> io::Result<PathBuf> {
 pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
     let paths = PluginPaths::new()?;
     let registry = load_registry(&paths)?;
+    registry_candidate(&registry)
+}
+
+fn registry_candidate(registry: &Registry) -> io::Result<RegistryCandidate> {
     let mut plugins = BTreeMap::new();
     let mut catalog = BTreeMap::new();
     let mut failed = BTreeMap::new();
@@ -320,6 +348,8 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
                 entry.id.clone(),
                 RuntimePlugin {
                     id: entry.id.clone(),
+                    version: entry.version.clone(),
+                    source: entry.source.clone(),
                     root: entry.root.clone(),
                     digest: entry.digest.clone(),
                     manifest_digest: entry.manifest_digest.clone(),
@@ -328,6 +358,7 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
                     panes: Vec::new(),
                     activation: Activation::OnDemand,
                     events: Vec::new(),
+                    workflows: Vec::new(),
                 },
             );
             continue;
@@ -390,6 +421,8 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
             Ok((
                 RuntimePlugin {
                     id: entry.id.clone(),
+                    version: entry.version.clone(),
+                    source: entry.source.clone(),
                     root: entry.root.clone(),
                     digest: actual_digest,
                     manifest_digest: actual_manifest,
@@ -408,6 +441,7 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
                         .filter(|hook| known_plugin_event(&hook.on))
                         .cloned()
                         .collect(),
+                    workflows: Vec::new(),
                 },
                 actions,
             ))
@@ -422,12 +456,638 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
             }
         }
     }
+    compile_registry_workflows(&mut plugins, &mut catalog, &mut failed);
     Ok(RegistryCandidate {
         generation: registry.generation,
         plugins,
         catalog,
         failed,
     })
+}
+
+fn compile_registry_workflows(
+    plugins: &mut BTreeMap<String, RuntimePlugin>,
+    catalog: &mut BTreeMap<String, Vec<Value>>,
+    failed: &mut BTreeMap<String, String>,
+) {
+    let ids = plugins.keys().cloned().collect::<Vec<_>>();
+    for id in ids {
+        let compiled = (|| -> io::Result<Vec<RuntimeWorkflow>> {
+            let plugin = plugins
+                .get(&id)
+                .ok_or_else(|| invalid("plugin disappeared while workflows were compiled"))?;
+            if !plugin.enabled {
+                return Ok(Vec::new());
+            }
+            let loaded = load_package(&plugin.root)?;
+            if loaded
+                .manifest
+                .workflows
+                .iter()
+                .all(|workflow| workflow.steps.is_empty())
+            {
+                return Ok(Vec::new());
+            }
+            if !plugin.permissions.contains(&Permission::PluginInvoke) {
+                return Err(invalid(format!(
+                    "capability_denied: plugin `{id}` declares workflows without `plugin.invoke`"
+                )));
+            }
+            let aliases = loaded
+                .manifest
+                .dependencies
+                .iter()
+                .map(|dependency| (dependency.alias.as_str(), dependency.id.as_str()))
+                .collect::<BTreeMap<_, _>>();
+            let mut workflows = Vec::new();
+            for workflow in &loaded.manifest.workflows {
+                if workflow.steps.is_empty() {
+                    continue;
+                }
+                if workflow.trigger != "manual" && !known_plugin_event(&workflow.trigger) {
+                    return Err(invalid(format!(
+                        "workflow `{}` has unknown trigger `{}`",
+                        workflow.id, workflow.trigger
+                    )));
+                }
+                if workflow.trigger != "manual"
+                    && !plugin.permissions.contains(&Permission::EventsSubscribe)
+                {
+                    return Err(invalid(format!(
+                        "capability_denied: event workflow `{}` requires `events.subscribe`",
+                        workflow.id
+                    )));
+                }
+                let input_schema = workflow.input_schema.as_ref().map_or_else(
+                    || serde_json::json!({}),
+                    |path| loaded.schemas[path].value.clone(),
+                );
+                let output_schema = workflow.output_schema.as_ref().map_or_else(
+                    || serde_json::json!({}),
+                    |path| loaded.schemas[path].value.clone(),
+                );
+                let mut steps = Vec::new();
+                let mut step_output_schemas = BTreeMap::new();
+                let mut step_input_schemas = BTreeMap::new();
+                for step in &workflow.steps {
+                    let (alias, action_id) = step.uses.split_once('/').unwrap();
+                    let dependency_id = aliases[alias];
+                    let dependency = plugins.get(dependency_id).ok_or_else(|| {
+                        invalid(format!(
+                            "dependency_failed: workflow `{}` requires `{dependency_id}`",
+                            workflow.id
+                        ))
+                    })?;
+                    if !dependency.enabled {
+                        return Err(invalid(format!(
+                            "dependency_failed: workflow `{}` dependency `{dependency_id}` is disabled",
+                            workflow.id
+                        )));
+                    }
+                    let dependency_package = load_package(&dependency.root)?;
+                    let action = dependency_package.action(action_id).ok_or_else(|| {
+                        invalid(format!(
+                            "action_not_found: workflow `{}` step `{}` uses {dependency_id}/{action_id}",
+                            workflow.id, step.id
+                        ))
+                    })?;
+                    step_output_schemas.insert(
+                        step.id.clone(),
+                        dependency_package.schemas[&action.output_schema]
+                            .value
+                            .clone(),
+                    );
+                    step_input_schemas.insert(
+                        step.id.clone(),
+                        dependency_package.schemas[&action.input_schema]
+                            .value
+                            .clone(),
+                    );
+                }
+                for step in &workflow.steps {
+                    validate_workflow_template(
+                        &step.input,
+                        &input_schema,
+                        &step_output_schemas,
+                        &workflow.id,
+                    )?;
+                    validate_workflow_schema_links(
+                        &step.input,
+                        &step_input_schemas[&step.id],
+                        &input_schema,
+                        &step_output_schemas,
+                        &workflow.id,
+                    )?;
+                    if !contains_workflow_substitution(&step.input) {
+                        validate_schema_value(
+                            &step_input_schemas[&step.id],
+                            &step.input,
+                            "schema_invalid",
+                        )?;
+                    }
+                    let mut needs = step.needs.clone();
+                    for reference in workflow_template_step_references(&step.input)? {
+                        if !needs.contains(&reference) {
+                            needs.push(reference);
+                        }
+                    }
+                    steps.push(RuntimeWorkflowStep {
+                        id: step.id.clone(),
+                        reference: {
+                            let (alias, action) = step.uses.split_once('/').unwrap();
+                            format!("{}/{}", aliases[alias], action)
+                        },
+                        input: step.input.clone(),
+                        needs,
+                    });
+                }
+                validate_workflow_template(
+                    &workflow.output,
+                    &input_schema,
+                    &step_output_schemas,
+                    &workflow.id,
+                )?;
+                validate_workflow_schema_links(
+                    &workflow.output,
+                    &output_schema,
+                    &input_schema,
+                    &step_output_schemas,
+                    &workflow.id,
+                )?;
+                if !contains_workflow_substitution(&workflow.output) {
+                    validate_schema_value(&output_schema, &workflow.output, "output_invalid")?;
+                }
+                workflows.push(RuntimeWorkflow {
+                    id: workflow.id.clone(),
+                    title: workflow.title.clone(),
+                    trigger: workflow.trigger.clone(),
+                    agent_visible: workflow.agent_visible,
+                    input_schema,
+                    output_schema,
+                    timeout_ms: workflow.timeout_ms,
+                    output: workflow.output.clone(),
+                    steps,
+                });
+            }
+            Ok(workflows)
+        })();
+        match compiled {
+            Ok(workflows) => {
+                let Some(plugin) = plugins.get_mut(&id) else {
+                    continue;
+                };
+                for workflow in workflows.iter().filter(|workflow| workflow.agent_visible) {
+                    catalog
+                        .entry(id.clone())
+                        .or_default()
+                        .push(serde_json::json!({
+                            "reference": format!("{}/{}", id, workflow.id),
+                            "title": workflow.title,
+                            "description": format!("Workflow: {}", workflow.title),
+                            "input_schema": workflow.input_schema,
+                            "output_schema": workflow.output_schema,
+                            "permissions": plugin.permissions,
+                            "declared_permissions": plugin.permissions,
+                            "runtime_tier": "workflow",
+                            "source": plugin.source,
+                            "digest": plugin.digest,
+                            "manifest_digest": plugin.manifest_digest,
+                            "timeout_ms": workflow.timeout_ms,
+                        }));
+                }
+                plugin.workflows = workflows;
+            }
+            Err(error) => {
+                plugins.remove(&id);
+                catalog.remove(&id);
+                failed.insert(id, error.to_string());
+            }
+        }
+    }
+}
+
+fn validate_schema_value(schema: &Value, value: &Value, code: &str) -> io::Result<()> {
+    vvmux_plugin_api::validate_schema_instance(schema, value)
+        .map_err(|errors| invalid(format!("{code}: {}", errors.join("; "))))
+}
+
+fn contains_workflow_substitution(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value.starts_with("${") && value.ends_with('}'),
+        Value::Array(values) => values.iter().any(contains_workflow_substitution),
+        Value::Object(values) => values.values().any(contains_workflow_substitution),
+        _ => false,
+    }
+}
+
+fn workflow_template_step_references(value: &Value) -> io::Result<Vec<String>> {
+    let mut references = Vec::new();
+    visit_workflow_substitutions(value, &mut |root, _| {
+        if let Some(step) = root
+            .strip_prefix("steps.")
+            .and_then(|root| root.strip_suffix(".output"))
+        {
+            references.push(step.to_owned());
+        }
+        Ok(())
+    })?;
+    Ok(references)
+}
+
+fn validate_workflow_template(
+    value: &Value,
+    trigger_schema: &Value,
+    step_schemas: &BTreeMap<String, Value>,
+    workflow: &str,
+) -> io::Result<()> {
+    visit_workflow_substitutions(value, &mut |root, pointer| {
+        let schema = if root == "trigger" {
+            trigger_schema
+        } else if let Some(step) = root
+            .strip_prefix("steps.")
+            .and_then(|root| root.strip_suffix(".output"))
+        {
+            step_schemas.get(step).ok_or_else(|| {
+                invalid(format!(
+                    "workflow `{workflow}` references unknown step `{step}`"
+                ))
+            })?
+        } else {
+            return Err(invalid(format!(
+                "workflow `{workflow}` contains an unknown substitution root"
+            )));
+        };
+        if let Some(pointer) = pointer {
+            ensure_schema_pointer(schema, pointer).map_err(|error| {
+                invalid(format!(
+                    "workflow `{workflow}` substitution {root}#{pointer} is invalid: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    })
+}
+
+fn visit_workflow_substitutions(
+    value: &Value,
+    visitor: &mut impl FnMut(&str, Option<&str>) -> io::Result<()>,
+) -> io::Result<()> {
+    match value {
+        Value::String(value) if value.contains("${") => {
+            let inner = value
+                .strip_prefix("${")
+                .and_then(|value| value.strip_suffix('}'))
+                .ok_or_else(|| invalid("ambiguous workflow substitution"))?;
+            let (root, pointer) = inner
+                .split_once('#')
+                .map_or((inner, None), |(root, pointer)| (root, Some(pointer)));
+            if pointer.is_some_and(|pointer| !pointer.starts_with('/')) {
+                return Err(invalid("workflow substitution has an invalid JSON Pointer"));
+            }
+            visitor(root, pointer)?;
+        }
+        Value::Array(values) => {
+            for value in values {
+                visit_workflow_substitutions(value, visitor)?;
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                visit_workflow_substitutions(value, visitor)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn ensure_schema_pointer(schema: &Value, pointer: &str) -> io::Result<()> {
+    schema_at_pointer(schema, pointer).map(|_| ())
+}
+
+fn schema_at_pointer<'a>(schema: &'a Value, pointer: &str) -> io::Result<&'a Value> {
+    let mut current = dereference_schema(schema, schema)?;
+    for component in pointer.split('/').skip(1) {
+        let component = component.replace("~1", "/").replace("~0", "~");
+        if current.as_object().is_none_or(|schema| schema.is_empty()) {
+            return Ok(current);
+        }
+        current = current
+            .get("properties")
+            .and_then(|properties| properties.get(&component))
+            .or_else(|| current.get("items"))
+            .ok_or_else(|| invalid(format!("schema has no path component `{component}`")))?;
+        current = dereference_schema(schema, current)?;
+    }
+    Ok(current)
+}
+
+fn dereference_schema<'a>(document: &'a Value, mut schema: &'a Value) -> io::Result<&'a Value> {
+    for _ in 0..32 {
+        let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
+            return Ok(schema);
+        };
+        let Some(pointer) = reference.strip_prefix('#') else {
+            return Err(invalid("workflow schema contains a remote reference"));
+        };
+        schema = document
+            .pointer(pointer)
+            .ok_or_else(|| invalid(format!("schema reference `{reference}` does not exist")))?;
+    }
+    Err(invalid("workflow schema references exceed depth 32"))
+}
+
+fn validate_workflow_schema_links(
+    template: &Value,
+    target_schema: &Value,
+    trigger_schema: &Value,
+    step_schemas: &BTreeMap<String, Value>,
+    workflow: &str,
+) -> io::Result<()> {
+    fn visit(
+        template: &Value,
+        target_document: &Value,
+        target: &Value,
+        trigger_schema: &Value,
+        step_schemas: &BTreeMap<String, Value>,
+        workflow: &str,
+    ) -> io::Result<()> {
+        let target = dereference_schema(target_document, target)?;
+        if let Value::String(value) = template
+            && let Some(inner) = value
+                .strip_prefix("${")
+                .and_then(|value| value.strip_suffix('}'))
+        {
+            let (root, pointer) = inner
+                .split_once('#')
+                .map_or((inner, ""), |(root, pointer)| (root, pointer));
+            let source_document = if root == "trigger" {
+                trigger_schema
+            } else if let Some(step) = root
+                .strip_prefix("steps.")
+                .and_then(|root| root.strip_suffix(".output"))
+            {
+                step_schemas.get(step).ok_or_else(|| {
+                    invalid(format!(
+                        "workflow `{workflow}` references unknown step `{step}`"
+                    ))
+                })?
+            } else {
+                return Err(invalid(format!(
+                    "workflow `{workflow}` contains an unknown substitution root"
+                )));
+            };
+            let source = schema_at_pointer(source_document, pointer)?;
+            if !schema_output_fits(source_document, source, target_document, target)? {
+                return Err(invalid(format!(
+                    "schema_invalid: workflow `{workflow}` substitution `{inner}` is incompatible with its destination"
+                )));
+            }
+            return Ok(());
+        }
+        match template {
+            Value::Object(values) => {
+                for (key, value) in values {
+                    let child = target
+                        .get("properties")
+                        .and_then(|properties| properties.get(key))
+                        .or_else(|| {
+                            target
+                                .get("additionalProperties")
+                                .filter(|additional| additional.is_object())
+                        });
+                    if target.get("additionalProperties") == Some(&Value::Bool(false))
+                        && child.is_none()
+                    {
+                        return Err(invalid(format!(
+                            "schema_invalid: workflow `{workflow}` supplies unknown property `{key}`"
+                        )));
+                    }
+                    if let Some(child) = child {
+                        visit(
+                            value,
+                            target_document,
+                            child,
+                            trigger_schema,
+                            step_schemas,
+                            workflow,
+                        )?;
+                    }
+                }
+            }
+            Value::Array(values) => {
+                if let Some(items) = target.get("items") {
+                    for value in values {
+                        visit(
+                            value,
+                            target_document,
+                            items,
+                            trigger_schema,
+                            step_schemas,
+                            workflow,
+                        )?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    visit(
+        template,
+        target_schema,
+        target_schema,
+        trigger_schema,
+        step_schemas,
+        workflow,
+    )
+}
+
+fn schema_output_fits(
+    source_document: &Value,
+    source: &Value,
+    target_document: &Value,
+    target: &Value,
+) -> io::Result<bool> {
+    let source = dereference_schema(source_document, source)?;
+    let target = dereference_schema(target_document, target)?;
+    let source_types = schema_types(source);
+    let target_types = schema_types(target);
+    if target_types.is_empty() {
+        return Ok(true);
+    }
+    if source_types.is_empty() {
+        return Ok(false);
+    }
+    if !source_types.iter().all(|source_type| {
+        target_types.contains(source_type)
+            || (*source_type == "integer" && target_types.contains("number"))
+    }) {
+        return Ok(false);
+    }
+    if source_types.contains("object") && target_types.contains("object") {
+        let source_properties = source.get("properties").and_then(Value::as_object);
+        let target_properties = target.get("properties").and_then(Value::as_object);
+        let source_required = source
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        for required in target
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if !source_required.contains(required) {
+                return Ok(false);
+            }
+            let Some(source_property) = source_properties.and_then(|values| values.get(required))
+            else {
+                return Ok(false);
+            };
+            let Some(target_property) = target_properties.and_then(|values| values.get(required))
+            else {
+                continue;
+            };
+            if !schema_output_fits(
+                source_document,
+                source_property,
+                target_document,
+                target_property,
+            )? {
+                return Ok(false);
+            }
+        }
+        if target.get("additionalProperties") == Some(&Value::Bool(false)) {
+            if source.get("additionalProperties") != Some(&Value::Bool(false)) {
+                return Ok(false);
+            }
+            if source_properties.is_some_and(|properties| {
+                properties
+                    .keys()
+                    .any(|key| target_properties.is_none_or(|target| !target.contains_key(key)))
+            }) {
+                return Ok(false);
+            }
+        }
+    }
+    if source_types.contains("array")
+        && target_types.contains("array")
+        && let Some(target_items) = target.get("items")
+    {
+        let Some(source_items) = source.get("items") else {
+            return Ok(false);
+        };
+        if !schema_output_fits(source_document, source_items, target_document, target_items)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn schema_types(schema: &Value) -> BTreeSet<&str> {
+    match schema.get("type") {
+        Some(Value::String(value)) => [value.as_str()].into_iter().collect(),
+        Some(Value::Array(values)) => values.iter().filter_map(Value::as_str).collect(),
+        _ => {
+            if let Some(value) = schema.get("const") {
+                return [json_schema_type(value)].into_iter().collect();
+            }
+            if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+                return values.iter().map(json_schema_type).collect();
+            }
+            if schema.get("properties").is_some() || schema.get("required").is_some() {
+                return ["object"].into_iter().collect();
+            }
+            if schema.get("items").is_some() {
+                return ["array"].into_iter().collect();
+            }
+            for keyword in ["oneOf", "anyOf"] {
+                if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+                    let mut types = BTreeSet::new();
+                    for branch in branches {
+                        let branch_types = schema_types(branch);
+                        if branch_types.is_empty() {
+                            return BTreeSet::new();
+                        }
+                        types.extend(branch_types);
+                    }
+                    return types;
+                }
+            }
+            BTreeSet::new()
+        }
+    }
+}
+
+fn json_schema_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+pub(crate) fn resolve_workflow_template(
+    value: &Value,
+    trigger: &Value,
+    outputs: &BTreeMap<String, Value>,
+) -> io::Result<Value> {
+    match value {
+        Value::String(value) if value.contains("${") => {
+            let inner = value
+                .strip_prefix("${")
+                .and_then(|value| value.strip_suffix('}'))
+                .ok_or_else(|| invalid("ambiguous workflow substitution"))?;
+            let (root, pointer) = inner
+                .split_once('#')
+                .map_or((inner, None), |(root, pointer)| (root, Some(pointer)));
+            let source = if root == "trigger" {
+                trigger
+            } else if let Some(step) = root
+                .strip_prefix("steps.")
+                .and_then(|root| root.strip_suffix(".output"))
+            {
+                outputs.get(step).ok_or_else(|| {
+                    invalid(format!("dependency_failed: step `{step}` has no output"))
+                })?
+            } else {
+                return Err(invalid("dependency_failed: unknown substitution root"));
+            };
+            pointer.map_or_else(
+                || Ok(source.clone()),
+                |pointer| {
+                    source.pointer(pointer).cloned().ok_or_else(|| {
+                        invalid(format!(
+                            "dependency_failed: substitution pointer `{pointer}` does not exist"
+                        ))
+                    })
+                },
+            )
+        }
+        Value::Array(values) => values
+            .iter()
+            .map(|value| resolve_workflow_template(value, trigger, outputs))
+            .collect::<io::Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| {
+                resolve_workflow_template(value, trigger, outputs).map(|value| (key.clone(), value))
+            })
+            .collect::<io::Result<serde_json::Map<_, _>>>()
+            .map(Value::Object),
+        _ => Ok(value.clone()),
+    }
 }
 
 fn load_registry(paths: &PluginPaths) -> io::Result<Registry> {
@@ -495,11 +1155,23 @@ fn commit_registry_with_reload(
             "plugin registry changed concurrently; retry the operation",
         ));
     }
-    save_registry(paths, next)?;
+    paths.ensure()?;
+    let previous_lock = match fs::read(&paths.lock) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let next_lock = encode_lock(next)?;
+    write_private_atomic(&paths.lock, next_lock.as_bytes())?;
+    if let Err(error) = save_registry(paths, next) {
+        restore_lock(paths, previous_lock.as_deref())?;
+        return Err(error);
+    }
     if let Err(apply_error) = reload() {
         let mut rollback = previous.clone();
         rollback.generation = next.generation;
         save_registry(paths, &mut rollback)?;
+        restore_lock(paths, previous_lock.as_deref())?;
         if let Err(rollback_error) = reload() {
             return Err(io::Error::other(format!(
                 "live plugin reload failed ({apply_error}); rollback generation {} was published but session acknowledgement failed: {rollback_error}",
@@ -512,6 +1184,17 @@ fn commit_registry_with_reload(
         )));
     }
     Ok(())
+}
+
+fn restore_lock(paths: &PluginPaths, contents: Option<&[u8]>) -> io::Result<()> {
+    match contents {
+        Some(contents) => write_private_atomic(&paths.lock, contents),
+        None => match fs::remove_file(&paths.lock) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+    }
 }
 
 #[cfg(not(test))]
@@ -554,116 +1237,364 @@ fn install_local(
     recorded_commit: Option<String>,
 ) -> io::Result<()> {
     let source = fs::canonicalize(source)?;
+    paths.ensure()?;
+    let previous_registry = load_registry(paths)?;
     let loaded = load_package(&source)?;
-    if !loaded
+    ensure_current_platform(&loaded)?;
+    let id = loaded.manifest.plugin.id.clone();
+    let mut pending = BTreeMap::new();
+    pending.insert(
+        id.clone(),
+        PendingPackage {
+            id: id.clone(),
+            source_dir: source.clone(),
+            source: recorded_source.unwrap_or_else(|| source.to_string_lossy().into_owned()),
+            commit: recorded_commit,
+            linked,
+            approved_manifest: digest_file(&source.join("vvmux-plugin.toml"))?,
+        },
+    );
+    let mut constraints = BTreeMap::new();
+    let mut temporary = Vec::new();
+    let acquisition = collect_dependency_sources(
+        paths,
+        &id,
+        &previous_registry,
+        &mut pending,
+        &mut constraints,
+        &mut temporary,
+        &mut BTreeSet::new(),
+        1,
+    );
+    if let Err(error) = acquisition {
+        cleanup_temporary(paths, &temporary);
+        return Err(error);
+    }
+    for package in pending.values() {
+        let loaded = load_package(&package.source_dir)?;
+        preview(
+            &loaded,
+            if package.linked {
+                "linked native/user package"
+            } else {
+                &package.source
+            },
+        );
+    }
+    for package in pending.values() {
+        confirm_if_needed(&load_package(&package.source_dir)?, yes)?;
+    }
+    let result = commit_package_graph(paths, &previous_registry, &pending);
+    cleanup_temporary(paths, &temporary);
+    result?;
+    println!(
+        "{} plugin {id}",
+        if linked { "linked" } else { "installed" }
+    );
+    Ok(())
+}
+
+struct PendingPackage {
+    id: String,
+    source_dir: PathBuf,
+    source: String,
+    commit: Option<String>,
+    linked: bool,
+    approved_manifest: String,
+}
+
+fn ensure_current_platform(loaded: &LoadedManifest) -> io::Result<()> {
+    if loaded
         .manifest
         .plugin
         .platforms
         .iter()
         .any(|platform| platform == current_platform())
     {
-        return Err(invalid(format!(
+        Ok(())
+    } else {
+        Err(invalid(format!(
             "plugin `{}` does not support {}",
             loaded.manifest.plugin.id,
             current_platform()
+        )))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_dependency_sources(
+    paths: &PluginPaths,
+    id: &str,
+    registry: &Registry,
+    pending: &mut BTreeMap<String, PendingPackage>,
+    constraints: &mut BTreeMap<String, (String, Vec<semver::VersionReq>)>,
+    temporary: &mut Vec<PathBuf>,
+    visiting: &mut BTreeSet<String>,
+    depth: usize,
+) -> io::Result<()> {
+    if depth > 8 {
+        return Err(invalid("dependency graph exceeds depth 8"));
+    }
+    let package_count = registry
+        .plugins
+        .keys()
+        .chain(pending.keys())
+        .collect::<BTreeSet<_>>()
+        .len();
+    if package_count > 64 {
+        return Err(invalid("dependency graph exceeds 64 packages"));
+    }
+    if !visiting.insert(id.to_owned()) {
+        return Err(invalid(format!("dependency cycle at `{id}`")));
+    }
+    let root = pending
+        .get(id)
+        .map(|package| package.source_dir.as_path())
+        .or_else(|| registry.plugins.get(id).map(|entry| entry.root.as_path()))
+        .ok_or_else(|| invalid(format!("dependency_failed: package `{id}` is unavailable")))?;
+    let loaded = load_package(root)?;
+    ensure_current_platform(&loaded)?;
+    for dependency in &loaded.manifest.dependencies {
+        if visiting.contains(&dependency.id) {
+            return Err(invalid(format!("dependency cycle at `{}`", dependency.id)));
+        }
+        let constraint = constraints
+            .entry(dependency.id.clone())
+            .or_insert_with(|| (dependency.source.clone(), Vec::new()));
+        if constraint.0 != dependency.source {
+            return Err(invalid(format!(
+                "dependency_failed: conflicting sources for {}",
+                dependency.id
+            )));
+        }
+        constraint.1.push(dependency.version.clone());
+        let usable_pending = pending.get(&dependency.id).is_some_and(|package| {
+            package.source == dependency.source
+                && load_package(&package.source_dir).is_ok_and(|loaded| {
+                    constraint
+                        .1
+                        .iter()
+                        .all(|required| required.matches(&loaded.manifest.plugin.version))
+                })
+        });
+        let usable_installed = registry.plugins.get(&dependency.id).is_some_and(|entry| {
+            entry.source == dependency.source
+                && load_package(&entry.root).is_ok_and(|loaded| {
+                    constraint
+                        .1
+                        .iter()
+                        .all(|required| required.matches(&loaded.manifest.plugin.version))
+                })
+        });
+        if pending.contains_key(&dependency.id) && !usable_pending {
+            return Err(invalid(format!(
+                "dependency_failed: {} does not satisfy all version constraints",
+                dependency.id
+            )));
+        }
+        if !usable_pending && !usable_installed {
+            let (checkout, commit) = clone_dependency(paths, &dependency.source, &dependency.id)?;
+            temporary.push(checkout.clone());
+            let dependency_package = load_package(&checkout)?;
+            if dependency_package.manifest.plugin.id != dependency.id {
+                return Err(invalid(format!(
+                    "dependency_failed: source for {} contains {}",
+                    dependency.id, dependency_package.manifest.plugin.id
+                )));
+            }
+            if !constraint
+                .1
+                .iter()
+                .all(|required| required.matches(&dependency_package.manifest.plugin.version))
+            {
+                return Err(invalid(format!(
+                    "dependency_failed: {} does not satisfy all version constraints",
+                    dependency.id
+                )));
+            }
+            ensure_current_platform(&dependency_package)?;
+            pending.insert(
+                dependency.id.clone(),
+                PendingPackage {
+                    id: dependency.id.clone(),
+                    source_dir: checkout.clone(),
+                    source: dependency.source.clone(),
+                    commit: Some(commit),
+                    linked: false,
+                    approved_manifest: digest_file(&checkout.join("vvmux-plugin.toml"))?,
+                },
+            );
+        }
+        collect_dependency_sources(
+            paths,
+            &dependency.id,
+            registry,
+            pending,
+            constraints,
+            temporary,
+            visiting,
+            depth + 1,
+        )?;
+    }
+    visiting.remove(id);
+    Ok(())
+}
+
+fn clone_dependency(paths: &PluginPaths, source: &str, id: &str) -> io::Result<(PathBuf, String)> {
+    if !source.starts_with("https://") {
+        return Err(invalid("dependency sources must use HTTPS"));
+    }
+    let identity = hex(&Sha256::digest(format!("{id}\0{source}").as_bytes())[..12]);
+    let checkout = paths
+        .packages
+        .join(format!(".dep-{}-{identity}", std::process::id()));
+    if checkout.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "dependency staging path exists",
+        ));
+    }
+    let status = Command::new("git")
+        .args(["clone", "--quiet", "--depth", "1", source])
+        .arg(&checkout)
+        .status()?;
+    if !status.success() {
+        let _ = remove_known_tree(&paths.packages, &checkout);
+        return Err(io::Error::other(format!(
+            "dependency_failed: could not clone {id}"
         )));
     }
-    preview(
-        &loaded,
-        if linked {
-            "linked native/user package"
-        } else {
-            "local package"
-        },
-    );
-    confirm_if_needed(&loaded, yes)?;
-    paths.ensure()?;
+    let output = Command::new("git")
+        .args([
+            "-C",
+            checkout.to_str().unwrap_or_default(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let _ = remove_known_tree(&paths.packages, &checkout);
+        return Err(io::Error::other(format!(
+            "dependency_failed: could not resolve {id}"
+        )));
+    }
+    Ok((
+        checkout,
+        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+    ))
+}
 
-    let id = loaded.manifest.plugin.id.clone();
-    let manifest_before = digest_file(&source.join("vvmux-plugin.toml"))?;
-    let previous_registry = load_registry(paths)?;
-    let mut registry = previous_registry.clone();
-    registry.plugins.insert(
-        id.clone(),
-        entry_for(
-            &loaded,
-            source.clone(),
-            recorded_source
-                .clone()
-                .unwrap_or_else(|| source.to_string_lossy().into_owned()),
-            recorded_commit.clone(),
-            digest_tree(&source)?,
-            manifest_before.clone(),
-            true,
-        ),
-    );
-    validate_dependency_graph(&registry)?;
-    let (root, digest, installed_new) = if linked {
-        (source.clone(), digest_tree(&source)?, false)
-    } else {
-        let staging = paths.packages.join(format!(
-            ".staging-{}-{}",
-            std::process::id(),
-            &manifest_before[..16]
-        ));
-        if staging.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "plugin staging path exists",
+fn commit_package_graph(
+    paths: &PluginPaths,
+    previous: &Registry,
+    pending: &BTreeMap<String, PendingPackage>,
+) -> io::Result<()> {
+    let mut registry = previous.clone();
+    let mut installed_new = Vec::new();
+    let mut installed_roots = BTreeMap::new();
+    for package in pending.values() {
+        let current_manifest = digest_file(&package.source_dir.join("vvmux-plugin.toml"))?;
+        if current_manifest != package.approved_manifest {
+            cleanup_temporary(paths, &installed_new);
+            return Err(invalid("manifest changed after dependency approval"));
+        }
+        let loaded = load_package(&package.source_dir)?;
+        let (root, digest) = if package.linked {
+            (
+                package.source_dir.clone(),
+                digest_tree(&package.source_dir)?,
+            )
+        } else {
+            let staging = paths.packages.join(format!(
+                ".staging-{}-{}",
+                std::process::id(),
+                &package.approved_manifest[..16]
             ));
-        }
-        copy_tree(&source, &staging)?;
-        let loaded_after = load_package(&staging)?;
-        let manifest_after = digest_file(&staging.join("vvmux-plugin.toml"))?;
-        if loaded_after.manifest.plugin.id != id || manifest_after != manifest_before {
-            remove_known_tree(&paths.packages, &staging)?;
-            return Err(invalid("manifest changed while the package was staged"));
-        }
-        let digest = digest_tree(&staging)?;
-        let destination = paths.package_version(&id, &digest);
-        let installed_new = if destination.exists() {
-            if digest_tree(&destination)? != digest {
-                remove_known_tree(&paths.packages, &staging)?;
-                return Err(invalid("installed version path has an unexpected digest"));
+            if staging.exists() {
+                cleanup_temporary(paths, &installed_new);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "plugin staging path exists",
+                ));
             }
-            remove_known_tree(&paths.packages, &staging)?;
-            false
-        } else {
-            let backup = atomic_package_swap(&destination, &staging)?;
-            debug_assert!(backup.is_none());
-            true
+            copy_tree(&package.source_dir, &staging)?;
+            let staged = load_package(&staging)?;
+            let staged_manifest = digest_file(&staging.join("vvmux-plugin.toml"))?;
+            if staged.manifest.plugin.id != package.id
+                || staged_manifest != package.approved_manifest
+            {
+                remove_known_tree(&paths.packages, &staging)?;
+                cleanup_temporary(paths, &installed_new);
+                return Err(invalid("manifest changed while the package was staged"));
+            }
+            let digest = digest_tree(&staging)?;
+            let destination = paths.package_version(&package.id, &digest);
+            if destination.exists() {
+                if digest_tree(&destination)? != digest {
+                    remove_known_tree(&paths.packages, &staging)?;
+                    cleanup_temporary(paths, &installed_new);
+                    return Err(invalid("installed version path has an unexpected digest"));
+                }
+                remove_known_tree(&paths.packages, &staging)?;
+            } else {
+                let backup = atomic_package_swap(&destination, &staging)?;
+                debug_assert!(backup.is_none());
+                installed_new.push(destination.clone());
+            }
+            (destination, digest)
         };
-        (destination, digest, installed_new)
-    };
-
-    let entry = entry_for(
-        &loaded,
-        root.clone(),
-        recorded_source.unwrap_or_else(|| source.to_string_lossy().into_owned()),
-        recorded_commit,
-        digest,
-        manifest_before,
-        linked,
-    );
-    registry.plugins.insert(id.clone(), entry);
-    if let Err(error) = commit_registry(paths, &previous_registry, &mut registry) {
-        if !linked && installed_new {
-            let _ = remove_known_tree(&paths.packages, &root);
-        }
+        let entry = entry_for(
+            &loaded,
+            root.clone(),
+            package.source.clone(),
+            package.commit.clone(),
+            digest,
+            package.approved_manifest.clone(),
+            package.linked,
+        );
+        installed_roots.insert(package.id.clone(), root);
+        registry.plugins.insert(package.id.clone(), entry);
+    }
+    if let Err(error) = validate_dependency_graph(&registry)
+        .and_then(|_| validate_registry_for_install(&registry))
+        .and_then(|_| commit_registry(paths, previous, &mut registry))
+    {
+        cleanup_temporary(paths, &installed_new);
         return Err(error);
     }
-    if let Some(previous) = previous_registry.plugins.get(&id)
-        && !previous.linked
-        && previous.root != root
-        && previous.root.exists()
-    {
-        remove_known_tree(&paths.packages, &previous.root)?;
+    for (id, root) in installed_roots {
+        if let Some(old) = previous.plugins.get(&id)
+            && !old.linked
+            && old.root != root
+            && old.root.exists()
+        {
+            remove_known_tree(&paths.packages, &old.root)?;
+        }
     }
-    println!(
-        "{} plugin {id}",
-        if linked { "linked" } else { "installed" }
-    );
     Ok(())
+}
+
+fn validate_registry_for_install(registry: &Registry) -> io::Result<()> {
+    let candidate = registry_candidate(registry)?;
+    if candidate.failed.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "dependency_failed: registry validation failed: {}",
+            candidate
+                .failed
+                .iter()
+                .map(|(id, error)| format!("{id}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )))
+    }
+}
+
+fn cleanup_temporary(paths: &PluginPaths, paths_to_remove: &[PathBuf]) {
+    for path in paths_to_remove {
+        let _ = remove_known_tree(&paths.packages, path);
+    }
 }
 
 fn install_git(
@@ -1127,6 +2058,7 @@ impl SessionPluginRuntime {
         reference: &str,
         input: Value,
         cancel: Arc<AtomicBool>,
+        context: Option<InvocationContext>,
     ) -> io::Result<Value> {
         self.last_logs = RuntimeLogs::default();
         if cancel.load(Ordering::Acquire) {
@@ -1147,7 +2079,46 @@ impl SessionPluginRuntime {
         self.loaded
             .validate_input(&action, &input)
             .map_err(|errors| invalid(format!("schema_invalid: {}", errors.join("; "))))?;
-        let timeout = Duration::from_millis(action.timeout_ms);
+        let action_timeout = Duration::from_millis(action.timeout_ms);
+        let deadline_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .saturating_add(action_timeout.as_millis())
+            .min(u128::from(u64::MAX)) as u64;
+        let mut context = match context {
+            Some(context) => context,
+            None => {
+                let correlation_id = random_id()?;
+                InvocationContext {
+                    correlation_id: correlation_id.clone(),
+                    causation_id: correlation_id,
+                    causation_depth: 0,
+                    source: "automation".into(),
+                    session_instance: self.session_instance.clone(),
+                    pane_id: None,
+                    tab_id: None,
+                    deadline_unix_ms,
+                }
+            }
+        };
+        context.session_instance.clone_from(&self.session_instance);
+        if context.deadline_unix_ms == 0 {
+            context.deadline_unix_ms = deadline_unix_ms;
+        } else {
+            context.deadline_unix_ms = context.deadline_unix_ms.min(deadline_unix_ms);
+        }
+        let remaining_ms = context
+            .deadline_unix_ms
+            .saturating_sub(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            )
+            .max(1);
+        let timeout = action_timeout.min(Duration::from_millis(remaining_ms));
         let output = if let Some(argv) = action.command.as_deref() {
             run_one_shot(
                 &self.loaded.root,
@@ -1199,7 +2170,7 @@ impl SessionPluginRuntime {
                         handler,
                         input,
                         timeout,
-                        &self.session_instance,
+                        context,
                         Some(&cancel),
                     );
                     if self.service.as_ref().unwrap().healthy {
@@ -1221,6 +2192,9 @@ impl SessionPluginRuntime {
                         ));
                     }
                     let deadline = Instant::now() + timeout;
+                    let mut component_context =
+                        serde_json::to_value(&context).map_err(io::Error::other)?;
+                    component_context["session"] = Value::String(self.session_name.clone());
                     if self.component.is_none() {
                         match crate::plugin_component::ComponentRuntime::start(
                             &self.loaded.root,
@@ -1243,12 +2217,8 @@ impl SessionPluginRuntime {
                     let result = self.component.as_mut().unwrap().invoke(
                         handler,
                         &input,
-                        &serde_json::json!({
-                            "source": "plugin",
-                            "session": self.session_name,
-                            "session_instance": self.session_instance,
-                            "deadline_ms": action.timeout_ms,
-                        }),
+                        &component_context,
+                        &context,
                         cancel,
                         deadline,
                     );
@@ -1521,7 +2491,7 @@ impl NativeService {
         handler: &str,
         input: Value,
         timeout: Duration,
-        session_instance: &str,
+        mut context: InvocationContext,
         cancel: Option<&AtomicBool>,
     ) -> io::Result<Value> {
         if !self.healthy || self.child.try_wait()?.is_some() {
@@ -1530,27 +2500,22 @@ impl NativeService {
         }
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(2);
-        let correlation_id = random_id()?;
         let deadline_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
             .saturating_add(timeout.as_millis())
             .min(u128::from(u64::MAX)) as u64;
+        context.deadline_unix_ms = context.deadline_unix_ms.min(deadline_unix_ms);
+        let _cause = self
+            .broker_lease
+            .as_ref()
+            .map(|lease| lease.enter_event(&context));
         self.write(&NativeMessage::Invoke(Invocation {
             request_id,
             action: handler.to_owned(),
             input,
-            context: InvocationContext {
-                correlation_id: correlation_id.clone(),
-                causation_id: correlation_id,
-                causation_depth: 0,
-                source: "automation".into(),
-                session_instance: session_instance.to_owned(),
-                pane_id: None,
-                tab_id: None,
-                deadline_unix_ms,
-            },
+            context,
         }))?;
         let deadline = Instant::now() + timeout;
         loop {
@@ -1807,6 +2772,20 @@ fn plugin_error_from_io(request_id: u64, error: &io::Error) -> PluginError {
         ErrorCode::Cancelled
     } else if message.starts_with("action_not_found") {
         ErrorCode::ActionNotFound
+    } else if message.starts_with("plugin_not_found") {
+        ErrorCode::PluginNotFound
+    } else if message.starts_with("plugin_disabled") {
+        ErrorCode::PluginDisabled
+    } else if message.starts_with("schema_invalid") {
+        ErrorCode::SchemaInvalid
+    } else if message.starts_with("runtime_crashed") {
+        ErrorCode::RuntimeCrashed
+    } else if message.starts_with("dependency_failed") {
+        ErrorCode::DependencyFailed
+    } else if message.starts_with("output_invalid") {
+        ErrorCode::OutputInvalid
+    } else if message.starts_with("protocol_error") {
+        ErrorCode::ProtocolError
     } else {
         ErrorCode::RuntimeUnavailable
     };
@@ -1832,22 +2811,8 @@ pub(crate) fn random_id() -> io::Result<String> {
 fn resolve(paths: &PluginPaths, frozen: bool) -> io::Result<()> {
     let registry = load_registry(paths)?;
     validate_dependency_graph(&registry)?;
-    let lock = LockFile {
-        lock_version: 1,
-        packages: registry
-            .plugins
-            .values()
-            .map(|entry| LockedPackage {
-                id: entry.id.clone(),
-                version: entry.version.clone(),
-                source: entry.source.clone(),
-                commit: entry.commit.clone(),
-                manifest_digest: entry.manifest_digest.clone(),
-                artifact_digest: entry.digest.clone(),
-            })
-            .collect(),
-    };
-    let encoded = toml::to_string_pretty(&lock).map_err(io::Error::other)?;
+    let encoded = encode_lock(&registry)?;
+    let lock: LockFile = toml::from_str(&encoded).map_err(io::Error::other)?;
     if frozen {
         let existing = fs::read_to_string(&paths.lock)
             .map_err(|error| invalid(format!("--frozen requires an existing lock: {error}")))?;
@@ -1861,6 +2826,26 @@ fn resolve(paths: &PluginPaths, frozen: bool) -> io::Result<()> {
     }
     println!("resolved {} plugins", lock.packages.len());
     Ok(())
+}
+
+fn encode_lock(registry: &Registry) -> io::Result<String> {
+    let mut packages = Vec::with_capacity(registry.plugins.len());
+    for entry in registry.plugins.values() {
+        let loaded = load_package(&entry.root)?;
+        packages.push(LockedPackage {
+            id: entry.id.clone(),
+            version: loaded.manifest.plugin.version.to_string(),
+            source: entry.source.clone(),
+            commit: entry.commit.clone(),
+            manifest_digest: digest_file(&entry.root.join("vvmux-plugin.toml"))?,
+            artifact_digest: digest_tree(&entry.root)?,
+        });
+    }
+    let lock = LockFile {
+        lock_version: 1,
+        packages,
+    };
+    toml::to_string_pretty(&lock).map_err(io::Error::other)
 }
 
 fn validate_dependency_graph(registry: &Registry) -> io::Result<()> {
@@ -1889,7 +2874,7 @@ fn validate_dependency_graph(registry: &Registry) -> io::Result<()> {
     Ok(())
 }
 
-fn load_package(root: &Path) -> io::Result<LoadedManifest> {
+pub(crate) fn load_package(root: &Path) -> io::Result<LoadedManifest> {
     LoadedManifest::load(root).map_err(|error| invalid(error.to_string()))
 }
 
@@ -2592,6 +3577,8 @@ agent_visible = true
             lock: root.join("vvmux-plugin.lock"),
             root,
         };
+        let package = paths.packages.join("p-example");
+        write_test_package(&package);
         let previous = Registry::default();
         let mut next = previous.clone();
         next.plugins.insert(
@@ -2599,11 +3586,11 @@ agent_visible = true
             RegistryEntry {
                 id: "dev.example".into(),
                 version: "1.0.0".into(),
-                root: paths.packages.join("p-example"),
+                root: package.clone(),
                 source: "test".into(),
                 commit: None,
-                digest: "a".repeat(64),
-                manifest_digest: "b".repeat(64),
+                digest: digest_tree(&package).unwrap(),
+                manifest_digest: digest_file(&package.join("vvmux-plugin.toml")).unwrap(),
                 enabled: true,
                 linked: false,
                 runtime_tier: "trusted_native".into(),
