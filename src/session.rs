@@ -68,7 +68,6 @@ const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTOMATION_REPLY_LIMIT: usize = 16 * 1024 * 1024;
 /// A `run` command is one shell command line, not a script; this only has to be generous.
 const MAX_RUN_COMMAND_BYTES: usize = 64 * 1024;
-const MAX_ACTIVE_PLUGIN_ACTIONS: usize = 16;
 #[cfg(windows)]
 const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
 #[cfg(windows)]
@@ -116,6 +115,12 @@ pub struct AutomationReplyTarget {
     request_id: u64,
     writer: SharedWriter,
     cancel: crate::platform::ConnectionCancel,
+}
+
+impl AutomationReplyTarget {
+    pub(crate) fn client_id(&self) -> u64 {
+        self.client_id
+    }
 }
 
 struct AutomationResponseJob {
@@ -761,7 +766,7 @@ struct SessionActor {
     response_sender: mpsc::SyncSender<AutomationResponseJob>,
     automation_inflight: HashMap<u64, HashSet<u64>>,
     pending_actor_work: HashSet<(u64, u64)>,
-    active_plugin_actions: usize,
+    plugin_supervisor: crate::plugin_supervisor::PluginSupervisor,
     automation_waiters: Vec<AutomationWaiter>,
     exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
@@ -865,6 +870,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
     let agent_detector = crate::agent::start_detector(move |updates| {
         let _ = detector_sender.send(ActorEvent::AgentProcesses(updates));
     })?;
+    let plugin_supervisor =
+        crate::plugin_supervisor::PluginSupervisor::start(name.clone(), sender.clone())?;
     let mut actor = SessionActor {
         name,
         config,
@@ -913,7 +920,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         response_sender,
         automation_inflight: HashMap::new(),
         pending_actor_work: HashSet::new(),
-        active_plugin_actions: 0,
+        plugin_supervisor,
         automation_waiters: Vec::new(),
         exit_tombstones: VecDeque::new(),
         shutdown: shutdown.clone(),
@@ -992,6 +999,7 @@ impl SessionActor {
             }
         }
         self.terminate_children();
+        self.plugin_supervisor.shutdown();
         self.shutdown.store(true, Ordering::Release);
     }
 
@@ -1076,6 +1084,7 @@ impl SessionActor {
                 self.handle_client(id, writer, cancel, message)?;
             }
             ActorEvent::Disconnected(id) => {
+                self.plugin_supervisor.cancel_client(id);
                 self.automation_inflight.remove(&id);
                 self.pending_actor_work
                     .retain(|(client_id, _)| *client_id != id);
@@ -1238,7 +1247,6 @@ impl SessionActor {
                 }
             }
             ActorEvent::PluginNotice { reference, result } => {
-                self.active_plugin_actions = self.active_plugin_actions.saturating_sub(1);
                 if let Err(error) = result {
                     self.status(&format!("plugin action {reference} failed: {error}"));
                 }
@@ -2089,26 +2097,12 @@ impl SessionActor {
                     );
                     return;
                 }
-                let sender = self.sender.clone();
-                let session = self.name.clone();
-                let reply = target.clone();
-                if std::thread::Builder::new()
-                    .name(format!("vvmux-plugin-{}", target.request_id))
-                    .spawn(move || {
-                        let result = crate::plugin::invoke_for_session(&reference, &session, input)
-                            .map_err(plugin_automation_error);
-                        let _ = sender.send(ActorEvent::PluginComplete { reply, result });
-                    })
-                    .is_err()
+                if let Err(error) =
+                    self.plugin_supervisor
+                        .invoke_automation(reference, input, target.clone())
                 {
                     self.complete_pending_actor_work(&target);
-                    self.reply_automation_error(
-                        target,
-                        AutomationError::new(
-                            "runtime_unavailable",
-                            "could not start plugin worker",
-                        ),
-                    );
+                    self.reply_automation_error(target, error);
                 }
             }
             AutomationMethod::Plugin(crate::ipc::PluginMethod::Reload) => {
@@ -3872,10 +3866,6 @@ impl SessionActor {
     }
 
     fn start_plugin_action(&mut self, reference: String) {
-        if self.active_plugin_actions >= MAX_ACTIVE_PLUGIN_ACTIONS {
-            self.status("plugin action limit reached");
-            return;
-        }
         let Some(invocation) = reference.strip_prefix("plugin:").map(ToOwned::to_owned) else {
             self.status("invalid plugin action reference");
             return;
@@ -3884,26 +3874,11 @@ impl SessionActor {
             self.status("invalid plugin action reference");
             return;
         }
-        let sender = self.sender.clone();
-        let session = self.name.clone();
-        let display_reference = reference.clone();
-        self.active_plugin_actions += 1;
-        if std::thread::Builder::new()
-            .name("vvmux-plugin-key-action".into())
-            .spawn(move || {
-                let result =
-                    crate::plugin::invoke_for_session(&invocation, &session, serde_json::json!({}))
-                        .map(|_| ())
-                        .map_err(|error| error.to_string());
-                let _ = sender.send(ActorEvent::PluginNotice {
-                    reference: display_reference,
-                    result,
-                });
-            })
-            .is_err()
+        if let Err(error) =
+            self.plugin_supervisor
+                .invoke_notice(invocation, serde_json::json!({}), reference)
         {
-            self.active_plugin_actions -= 1;
-            self.status("could not start plugin action");
+            self.status(&format!("plugin action rejected: {}", error.message));
         }
     }
 
@@ -6224,7 +6199,7 @@ fn automation_capabilities() -> serde_json::Value {
     })
 }
 
-fn plugin_automation_error(error: io::Error) -> AutomationError {
+pub(crate) fn plugin_automation_error(error: io::Error) -> AutomationError {
     let message = error.to_string();
     let code = [
         "plugin_not_found",

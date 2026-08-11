@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -653,14 +654,6 @@ fn invoke_via_session(target: &str, reference: String, input: Value) -> io::Resu
     crate::automation::response_result(crate::automation::receive_response(&mut reader, 1)?)
 }
 
-pub(crate) fn invoke_for_session(
-    reference: &str,
-    session: &str,
-    input: Value,
-) -> io::Result<Value> {
-    invoke_reference(&PluginPaths::new()?, reference, Some(session), input)
-}
-
 fn invoke_reference(
     paths: &PluginPaths,
     reference: &str,
@@ -694,8 +687,12 @@ fn invoke_reference(
             argv,
             &input,
             Duration::from_millis(action.timeout_ms),
-            target,
-            plugin_id,
+            OneShotContext {
+                session: target,
+                plugin_id,
+                cancel: None,
+                session_instance: None,
+            },
         )?
     } else if let (Some(handler), Some(runtime)) =
         (action.handler.as_deref(), loaded.manifest.runtime.as_ref())
@@ -727,6 +724,161 @@ fn invoke_reference(
     Ok(output)
 }
 
+pub(crate) struct SessionPluginRuntime {
+    paths: PluginPaths,
+    session_name: String,
+    session_instance: String,
+    plugin_id: String,
+    service: Option<(String, NativeService)>,
+    consecutive_crashes: u32,
+    retry_at: Option<Instant>,
+}
+
+impl SessionPluginRuntime {
+    pub(crate) fn new(
+        session_name: String,
+        session_instance: String,
+        plugin_id: String,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            paths: PluginPaths::new()?,
+            session_name,
+            session_instance,
+            plugin_id,
+            service: None,
+            consecutive_crashes: 0,
+            retry_at: None,
+        })
+    }
+
+    pub(crate) fn invoke(
+        &mut self,
+        reference: &str,
+        input: Value,
+        cancel: &AtomicBool,
+    ) -> io::Result<Value> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(invalid("cancelled: plugin invocation was cancelled"));
+        }
+        let (plugin_id, action_id) = reference
+            .split_once('/')
+            .ok_or_else(|| invalid("action_not_found: plugin reference must be ID/ACTION"))?;
+        if plugin_id != self.plugin_id {
+            return Err(invalid("scope_denied: plugin worker identity mismatch"));
+        }
+        crate::runtime::validate_session_name(&self.session_name)?;
+        let registry = load_registry(&self.paths)?;
+        let entry = registry
+            .plugins
+            .get(plugin_id)
+            .ok_or_else(|| not_found(plugin_id))?;
+        if !entry.enabled {
+            self.service.take();
+            return Err(invalid("plugin_disabled: plugin is disabled"));
+        }
+        let loaded = load_package(&entry.root)?;
+        let action = loaded
+            .action(action_id)
+            .cloned()
+            .ok_or_else(|| invalid("action_not_found: action does not exist"))?;
+        loaded
+            .validate_input(&action, &input)
+            .map_err(|errors| invalid(format!("schema_invalid: {}", errors.join("; "))))?;
+        let timeout = Duration::from_millis(action.timeout_ms);
+        let output = if let Some(argv) = action.command.as_deref() {
+            run_one_shot(
+                &loaded.root,
+                argv,
+                &input,
+                timeout,
+                OneShotContext {
+                    session: Some(&self.session_name),
+                    plugin_id,
+                    cancel: Some(cancel),
+                    session_instance: Some(&self.session_instance),
+                },
+            )?
+        } else if let (Some(handler), Some(runtime)) =
+            (action.handler.as_deref(), loaded.manifest.runtime.as_ref())
+        {
+            match runtime.kind {
+                RuntimeKind::Process => {
+                    if self
+                        .retry_at
+                        .is_some_and(|retry_at| retry_at > Instant::now())
+                    {
+                        return Err(invalid(
+                            "runtime_unavailable: native plugin is in crash backoff",
+                        ));
+                    }
+                    let artifact_key = format!("{}:{}", entry.digest, entry.manifest_digest);
+                    if self
+                        .service
+                        .as_ref()
+                        .is_some_and(|(key, _)| key != &artifact_key)
+                    {
+                        self.service.take();
+                    }
+                    if self.service.is_none() {
+                        match NativeService::start(
+                            &loaded.root,
+                            runtime.command.as_deref().unwrap(),
+                            plugin_id,
+                            Some(&self.session_name),
+                            &self.session_instance,
+                            timeout,
+                        ) {
+                            Ok(service) => self.service = Some((artifact_key, service)),
+                            Err(error) => {
+                                self.note_crash();
+                                return Err(error);
+                            }
+                        }
+                    }
+                    let result = self.service.as_mut().unwrap().1.invoke(
+                        handler,
+                        input,
+                        timeout,
+                        &self.session_instance,
+                        Some(cancel),
+                    );
+                    if self.service.as_ref().unwrap().1.healthy {
+                        self.consecutive_crashes = 0;
+                        self.retry_at = None;
+                    } else {
+                        self.service.take();
+                        self.note_crash();
+                    }
+                    result?
+                }
+                RuntimeKind::Component => {
+                    return Err(invalid(
+                        "runtime_unavailable: component execution is not enabled in this build",
+                    ));
+                }
+            }
+        } else {
+            return Err(invalid(
+                "runtime_unavailable: action has no executable runtime",
+            ));
+        };
+        loaded
+            .validate_output(&action, &output)
+            .map_err(|errors| invalid(format!("output_invalid: {}", errors.join("; "))))?;
+        Ok(output)
+    }
+
+    fn note_crash(&mut self) {
+        self.consecutive_crashes = self.consecutive_crashes.saturating_add(1);
+        self.retry_at = Some(Instant::now() + crash_backoff(self.consecutive_crashes));
+    }
+}
+
+fn crash_backoff(consecutive_crashes: u32) -> Duration {
+    let exponent = consecutive_crashes.saturating_sub(1).min(8);
+    Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent)).min(Duration::from_secs(30))
+}
+
 fn run_native_service(
     root: &Path,
     argv: &[String],
@@ -736,65 +888,114 @@ fn run_native_service(
     timeout: Duration,
     session: Option<&str>,
 ) -> io::Result<Value> {
-    let instance_id = random_id()?;
-    let mut command = trusted_command(root, argv, session, plugin_id);
-    command.env("VVMUX_PLUGIN_INSTANCE", &instance_id);
-    let mut child = command.spawn()?;
-    let process_id = child.id();
-    let mut writer = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let (sender, receiver) = std::sync::mpsc::sync_channel(8);
-    let reader = thread::spawn(move || {
-        loop {
-            let frame = read_frame::<NativeReply>(&mut stdout)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
-            let stop = frame.is_err();
-            if sender.send(frame).is_err() || stop {
-                break;
-            }
-        }
-    });
-    let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_LOG_OUTPUT));
-    let deadline = Instant::now() + timeout;
+    let session_instance = session.unwrap_or("direct");
+    let mut service =
+        NativeService::start(root, argv, plugin_id, session, session_instance, timeout)?;
+    service.invoke(handler, input, timeout, session_instance, None)
+}
 
-    let hello = receive_native_reply(&receiver, deadline, &mut child, process_id)?;
-    match hello {
-        NativeReply::Hello(Hello {
-            protocol_version,
-            plugin_id: actual_plugin,
-            instance_id: actual_instance,
-            ..
-        }) if protocol_version == PROTOCOL_VERSION
-            && actual_plugin == plugin_id
-            && actual_instance == instance_id => {}
-        _ => {
-            terminate_process_tree(&mut child, process_id);
+struct NativeService {
+    plugin_id: String,
+    child: std::process::Child,
+    process_id: u32,
+    writer: Option<std::process::ChildStdin>,
+    receiver: std::sync::mpsc::Receiver<io::Result<NativeReply>>,
+    reader: Option<thread::JoinHandle<()>>,
+    stderr_reader: Option<thread::JoinHandle<io::Result<CappedOutput>>>,
+    next_request_id: u64,
+    healthy: bool,
+}
+
+impl NativeService {
+    fn start(
+        root: &Path,
+        argv: &[String],
+        plugin_id: &str,
+        session: Option<&str>,
+        session_instance: &str,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        let instance_id = random_id()?;
+        let mut command = trusted_command(root, argv, session, plugin_id);
+        command
+            .env("VVMUX_PLUGIN_INSTANCE", &instance_id)
+            .env("VVMUX_SESSION_INSTANCE", session_instance);
+        let mut child = command.spawn()?;
+        let process_id = child.id();
+        let writer = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let reader = thread::spawn(move || {
+            loop {
+                let frame = read_frame::<NativeReply>(&mut stdout)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
+                let stop = frame.is_err();
+                if sender.send(frame).is_err() || stop {
+                    break;
+                }
+            }
+        });
+        let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_LOG_OUTPUT));
+        let mut service = Self {
+            plugin_id: plugin_id.to_owned(),
+            child,
+            process_id,
+            writer: Some(writer),
+            receiver,
+            reader: Some(reader),
+            stderr_reader: Some(stderr_reader),
+            next_request_id: 2,
+            healthy: true,
+        };
+        let deadline = Instant::now() + timeout;
+        let hello = service.receive(deadline)?;
+        if !matches!(
+            hello,
+            NativeReply::Hello(Hello {
+                protocol_version: PROTOCOL_VERSION,
+                plugin_id: actual_plugin,
+                instance_id: actual_instance,
+                ..
+            }) if actual_plugin == plugin_id && actual_instance == instance_id
+        ) {
+            service.healthy = false;
             return Err(invalid("runtime_unavailable: invalid native plugin hello"));
         }
+        service.write(&NativeMessage::Initialize { request_id: 1 })?;
+        if !matches!(
+            service.receive(deadline)?,
+            NativeReply::Ready { request_id: 1 }
+        ) {
+            service.healthy = false;
+            return Err(invalid("protocol_error: native plugin did not initialize"));
+        }
+        Ok(service)
     }
 
-    write_frame(&mut writer, &NativeMessage::Initialize { request_id: 1 })
-        .map_err(|error| invalid(format!("protocol_error: {error}")))?;
-    if !matches!(
-        receive_native_reply(&receiver, deadline, &mut child, process_id)?,
-        NativeReply::Ready { request_id: 1 }
-    ) {
-        terminate_process_tree(&mut child, process_id);
-        return Err(invalid("protocol_error: native plugin did not initialize"));
-    }
-
-    let correlation_id = random_id()?;
-    let deadline_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .saturating_add(timeout.as_millis())
-        .min(u128::from(u64::MAX)) as u64;
-    write_frame(
-        &mut writer,
-        &NativeMessage::Invoke(Invocation {
-            request_id: 2,
+    fn invoke(
+        &mut self,
+        handler: &str,
+        input: Value,
+        timeout: Duration,
+        session_instance: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> io::Result<Value> {
+        if !self.healthy || self.child.try_wait()?.is_some() {
+            self.healthy = false;
+            return Err(invalid("runtime_crashed: native plugin process exited"));
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(2);
+        let correlation_id = random_id()?;
+        let deadline_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .saturating_add(timeout.as_millis())
+            .min(u128::from(u64::MAX)) as u64;
+        self.write(&NativeMessage::Invoke(Invocation {
+            request_id,
             action: handler.to_owned(),
             input,
             context: InvocationContext {
@@ -802,60 +1003,137 @@ fn run_native_service(
                 causation_id: correlation_id,
                 causation_depth: 0,
                 source: "automation".into(),
-                session_instance: session.unwrap_or("default").to_owned(),
+                session_instance: session_instance.to_owned(),
                 pane_id: None,
                 tab_id: None,
                 deadline_unix_ms,
             },
-        }),
-    )
-    .map_err(|error| invalid(format!("protocol_error: {error}")))?;
-    let result = match receive_native_reply(&receiver, deadline, &mut child, process_id)? {
-        NativeReply::Result(result) if result.request_id == 2 => result.result,
-        NativeReply::Error(error) if error.request_id == 2 => {
-            terminate_process_tree(&mut child, process_id);
-            return Err(invalid(format!(
-                "{}: {}",
-                serde_json::to_value(error.code).unwrap().as_str().unwrap(),
-                error.message
-            )));
+        }))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+                return self.cancel(request_id, "cancelled: plugin invocation was cancelled");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.cancel(request_id, "timeout: native plugin exceeded its deadline");
+            }
+            match self
+                .receiver
+                .recv_timeout(remaining.min(Duration::from_millis(20)))
+            {
+                Ok(Ok(NativeReply::Result(result))) if result.request_id == request_id => {
+                    return Ok(result.result);
+                }
+                Ok(Ok(NativeReply::Error(error))) if error.request_id == request_id => {
+                    return Err(invalid(format!(
+                        "{}: {}",
+                        serde_json::to_value(error.code).unwrap().as_str().unwrap(),
+                        error.message
+                    )));
+                }
+                Ok(Ok(_)) => {
+                    self.healthy = false;
+                    return Err(invalid("protocol_error: unexpected native plugin reply"));
+                }
+                Ok(Err(error)) => {
+                    self.healthy = false;
+                    return Err(error);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.healthy = false;
+                    return Err(invalid("runtime_crashed: native plugin protocol closed"));
+                }
+            }
         }
-        _ => {
-            terminate_process_tree(&mut child, process_id);
-            return Err(invalid("protocol_error: unexpected native plugin reply"));
+    }
+
+    fn write(&mut self, message: &NativeMessage) -> io::Result<()> {
+        write_frame(self.writer.as_mut().unwrap(), message)
+            .map_err(|error| invalid(format!("protocol_error: {error}")))
+            .inspect_err(|_| self.healthy = false)
+    }
+
+    fn receive(&mut self, deadline: Instant) -> io::Result<NativeReply> {
+        match self
+            .receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.healthy = false;
+                Err(invalid("timeout: native plugin exceeded its deadline"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.healthy = false;
+                Err(invalid("runtime_crashed: native plugin protocol closed"))
+            }
         }
-    };
-    let _ = write_frame(&mut writer, &NativeMessage::Shutdown { request_id: 3 });
-    drop(writer);
-    if wait_until(&mut child, deadline)?.is_none() {
-        terminate_process_tree(&mut child, process_id);
     }
-    let _ = reader.join();
-    let logs = stderr_reader
-        .join()
-        .map_err(|_| io::Error::other("stderr reader panicked"))??;
-    if logs.truncated {
-        eprintln!("vvmux: plugin {plugin_id} stderr truncated at {MAX_LOG_OUTPUT} bytes");
+
+    fn cancel(&mut self, request_id: u64, message: &'static str) -> io::Result<Value> {
+        let _ = self.write(&NativeMessage::Cancel { request_id });
+        let grace = Instant::now() + Duration::from_secs(2);
+        match self
+            .receiver
+            .recv_timeout(grace.saturating_duration_since(Instant::now()))
+        {
+            Ok(Ok(NativeReply::Cancelled {
+                request_id: reply_id,
+            })) if reply_id == request_id => Err(invalid(message)),
+            Ok(Ok(NativeReply::Result(result))) if result.request_id == request_id => {
+                Err(invalid(message))
+            }
+            Ok(Ok(NativeReply::Error(error))) if error.request_id == request_id => {
+                Err(invalid(message))
+            }
+            Ok(Ok(_)) | Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.healthy = false;
+                Err(invalid(message))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.healthy = false;
+                terminate_process_tree(&mut self.child, self.process_id);
+                Err(invalid(message))
+            }
+        }
     }
-    Ok(result)
+
+    fn shutdown(&mut self) {
+        if self.healthy {
+            let request_id = self.next_request_id;
+            let _ = self.write(&NativeMessage::Shutdown { request_id });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            if wait_until(&mut self.child, deadline)
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                terminate_process_tree(&mut self.child, self.process_id);
+            }
+        } else if self.child.try_wait().ok().flatten().is_none() {
+            terminate_process_tree(&mut self.child, self.process_id);
+        }
+        self.writer.take();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(stderr_reader) = self.stderr_reader.take()
+            && let Ok(Ok(logs)) = stderr_reader.join()
+            && logs.truncated
+        {
+            eprintln!(
+                "vvmux: plugin {} stderr truncated at {MAX_LOG_OUTPUT} bytes",
+                self.plugin_id
+            );
+        }
+    }
 }
 
-fn receive_native_reply(
-    receiver: &std::sync::mpsc::Receiver<io::Result<NativeReply>>,
-    deadline: Instant,
-    child: &mut std::process::Child,
-    process_id: u32,
-) -> io::Result<NativeReply> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            terminate_process_tree(child, process_id);
-            Err(invalid("timeout: native plugin exceeded its deadline"))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(invalid("runtime_crashed: native plugin protocol closed"))
-        }
+impl Drop for NativeService {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1027,15 +1305,26 @@ fn trust_text(loaded: &LoadedManifest) -> &'static str {
     }
 }
 
+struct OneShotContext<'a> {
+    session: Option<&'a str>,
+    plugin_id: &'a str,
+    cancel: Option<&'a AtomicBool>,
+    session_instance: Option<&'a str>,
+}
+
 fn run_one_shot(
     root: &Path,
     argv: &[String],
     input: &Value,
     timeout: Duration,
-    session: Option<&str>,
-    plugin_id: &str,
+    context: OneShotContext<'_>,
 ) -> io::Result<Value> {
-    let mut command = trusted_command(root, argv, session, plugin_id);
+    let mut command = trusted_command(root, argv, context.session, context.plugin_id);
+    let instance_id = random_id()?;
+    command.env("VVMUX_PLUGIN_INSTANCE", instance_id);
+    if let Some(session_instance) = context.session_instance {
+        command.env("VVMUX_SESSION_INSTANCE", session_instance);
+    }
     let mut child = command.spawn()?;
     let process_id = child.id();
     let mut stdin = child.stdin.take().unwrap();
@@ -1054,6 +1343,15 @@ fn run_one_shot(
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
+        }
+        if context
+            .cancel
+            .is_some_and(|cancel| cancel.load(Ordering::Acquire))
+        {
+            terminate_process_tree(&mut child, process_id);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(invalid("cancelled: plugin invocation was cancelled"));
         }
         if Instant::now() >= deadline {
             terminate_process_tree(&mut child, process_id);
@@ -1472,6 +1770,41 @@ agent_visible = true
         let output = read_capped(&b"abcdef"[..], 3).unwrap();
         assert_eq!(output.bytes, b"abc");
         assert!(output.truncated);
+    }
+
+    #[test]
+    fn crash_backoff_is_capped_and_exponential() {
+        assert_eq!(crash_backoff(1), Duration::from_millis(100));
+        assert_eq!(crash_backoff(2), Duration::from_millis(200));
+        assert_eq!(crash_backoff(9), Duration::from_millis(25_600));
+        assert_eq!(crash_backoff(u32::MAX), Duration::from_millis(25_600));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_one_shot_terminates_its_process_group() {
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let setter = cancelled.clone();
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            setter.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = run_one_shot(
+            Path::new("/"),
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            &serde_json::json!({}),
+            Duration::from_secs(30),
+            OneShotContext {
+                session: Some("test"),
+                plugin_id: "dev.example",
+                cancel: Some(cancelled.as_ref()),
+                session_instance: Some("session-instance"),
+            },
+        );
+        cancel_thread.join().unwrap();
+        assert!(result.unwrap_err().to_string().starts_with("cancelled:"));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
