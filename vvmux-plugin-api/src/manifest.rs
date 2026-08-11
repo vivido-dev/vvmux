@@ -119,6 +119,20 @@ pub struct Runtime {
     pub command: Option<Vec<String>>,
     #[serde(default = "default_activation")]
     pub activation: Activation,
+    /// Explicit filesystem capabilities for a WebAssembly component.
+    #[serde(default)]
+    pub preopens: Vec<ComponentPreopen>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentPreopen {
+    /// The immutable installed package, mounted at `/package`.
+    Package,
+    /// User-managed plugin configuration, mounted read-only at `/config`.
+    Config,
+    /// Plugin-owned durable data, mounted read-write at `/data`.
+    Data,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -475,10 +489,18 @@ impl Runtime {
                     return invalid("component runtime requires artifact and forbids command");
                 }
                 validate_relative_path(self.artifact.as_ref().unwrap(), "runtime artifact")?;
+                let mut preopens = BTreeSet::new();
+                for preopen in &self.preopens {
+                    if !preopens.insert(*preopen) {
+                        return invalid("component runtime contains a duplicate preopen");
+                    }
+                }
             }
             RuntimeKind::Process => {
-                if self.artifact.is_some() || self.command.is_none() {
-                    return invalid("process runtime requires command and forbids artifact");
+                if self.artifact.is_some() || self.command.is_none() || !self.preopens.is_empty() {
+                    return invalid(
+                        "process runtime requires command and forbids artifact and preopens",
+                    );
                 }
                 validate_argv(self.command.as_deref(), "runtime", "process")?;
             }
@@ -773,6 +795,7 @@ mod tests {
                 artifact: None,
                 command: Some(vec!["python".into(), "plugin.py".into()]),
                 activation: Activation::OnDemand,
+                preopens: Vec::new(),
             }),
             actions: vec![Action {
                 id: "read".into(),
@@ -807,6 +830,48 @@ mod tests {
         let mut manifest = valid_manifest();
         manifest.actions[0].id = "not.local".into();
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn component_preopens_are_explicit_unique_capabilities() {
+        let mut manifest = valid_manifest();
+        manifest.runtime = Some(Runtime {
+            kind: RuntimeKind::Component,
+            artifact: Some("plugin.wasm".into()),
+            command: None,
+            activation: Activation::OnDemand,
+            preopens: vec![ComponentPreopen::Package, ComponentPreopen::Data],
+        });
+        manifest.validate().unwrap();
+
+        manifest
+            .runtime
+            .as_mut()
+            .unwrap()
+            .preopens
+            .push(ComponentPreopen::Data);
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate preopen")
+        );
+
+        let mut process = valid_manifest();
+        process
+            .runtime
+            .as_mut()
+            .unwrap()
+            .preopens
+            .push(ComponentPreopen::Config);
+        assert!(
+            process
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("forbids")
+        );
     }
 
     #[test]

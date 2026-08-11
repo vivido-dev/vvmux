@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -971,9 +972,30 @@ fn invoke_reference(
                 target,
             )?,
             RuntimeKind::Component => {
-                return Err(invalid(
-                    "runtime_unavailable: component execution is not enabled in this build",
-                ));
+                let cancel = Arc::new(AtomicBool::new(false));
+                let deadline = Instant::now() + Duration::from_millis(action.timeout_ms);
+                let mut component = crate::plugin_component::ComponentRuntime::start(
+                    &loaded.root,
+                    runtime.artifact.as_deref().unwrap(),
+                    plugin_id,
+                    None,
+                    None,
+                    &loaded.manifest.plugin.permissions,
+                    &runtime.preopens,
+                    cancel.clone(),
+                    deadline,
+                )?;
+                component.invoke(
+                    handler,
+                    &input,
+                    &serde_json::json!({
+                        "source": "automation",
+                        "session_instance": null,
+                        "deadline_ms": action.timeout_ms,
+                    }),
+                    cancel,
+                    deadline,
+                )?
             }
         }
     } else {
@@ -994,6 +1016,7 @@ pub(crate) struct SessionPluginRuntime {
     loaded: LoadedManifest,
     broker: crate::plugin_supervisor::HostBroker,
     service: Option<NativeService>,
+    component: Option<crate::plugin_component::ComponentRuntime>,
     consecutive_crashes: u32,
     retry_at: Option<Instant>,
 }
@@ -1019,6 +1042,7 @@ impl SessionPluginRuntime {
             loaded,
             broker,
             service: None,
+            component: None,
             consecutive_crashes: 0,
             retry_at: None,
         })
@@ -1028,7 +1052,7 @@ impl SessionPluginRuntime {
         &mut self,
         reference: &str,
         input: Value,
-        cancel: &AtomicBool,
+        cancel: Arc<AtomicBool>,
     ) -> io::Result<Value> {
         if cancel.load(Ordering::Acquire) {
             return Err(invalid("cancelled: plugin invocation was cancelled"));
@@ -1058,7 +1082,7 @@ impl SessionPluginRuntime {
                 OneShotContext {
                     session: Some(&self.session_name),
                     plugin_id,
-                    cancel: Some(cancel),
+                    cancel: Some(&cancel),
                     session_instance: Some(&self.session_instance),
                     broker: Some(&self.broker),
                     permissions: &self.loaded.manifest.plugin.permissions,
@@ -1103,7 +1127,7 @@ impl SessionPluginRuntime {
                         input,
                         timeout,
                         &self.session_instance,
-                        Some(cancel),
+                        Some(&cancel),
                     );
                     if self.service.as_ref().unwrap().healthy {
                         self.consecutive_crashes = 0;
@@ -1115,9 +1139,64 @@ impl SessionPluginRuntime {
                     result?
                 }
                 RuntimeKind::Component => {
-                    return Err(invalid(
-                        "runtime_unavailable: component execution is not enabled in this build",
-                    ));
+                    if self
+                        .retry_at
+                        .is_some_and(|retry_at| retry_at > Instant::now())
+                    {
+                        return Err(invalid(
+                            "runtime_unavailable: component plugin is in crash backoff",
+                        ));
+                    }
+                    let deadline = Instant::now() + timeout;
+                    if self.component.is_none() {
+                        match crate::plugin_component::ComponentRuntime::start(
+                            &self.loaded.root,
+                            runtime.artifact.as_deref().unwrap(),
+                            plugin_id,
+                            Some(&self.session_instance),
+                            Some(&self.broker),
+                            &self.loaded.manifest.plugin.permissions,
+                            &runtime.preopens,
+                            cancel.clone(),
+                            deadline,
+                        ) {
+                            Ok(component) => self.component = Some(component),
+                            Err(error) => {
+                                self.note_crash();
+                                return Err(error);
+                            }
+                        }
+                    }
+                    let result = self.component.as_mut().unwrap().invoke(
+                        handler,
+                        &input,
+                        &serde_json::json!({
+                            "source": "plugin",
+                            "session": self.session_name,
+                            "session_instance": self.session_instance,
+                            "deadline_ms": action.timeout_ms,
+                        }),
+                        cancel,
+                        deadline,
+                    );
+                    match result {
+                        Ok(output) => {
+                            self.consecutive_crashes = 0;
+                            self.retry_at = None;
+                            output
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            if message.starts_with("runtime_crashed")
+                                || message.starts_with("timeout")
+                                || message.starts_with("cancelled")
+                            {
+                                self.component.take();
+                                self.note_crash();
+                            }
+                            return Err(error);
+                        }
+                    }
                 }
             }
         } else {
@@ -1476,7 +1555,7 @@ impl Drop for NativeService {
     }
 }
 
-fn random_id() -> io::Result<String> {
+pub(crate) fn random_id() -> io::Result<String> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(io::Error::other)?;
     Ok(hex(&bytes))

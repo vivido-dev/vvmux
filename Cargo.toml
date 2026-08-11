@@ -61,6 +61,15 @@ vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
 zeroize = { version = "1.9", features = ["serde"] }
 vvmux-plugin-api = { path = "vvmux-plugin-api" }
+# 38.0.4 was the original design pin but now has applicable RustSec sandbox/WASI advisories.
+# 36.0.13 is the fully patched maintenance line that still supports this workspace's Rust 1.88.
+wasmtime = { version = "=36.0.13", default-features = false, features = [
+  "component-model",
+  "cranelift",
+  "runtime",
+  "std",
+] }
+wasmtime-wasi = { version = "=36.0.13", default-features = false }
 
 [features]
 default = ["server-capability"]
@@ -111,6 +120,7 @@ windows-sys = { version = "0.61.2", features = [
 [dev-dependencies]
 rcgen = "0.13"
 tempfile = "3"
+wat = "1"
 tokio-rustls = "0.26"
 tokio-tungstenite = "0.30"
 # The gateway's test-support API (wait_for_retained_media) is gated behind its testing feature.

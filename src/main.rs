@@ -16,6 +16,7 @@ mod media_trace;
 mod metrics;
 mod platform;
 mod plugin;
+mod plugin_component;
 mod plugin_supervisor;
 mod region;
 mod runtime;

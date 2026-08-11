@@ -876,7 +876,8 @@ fn spawn_worker(
             while let Ok(message) = receiver.recv() {
                 match message {
                     WorkerMessage::Invoke(job) => {
-                        let result = runtime.invoke(&job.reference, job.input.clone(), &job.cancel);
+                        let result =
+                            runtime.invoke(&job.reference, job.input.clone(), job.cancel.clone());
                         if manager.send(Message::Complete { job, result }).is_err() {
                             break;
                         }
