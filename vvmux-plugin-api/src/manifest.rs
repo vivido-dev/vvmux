@@ -11,6 +11,7 @@ use serde_json::Value;
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_SCHEMA_BYTES: u64 = 64 * 1024;
 pub const MAX_SCHEMA_DEPTH: usize = 32;
+pub const MAX_WORKFLOWS: usize = 128;
 pub const MAX_WORKFLOW_STEPS: usize = 32;
 
 #[derive(Debug)]
@@ -528,6 +529,9 @@ impl Manifest {
             .iter()
             .map(|action| action.id.as_str())
             .collect::<BTreeSet<_>>();
+        if self.workflows.len() > MAX_WORKFLOWS {
+            return invalid("plugin exceeds 128 workflows");
+        }
         validate_workflows(&self.workflows, &aliases, &action_ids)?;
         Ok(())
     }
@@ -981,6 +985,42 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("cycle")
+        );
+    }
+
+    #[test]
+    fn rejects_more_workflows_than_one_plugin_can_retain() {
+        let mut manifest = valid_manifest();
+        manifest.dependencies.push(Dependency {
+            alias: "dep".into(),
+            id: "dev.dependency".into(),
+            version: VersionReq::STAR,
+            source: "https://example.invalid/dep".into(),
+        });
+        for index in 0..=MAX_WORKFLOWS {
+            manifest.workflows.push(Workflow {
+                id: format!("workflow-{index}"),
+                title: format!("workflow {index}"),
+                trigger: "pane.screen_changed".into(),
+                agent_visible: false,
+                input_schema: None,
+                output_schema: None,
+                timeout_ms: 30_000,
+                output: Value::Null,
+                steps: vec![WorkflowStep {
+                    id: "run".into(),
+                    uses: "dep/run".into(),
+                    input: Value::Null,
+                    needs: Vec::new(),
+                }],
+            });
+        }
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("128 workflows")
         );
     }
 

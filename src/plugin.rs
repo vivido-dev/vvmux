@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use vvmux_plugin_api::{
-    Activation, ErrorCode, Event, EventHook, Hello, HostCallResult, Invocation, InvocationContext,
-    LoadedManifest, NativeMessage, NativeReply, PROTOCOL_VERSION, Permission, PluginError,
-    RuntimeKind, read_frame, write_frame,
+    Activation, ErrorCode, Event, EventHook, FrameError, Hello, HostCallResult, Invocation,
+    InvocationContext, LoadedManifest, NativeMessage, NativeReply, PROTOCOL_VERSION, Permission,
+    PluginError, RuntimeKind, read_frame, write_frame,
 };
 
 const REGISTRY_SCHEMA: u16 = 1;
@@ -1282,7 +1282,14 @@ fn install_local(
         );
     }
     for package in pending.values() {
-        confirm_if_needed(&load_package(&package.source_dir)?, yes)?;
+        let loaded = load_package(&package.source_dir)?;
+        let delta = approval_delta(
+            previous_registry.plugins.get(&package.id),
+            &loaded,
+            &package.source,
+        );
+        print_approval_delta(&delta);
+        confirm_if_needed(&loaded, &delta, yes)?;
     }
     let result = commit_package_graph(paths, &previous_registry, &pending);
     cleanup_temporary(paths, &temporary);
@@ -2440,8 +2447,14 @@ impl NativeService {
         let (sender, receiver) = std::sync::mpsc::sync_channel(8);
         let reader = thread::spawn(move || {
             loop {
-                let frame = read_frame::<NativeReply>(&mut stdout)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
+                let frame = read_frame::<NativeReply>(&mut stdout).map_err(|error| match error {
+                    FrameError::Io(error) => io::Error::other(format!(
+                        "runtime_crashed: native plugin protocol closed: {error}"
+                    )),
+                    FrameError::TooLarge(_) | FrameError::Json(_) => {
+                        invalid(format!("protocol_error: {error}"))
+                    }
+                });
                 let stop = frame.is_err();
                 if sender.send(frame).is_err() || stop {
                     break;
@@ -2907,11 +2920,70 @@ fn preview(loaded: &LoadedManifest, source: &str) {
     }
 }
 
-fn confirm_if_needed(loaded: &LoadedManifest, yes: bool) -> io::Result<()> {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ApprovalDelta {
+    source_change: Option<(String, String)>,
+    runtime_tier_change: Option<(String, String)>,
+    added_permissions: Vec<String>,
+}
+
+impl ApprovalDelta {
+    fn requires_fresh_approval(&self) -> bool {
+        self.source_change.is_some()
+            || self.runtime_tier_change.is_some()
+            || !self.added_permissions.is_empty()
+    }
+}
+
+fn approval_delta(
+    previous: Option<&RegistryEntry>,
+    loaded: &LoadedManifest,
+    source: &str,
+) -> ApprovalDelta {
+    let Some(previous) = previous else {
+        return ApprovalDelta::default();
+    };
+    let next_tier = runtime_tier(loaded).to_owned();
+    let next_permissions = permission_names(loaded);
+    ApprovalDelta {
+        source_change: (previous.source != source)
+            .then(|| (previous.source.clone(), source.to_owned())),
+        runtime_tier_change: (previous.runtime_tier != next_tier)
+            .then(|| (previous.runtime_tier.clone(), next_tier)),
+        added_permissions: next_permissions
+            .into_iter()
+            .filter(|permission| !previous.permissions.contains(permission))
+            .collect(),
+    }
+}
+
+fn print_approval_delta(delta: &ApprovalDelta) {
+    if let Some((previous, next)) = &delta.source_change {
+        println!("approval change: source {previous} -> {next}");
+    }
+    if let Some((previous, next)) = &delta.runtime_tier_change {
+        println!("approval change: runtime {previous} -> {next}");
+    }
+    if !delta.added_permissions.is_empty() {
+        println!(
+            "approval change: added permissions {:?}",
+            delta.added_permissions
+        );
+    }
+}
+
+fn confirm_if_needed(loaded: &LoadedManifest, delta: &ApprovalDelta, yes: bool) -> io::Result<()> {
     if yes {
         return Ok(());
     }
-    eprint!("install {}? [y/N] ", loaded.manifest.plugin.id);
+    if delta.requires_fresh_approval() {
+        eprint!(
+            "approve security-relevant changes to {}? [y/N] ",
+            loaded.manifest.plugin.id
+        );
+    } else {
+        eprint!("install {}? [y/N] ", loaded.manifest.plugin.id);
+    }
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -2944,20 +3016,24 @@ fn entry_for(
         enabled: true,
         linked,
         runtime_tier: runtime_tier(loaded).into(),
-        permissions: loaded
-            .manifest
-            .plugin
-            .permissions
-            .iter()
-            .map(|permission| {
-                serde_json::to_value(permission)
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
-            })
-            .collect(),
+        permissions: permission_names(loaded),
     }
+}
+
+fn permission_names(loaded: &LoadedManifest) -> Vec<String> {
+    loaded
+        .manifest
+        .plugin
+        .permissions
+        .iter()
+        .map(|permission| {
+            serde_json::to_value(permission)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
 }
 
 fn runtime_tier(loaded: &LoadedManifest) -> &'static str {
@@ -3429,6 +3505,31 @@ agent_visible = true
         fs::write(root.join("schemas/output.json"), r#"{"type":"object"}"#).unwrap();
     }
 
+    fn write_named_test_package(root: &Path, id: &str, version: &str) {
+        write_test_package(root);
+        let manifest = fs::read_to_string(root.join("vvmux-plugin.toml"))
+            .unwrap()
+            .replace("dev.example", id)
+            .replace("version = \"1.0.0\"", &format!("version = \"{version}\""));
+        fs::write(root.join("vvmux-plugin.toml"), manifest).unwrap();
+    }
+
+    fn test_registry_entry(root: &Path, id: &str, version: &str) -> RegistryEntry {
+        RegistryEntry {
+            id: id.into(),
+            version: version.into(),
+            root: root.into(),
+            source: format!("https://example.invalid/{id}"),
+            commit: Some("a".repeat(40)),
+            digest: digest_tree(root).unwrap(),
+            manifest_digest: digest_file(&root.join("vvmux-plugin.toml")).unwrap(),
+            enabled: true,
+            linked: false,
+            runtime_tier: "trusted_native".into(),
+            permissions: vec!["pane.read".into()],
+        }
+    }
+
     #[test]
     fn package_paths_are_collision_resistant_and_windows_safe() {
         let paths = PluginPaths {
@@ -3568,6 +3669,39 @@ agent_visible = true
     }
 
     #[test]
+    fn approval_delta_identifies_only_security_relevant_increases() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("package");
+        write_test_package(&package);
+        let loaded = load_package(&package).unwrap();
+        let mut previous = test_registry_entry(&package, "dev.example", "1.0.0");
+        previous.source = "https://old.invalid/example".into();
+        previous.runtime_tier = "workflow".into();
+        previous.permissions.clear();
+
+        let delta = approval_delta(Some(&previous), &loaded, "https://new.invalid/example");
+        assert_eq!(
+            delta.source_change,
+            Some((
+                "https://old.invalid/example".into(),
+                "https://new.invalid/example".into()
+            ))
+        );
+        assert_eq!(
+            delta.runtime_tier_change,
+            Some(("workflow".into(), "trusted_native".into()))
+        );
+        assert_eq!(delta.added_permissions, vec!["pane.read"]);
+        assert!(delta.requires_fresh_approval());
+
+        let mut trusted = test_registry_entry(&package, "dev.example", "1.0.0");
+        trusted.permissions.push("pane.write".into());
+        let reduction = approval_delta(Some(&trusted), &loaded, &trusted.source);
+        assert_eq!(reduction, ApprovalDelta::default());
+        assert!(!reduction.requires_fresh_approval());
+    }
+
+    #[test]
     fn failed_live_reload_publishes_a_new_rollback_generation() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("config/plugins");
@@ -3618,5 +3752,71 @@ agent_visible = true
         assert_eq!(restored.generation, 2);
         assert!(restored.plugins.is_empty());
         assert_eq!(reloads, 2);
+    }
+
+    #[test]
+    fn failed_multi_package_update_restores_the_complete_graph_and_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("config/plugins");
+        let paths = PluginPaths {
+            registry: root.join("registry.json"),
+            packages: root.join("packages"),
+            lock: root.join("vvmux-plugin.lock"),
+            root,
+        };
+        paths.ensure().unwrap();
+        let old_one = paths.packages.join("p-one-old");
+        let old_two = paths.packages.join("p-two-old");
+        let new_one = paths.packages.join("p-one-new");
+        let new_two = paths.packages.join("p-two-new");
+        write_named_test_package(&old_one, "dev.one", "1.0.0");
+        write_named_test_package(&old_two, "dev.two", "1.0.0");
+        write_named_test_package(&new_one, "dev.one", "2.0.0");
+        write_named_test_package(&new_two, "dev.two", "2.0.0");
+
+        let mut previous = Registry::default();
+        previous.plugins.insert(
+            "dev.one".into(),
+            test_registry_entry(&old_one, "dev.one", "1.0.0"),
+        );
+        previous.plugins.insert(
+            "dev.two".into(),
+            test_registry_entry(&old_two, "dev.two", "1.0.0"),
+        );
+        save_registry(&paths, &mut previous).unwrap();
+        let old_lock = encode_lock(&previous).unwrap();
+        write_private_atomic(&paths.lock, old_lock.as_bytes()).unwrap();
+
+        let mut next = previous.clone();
+        next.plugins.insert(
+            "dev.one".into(),
+            test_registry_entry(&new_one, "dev.one", "2.0.0"),
+        );
+        next.plugins.insert(
+            "dev.two".into(),
+            test_registry_entry(&new_two, "dev.two", "2.0.0"),
+        );
+        let mut reloads = 0;
+        let error = commit_registry_with_reload(&paths, &previous, &mut next, || {
+            reloads += 1;
+            let published = load_registry(&paths).unwrap();
+            if reloads == 1 {
+                assert_eq!(published.plugins["dev.one"].version, "2.0.0");
+                assert_eq!(published.plugins["dev.two"].version, "2.0.0");
+                Err(io::Error::other("second session rejected graph"))
+            } else {
+                assert_eq!(published.plugins["dev.one"].version, "1.0.0");
+                assert_eq!(published.plugins["dev.two"].version, "1.0.0");
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rolled back at generation 3"));
+        assert_eq!(reloads, 2);
+        let restored = load_registry(&paths).unwrap();
+        assert_eq!(restored.generation, 3);
+        assert_eq!(restored.plugins, previous.plugins);
+        assert_eq!(fs::read_to_string(&paths.lock).unwrap(), old_lock);
     }
 }

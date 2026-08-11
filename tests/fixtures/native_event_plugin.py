@@ -2,6 +2,11 @@ import json
 import os
 import struct
 import sys
+import time
+
+
+SESSION = os.environ["VVMUX_SESSION"]
+INSTANCE = os.environ["VVMUX_PLUGIN_INSTANCE"]
 
 
 def read_frame():
@@ -31,15 +36,26 @@ while True:
     message = read_frame()
     request_id = message["request_id"]
     if message["type"] == "initialize":
-        with open("activated", "w", encoding="utf-8") as marker:
+        with open(f"activated-{SESSION}", "w", encoding="utf-8") as marker:
             marker.write(os.environ["VVMUX_SESSION_INSTANCE"])
         write_frame({"type": "ready", "request_id": request_id})
     elif message["type"] == "event":
-        with open("events.ndjson", "a", encoding="utf-8") as events:
+        with open(f"events-{SESSION}.ndjson", "a", encoding="utf-8") as events:
             events.write(json.dumps(message, separators=(",", ":")) + "\n")
+        if os.path.exists("slow-event-ms"):
+            with open("slow-event-ms", "r", encoding="utf-8") as delay:
+                time.sleep(int(delay.read().strip()) / 1000)
         write_frame({"type": "ready", "request_id": request_id})
     elif message["type"] == "invoke":
-        write_frame({"type": "result", "request_id": request_id, "result": {}})
+        if message["action"] == "crash":
+            os._exit(17)
+        write_frame(
+            {
+                "type": "result",
+                "request_id": request_id,
+                "result": {"session": SESSION, "instance": INSTANCE},
+            }
+        )
     elif message["type"] == "cancel":
         write_frame({"type": "cancelled", "request_id": request_id})
     elif message["type"] == "shutdown":

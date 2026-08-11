@@ -239,6 +239,34 @@ fn recursive_git_dependencies_and_bounded_workflows_execute_end_to_end() {
             })
     );
 
+    fs::write(directory.path().join("start-workflow-firehose"), b"start").unwrap();
+    for action in ["list-panes", "reload-config"] {
+        let started = Instant::now();
+        assert_success(
+            &command(binary, &runtime, &config_home)
+                .args(["msg", "--target", &name, action])
+                .output()
+                .unwrap(),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "event workflow firehose delayed {action}"
+        );
+    }
+    let event_workflow_jobs = wait_for_event_workflow_jobs(binary, &runtime, &config_home, &name);
+    assert!(
+        event_workflow_jobs.len() <= 4,
+        "coalescing admitted too many event workflows: {event_workflow_jobs:?}"
+    );
+    assert!(event_workflow_jobs.iter().any(|job_id| {
+        let status = json_command(
+            command(binary, &runtime, &config_home).args(["plugin", "job", "status", job_id]),
+        );
+        status["trace"]["steps"]
+            .as_array()
+            .is_some_and(|steps| steps.iter().any(|step| step["kind"] == "event_gap"))
+    }));
+
     let installed_bundle = listed
         .as_array()
         .unwrap()
@@ -274,6 +302,9 @@ elif operation == "sum":
     result = {"total": value["left"] + value["right"]}
 elif operation == "slow":
     time.sleep(5)
+    result = {}
+elif operation == "event-slow":
+    time.sleep(1)
     result = {}
 elif operation == "fail":
     raise RuntimeError("fixture failure")
@@ -342,6 +373,14 @@ description = "Fail deterministically"
 command = ["python3", "action.py", "fail"]
 input_schema = "schemas/empty.json"
 output_schema = "schemas/empty.json"
+[[actions]]
+id = "event-slow"
+title = "Event slow"
+description = "Delay event workflow delivery"
+command = ["python3", "action.py", "event-slow"]
+input_schema = "schemas/empty.json"
+output_schema = "schemas/empty.json"
+timeout_ms = 5000
 "#,
     )
     .unwrap();
@@ -447,6 +486,16 @@ output = "${steps.record.output}"
 id = "record"
 uses = "runner/pass"
 with = { value = 1 }
+[[workflows]]
+id = "on-screen"
+title = "On screen change"
+trigger = "pane.screen_changed"
+timeout_ms = 10000
+output = "${steps.wait.output}"
+[[workflows.steps]]
+id = "wait"
+uses = "runner/event-slow"
+with = {}
 [[workflows]]
 id = "fail"
 title = "Fail"
@@ -645,6 +694,47 @@ fn replay_events(binary: &str, runtime: &Path, config_home: &Path, name: &str) -
     String::from_utf8(stream.wait_with_output().unwrap().stdout).unwrap()
 }
 
+fn wait_for_event_workflow_jobs(
+    binary: &str,
+    runtime: &Path,
+    config_home: &Path,
+    name: &str,
+) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(9);
+    loop {
+        let events = replay_events(binary, runtime, config_home, name);
+        let jobs = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| {
+                event["name"] == "plugin.job_completed"
+                    && event["payload"]["action"] == "dev.bundle/on-screen"
+            })
+            .filter_map(|event| event["payload"]["job_id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let has_gap = jobs.iter().any(|job_id| {
+            let status = command(binary, runtime, config_home)
+                .args(["plugin", "job", "status", job_id])
+                .output()
+                .unwrap();
+            status.status.success()
+                && serde_json::from_slice::<Value>(&status.stdout).is_ok_and(|status| {
+                    status["trace"]["steps"]
+                        .as_array()
+                        .is_some_and(|steps| steps.iter().any(|step| step["kind"] == "event_gap"))
+                })
+        });
+        if jobs.len() >= 2 && has_gap {
+            return jobs;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "event workflow did not finish a coalesced successor: {events}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn json_command(command: &mut Command) -> Value {
     let output = command.output().unwrap();
     assert_success(&output);
@@ -653,9 +743,13 @@ fn json_command(command: &mut Command) -> Value {
 
 fn write_config(root: &Path) -> PathBuf {
     let shell = root.join("fixture-shell");
+    let marker = root.join("start-workflow-firehose");
     fs::write(
         &shell,
-        b"#!/bin/sh\nprintf 'READY\\n'\nwhile :; do sleep 60; done\n",
+        format!(
+            "#!/bin/sh\nprintf 'READY\\n'\nwhile ! test -f {}; do sleep 0.01; done\ni=0\nwhile test \"$i\" -lt 1000; do printf '\\r%04d' \"$i\"; i=$((i + 1)); sleep 0.003; done\nprintf '\\nWORKFLOW-FLOOD-DONE\\n'\nwhile :; do sleep 60; done\n",
+            serde_json::to_string(marker.to_str().unwrap()).unwrap()
+        ),
     )
     .unwrap();
     fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();

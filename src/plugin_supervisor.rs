@@ -24,6 +24,7 @@ const MAX_SESSION_JOBS: usize = 16;
 const MAX_PLUGIN_JOBS: usize = 4;
 const MAX_RETAINED_JOBS: usize = 200;
 const MAX_RETAINED_LOG_BYTES: usize = 256 * 1024;
+const MAX_PENDING_EVENT_WORKFLOWS_PER_PLUGIN: usize = 128;
 
 #[derive(Clone)]
 pub(crate) struct PluginSupervisor {
@@ -299,6 +300,24 @@ struct Job {
     context: Option<vvmux_plugin_api::InvocationContext>,
     cancel: Arc<AtomicBool>,
     completion: Completion,
+    event_workflow: Option<EventWorkflowDelivery>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EventWorkflowDelivery {
+    workflow_id: String,
+    sequence: u64,
+    gap: Option<(u64, u64)>,
+}
+
+#[derive(Clone)]
+struct PendingEventWorkflow {
+    plugin_id: String,
+    workflow_id: String,
+    sequence: u64,
+    payload: Value,
+    context: vvmux_plugin_api::InvocationContext,
+    gap: Option<(u64, u64)>,
 }
 
 struct WorkflowStepJob {
@@ -533,9 +552,13 @@ struct JobAccounting {
 }
 
 impl JobAccounting {
-    fn admit(&mut self, plugin_id: &str) -> bool {
+    fn can_admit(&self, plugin_id: &str) -> bool {
         let plugin_jobs = self.per_plugin.get(plugin_id).copied().unwrap_or(0);
-        if self.total >= MAX_SESSION_JOBS || plugin_jobs >= MAX_PLUGIN_JOBS {
+        self.total < MAX_SESSION_JOBS && plugin_jobs < MAX_PLUGIN_JOBS
+    }
+
+    fn admit(&mut self, plugin_id: &str) -> bool {
+        if !self.can_admit(plugin_id) {
             return false;
         }
         self.total += 1;
@@ -575,7 +598,7 @@ enum Message {
         logs: crate::plugin::RuntimeLogs,
     },
     WorkflowDeadline(u64),
-    WorkflowWake,
+    WorkerReady(String),
     JobStatus {
         job_id: String,
         reply: AutomationReplyTarget,
@@ -791,6 +814,7 @@ impl PluginSupervisor {
             context: None,
             cancel: Arc::new(AtomicBool::new(false)),
             completion,
+            event_workflow: None,
         };
         self.sender
             .try_send(Message::Invoke(job))
@@ -903,7 +927,10 @@ fn run_manager(inputs: ManagerInputs) {
     let mut reload_loading = false;
     let mut queued_reloads = Vec::<ReloadCompletion>::new();
     let mut event_gaps = HashMap::<String, (u64, u64)>::new();
+    let mut upstream_workflow_gap = None;
     let mut workflows = HashMap::<u64, WorkflowRun>::new();
+    let mut queued_event_workflows = BTreeSet::<(String, String)>::new();
+    let mut pending_event_workflows = BTreeMap::<(String, String), PendingEventWorkflow>::new();
     let mut next_dependency_job_id = 1_u64 << 62;
     let mut next_event_workflow_id = 1_u64 << 63;
     activate_session_plugins(
@@ -914,7 +941,22 @@ fn run_manager(inputs: ManagerInputs) {
         &broker,
         &sender,
     );
-    while let Ok(message) = receiver.recv() {
+    loop {
+        drain_pending_event_workflows(
+            &mut pending_event_workflows,
+            &mut queued_event_workflows,
+            &workflows,
+            &accounting,
+            &registry,
+            &transitions,
+            &sender,
+            &session_name,
+            &session_instance,
+            &mut next_event_workflow_id,
+        );
+        let Ok(message) = receiver.recv() else {
+            break;
+        };
         match message {
             Message::DependencyInvoke {
                 caller,
@@ -962,6 +1004,10 @@ fn run_manager(inputs: ManagerInputs) {
                 }
             }
             Message::Invoke(job) => {
+                if let Some(delivery) = &job.event_workflow {
+                    queued_event_workflows
+                        .remove(&(job.plugin_id.clone(), delivery.workflow_id.clone()));
+                }
                 retained.start(&job);
                 let Some(plugin) = registry.plugins.get(&job.plugin_id).cloned() else {
                     let result = if let Some(error) = registry.failures.get(&job.plugin_id) {
@@ -1017,6 +1063,7 @@ fn run_manager(inputs: ManagerInputs) {
                         continue;
                     }
                     if !accounting.admit(&job.plugin_id) {
+                        restore_pending_event_workflow(&job, &mut pending_event_workflows);
                         let result = Err(io::Error::other("busy: plugin job limit reached"));
                         retained.finish(&job, &result);
                         deliver(&actor, job.completion, result);
@@ -1055,6 +1102,18 @@ fn run_manager(inputs: ManagerInputs) {
                             public_id,
                         },
                     );
+                    let trace = job
+                        .event_workflow
+                        .as_ref()
+                        .and_then(|delivery| delivery.gap)
+                        .map(|(from_sequence, to_sequence)| {
+                            vec![serde_json::json!({
+                                "kind": "event_gap",
+                                "from_sequence": from_sequence,
+                                "to_sequence": to_sequence,
+                            })]
+                        })
+                        .unwrap_or_default();
                     workflows.insert(
                         run_id,
                         WorkflowRun {
@@ -1063,7 +1122,7 @@ fn run_manager(inputs: ManagerInputs) {
                             workflow,
                             outputs: BTreeMap::new(),
                             running: BTreeMap::new(),
-                            trace: Vec::new(),
+                            trace,
                             aggregate_bytes: 0,
                             deadline,
                             failure: None,
@@ -1092,6 +1151,7 @@ fn run_manager(inputs: ManagerInputs) {
                     continue;
                 }
                 if !accounting.admit(&job.plugin_id) {
+                    restore_pending_event_workflow(&job, &mut pending_event_workflows);
                     let result = Err(io::Error::other("busy: plugin job limit reached"));
                     retained.finish(&job, &result);
                     deliver(&actor, job.completion, result);
@@ -1328,7 +1388,14 @@ fn run_manager(inputs: ManagerInputs) {
                     &actor,
                 );
             }
-            Message::WorkflowWake => {
+            Message::WorkerReady(plugin_id) => {
+                flush_plugin_event_gap(
+                    &plugin_id,
+                    &registry,
+                    &mut workers,
+                    &mut event_gaps,
+                    &session_instance,
+                );
                 advance_all_workflows(
                     &mut workflows,
                     &registry,
@@ -1545,6 +1612,7 @@ fn run_manager(inputs: ManagerInputs) {
                     to_sequence,
                 } = &envelope
                 {
+                    merge_gap(&mut upstream_workflow_gap, (*from_sequence, *to_sequence));
                     for plugin in registry.plugins.values().filter(|plugin| {
                         plugin.enabled
                             && !plugin.events.is_empty()
@@ -1681,10 +1749,8 @@ fn run_manager(inputs: ManagerInputs) {
                             .map(|workflow| (plugin.id.clone(), workflow.clone()))
                     })
                     .collect::<Vec<_>>();
+                let has_triggered_workflows = !triggered.is_empty();
                 for (plugin_id, workflow) in triggered {
-                    let id = next_event_workflow_id;
-                    next_event_workflow_id =
-                        next_event_workflow_id.checked_add(1).unwrap_or(1_u64 << 63);
                     let mut workflow_context = context.clone();
                     workflow_context.causation_depth =
                         workflow_context.causation_depth.saturating_add(1);
@@ -1692,24 +1758,20 @@ fn run_manager(inputs: ManagerInputs) {
                         .saturating_add(u128::from(workflow.timeout_ms))
                         .min(u128::from(u64::MAX))
                         as u64;
-                    let public_id = format!("{session_name}/{session_instance}-{id:016x}");
-                    let job = Job {
-                        id,
-                        public_id,
-                        created_ms: now_ms(),
-                        reference: format!("{plugin_id}/{}", workflow.id),
-                        plugin_id: plugin_id.clone(),
-                        input: payload.clone(),
-                        context: Some(workflow_context),
-                        cancel: Arc::new(AtomicBool::new(false)),
-                        completion: Completion::Detached,
-                    };
-                    if sender.try_send(Message::Invoke(job)).is_err() {
-                        event_gaps
-                            .entry(plugin_id)
-                            .and_modify(|gap| gap.1 = sequence)
-                            .or_insert((sequence, sequence));
-                    }
+                    retain_event_workflow_trigger(
+                        &mut pending_event_workflows,
+                        PendingEventWorkflow {
+                            plugin_id,
+                            workflow_id: workflow.id,
+                            sequence,
+                            payload: payload.clone(),
+                            context: workflow_context,
+                            gap: upstream_workflow_gap,
+                        },
+                    );
+                }
+                if has_triggered_workflows {
+                    upstream_workflow_gap = None;
                 }
             }
             Message::RuntimeCrashed {
@@ -1807,6 +1869,216 @@ fn hook_accepts_event(
 ) -> bool {
     context.causation_depth < 8
         && (hook.include_self || !context.source.starts_with(&format!("plugin:{plugin_id}:")))
+}
+
+fn merge_gap(target: &mut Option<(u64, u64)>, incoming: (u64, u64)) {
+    match target {
+        Some((from_sequence, to_sequence)) => {
+            *from_sequence = (*from_sequence).min(incoming.0);
+            *to_sequence = (*to_sequence).max(incoming.1);
+        }
+        None => *target = Some(incoming),
+    }
+}
+
+fn retain_event_workflow_trigger(
+    pending: &mut BTreeMap<(String, String), PendingEventWorkflow>,
+    mut incoming: PendingEventWorkflow,
+) {
+    let key = (incoming.plugin_id.clone(), incoming.workflow_id.clone());
+    if let Some(previous) = pending.remove(&key) {
+        merge_gap(
+            &mut incoming.gap,
+            previous
+                .gap
+                .unwrap_or((previous.sequence, previous.sequence)),
+        );
+        if previous.sequence < incoming.sequence {
+            merge_gap(
+                &mut incoming.gap,
+                (previous.sequence, incoming.sequence.saturating_sub(1)),
+            );
+        }
+    } else if pending
+        .keys()
+        .filter(|(plugin_id, _)| plugin_id == &incoming.plugin_id)
+        .count()
+        >= MAX_PENDING_EVENT_WORKFLOWS_PER_PLUGIN
+    {
+        return;
+    }
+    pending.insert(key, incoming);
+}
+
+fn restore_pending_event_workflow(
+    job: &Job,
+    pending: &mut BTreeMap<(String, String), PendingEventWorkflow>,
+) {
+    let Some(delivery) = &job.event_workflow else {
+        return;
+    };
+    let Some(context) = job.context.clone() else {
+        return;
+    };
+    let key = (job.plugin_id.clone(), delivery.workflow_id.clone());
+    if let Some(existing) = pending.get_mut(&key) {
+        merge_gap(
+            &mut existing.gap,
+            delivery
+                .gap
+                .unwrap_or((delivery.sequence, delivery.sequence)),
+        );
+        if delivery.sequence < existing.sequence {
+            merge_gap(
+                &mut existing.gap,
+                (delivery.sequence, existing.sequence.saturating_sub(1)),
+            );
+        }
+        return;
+    }
+    pending.insert(
+        key,
+        PendingEventWorkflow {
+            plugin_id: job.plugin_id.clone(),
+            workflow_id: delivery.workflow_id.clone(),
+            sequence: delivery.sequence,
+            payload: job.input.clone(),
+            context,
+            gap: delivery.gap,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_pending_event_workflows(
+    pending: &mut BTreeMap<(String, String), PendingEventWorkflow>,
+    queued: &mut BTreeSet<(String, String)>,
+    workflows: &HashMap<u64, WorkflowRun>,
+    accounting: &JobAccounting,
+    registry: &AppliedRegistry,
+    transitions: &BTreeSet<String>,
+    manager: &mpsc::SyncSender<Message>,
+    session_name: &str,
+    session_instance: &str,
+    next_id: &mut u64,
+) {
+    let active = workflows
+        .values()
+        .filter_map(|run| {
+            run.job
+                .event_workflow
+                .as_ref()
+                .map(|delivery| (run.job.plugin_id.clone(), delivery.workflow_id.clone()))
+        })
+        .collect::<BTreeSet<_>>();
+    let candidates = pending
+        .keys()
+        .filter(|key| !queued.contains(*key) && !active.contains(*key))
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in candidates {
+        let Some(trigger) = pending.get(&key).cloned() else {
+            continue;
+        };
+        let Some(plugin) = registry.plugins.get(&trigger.plugin_id) else {
+            pending.remove(&key);
+            continue;
+        };
+        if !plugin.enabled || transitions.contains(&trigger.plugin_id) {
+            pending.remove(&key);
+            continue;
+        }
+        if !plugin
+            .workflows
+            .iter()
+            .any(|workflow| workflow.id == trigger.workflow_id)
+        {
+            pending.remove(&key);
+            continue;
+        }
+        if !accounting.can_admit(&trigger.plugin_id) {
+            continue;
+        }
+        let id = *next_id;
+        let job = Job {
+            id,
+            public_id: format!("{session_name}/{session_instance}-{id:016x}"),
+            created_ms: now_ms(),
+            plugin_id: trigger.plugin_id.clone(),
+            reference: format!("{}/{}", trigger.plugin_id, trigger.workflow_id),
+            input: trigger.payload,
+            context: Some(trigger.context),
+            cancel: Arc::new(AtomicBool::new(false)),
+            completion: Completion::Detached,
+            event_workflow: Some(EventWorkflowDelivery {
+                workflow_id: trigger.workflow_id,
+                sequence: trigger.sequence,
+                gap: trigger.gap,
+            }),
+        };
+        match manager.try_send(Message::Invoke(job)) {
+            Ok(()) => {
+                pending.remove(&key);
+                queued.insert(key);
+                *next_id = next_id.checked_add(1).unwrap_or(1_u64 << 63);
+            }
+            Err(mpsc::TrySendError::Full(Message::Invoke(_))) => break,
+            Err(mpsc::TrySendError::Disconnected(Message::Invoke(_))) => break,
+            Err(_) => unreachable!("event workflows queue only invocation jobs"),
+        }
+    }
+}
+
+fn flush_plugin_event_gap(
+    plugin_id: &str,
+    registry: &AppliedRegistry,
+    workers: &mut HashMap<String, WorkerHandle>,
+    event_gaps: &mut HashMap<String, (u64, u64)>,
+    session_instance: &str,
+) {
+    let Some(&(from_sequence, to_sequence)) = event_gaps.get(plugin_id) else {
+        return;
+    };
+    let Some(plugin) = registry.plugins.get(plugin_id) else {
+        event_gaps.remove(plugin_id);
+        return;
+    };
+    let Some(hook) = plugin.events.first().cloned() else {
+        return;
+    };
+    let Some(worker) = workers.get(plugin_id) else {
+        return;
+    };
+    let correlation_id = format!("{session_instance}-event-gap-{to_sequence:016x}");
+    let event = Event {
+        request_id: 0,
+        sequence: to_sequence,
+        name: "vvmux.event_gap".into(),
+        payload: serde_json::json!({
+            "from_sequence": from_sequence,
+            "to_sequence": to_sequence,
+        }),
+        context: vvmux_plugin_api::InvocationContext {
+            correlation_id: correlation_id.clone(),
+            causation_id: correlation_id,
+            causation_depth: 0,
+            source: "session".into(),
+            session_instance: session_instance.to_owned(),
+            pane_id: None,
+            tab_id: None,
+            deadline_unix_ms: now_ms()
+                .saturating_add(u128::from(hook.timeout_ms))
+                .min(u128::from(u64::MAX)) as u64,
+        },
+    };
+    if worker
+        .sender
+        .try_send(WorkerMessage::Event { hook, event })
+        .is_ok()
+    {
+        event_gaps.remove(plugin_id);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1933,6 +2205,7 @@ fn resolve_dependency_invocation(
             }),
             cancel: Arc::new(AtomicBool::new(false)),
             completion: Completion::Broker(reply.clone()),
+            event_workflow: None,
         })
     })();
     result.map_err(|error| (reply, error))
@@ -2011,7 +2284,7 @@ fn spawn_worker(
                                 context: Some(context),
                             });
                         }
-                        let _ = manager.try_send(Message::WorkflowWake);
+                        let _ = manager.try_send(Message::WorkerReady(plugin_id.clone()));
                     }
                     WorkerMessage::Shutdown => break,
                 }
@@ -2821,6 +3094,60 @@ mod tests {
     }
 
     #[test]
+    fn event_workflow_firehose_retains_one_latest_trigger_with_a_gap() {
+        let mut pending = BTreeMap::new();
+        for sequence in [10, 11, 14] {
+            retain_event_workflow_trigger(
+                &mut pending,
+                pending_event_workflow("dev.bundle", "refresh", sequence),
+            );
+        }
+
+        assert_eq!(pending.len(), 1);
+        let retained = &pending[&("dev.bundle".into(), "refresh".into())];
+        assert_eq!(retained.sequence, 14);
+        assert_eq!(retained.payload, serde_json::json!({"sequence": 14}));
+        assert_eq!(retained.gap, Some((10, 13)));
+    }
+
+    #[test]
+    fn pending_event_workflow_memory_is_bounded_per_plugin() {
+        let mut pending = BTreeMap::new();
+        for index in 0..(MAX_PENDING_EVENT_WORKFLOWS_PER_PLUGIN + 32) {
+            retain_event_workflow_trigger(
+                &mut pending,
+                pending_event_workflow("dev.bundle", &format!("workflow-{index}"), index as u64),
+            );
+        }
+
+        assert_eq!(pending.len(), MAX_PENDING_EVENT_WORKFLOWS_PER_PLUGIN);
+    }
+
+    fn pending_event_workflow(
+        plugin_id: &str,
+        workflow_id: &str,
+        sequence: u64,
+    ) -> PendingEventWorkflow {
+        PendingEventWorkflow {
+            plugin_id: plugin_id.into(),
+            workflow_id: workflow_id.into(),
+            sequence,
+            payload: serde_json::json!({"sequence": sequence}),
+            context: vvmux_plugin_api::InvocationContext {
+                correlation_id: format!("correlation-{sequence}"),
+                causation_id: "cause".into(),
+                causation_depth: 1,
+                source: "session".into(),
+                session_instance: "session-a".into(),
+                pane_id: Some(1),
+                tab_id: Some(1),
+                deadline_unix_ms: u64::MAX,
+            },
+            gap: None,
+        }
+    }
+
+    #[test]
     fn retained_logs_are_utf8_safe_and_bounded() {
         let value = "é".repeat(MAX_RETAINED_LOG_BYTES);
         let (truncated, was_truncated) = truncate_log(value, MAX_RETAINED_LOG_BYTES);
@@ -2843,6 +3170,7 @@ mod tests {
                 context: None,
                 cancel: Arc::new(AtomicBool::new(false)),
                 completion: Completion::Detached,
+                event_workflow: None,
             };
             store.start(&job);
             store.finish(&job, &Ok(serde_json::json!({"id": id})));

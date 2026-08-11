@@ -65,6 +65,7 @@ const AUTOMATION_RESPONSE_QUEUE: usize = 8;
 const SCREEN_CHANGE_HISTORY: usize = 1024;
 const EXIT_TOMBSTONES: usize = 128;
 const PLUGIN_EVENT_JOURNAL: usize = 1024;
+const PLUGIN_EVENT_JOURNAL_BYTES: usize = 2 * 1024 * 1024;
 const PLUGIN_EVENT_SUBSCRIPTIONS: usize = 16;
 const PLUGIN_EVENT_STREAM_QUEUE: usize = 64;
 const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -210,6 +211,84 @@ struct PluginEventSubscription {
 enum PluginStreamMessage {
     Response(AutomationResponse),
     Event(PluginEventEnvelope),
+}
+
+#[derive(Default)]
+struct PluginEventJournal {
+    entries: VecDeque<(PluginEventEnvelope, usize)>,
+    bytes: usize,
+}
+
+impl PluginEventJournal {
+    fn push(&mut self, envelope: PluginEventEnvelope) {
+        let size =
+            serde_json::to_vec(&envelope).map_or(PLUGIN_EVENT_JOURNAL_BYTES + 1, |body| body.len());
+        if size > PLUGIN_EVENT_JOURNAL_BYTES {
+            self.entries.clear();
+            self.bytes = 0;
+            return;
+        }
+        self.entries.push_back((envelope, size));
+        self.bytes = self.bytes.saturating_add(size);
+        while self.entries.len() > PLUGIN_EVENT_JOURNAL || self.bytes > PLUGIN_EVENT_JOURNAL_BYTES {
+            if let Some((_, removed)) = self.entries.pop_front() {
+                self.bytes = self.bytes.saturating_sub(removed);
+            }
+        }
+    }
+
+    fn replay(&self, after: u64, latest: u64, capacity: usize) -> Vec<PluginEventEnvelope> {
+        if capacity == 0 || after >= latest {
+            return Vec::new();
+        }
+        if capacity == 1 {
+            return vec![PluginEventEnvelope::Gap {
+                from_sequence: after.saturating_add(1),
+                to_sequence: latest,
+            }];
+        }
+        let eligible = self
+            .entries
+            .iter()
+            .filter(|(envelope, _)| {
+                event_sequence(envelope).is_some_and(|sequence| sequence > after)
+            })
+            .map(|(envelope, _)| envelope)
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            return vec![PluginEventEnvelope::Gap {
+                from_sequence: after.saturating_add(1),
+                to_sequence: latest,
+            }];
+        }
+        let first_available = event_sequence(eligible[0]).unwrap();
+        let retention_gap = after.saturating_add(1) < first_available;
+        let event_capacity = if retention_gap || eligible.len() > capacity {
+            capacity.saturating_sub(1)
+        } else {
+            capacity
+        };
+        let start = eligible.len().saturating_sub(event_capacity);
+        let first_sent = eligible
+            .get(start)
+            .and_then(|envelope| event_sequence(envelope));
+        let mut replay = Vec::with_capacity(capacity);
+        if let Some(first_sent) = first_sent
+            && after.saturating_add(1) < first_sent
+        {
+            replay.push(PluginEventEnvelope::Gap {
+                from_sequence: after.saturating_add(1),
+                to_sequence: first_sent.saturating_sub(1),
+            });
+        }
+        replay.extend(eligible.into_iter().skip(start).cloned());
+        replay
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 type PendingPluginStateEvent = (
@@ -945,7 +1024,7 @@ struct SessionActor {
     pending_actor_work: HashSet<(u64, u64)>,
     plugin_supervisor: Option<crate::plugin_supervisor::PluginSupervisor>,
     plugin_event_sequence: u64,
-    plugin_event_journal: VecDeque<PluginEventEnvelope>,
+    plugin_event_journal: PluginEventJournal,
     pending_plugin_state_events: BTreeMap<(String, String), PendingPluginStateEvent>,
     plugin_event_subscriptions: HashMap<String, PluginEventSubscription>,
     next_plugin_subscription: u64,
@@ -1134,7 +1213,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         pending_actor_work: HashSet::new(),
         plugin_supervisor,
         plugin_event_sequence: 0,
-        plugin_event_journal: VecDeque::new(),
+        plugin_event_journal: PluginEventJournal::default(),
         pending_plugin_state_events: BTreeMap::new(),
         plugin_event_subscriptions: HashMap::new(),
         next_plugin_subscription: 1,
@@ -2848,19 +2927,13 @@ impl SessionActor {
             return;
         }
         if let Some(after) = after_sequence {
-            if let Some(first) = self.plugin_event_journal.front().and_then(event_sequence)
-                && after.saturating_add(1) < first
-            {
-                let _ = sender.try_send(PluginStreamMessage::Event(PluginEventEnvelope::Gap {
-                    from_sequence: after.saturating_add(1),
-                    to_sequence: first.saturating_sub(1),
-                }));
-            }
-            for envelope in self.plugin_event_journal.iter().filter(|envelope| {
-                event_sequence(envelope).is_some_and(|sequence| sequence > after)
-            }) {
+            for envelope in self.plugin_event_journal.replay(
+                after,
+                self.plugin_event_sequence,
+                PLUGIN_EVENT_STREAM_QUEUE.saturating_sub(1),
+            ) {
                 if sender
-                    .try_send(PluginStreamMessage::Event(envelope.clone()))
+                    .try_send(PluginStreamMessage::Event(envelope))
                     .is_err()
                 {
                     target.cancel.cancel();
@@ -2937,10 +3010,7 @@ impl SessionActor {
             payload,
             context,
         };
-        self.plugin_event_journal.push_back(envelope.clone());
-        while self.plugin_event_journal.len() > PLUGIN_EVENT_JOURNAL {
-            self.plugin_event_journal.pop_front();
-        }
+        self.plugin_event_journal.push(envelope.clone());
         self.plugin_event_subscriptions.retain(|_, subscription| {
             let sent = subscription
                 .sender
@@ -8914,6 +8984,61 @@ mod tests {
             media_receiver.try_recv().is_ok(),
             "the test must leave media queued rather than accidentally exercising exhaustion"
         );
+    }
+
+    #[test]
+    fn plugin_event_replay_is_capacity_bounded_and_reports_direct_eviction_gap() {
+        let mut journal = PluginEventJournal::default();
+        for sequence in 1..=1_100 {
+            journal.push(test_plugin_event(sequence, 8));
+        }
+
+        let replay = journal.replay(0, 1_100, 63);
+        assert_eq!(replay.len(), 63);
+        assert_eq!(
+            replay.first(),
+            Some(&PluginEventEnvelope::Gap {
+                from_sequence: 1,
+                to_sequence: 1_038,
+            })
+        );
+        assert_eq!(event_sequence(replay.last().unwrap()), Some(1_100));
+    }
+
+    #[test]
+    fn plugin_event_journal_stays_within_entry_and_byte_limits_under_firehose() {
+        let mut journal = PluginEventJournal::default();
+        for sequence in 1..=4_096 {
+            journal.push(test_plugin_event(sequence, 8 * 1024));
+        }
+
+        assert!(journal.len() <= PLUGIN_EVENT_JOURNAL);
+        assert!(journal.bytes <= PLUGIN_EVENT_JOURNAL_BYTES);
+        let replay = journal.replay(0, 4_096, 63);
+        assert!(replay.len() <= 63);
+        assert!(matches!(
+            replay.first(),
+            Some(PluginEventEnvelope::Gap { .. })
+        ));
+        assert_eq!(event_sequence(replay.last().unwrap()), Some(4_096));
+    }
+
+    fn test_plugin_event(sequence: u64, payload_bytes: usize) -> PluginEventEnvelope {
+        PluginEventEnvelope::Event {
+            sequence,
+            name: "pane.screen_changed".into(),
+            payload: serde_json::json!({"padding": "x".repeat(payload_bytes)}),
+            context: vvmux_plugin_api::InvocationContext {
+                correlation_id: format!("correlation-{sequence}"),
+                causation_id: format!("cause-{sequence}"),
+                causation_depth: 0,
+                source: "session".into(),
+                session_instance: "session-a".into(),
+                pane_id: Some(1),
+                tab_id: Some(1),
+                deadline_unix_ms: 0,
+            },
+        }
     }
 
     #[test]
