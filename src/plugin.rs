@@ -116,10 +116,12 @@ pub enum PluginJobCommand {
     Logs { job_id: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Registry {
     schema: u16,
+    #[serde(default)]
+    generation: u64,
     #[serde(default)]
     plugins: BTreeMap<String, RegistryEntry>,
 }
@@ -128,12 +130,13 @@ impl Default for Registry {
     fn default() -> Self {
         Self {
             schema: REGISTRY_SCHEMA,
+            generation: 0,
             plugins: BTreeMap::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RegistryEntry {
     id: String,
@@ -175,10 +178,26 @@ struct PluginPaths {
     lock: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimePlugin {
+    pub(crate) id: String,
+    pub(crate) root: PathBuf,
+    pub(crate) digest: String,
+    pub(crate) manifest_digest: String,
+    pub(crate) enabled: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct RegistryCandidate {
+    pub(crate) generation: u64,
+    pub(crate) plugins: BTreeMap<String, RuntimePlugin>,
+    pub(crate) failed: BTreeMap<String, String>,
+}
+
 pub fn run(command: PluginCommand) -> io::Result<()> {
     let paths = PluginPaths::new()?;
     match command {
-        PluginCommand::Link { path, yes } => install_local(&paths, &path, true, yes, None),
+        PluginCommand::Link { path, yes } => install_local(&paths, &path, true, yes, None, None),
         PluginCommand::Install {
             source,
             git_ref,
@@ -187,7 +206,7 @@ pub fn run(command: PluginCommand) -> io::Result<()> {
             if source.starts_with("https://") {
                 install_git(&paths, &source, git_ref.as_deref(), yes)
             } else {
-                install_local(&paths, Path::new(&source), false, yes, None)
+                install_local(&paths, Path::new(&source), false, yes, None, None)
             }
         }
         PluginCommand::Update { id, git_ref, yes } => update(&paths, &id, git_ref.as_deref(), yes),
@@ -227,6 +246,74 @@ impl PluginPaths {
         let digest = Sha256::digest(id.as_bytes());
         self.packages.join(format!("p-{}", hex(&digest[..16])))
     }
+
+    fn package_version(&self, id: &str, artifact_digest: &str) -> PathBuf {
+        self.packages.join(format!(
+            "{}-{}",
+            self.package(id).file_name().unwrap().to_string_lossy(),
+            &artifact_digest[..16]
+        ))
+    }
+}
+
+pub(crate) fn registry_path() -> io::Result<PathBuf> {
+    Ok(PluginPaths::new()?.registry)
+}
+
+pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
+    let paths = PluginPaths::new()?;
+    let registry = load_registry(&paths)?;
+    let mut plugins = BTreeMap::new();
+    let mut failed = BTreeMap::new();
+    for entry in registry.plugins.values() {
+        if !entry.enabled {
+            plugins.insert(
+                entry.id.clone(),
+                RuntimePlugin {
+                    id: entry.id.clone(),
+                    root: entry.root.clone(),
+                    digest: entry.digest.clone(),
+                    manifest_digest: entry.manifest_digest.clone(),
+                    enabled: false,
+                },
+            );
+            continue;
+        }
+        let validated = (|| {
+            let loaded = load_package(&entry.root)?;
+            if loaded.manifest.plugin.id != entry.id {
+                return Err(invalid("manifest ID differs from registry ID"));
+            }
+            let actual_digest = digest_tree(&entry.root)?;
+            if !entry.linked && actual_digest != entry.digest {
+                return Err(invalid("installed package digest differs from registry"));
+            }
+            let actual_manifest = digest_file(&entry.root.join("vvmux-plugin.toml"))?;
+            if !entry.linked && actual_manifest != entry.manifest_digest {
+                return Err(invalid("installed manifest digest differs from registry"));
+            }
+            Ok(RuntimePlugin {
+                id: entry.id.clone(),
+                root: entry.root.clone(),
+                digest: actual_digest,
+                manifest_digest: actual_manifest,
+                enabled: true,
+            })
+        })();
+        match validated {
+            Ok(plugin) => {
+                plugins.insert(entry.id.clone(), plugin);
+            }
+            Err(error) => {
+                failed.insert(entry.id.clone(), error.to_string());
+            }
+        }
+    }
+    Ok(RegistryCandidate {
+        generation: registry.generation,
+        plugins,
+        failed,
+    })
 }
 
 fn load_registry(paths: &PluginPaths) -> io::Result<Registry> {
@@ -251,8 +338,12 @@ fn load_registry(paths: &PluginPaths) -> io::Result<Registry> {
     Ok(registry)
 }
 
-fn save_registry(paths: &PluginPaths, registry: &Registry) -> io::Result<()> {
+fn save_registry(paths: &PluginPaths, registry: &mut Registry) -> io::Result<()> {
     paths.ensure()?;
+    registry.generation = registry
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| invalid("plugin registry generation exhausted"))?;
     let bytes = serde_json::to_vec_pretty(registry).map_err(io::Error::other)?;
     let temporary = paths
         .registry
@@ -269,12 +360,84 @@ fn save_registry(paths: &PluginPaths, registry: &Registry) -> io::Result<()> {
     Ok(())
 }
 
+fn commit_registry(
+    paths: &PluginPaths,
+    previous: &Registry,
+    next: &mut Registry,
+) -> io::Result<()> {
+    commit_registry_with_reload(paths, previous, next, reload_live_sessions)
+}
+
+fn commit_registry_with_reload(
+    paths: &PluginPaths,
+    previous: &Registry,
+    next: &mut Registry,
+    mut reload: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    let current = load_registry(paths)?;
+    if current.generation != previous.generation || current.plugins != previous.plugins {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "plugin registry changed concurrently; retry the operation",
+        ));
+    }
+    save_registry(paths, next)?;
+    if let Err(apply_error) = reload() {
+        let mut rollback = previous.clone();
+        rollback.generation = next.generation;
+        save_registry(paths, &mut rollback)?;
+        if let Err(rollback_error) = reload() {
+            return Err(io::Error::other(format!(
+                "live plugin reload failed ({apply_error}); rollback generation {} was published but session acknowledgement failed: {rollback_error}",
+                rollback.generation
+            )));
+        }
+        return Err(io::Error::other(format!(
+            "live plugin reload failed; registry rolled back at generation {}: {apply_error}",
+            rollback.generation
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn reload_live_sessions() -> io::Result<()> {
+    let mut failures = Vec::new();
+    for session in crate::runtime::list_registries()? {
+        match plugin_session_request(&session.name, crate::ipc::PluginMethod::Reload) {
+            Ok(report) => {
+                if let Some(failed) = report["failed"].as_object()
+                    && !failed.is_empty()
+                {
+                    failures.push(format!(
+                        "{} rejected entries: {}",
+                        session.name,
+                        serde_json::to_string(failed).unwrap_or_else(|_| "invalid report".into())
+                    ));
+                }
+            }
+            Err(error) => failures.push(format!("{}: {error}", session.name)),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(failures.join("; ")))
+    }
+}
+
+#[cfg(test)]
+fn reload_live_sessions() -> io::Result<()> {
+    Ok(())
+}
+
 fn install_local(
     paths: &PluginPaths,
     source: &Path,
     linked: bool,
     yes: bool,
     recorded_source: Option<String>,
+    recorded_commit: Option<String>,
 ) -> io::Result<()> {
     let source = fs::canonicalize(source)?;
     let loaded = load_package(&source)?;
@@ -304,7 +467,8 @@ fn install_local(
 
     let id = loaded.manifest.plugin.id.clone();
     let manifest_before = digest_file(&source.join("vvmux-plugin.toml"))?;
-    let mut registry = load_registry(paths)?;
+    let previous_registry = load_registry(paths)?;
+    let mut registry = previous_registry.clone();
     registry.plugins.insert(
         id.clone(),
         entry_for(
@@ -313,17 +477,16 @@ fn install_local(
             recorded_source
                 .clone()
                 .unwrap_or_else(|| source.to_string_lossy().into_owned()),
-            None,
+            recorded_commit.clone(),
             digest_tree(&source)?,
             manifest_before.clone(),
             true,
         ),
     );
     validate_dependency_graph(&registry)?;
-    let (root, digest, backup) = if linked {
-        (source.clone(), digest_tree(&source)?, None)
+    let (root, digest, installed_new) = if linked {
+        (source.clone(), digest_tree(&source)?, false)
     } else {
-        let destination = paths.package(&id);
         let staging = paths.packages.join(format!(
             ".staging-{}-{}",
             std::process::id(),
@@ -343,31 +506,44 @@ fn install_local(
             return Err(invalid("manifest changed while the package was staged"));
         }
         let digest = digest_tree(&staging)?;
-        let backup = atomic_package_swap(&destination, &staging)?;
-        (destination, digest, backup)
+        let destination = paths.package_version(&id, &digest);
+        let installed_new = if destination.exists() {
+            if digest_tree(&destination)? != digest {
+                remove_known_tree(&paths.packages, &staging)?;
+                return Err(invalid("installed version path has an unexpected digest"));
+            }
+            remove_known_tree(&paths.packages, &staging)?;
+            false
+        } else {
+            let backup = atomic_package_swap(&destination, &staging)?;
+            debug_assert!(backup.is_none());
+            true
+        };
+        (destination, digest, installed_new)
     };
 
     let entry = entry_for(
         &loaded,
         root.clone(),
         recorded_source.unwrap_or_else(|| source.to_string_lossy().into_owned()),
-        None,
+        recorded_commit,
         digest,
         manifest_before,
         linked,
     );
     registry.plugins.insert(id.clone(), entry);
-    if let Err(error) = save_registry(paths, &registry) {
-        if !linked {
+    if let Err(error) = commit_registry(paths, &previous_registry, &mut registry) {
+        if !linked && installed_new {
             let _ = remove_known_tree(&paths.packages, &root);
-            if let Some(backup) = &backup {
-                let _ = fs::rename(backup, &root);
-            }
         }
         return Err(error);
     }
-    if let Some(backup) = backup {
-        remove_known_tree(&paths.packages, &backup)?;
+    if let Some(previous) = previous_registry.plugins.get(&id)
+        && !previous.linked
+        && previous.root != root
+        && previous.root.exists()
+    {
+        remove_known_tree(&paths.packages, &previous.root)?;
     }
     println!(
         "{} plugin {id}",
@@ -420,19 +596,15 @@ fn install_git(
         return Err(io::Error::other("git rev-parse failed"));
     }
     let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let result = install_local(paths, &checkout, false, yes, Some(source.to_owned()));
+    let result = install_local(
+        paths,
+        &checkout,
+        false,
+        yes,
+        Some(source.to_owned()),
+        Some(commit),
+    );
     let _ = remove_known_tree(&paths.packages, &checkout);
-    if result.is_ok() {
-        let mut registry = load_registry(paths)?;
-        if let Some(entry) = registry
-            .plugins
-            .values_mut()
-            .find(|entry| entry.source == source)
-        {
-            entry.commit = Some(commit);
-        }
-        save_registry(paths, &registry)?;
-    }
     result
 }
 
@@ -452,14 +624,16 @@ fn update(paths: &PluginPaths, id: &str, git_ref: Option<&str>, yes: bool) -> io
             entry.linked,
             yes,
             Some(entry.source.clone()),
+            entry.commit.clone(),
         )
     }
 }
 
 fn uninstall(paths: &PluginPaths, id: &str) -> io::Result<()> {
-    let mut registry = load_registry(paths)?;
+    let previous = load_registry(paths)?;
+    let mut registry = previous.clone();
     let entry = registry.plugins.remove(id).ok_or_else(|| not_found(id))?;
-    save_registry(paths, &registry)?;
+    commit_registry(paths, &previous, &mut registry)?;
     if !entry.linked && entry.root.exists() {
         remove_known_tree(&paths.packages, &entry.root)?;
     }
@@ -468,10 +642,11 @@ fn uninstall(paths: &PluginPaths, id: &str) -> io::Result<()> {
 }
 
 fn set_enabled(paths: &PluginPaths, id: &str, enabled: bool) -> io::Result<()> {
-    let mut registry = load_registry(paths)?;
+    let previous = load_registry(paths)?;
+    let mut registry = previous.clone();
     let entry = registry.plugins.get_mut(id).ok_or_else(|| not_found(id))?;
     entry.enabled = enabled;
-    save_registry(paths, &registry)?;
+    commit_registry(paths, &previous, &mut registry)?;
     println!(
         "{} plugin {id}",
         if enabled { "enabled" } else { "disabled" }
@@ -813,12 +988,12 @@ fn invoke_reference(
 }
 
 pub(crate) struct SessionPluginRuntime {
-    paths: PluginPaths,
     session_name: String,
     session_instance: String,
-    plugin_id: String,
+    plugin: RuntimePlugin,
+    loaded: LoadedManifest,
     broker: crate::plugin_supervisor::HostBroker,
-    service: Option<(String, NativeService)>,
+    service: Option<NativeService>,
     consecutive_crashes: u32,
     retry_at: Option<Instant>,
 }
@@ -827,14 +1002,21 @@ impl SessionPluginRuntime {
     pub(crate) fn new(
         session_name: String,
         session_instance: String,
-        plugin_id: String,
+        plugin: RuntimePlugin,
         broker: crate::plugin_supervisor::HostBroker,
     ) -> io::Result<Self> {
+        if !plugin.enabled {
+            return Err(invalid("plugin_disabled: plugin is disabled"));
+        }
+        let loaded = load_package(&plugin.root)?;
+        if loaded.manifest.plugin.id != plugin.id {
+            return Err(invalid("scope_denied: plugin manifest identity mismatch"));
+        }
         Ok(Self {
-            paths: PluginPaths::new()?,
             session_name,
             session_instance,
-            plugin_id,
+            plugin,
+            loaded,
             broker,
             service: None,
             consecutive_crashes: 0,
@@ -854,31 +1036,22 @@ impl SessionPluginRuntime {
         let (plugin_id, action_id) = reference
             .split_once('/')
             .ok_or_else(|| invalid("action_not_found: plugin reference must be ID/ACTION"))?;
-        if plugin_id != self.plugin_id {
+        if plugin_id != self.plugin.id {
             return Err(invalid("scope_denied: plugin worker identity mismatch"));
         }
         crate::runtime::validate_session_name(&self.session_name)?;
-        let registry = load_registry(&self.paths)?;
-        let entry = registry
-            .plugins
-            .get(plugin_id)
-            .ok_or_else(|| not_found(plugin_id))?;
-        if !entry.enabled {
-            self.service.take();
-            return Err(invalid("plugin_disabled: plugin is disabled"));
-        }
-        let loaded = load_package(&entry.root)?;
-        let action = loaded
+        let action = self
+            .loaded
             .action(action_id)
             .cloned()
             .ok_or_else(|| invalid("action_not_found: action does not exist"))?;
-        loaded
+        self.loaded
             .validate_input(&action, &input)
             .map_err(|errors| invalid(format!("schema_invalid: {}", errors.join("; "))))?;
         let timeout = Duration::from_millis(action.timeout_ms);
         let output = if let Some(argv) = action.command.as_deref() {
             run_one_shot(
-                &loaded.root,
+                &self.loaded.root,
                 argv,
                 &input,
                 timeout,
@@ -888,12 +1061,13 @@ impl SessionPluginRuntime {
                     cancel: Some(cancel),
                     session_instance: Some(&self.session_instance),
                     broker: Some(&self.broker),
-                    permissions: &loaded.manifest.plugin.permissions,
+                    permissions: &self.loaded.manifest.plugin.permissions,
                 },
             )?
-        } else if let (Some(handler), Some(runtime)) =
-            (action.handler.as_deref(), loaded.manifest.runtime.as_ref())
-        {
+        } else if let (Some(handler), Some(runtime)) = (
+            action.handler.as_deref(),
+            self.loaded.manifest.runtime.as_ref(),
+        ) {
             match runtime.kind {
                 RuntimeKind::Process => {
                     if self
@@ -904,17 +1078,9 @@ impl SessionPluginRuntime {
                             "runtime_unavailable: native plugin is in crash backoff",
                         ));
                     }
-                    let artifact_key = format!("{}:{}", entry.digest, entry.manifest_digest);
-                    if self
-                        .service
-                        .as_ref()
-                        .is_some_and(|(key, _)| key != &artifact_key)
-                    {
-                        self.service.take();
-                    }
                     if self.service.is_none() {
                         match NativeService::start(
-                            &loaded.root,
+                            &self.loaded.root,
                             runtime.command.as_deref().unwrap(),
                             timeout,
                             NativeServiceContext {
@@ -922,24 +1088,24 @@ impl SessionPluginRuntime {
                                 session: Some(&self.session_name),
                                 session_instance: &self.session_instance,
                                 broker: Some(&self.broker),
-                                permissions: &loaded.manifest.plugin.permissions,
+                                permissions: &self.loaded.manifest.plugin.permissions,
                             },
                         ) {
-                            Ok(service) => self.service = Some((artifact_key, service)),
+                            Ok(service) => self.service = Some(service),
                             Err(error) => {
                                 self.note_crash();
                                 return Err(error);
                             }
                         }
                     }
-                    let result = self.service.as_mut().unwrap().1.invoke(
+                    let result = self.service.as_mut().unwrap().invoke(
                         handler,
                         input,
                         timeout,
                         &self.session_instance,
                         Some(cancel),
                     );
-                    if self.service.as_ref().unwrap().1.healthy {
+                    if self.service.as_ref().unwrap().healthy {
                         self.consecutive_crashes = 0;
                         self.retry_at = None;
                     } else {
@@ -959,7 +1125,7 @@ impl SessionPluginRuntime {
                 "runtime_unavailable: action has no executable runtime",
             ));
         };
-        loaded
+        self.loaded
             .validate_output(&action, &output)
             .map_err(|errors| invalid(format!("output_invalid: {}", errors.join("; "))))?;
         Ok(output)
@@ -1945,6 +2111,14 @@ agent_visible = true
             name.bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         );
+        let version = paths.package_version("dev.one", &"a".repeat(64));
+        assert!(
+            version
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(&"a".repeat(16))
+        );
     }
 
     #[test]
@@ -2028,7 +2202,7 @@ agent_visible = true
             lock: root.join("vvmux-plugin.lock"),
             root,
         };
-        install_local(&paths, &source, false, true, None).unwrap();
+        install_local(&paths, &source, false, true, None, None).unwrap();
         let registry = load_registry(&paths).unwrap();
         let entry = &registry.plugins["dev.example"];
         assert!(entry.enabled);
@@ -2036,5 +2210,56 @@ agent_visible = true
         assert_eq!(digest_tree(&entry.root).unwrap(), entry.digest);
         resolve(&paths, false).unwrap();
         assert!(paths.lock.is_file());
+    }
+
+    #[test]
+    fn failed_live_reload_publishes_a_new_rollback_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("config/plugins");
+        let paths = PluginPaths {
+            registry: root.join("registry.json"),
+            packages: root.join("packages"),
+            lock: root.join("vvmux-plugin.lock"),
+            root,
+        };
+        let previous = Registry::default();
+        let mut next = previous.clone();
+        next.plugins.insert(
+            "dev.example".into(),
+            RegistryEntry {
+                id: "dev.example".into(),
+                version: "1.0.0".into(),
+                root: paths.packages.join("p-example"),
+                source: "test".into(),
+                commit: None,
+                digest: "a".repeat(64),
+                manifest_digest: "b".repeat(64),
+                enabled: true,
+                linked: false,
+                runtime_tier: "trusted_native".into(),
+                permissions: Vec::new(),
+            },
+        );
+        let mut reloads = 0;
+        let error = commit_registry_with_reload(&paths, &previous, &mut next, || {
+            reloads += 1;
+            if reloads == 1 {
+                let published = load_registry(&paths).unwrap();
+                assert_eq!(published.generation, 1);
+                assert!(published.plugins.contains_key("dev.example"));
+                Err(io::Error::other("session rejected generation"))
+            } else {
+                let restored = load_registry(&paths).unwrap();
+                assert_eq!(restored.generation, 2);
+                assert!(restored.plugins.is_empty());
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("rolled back at generation 2"));
+        let restored = load_registry(&paths).unwrap();
+        assert_eq!(restored.generation, 2);
+        assert!(restored.plugins.is_empty());
+        assert_eq!(reloads, 2);
     }
 }

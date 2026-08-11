@@ -100,6 +100,9 @@ pub enum ActorEvent {
         call: vvmux_plugin_api::HostCall,
         reply: mpsc::SyncSender<Result<serde_json::Value, AutomationError>>,
     },
+    PluginReloaded {
+        result: Result<serde_json::Value, AutomationError>,
+    },
     /// A media event is waiting on the dedicated media receiver.
     ///
     /// Carries no payload: it exists only to wake the actor promptly. Losing one to a full queue
@@ -110,6 +113,8 @@ pub enum ActorEvent {
     /// Carries no payload: the actor re-reads the file itself, so the watcher, SIGUSR1, and
     /// `msg reload-config` all converge on one parse-validate-apply path.
     ConfigChanged,
+    /// The global plugin registry settled on a new atomic generation.
+    PluginsChanged,
     /// Foreground process identity changes discovered by the bounded agent worker.
     AgentProcesses(Vec<ProcessUpdate>),
 }
@@ -780,6 +785,8 @@ struct SessionActor {
     /// Coalesces config-change wakes from the watcher thread, as `media_projection_pending` does
     /// for media: one queued wake the actor has not yet observed makes another redundant.
     config_reload_pending: Arc<AtomicBool>,
+    /// Coalesces global plugin-registry watcher wakes until the actor submits one reload.
+    plugin_reload_pending: Arc<AtomicBool>,
     /// Latest foreground-bridge counter report. Diagnostic only; retained across a detach so
     /// `inspect-media` still describes the last live bridge.
     bridge_metrics: crate::metrics::BridgeMetrics,
@@ -837,6 +844,13 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
             config_reload_pending.clone(),
         )?;
     }
+    let plugin_reload_pending = Arc::new(AtomicBool::new(false));
+    crate::config_watch::spawn_plugin_registry(
+        crate::plugin::registry_path()?,
+        sender.clone(),
+        shutdown.clone(),
+        plugin_reload_pending.clone(),
+    )?;
     let (response_sender, response_receiver) =
         mpsc::sync_channel::<AutomationResponseJob>(AUTOMATION_RESPONSE_QUEUE);
     let response_receiver = Arc::new(std::sync::Mutex::new(response_receiver));
@@ -932,6 +946,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         vivid,
         media_projection_pending,
         config_reload_pending,
+        plugin_reload_pending,
         bridge_metrics: crate::metrics::BridgeMetrics::default(),
         client_ipc: None,
     };
@@ -1260,6 +1275,21 @@ impl SessionActor {
                 let result = self.handle_plugin_host_call(&scope, &call.method, call.params);
                 let _ = reply.try_send(result);
             }
+            ActorEvent::PluginReloaded { result } => match result {
+                Ok(report)
+                    if report["failed"]
+                        .as_object()
+                        .is_some_and(|failed| !failed.is_empty()) =>
+                {
+                    self.status(
+                        "plugin registry reload kept invalid entries on their prior generation",
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.status(&format!("plugin registry reload failed: {}", error.message))
+                }
+            },
             // The payload or retained-projection dirty bit is drained by the run loop.
             ActorEvent::MediaReady => {}
             ActorEvent::ConfigChanged => {
@@ -1268,6 +1298,12 @@ impl SessionActor {
                 self.config_reload_pending.store(false, Ordering::Release);
                 if let Err(error) = self.reload_config() {
                     self.status(&format!("config reload failed: {error}"));
+                }
+            }
+            ActorEvent::PluginsChanged => {
+                self.plugin_reload_pending.store(false, Ordering::Release);
+                if let Err(error) = self.plugin_supervisor.reload_notice() {
+                    self.status(&format!("plugin registry reload failed: {}", error.message));
                 }
             }
             ActorEvent::AgentProcesses(updates) => {
@@ -2154,15 +2190,17 @@ impl SessionActor {
                 }
             }
             AutomationMethod::Plugin(crate::ipc::PluginMethod::Reload) => {
-                self.reply_automation(
-                    target,
-                    serde_json::json!({
-                        "applied": [],
-                        "deferred": [],
-                        "failed": [],
-                        "registry": "revalidated_on_next_invocation",
-                    }),
-                );
+                if !self.register_pending_actor_work(&target) {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("busy", "session pending-work quota is exhausted"),
+                    );
+                    return;
+                }
+                if let Err(error) = self.plugin_supervisor.reload_automation(target.clone()) {
+                    self.complete_pending_actor_work(&target);
+                    self.reply_automation_error(target, error);
+                }
             }
             AutomationMethod::WaitText {
                 text,

@@ -477,6 +477,14 @@ their short-lived broker tokens provide attribution and revocation, not an OS se
 the newest 200 detached completions and at most 256 KiB each of result/error log text; detached work
 survives the invoking CLI client, while synchronous work remains client-scoped.
 
+The global plugin registry carries a monotonic generation and is watched by every live session.
+Install, update, enable, disable, and uninstall publish an atomic generation, wait for every live
+session to accept it, and publish a newer rollback generation if any session rejects it. Changed
+artifacts use immutable content-addressed package directories: existing calls drain on their pinned
+artifact, disabled or removed plugins cancel their jobs, and old runtimes fully stop before package
+cleanup or update acknowledgement. `vvmux msg --target SESSION reload-plugins` forces validation
+and reports the generation plus applied, deferred, and failed plugin IDs.
+
 ## Windows troubleshooting
 
 | Host terminal | Supported profile |

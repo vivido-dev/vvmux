@@ -22,7 +22,10 @@ use crate::session::ActorEvent;
 
 /// How often the file is stat'd. Also the debounce interval, since a change must survive one
 /// further poll before it fires.
+#[cfg(not(test))]
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// What identifies a revision of the file. Modification time alone misses a same-second edit that
 /// changes the length, and length alone misses an in-place edit of the same size.
@@ -44,8 +47,48 @@ pub fn spawn(
     shutdown: Arc<AtomicBool>,
     pending: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    spawn_path(
+        path,
+        sender,
+        shutdown,
+        pending,
+        "vvmux-config-watch",
+        || ActorEvent::ConfigChanged,
+    )
+}
+
+/// Watch the global plugin registry for a settled atomic replacement.
+///
+/// Plugin removal is represented by a newer registry generation without that entry; the registry
+/// file itself is durable and its deletion is ignored so generation replay protection cannot be
+/// reset accidentally. The same coalesced wakeup rule keeps this watcher from adding actor work
+/// when nothing changes.
+pub fn spawn_plugin_registry(
+    path: PathBuf,
+    sender: mpsc::SyncSender<ActorEvent>,
+    shutdown: Arc<AtomicBool>,
+    pending: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    spawn_path(
+        path,
+        sender,
+        shutdown,
+        pending,
+        "vvmux-plugin-registry-watch",
+        || ActorEvent::PluginsChanged,
+    )
+}
+
+fn spawn_path(
+    path: PathBuf,
+    sender: mpsc::SyncSender<ActorEvent>,
+    shutdown: Arc<AtomicBool>,
+    pending: Arc<AtomicBool>,
+    thread_name: &'static str,
+    event: fn() -> ActorEvent,
+) -> std::io::Result<()> {
     std::thread::Builder::new()
-        .name("vvmux-config-watch".into())
+        .name(thread_name.into())
         .spawn(move || {
             let mut current = stamp(&path);
             // A change seen once but not yet confirmed by a second identical observation.
@@ -71,7 +114,7 @@ pub fn spawn(
                         current = Some(observed);
                         settling = None;
                         if !pending.swap(true, Ordering::AcqRel)
-                            && sender.try_send(ActorEvent::ConfigChanged).is_err()
+                            && sender.try_send(event()).is_err()
                         {
                             // The queue is full or the actor is gone. Clear the bit so the next
                             // poll retries rather than latching pending forever.
@@ -128,5 +171,55 @@ mod tests {
             receiver.recv_timeout(Duration::from_secs(5)),
             Err(mpsc::RecvTimeoutError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn an_unchanged_plugin_registry_adds_no_actor_wakeup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.json");
+        std::fs::write(&path, r#"{"schema":1,"generation":1,"plugins":{}}"#).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        spawn_plugin_registry(
+            path,
+            sender,
+            shutdown.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(POLL_INTERVAL * 5),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        shutdown.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn plugin_registry_wakeups_are_settled_and_coalesced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.json");
+        std::fs::write(&path, r#"{"schema":1,"generation":1,"plugins":{}}"#).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicBool::new(false));
+        spawn_plugin_registry(path.clone(), sender, shutdown.clone(), pending.clone()).unwrap();
+        std::thread::sleep(POLL_INTERVAL * 2);
+        std::fs::write(&path, r#"{"schema":1,"generation":2,"plugins":{}}"#).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(POLL_INTERVAL * 5),
+            Ok(ActorEvent::PluginsChanged)
+        ));
+        std::fs::write(&path, r#"{"schema":1,"generation":3,"plugins":{}}"#).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(POLL_INTERVAL * 5),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        pending.store(false, Ordering::Release);
+        std::fs::write(&path, r#"{"schema":1,"generation":4,"plugins":{}}"#).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(POLL_INTERVAL * 5),
+            Ok(ActorEvent::PluginsChanged)
+        ));
+        shutdown.store(true, Ordering::Release);
     }
 }

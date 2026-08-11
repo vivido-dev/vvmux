@@ -4,7 +4,7 @@
 //! validation, process startup, or protocol I/O itself. Each plugin gets one deterministic worker
 //! and runtime cache; different plugins can progress independently.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -29,6 +29,7 @@ const MAX_RETAINED_LOG_BYTES: usize = 256 * 1024;
 pub(crate) struct PluginSupervisor {
     sender: mpsc::SyncSender<Message>,
     next_job_id: Arc<AtomicU64>,
+    reload_requested: Arc<AtomicBool>,
     session_name: String,
     session_instance: String,
 }
@@ -172,6 +173,31 @@ struct ActiveJob {
     client_id: Option<u64>,
     cancel: Arc<AtomicBool>,
     public_id: String,
+}
+
+struct WorkerHandle {
+    sender: mpsc::SyncSender<WorkerMessage>,
+    plugin: crate::plugin::RuntimePlugin,
+    stopping: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct RegistryReloadReport {
+    generation: u64,
+    applied: Vec<String>,
+    deferred: Vec<String>,
+    failed: BTreeMap<String, String>,
+}
+
+enum ReloadCompletion {
+    Automation(AutomationReplyTarget),
+    Notice,
+}
+
+struct ReloadWaiter {
+    pending: BTreeSet<String>,
+    report: RegistryReloadReport,
+    completion: ReloadCompletion,
 }
 
 #[derive(Clone, Serialize)]
@@ -336,6 +362,17 @@ enum Message {
         job_id: String,
         reply: AutomationReplyTarget,
     },
+    Reload {
+        completion: ReloadCompletion,
+    },
+    ReloadLoaded {
+        result: io::Result<crate::plugin::RegistryCandidate>,
+        completions: Vec<ReloadCompletion>,
+    },
+    WorkerStopped {
+        plugin_id: String,
+        digest: String,
+    },
     CancelClient(u64),
     Shutdown,
 }
@@ -358,6 +395,8 @@ impl PluginSupervisor {
         };
         let (sender, receiver) = mpsc::sync_channel(COMMAND_QUEUE);
         let manager_sender = sender.clone();
+        let reload_requested = Arc::new(AtomicBool::new(false));
+        let manager_reload_requested = reload_requested.clone();
         let manager_session_name = session_name.clone();
         let manager_session_instance = session_instance.clone();
         thread::Builder::new()
@@ -370,11 +409,13 @@ impl PluginSupervisor {
                     manager_session_name,
                     manager_session_instance,
                     broker,
+                    manager_reload_requested,
                 );
             })?;
         Ok(Self {
             sender,
             next_job_id: Arc::new(AtomicU64::new(1)),
+            reload_requested,
             session_name,
             session_instance,
         })
@@ -428,6 +469,31 @@ impl PluginSupervisor {
         reply: AutomationReplyTarget,
     ) -> Result<(), AutomationError> {
         self.send_control(Message::JobLogs { job_id, reply })
+    }
+
+    pub(crate) fn reload_automation(
+        &self,
+        reply: AutomationReplyTarget,
+    ) -> Result<(), AutomationError> {
+        self.send_control(Message::Reload {
+            completion: ReloadCompletion::Automation(reply),
+        })
+    }
+
+    pub(crate) fn reload_notice(&self) -> Result<(), AutomationError> {
+        match self.sender.try_send(Message::Reload {
+            completion: ReloadCompletion::Notice,
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.reload_requested.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(AutomationError::new(
+                "runtime_unavailable",
+                "plugin supervisor is unavailable",
+            )),
+        }
     }
 
     fn submit(
@@ -509,15 +575,58 @@ fn run_manager(
     session_name: String,
     session_instance: String,
     broker: HostBroker,
+    reload_requested: Arc<AtomicBool>,
 ) {
-    let mut workers = HashMap::<String, mpsc::SyncSender<WorkerMessage>>::new();
+    let initial = crate::plugin::load_registry_candidate();
+    let (mut generation, mut plugins, mut registry_failures) = match initial {
+        Ok(candidate) => (candidate.generation, candidate.plugins, candidate.failed),
+        Err(error) => {
+            let mut failures = BTreeMap::new();
+            failures.insert("registry".into(), error.to_string());
+            (0, BTreeMap::new(), failures)
+        }
+    };
+    let mut workers = HashMap::<String, WorkerHandle>::new();
     let mut active = HashMap::<u64, ActiveJob>::new();
     let mut accounting = JobAccounting::default();
     let mut retained = JobStore::default();
+    let mut transitions = BTreeSet::<String>::new();
+    let mut reload_waiters = Vec::<ReloadWaiter>::new();
+    let mut reload_loading = false;
+    let mut queued_reloads = Vec::<ReloadCompletion>::new();
     while let Ok(message) = receiver.recv() {
         match message {
             Message::Invoke(job) => {
                 retained.start(&job);
+                let Some(plugin) = plugins.get(&job.plugin_id).cloned() else {
+                    let result = if let Some(error) = registry_failures.get(&job.plugin_id) {
+                        Err(io::Error::other(format!(
+                            "runtime_unavailable: registry entry is invalid: {error}"
+                        )))
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("plugin_not_found: `{}` is not installed", job.plugin_id),
+                        ))
+                    };
+                    retained.finish(&job, &result);
+                    deliver(&actor, job.completion, result);
+                    continue;
+                };
+                if !plugin.enabled {
+                    let result = Err(io::Error::other("plugin_disabled: plugin is disabled"));
+                    retained.finish(&job, &result);
+                    deliver(&actor, job.completion, result);
+                    continue;
+                }
+                if transitions.contains(&job.plugin_id) {
+                    let result = Err(io::Error::other(
+                        "busy: plugin runtime is draining for a registry update",
+                    ));
+                    retained.finish(&job, &result);
+                    deliver(&actor, job.completion, result);
+                    continue;
+                }
                 if !accounting.admit(&job.plugin_id) {
                     let result = Err(io::Error::other("busy: plugin job limit reached"));
                     retained.finish(&job, &result);
@@ -525,17 +634,24 @@ fn run_manager(
                     continue;
                 }
                 let worker = if let Some(worker) = workers.get(&job.plugin_id) {
-                    worker.clone()
+                    worker.sender.clone()
                 } else {
                     match spawn_worker(
-                        &job.plugin_id,
+                        plugin.clone(),
                         &session_name,
                         &session_instance,
                         broker.clone(),
                         sender.clone(),
                     ) {
                         Ok(worker) => {
-                            workers.insert(job.plugin_id.clone(), worker.clone());
+                            workers.insert(
+                                job.plugin_id.clone(),
+                                WorkerHandle {
+                                    sender: worker.clone(),
+                                    plugin,
+                                    stopping: false,
+                                },
+                            );
                             worker
                         }
                         Err(error) => {
@@ -584,6 +700,7 @@ fn run_manager(
                 }
                 retained.finish(&job, &result);
                 deliver(&actor, job.completion, result);
+                request_worker_stop_if_drained(&job.plugin_id, &active, &transitions, &mut workers);
             }
             Message::JobStatus { job_id, reply } => {
                 deliver_query(&actor, reply, retained.status(&job_id));
@@ -603,6 +720,106 @@ fn run_manager(
             Message::JobLogs { job_id, reply } => {
                 deliver_query(&actor, reply, retained.logs(&job_id));
             }
+            Message::Reload { completion } => {
+                if reload_loading {
+                    queued_reloads.push(completion);
+                } else {
+                    reload_loading = true;
+                    if let Err((error, completions)) =
+                        spawn_registry_load(sender.clone(), vec![completion])
+                    {
+                        reload_loading = false;
+                        for completion in completions {
+                            finish_reload(&actor, completion, Err(error.clone()));
+                        }
+                    }
+                }
+            }
+            Message::ReloadLoaded {
+                result,
+                completions,
+            } => {
+                reload_loading = false;
+                match result {
+                    Ok(candidate) if candidate.generation < generation => {
+                        let error = AutomationError::new(
+                            "dependency_failed",
+                            format!(
+                                "plugin registry generation {} is older than applied generation {generation}",
+                                candidate.generation
+                            ),
+                        );
+                        for completion in completions {
+                            finish_reload(&actor, completion, Err(error.clone()));
+                        }
+                    }
+                    Ok(candidate) => {
+                        let report = apply_registry_candidate(
+                            candidate,
+                            &mut generation,
+                            &mut plugins,
+                            &mut registry_failures,
+                            &active,
+                            &mut workers,
+                            &mut transitions,
+                        );
+                        let pending = transitions.clone();
+                        for completion in completions {
+                            if pending.is_empty() {
+                                finish_reload(
+                                    &actor,
+                                    completion,
+                                    serde_json::to_value(&report).map_err(|error| {
+                                        AutomationError::new(
+                                            "runtime_unavailable",
+                                            format!("serialize plugin reload report: {error}"),
+                                        )
+                                    }),
+                                );
+                            } else {
+                                reload_waiters.push(ReloadWaiter {
+                                    pending: pending.clone(),
+                                    report: report.clone(),
+                                    completion,
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let error = AutomationError::new(
+                            "dependency_failed",
+                            format!("plugin registry reload failed: {error}"),
+                        );
+                        for completion in completions {
+                            finish_reload(&actor, completion, Err(error.clone()));
+                        }
+                    }
+                }
+                if !queued_reloads.is_empty() {
+                    reload_loading = true;
+                    if let Err((error, completions)) =
+                        spawn_registry_load(sender.clone(), std::mem::take(&mut queued_reloads))
+                    {
+                        reload_loading = false;
+                        for completion in completions {
+                            finish_reload(&actor, completion, Err(error.clone()));
+                        }
+                    }
+                }
+            }
+            Message::WorkerStopped { plugin_id, digest } => {
+                if workers
+                    .get(&plugin_id)
+                    .is_some_and(|worker| worker.plugin.digest == digest)
+                {
+                    workers.remove(&plugin_id);
+                    transitions.remove(&plugin_id);
+                    for waiter in &mut reload_waiters {
+                        waiter.pending.remove(&plugin_id);
+                    }
+                    finish_ready_reload_waiters(&actor, &mut reload_waiters);
+                }
+            }
             Message::CancelClient(client_id) => {
                 for job in active
                     .values()
@@ -616,31 +833,43 @@ fn run_manager(
                     job.cancel.store(true, Ordering::Release);
                 }
                 for worker in workers.values() {
-                    let _ = worker.try_send(WorkerMessage::Shutdown);
+                    let _ = worker.sender.try_send(WorkerMessage::Shutdown);
                 }
                 break;
+            }
+        }
+        if reload_requested.swap(false, Ordering::AcqRel) {
+            if reload_loading {
+                queued_reloads.push(ReloadCompletion::Notice);
+            } else {
+                reload_loading = true;
+                if let Err((error, completions)) =
+                    spawn_registry_load(sender.clone(), vec![ReloadCompletion::Notice])
+                {
+                    reload_loading = false;
+                    for completion in completions {
+                        finish_reload(&actor, completion, Err(error.clone()));
+                    }
+                }
             }
         }
     }
 }
 
 fn spawn_worker(
-    plugin_id: &str,
+    plugin: crate::plugin::RuntimePlugin,
     session_name: &str,
     session_instance: &str,
     broker: HostBroker,
     manager: mpsc::SyncSender<Message>,
 ) -> io::Result<mpsc::SyncSender<WorkerMessage>> {
     let (sender, receiver) = mpsc::sync_channel(PLUGIN_QUEUE);
-    let plugin_id = plugin_id.to_owned();
+    let plugin_id = plugin.id.clone();
+    let digest = plugin.digest.clone();
     let session_name = session_name.to_owned();
     let session_instance = session_instance.to_owned();
-    let mut runtime = crate::plugin::SessionPluginRuntime::new(
-        session_name,
-        session_instance,
-        plugin_id.clone(),
-        broker,
-    )?;
+    let mut runtime =
+        crate::plugin::SessionPluginRuntime::new(session_name, session_instance, plugin, broker)?;
     thread::Builder::new()
         .name(format!("vvmux-plugin-{plugin_id}"))
         .spawn(move || {
@@ -655,8 +884,164 @@ fn spawn_worker(
                     WorkerMessage::Shutdown => break,
                 }
             }
+            drop(runtime);
+            let _ = manager.send(Message::WorkerStopped { plugin_id, digest });
         })?;
     Ok(sender)
+}
+
+fn spawn_registry_load(
+    manager: mpsc::SyncSender<Message>,
+    completions: Vec<ReloadCompletion>,
+) -> Result<(), (AutomationError, Vec<ReloadCompletion>)> {
+    let shared_completions = Arc::new(Mutex::new(Some(completions)));
+    let thread_completions = shared_completions.clone();
+    thread::Builder::new()
+        .name("vvmux-plugin-registry-load".into())
+        .spawn(move || {
+            let result = crate::plugin::load_registry_candidate();
+            let completions = thread_completions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .unwrap_or_default();
+            let _ = manager.send(Message::ReloadLoaded {
+                result,
+                completions,
+            });
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            let completions = shared_completions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .unwrap_or_default();
+            (
+                AutomationError::new(
+                    "runtime_unavailable",
+                    format!("could not start plugin registry loader: {error}"),
+                ),
+                completions,
+            )
+        })
+}
+
+fn apply_registry_candidate(
+    candidate: crate::plugin::RegistryCandidate,
+    generation: &mut u64,
+    plugins: &mut BTreeMap<String, crate::plugin::RuntimePlugin>,
+    failures: &mut BTreeMap<String, String>,
+    active: &HashMap<u64, ActiveJob>,
+    workers: &mut HashMap<String, WorkerHandle>,
+    transitions: &mut BTreeSet<String>,
+) -> RegistryReloadReport {
+    let mut ids = BTreeSet::new();
+    ids.extend(plugins.keys().cloned());
+    ids.extend(candidate.plugins.keys().cloned());
+    ids.extend(candidate.failed.keys().cloned());
+    let mut report = RegistryReloadReport {
+        generation: candidate.generation,
+        applied: Vec::new(),
+        deferred: Vec::new(),
+        failed: candidate.failed.clone(),
+    };
+    for id in ids {
+        if candidate.failed.contains_key(&id) {
+            continue;
+        }
+        let previous = plugins.get(&id);
+        let next = candidate.plugins.get(&id);
+        let changed = previous != next;
+        if changed {
+            match next {
+                Some(plugin) => {
+                    plugins.insert(id.clone(), plugin.clone());
+                }
+                None => {
+                    plugins.remove(&id);
+                }
+            }
+        }
+        let worker_needs_stop = workers.get(&id).is_some_and(|worker| {
+            transitions.contains(&id)
+                || next.is_none_or(|plugin| !plugin.enabled || worker.plugin != *plugin)
+        });
+        if worker_needs_stop {
+            transitions.insert(id.clone());
+            if next.is_none_or(|plugin| !plugin.enabled) {
+                for job in active.values().filter(|job| job.plugin_id == id) {
+                    job.cancel.store(true, Ordering::Release);
+                }
+            }
+            request_worker_stop_if_drained(&id, active, transitions, workers);
+            report.deferred.push(id);
+        } else if changed {
+            report.applied.push(id);
+        }
+    }
+    *generation = candidate.generation.max(*generation);
+    *failures = candidate.failed;
+    report
+}
+
+fn request_worker_stop_if_drained(
+    plugin_id: &str,
+    active: &HashMap<u64, ActiveJob>,
+    transitions: &BTreeSet<String>,
+    workers: &mut HashMap<String, WorkerHandle>,
+) {
+    if !transitions.contains(plugin_id) || active.values().any(|job| job.plugin_id == plugin_id) {
+        return;
+    }
+    if let Some(worker) = workers.get_mut(plugin_id)
+        && !worker.stopping
+    {
+        worker.stopping = true;
+        if worker.sender.try_send(WorkerMessage::Shutdown).is_err() {
+            // A disconnected worker will have already queued WorkerStopped. A full queue cannot
+            // occur after every accounted invocation completed, but leaving the transition set
+            // makes a later completion/reload retry safely instead of accepting work too early.
+            worker.stopping = false;
+        }
+    }
+}
+
+fn finish_ready_reload_waiters(
+    actor: &mpsc::SyncSender<ActorEvent>,
+    waiters: &mut Vec<ReloadWaiter>,
+) {
+    let mut index = 0;
+    while index < waiters.len() {
+        if waiters[index].pending.is_empty() {
+            let waiter = waiters.swap_remove(index);
+            finish_reload(
+                actor,
+                waiter.completion,
+                serde_json::to_value(waiter.report).map_err(|error| {
+                    AutomationError::new(
+                        "runtime_unavailable",
+                        format!("serialize plugin reload report: {error}"),
+                    )
+                }),
+            );
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn finish_reload(
+    actor: &mpsc::SyncSender<ActorEvent>,
+    completion: ReloadCompletion,
+    result: Result<Value, AutomationError>,
+) {
+    match completion {
+        ReloadCompletion::Automation(reply) => deliver_query(actor, reply, result),
+        ReloadCompletion::Notice => {
+            let _ = actor.send(ActorEvent::PluginReloaded { result });
+        }
+    }
 }
 
 fn deliver(
