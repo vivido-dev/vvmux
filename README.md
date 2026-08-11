@@ -469,6 +469,9 @@ Plugin packages use a strict `vvmux-plugin.toml` and JSON Schema Draft 2020-12 a
 Discover agent-visible actions with `vvmux plugin catalog --json`; `vvmux --skill` prints the
 release-matched automation guidance. WebAssembly Components are the sandboxed tier. Native process,
 one-shot, and PTY-pane plugins are trusted user code and run with the user's full OS authority.
+Native service SDKs expose scoped host calls for session inspection, bounded pane text, and pane
+input. These calls enforce the manifest's `session.read`, `pane.read`, and `pane.input` declarations;
+their short-lived broker tokens provide attribution and revocation, not an OS security boundary.
 
 ## Windows troubleshooting
 

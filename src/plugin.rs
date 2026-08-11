@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use vvmux_plugin_api::{
-    Hello, Invocation, InvocationContext, LoadedManifest, NativeMessage, NativeReply,
-    PROTOCOL_VERSION, RuntimeKind, read_frame, write_frame,
+    ErrorCode, Hello, HostCallResult, Invocation, InvocationContext, LoadedManifest, NativeMessage,
+    NativeReply, PROTOCOL_VERSION, Permission, PluginError, RuntimeKind, read_frame, write_frame,
 };
 
 const REGISTRY_SCHEMA: u16 = 1;
@@ -692,6 +692,8 @@ fn invoke_reference(
                 plugin_id,
                 cancel: None,
                 session_instance: None,
+                broker: None,
+                permissions: &[],
             },
         )?
     } else if let (Some(handler), Some(runtime)) =
@@ -729,6 +731,7 @@ pub(crate) struct SessionPluginRuntime {
     session_name: String,
     session_instance: String,
     plugin_id: String,
+    broker: crate::plugin_supervisor::HostBroker,
     service: Option<(String, NativeService)>,
     consecutive_crashes: u32,
     retry_at: Option<Instant>,
@@ -739,12 +742,14 @@ impl SessionPluginRuntime {
         session_name: String,
         session_instance: String,
         plugin_id: String,
+        broker: crate::plugin_supervisor::HostBroker,
     ) -> io::Result<Self> {
         Ok(Self {
             paths: PluginPaths::new()?,
             session_name,
             session_instance,
             plugin_id,
+            broker,
             service: None,
             consecutive_crashes: 0,
             retry_at: None,
@@ -796,6 +801,8 @@ impl SessionPluginRuntime {
                     plugin_id,
                     cancel: Some(cancel),
                     session_instance: Some(&self.session_instance),
+                    broker: Some(&self.broker),
+                    permissions: &loaded.manifest.plugin.permissions,
                 },
             )?
         } else if let (Some(handler), Some(runtime)) =
@@ -823,10 +830,14 @@ impl SessionPluginRuntime {
                         match NativeService::start(
                             &loaded.root,
                             runtime.command.as_deref().unwrap(),
-                            plugin_id,
-                            Some(&self.session_name),
-                            &self.session_instance,
                             timeout,
+                            NativeServiceContext {
+                                plugin_id,
+                                session: Some(&self.session_name),
+                                session_instance: &self.session_instance,
+                                broker: Some(&self.broker),
+                                permissions: &loaded.manifest.plugin.permissions,
+                            },
                         ) {
                             Ok(service) => self.service = Some((artifact_key, service)),
                             Err(error) => {
@@ -889,8 +900,18 @@ fn run_native_service(
     session: Option<&str>,
 ) -> io::Result<Value> {
     let session_instance = session.unwrap_or("direct");
-    let mut service =
-        NativeService::start(root, argv, plugin_id, session, session_instance, timeout)?;
+    let mut service = NativeService::start(
+        root,
+        argv,
+        timeout,
+        NativeServiceContext {
+            plugin_id,
+            session,
+            session_instance,
+            broker: None,
+            permissions: &[],
+        },
+    )?;
     service.invoke(handler, input, timeout, session_instance, None)
 }
 
@@ -904,22 +925,36 @@ struct NativeService {
     stderr_reader: Option<thread::JoinHandle<io::Result<CappedOutput>>>,
     next_request_id: u64,
     healthy: bool,
+    broker_lease: Option<crate::plugin_supervisor::BrokerLease>,
+}
+
+struct NativeServiceContext<'a> {
+    plugin_id: &'a str,
+    session: Option<&'a str>,
+    session_instance: &'a str,
+    broker: Option<&'a crate::plugin_supervisor::HostBroker>,
+    permissions: &'a [Permission],
 }
 
 impl NativeService {
     fn start(
         root: &Path,
         argv: &[String],
-        plugin_id: &str,
-        session: Option<&str>,
-        session_instance: &str,
         timeout: Duration,
+        context: NativeServiceContext<'_>,
     ) -> io::Result<Self> {
         let instance_id = random_id()?;
-        let mut command = trusted_command(root, argv, session, plugin_id);
+        let broker_lease = context
+            .broker
+            .map(|broker| broker.issue(context.plugin_id, &instance_id, context.permissions))
+            .transpose()?;
+        let mut command = trusted_command(root, argv, context.session, context.plugin_id);
         command
             .env("VVMUX_PLUGIN_INSTANCE", &instance_id)
-            .env("VVMUX_SESSION_INSTANCE", session_instance);
+            .env("VVMUX_SESSION_INSTANCE", context.session_instance);
+        if let Some(lease) = &broker_lease {
+            command.env("VVMUX_PLUGIN_BROKER_TOKEN", lease.token());
+        }
         let mut child = command.spawn()?;
         let process_id = child.id();
         let writer = child.stdin.take().unwrap();
@@ -938,7 +973,7 @@ impl NativeService {
         });
         let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_LOG_OUTPUT));
         let mut service = Self {
-            plugin_id: plugin_id.to_owned(),
+            plugin_id: context.plugin_id.to_owned(),
             child,
             process_id,
             writer: Some(writer),
@@ -947,6 +982,7 @@ impl NativeService {
             stderr_reader: Some(stderr_reader),
             next_request_id: 2,
             healthy: true,
+            broker_lease,
         };
         let deadline = Instant::now() + timeout;
         let hello = service.receive(deadline)?;
@@ -957,7 +993,7 @@ impl NativeService {
                 plugin_id: actual_plugin,
                 instance_id: actual_instance,
                 ..
-            }) if actual_plugin == plugin_id && actual_instance == instance_id
+            }) if actual_plugin == context.plugin_id && actual_instance == instance_id
         ) {
             service.healthy = false;
             return Err(invalid("runtime_unavailable: invalid native plugin hello"));
@@ -1031,6 +1067,33 @@ impl NativeService {
                         serde_json::to_value(error.code).unwrap().as_str().unwrap(),
                         error.message
                     )));
+                }
+                Ok(Ok(NativeReply::HostCall(call))) => {
+                    let host_request_id = call.request_id;
+                    if host_request_id == 0 {
+                        self.healthy = false;
+                        return Err(invalid(
+                            "protocol_error: host-call request ID must be nonzero",
+                        ));
+                    }
+                    let reply = match &self.broker_lease {
+                        Some(lease) => match lease.call(call, deadline) {
+                            Ok(result) => NativeMessage::HostCallResult(HostCallResult {
+                                request_id: host_request_id,
+                                result,
+                            }),
+                            Err(error) => NativeMessage::HostCallError(plugin_error_from_io(
+                                host_request_id,
+                                &error,
+                            )),
+                        },
+                        None => NativeMessage::HostCallError(PluginError {
+                            request_id: host_request_id,
+                            code: ErrorCode::CapabilityDenied,
+                            message: "host calls require a live session plugin supervisor".into(),
+                        }),
+                    };
+                    self.write(&reply)?;
                 }
                 Ok(Ok(_)) => {
                     self.healthy = false;
@@ -1128,6 +1191,30 @@ impl NativeService {
                 self.plugin_id
             );
         }
+    }
+}
+
+fn plugin_error_from_io(request_id: u64, error: &io::Error) -> PluginError {
+    let message = error.to_string();
+    let code = if message.starts_with("capability_denied") {
+        ErrorCode::CapabilityDenied
+    } else if message.starts_with("scope_denied") {
+        ErrorCode::ScopeDenied
+    } else if message.starts_with("busy") {
+        ErrorCode::Busy
+    } else if message.starts_with("timeout") {
+        ErrorCode::Timeout
+    } else if message.starts_with("cancelled") {
+        ErrorCode::Cancelled
+    } else if message.starts_with("action_not_found") {
+        ErrorCode::ActionNotFound
+    } else {
+        ErrorCode::RuntimeUnavailable
+    };
+    PluginError {
+        request_id,
+        code,
+        message,
     }
 }
 
@@ -1310,6 +1397,8 @@ struct OneShotContext<'a> {
     plugin_id: &'a str,
     cancel: Option<&'a AtomicBool>,
     session_instance: Option<&'a str>,
+    broker: Option<&'a crate::plugin_supervisor::HostBroker>,
+    permissions: &'a [Permission],
 }
 
 fn run_one_shot(
@@ -1319,11 +1408,18 @@ fn run_one_shot(
     timeout: Duration,
     context: OneShotContext<'_>,
 ) -> io::Result<Value> {
-    let mut command = trusted_command(root, argv, context.session, context.plugin_id);
     let instance_id = random_id()?;
-    command.env("VVMUX_PLUGIN_INSTANCE", instance_id);
+    let broker_lease = context
+        .broker
+        .map(|broker| broker.issue(context.plugin_id, &instance_id, context.permissions))
+        .transpose()?;
+    let mut command = trusted_command(root, argv, context.session, context.plugin_id);
+    command.env("VVMUX_PLUGIN_INSTANCE", &instance_id);
     if let Some(session_instance) = context.session_instance {
         command.env("VVMUX_SESSION_INSTANCE", session_instance);
+    }
+    if let Some(lease) = &broker_lease {
+        command.env("VVMUX_PLUGIN_BROKER_TOKEN", lease.token());
     }
     let mut child = command.spawn()?;
     let process_id = child.id();
@@ -1800,6 +1896,8 @@ agent_visible = true
                 plugin_id: "dev.example",
                 cancel: Some(cancelled.as_ref()),
                 session_instance: Some("session-instance"),
+                broker: None,
+                permissions: &[],
             },
         );
         cancel_thread.join().unwrap();

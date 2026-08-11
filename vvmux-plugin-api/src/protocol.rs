@@ -61,12 +61,23 @@ pub struct HostCall {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NativeMessage {
     Hello(Hello),
-    Initialize { request_id: u64 },
+    Initialize {
+        request_id: u64,
+    },
     Invoke(Invocation),
     Event(Event),
-    Cancel { request_id: u64 },
+    Cancel {
+        request_id: u64,
+    },
+    /// Reserved legacy direction; protocol-1 SDKs do not send host calls this way.
     HostCall(HostCall),
-    Shutdown { request_id: u64 },
+    /// Result of a host call initiated by the plugin on the reply stream.
+    HostCallResult(HostCallResult),
+    /// Typed failure of a host call initiated by the plugin.
+    HostCallError(PluginError),
+    Shutdown {
+        request_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -95,11 +106,18 @@ pub struct PluginError {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NativeReply {
     Hello(Hello),
-    Ready { request_id: u64 },
+    Ready {
+        request_id: u64,
+    },
     Result(ResultEnvelope),
+    /// A plugin-to-host call. The host answers on the message stream with the same request ID.
+    HostCall(HostCall),
+    /// Reserved legacy direction; protocol-1 hosts answer on `NativeMessage` instead.
     HostCallResult(HostCallResult),
     Error(PluginError),
-    Cancelled { request_id: u64 },
+    Cancelled {
+        request_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,5 +208,35 @@ mod tests {
             read_frame::<Value>(&bytes[..]),
             Err(FrameError::TooLarge(_))
         ));
+    }
+
+    #[test]
+    fn host_calls_use_plugin_reply_and_host_message_directions() {
+        let call = HostCall {
+            request_id: 11,
+            method: "session.inspect".into(),
+            params: serde_json::json!({}),
+        };
+        let mut plugin_bytes = Vec::new();
+        write_frame(&mut plugin_bytes, &NativeReply::HostCall(call.clone())).unwrap();
+        assert_eq!(
+            read_frame::<NativeReply>(&plugin_bytes[..]).unwrap(),
+            NativeReply::HostCall(call)
+        );
+
+        let result = HostCallResult {
+            request_id: 11,
+            result: serde_json::json!({"session": "test"}),
+        };
+        let mut host_bytes = Vec::new();
+        write_frame(
+            &mut host_bytes,
+            &NativeMessage::HostCallResult(result.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame::<NativeMessage>(&host_bytes[..]).unwrap(),
+            NativeMessage::HostCallResult(result)
+        );
     }
 }

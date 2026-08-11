@@ -95,6 +95,11 @@ pub enum ActorEvent {
         reference: String,
         result: Result<(), String>,
     },
+    PluginHostCall {
+        scope: crate::plugin_supervisor::RuntimeScope,
+        call: vvmux_plugin_api::HostCall,
+        reply: mpsc::SyncSender<Result<serde_json::Value, AutomationError>>,
+    },
     /// A media event is waiting on the dedicated media receiver.
     ///
     /// Carries no payload: it exists only to wake the actor promptly. Losing one to a full queue
@@ -1250,6 +1255,10 @@ impl SessionActor {
                 if let Err(error) = result {
                     self.status(&format!("plugin action {reference} failed: {error}"));
                 }
+            }
+            ActorEvent::PluginHostCall { scope, call, reply } => {
+                let result = self.handle_plugin_host_call(&scope, &call.method, call.params);
+                let _ = reply.try_send(result);
             }
             // The payload or retained-projection dirty bit is drained by the run loop.
             ActorEvent::MediaReady => {}
@@ -3882,6 +3891,86 @@ impl SessionActor {
         }
     }
 
+    fn handle_plugin_host_call(
+        &mut self,
+        scope: &crate::plugin_supervisor::RuntimeScope,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, AutomationError> {
+        authorize_plugin_host_call(scope, self.plugin_supervisor.session_instance(), method)?;
+        match method {
+            "session.inspect" => {
+                require_plugin_params(&params, &[])?;
+                let panes = self
+                    .panes
+                    .keys()
+                    .copied()
+                    .filter_map(|pane| self.pane_description(pane))
+                    .collect::<Vec<_>>();
+                Ok(serde_json::json!({
+                    "session": self.name,
+                    "session_instance": scope.session_instance,
+                    "session_sequence": self.session_sequence,
+                    "layout_sequence": self.layout_revision,
+                    "panes": panes,
+                }))
+            }
+            "pane.get_text" => {
+                require_plugin_params(&params, &["pane_id", "rows"])?;
+                let pane_id = plugin_u64_param(&params, "pane_id")?;
+                let rows = plugin_optional_u64_param(&params, "rows")?
+                    .map(|rows| usize::try_from(rows).unwrap_or(usize::MAX));
+                if rows.is_some_and(|rows| !(1..=1000).contains(&rows)) {
+                    return Err(AutomationError::new(
+                        "invalid_params",
+                        "rows must be from 1 through 1000",
+                    ));
+                }
+                let pane = self.panes.get(&pane_id).ok_or_else(|| {
+                    AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
+                })?;
+                let text = rows.map_or_else(
+                    || {
+                        pane.terminal
+                            .visible_text(pane.copy.as_ref().map_or(0, |copy| copy.offset))
+                    },
+                    |rows| pane.terminal.latest_text(rows),
+                );
+                if text.len() > vvmux_plugin_api::MAX_FRAME_BYTES / 2 {
+                    return Err(AutomationError::new(
+                        "limit_exceeded",
+                        "pane text exceeds the bounded host-call result",
+                    ));
+                }
+                Ok(serde_json::Value::String(text))
+            }
+            "pane.input" => {
+                require_plugin_params(&params, &["pane_id", "text"])?;
+                let pane_id = plugin_u64_param(&params, "pane_id")?;
+                let text = params
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        AutomationError::new("invalid_params", "text must be a string")
+                    })?;
+                if text.len() > 1024 * 1024 {
+                    return Err(AutomationError::new(
+                        "limit_exceeded",
+                        "PTY input exceeds 1 MiB",
+                    ));
+                }
+                let pane = self.panes.get_mut(&pane_id).ok_or_else(|| {
+                    AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
+                })?;
+                pane.input.send(text.as_bytes()).map_err(|error| {
+                    AutomationError::new("runtime_unavailable", error.to_string())
+                })?;
+                Ok(serde_json::Value::Null)
+            }
+            _ => unreachable!("host-call method was validated above"),
+        }
+    }
+
     fn agent_navigator_rows(&self) -> Vec<AgentNavigatorRow> {
         let mut rows = Vec::new();
         for (tab_index, tab) in self.tabs.iter().enumerate() {
@@ -6224,6 +6313,86 @@ pub(crate) fn plugin_automation_error(error: io::Error) -> AutomationError {
     AutomationError::new(code, message)
 }
 
+fn require_plugin_params(
+    params: &serde_json::Value,
+    allowed: &[&str],
+) -> Result<(), AutomationError> {
+    let object = params.as_object().ok_or_else(|| {
+        AutomationError::new("invalid_params", "host-call params must be an object")
+    })?;
+    if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(AutomationError::new(
+            "invalid_params",
+            format!("unknown host-call parameter `{unknown}`"),
+        ));
+    }
+    Ok(())
+}
+
+fn plugin_host_permission(method: &str) -> Option<vvmux_plugin_api::Permission> {
+    use vvmux_plugin_api::Permission;
+
+    match method {
+        "session.inspect" => Some(Permission::SessionRead),
+        "pane.get_text" => Some(Permission::PaneRead),
+        "pane.input" => Some(Permission::PaneInput),
+        _ => None,
+    }
+}
+
+fn authorize_plugin_host_call(
+    scope: &crate::plugin_supervisor::RuntimeScope,
+    session_instance: &str,
+    method: &str,
+) -> Result<(), AutomationError> {
+    if scope.session_instance != session_instance {
+        return Err(AutomationError::new(
+            "scope_denied",
+            "plugin runtime belongs to a different session instance",
+        ));
+    }
+    let required = plugin_host_permission(method).ok_or_else(|| {
+        AutomationError::new(
+            "action_not_found",
+            format!("unknown plugin host call `{method}`"),
+        )
+    })?;
+    if !scope.permissions.contains(&required) {
+        return Err(AutomationError::new(
+            "capability_denied",
+            format!("plugin `{}` lacks `{method}` capability", scope.plugin_id),
+        ));
+    }
+    Ok(())
+}
+
+fn plugin_u64_param(params: &serde_json::Value, name: &str) -> Result<u64, AutomationError> {
+    params
+        .get(name)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            AutomationError::new(
+                "invalid_params",
+                format!("{name} must be an unsigned integer"),
+            )
+        })
+}
+
+fn plugin_optional_u64_param(
+    params: &serde_json::Value,
+    name: &str,
+) -> Result<Option<u64>, AutomationError> {
+    match params.get(name) {
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            AutomationError::new(
+                "invalid_params",
+                format!("{name} must be an unsigned integer"),
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
 fn valid_plugin_reference(reference: &str) -> bool {
     let Some(value) = reference.strip_prefix("plugin:") else {
         return false;
@@ -7390,6 +7559,52 @@ fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_host_calls_have_explicit_capabilities_and_strict_params() {
+        use vvmux_plugin_api::Permission;
+
+        assert_eq!(
+            plugin_host_permission("session.inspect"),
+            Some(Permission::SessionRead)
+        );
+        assert_eq!(
+            plugin_host_permission("pane.get_text"),
+            Some(Permission::PaneRead)
+        );
+        assert_eq!(
+            plugin_host_permission("pane.input"),
+            Some(Permission::PaneInput)
+        );
+        assert_eq!(plugin_host_permission("pane.delete_anything"), None);
+        let scope = crate::plugin_supervisor::RuntimeScope {
+            session_instance: "session-a".into(),
+            plugin_id: "dev.example".into(),
+            plugin_instance: "instance-a".into(),
+            permissions: vec![Permission::PaneRead],
+        };
+        assert!(authorize_plugin_host_call(&scope, "session-a", "pane.get_text").is_ok());
+        assert_eq!(
+            authorize_plugin_host_call(&scope, "session-a", "pane.input")
+                .unwrap_err()
+                .code,
+            "capability_denied"
+        );
+        assert_eq!(
+            authorize_plugin_host_call(&scope, "session-b", "pane.get_text")
+                .unwrap_err()
+                .code,
+            "scope_denied"
+        );
+        assert!(require_plugin_params(&serde_json::json!({"pane_id": 1}), &["pane_id"]).is_ok());
+        assert!(
+            require_plugin_params(
+                &serde_json::json!({"pane_id": 1, "unexpected": true}),
+                &["pane_id"]
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn agent_navigator_geometry_is_centered_and_bounded() {

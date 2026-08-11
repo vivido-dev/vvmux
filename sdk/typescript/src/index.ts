@@ -6,6 +6,12 @@ export const MAX_FRAME_BYTES = 1024 * 1024;
 
 export class ProtocolError extends Error {}
 
+export class HostCallError extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(message);
+  }
+}
+
 async function readExact(stream: Readable, length: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -50,10 +56,59 @@ export type Handler = (
   context: Record<string, unknown>,
 ) => unknown | Promise<unknown>;
 
+export class NativeHost {
+  private nextRequestId = 1;
+
+  constructor(
+    private readonly input: Readable,
+    private readonly output: Writable,
+  ) {}
+
+  async call(method: string, params: unknown): Promise<unknown> {
+    const requestId = this.nextRequestId++;
+    await writeFrame(this.output, {
+      type: "host_call",
+      request_id: requestId,
+      method,
+      params,
+    });
+    const reply = await readFrame(this.input);
+    if (reply.request_id !== requestId) throw new ProtocolError("host call reply ID does not match");
+    if (reply.type === "host_call_result") return reply.result;
+    if (reply.type === "host_call_error") {
+      throw new HostCallError(String(reply.code), String(reply.message));
+    }
+    throw new ProtocolError(`unexpected host call reply: ${String(reply.type)}`);
+  }
+}
+
+export type HostHandler = (
+  action: string,
+  input: unknown,
+  context: Record<string, unknown>,
+  host: NativeHost,
+) => unknown | Promise<unknown>;
+
 export async function serve(
   pluginId: string,
   instanceId: string,
   handler: Handler,
+  input: Readable = process.stdin,
+  output: Writable = process.stdout,
+): Promise<void> {
+  return serveWithHost(
+    pluginId,
+    instanceId,
+    (action, value, context) => handler(action, value, context),
+    input,
+    output,
+  );
+}
+
+export async function serveWithHost(
+  pluginId: string,
+  instanceId: string,
+  handler: HostHandler,
   input: Readable = process.stdin,
   output: Writable = process.stdout,
 ): Promise<void> {
@@ -77,13 +132,14 @@ export async function serve(
             message.action as string,
             message.input,
             message.context as Record<string, unknown>,
+            new NativeHost(input, output),
           );
           await writeFrame(output, { type: "result", request_id: requestId, result });
         } catch (error) {
           await writeFrame(output, {
             type: "error",
             request_id: requestId,
-            code: "runtime_crashed",
+            code: error instanceof HostCallError ? error.code : "runtime_crashed",
             message: error instanceof Error ? error.message : String(error),
           });
         }

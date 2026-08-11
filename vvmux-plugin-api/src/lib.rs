@@ -12,8 +12,8 @@ pub use manifest::{
 };
 pub use protocol::{
     ErrorCode, Event, FrameError, Hello, HostCall, HostCallResult, Invocation, InvocationContext,
-    NativeMessage, NativeReply, PROTOCOL_VERSION, PluginError, ResultEnvelope, read_frame,
-    write_frame,
+    MAX_FRAME_BYTES, NativeMessage, NativeReply, PROTOCOL_VERSION, PluginError, ResultEnvelope,
+    read_frame, write_frame,
 };
 
 /// Canonical component interface implemented by sandboxed plugins.

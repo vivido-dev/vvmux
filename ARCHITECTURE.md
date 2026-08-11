@@ -122,6 +122,13 @@ manifest commands out of shell parsing. Native plugins are trusted same-user cod
 Components receive a sandbox claim. Plugin media continues through the existing pane-scoped Vivid
 capability path and never through terminal bytes.
 
+Each session owns a bounded plugin supervisor outside the actor. Native services receive an exact
+session/plugin-instance identity and a short-lived broker token through their scrubbed environment;
+the token is revoked when that runtime stops and is never an argv value or protocol payload. Native
+protocol handlers may issue correlated `host_call` replies. The supervisor validates the live token
+and the actor enforces manifest capabilities before serving `session.inspect`, `pane.get_text`, or
+`pane.input`. Native code remains trusted because it can bypass this broker as the same OS user.
+
 The inner presenter accepts Control and Track only, verifies root and channel authentication,
 consumes marker-v3 anchors, and grants cumulative flow per track. The outer producer allocates all
 of its own identities and re-encodes portable media headers. Per-track bridge queues are

@@ -7,10 +7,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Instant;
 
 use serde_json::Value;
+use vvmux_plugin_api::{HostCall, Permission};
 
 use crate::ipc::AutomationError;
 use crate::session::{ActorEvent, AutomationReplyTarget};
@@ -24,6 +26,124 @@ const MAX_PLUGIN_JOBS: usize = 4;
 pub(crate) struct PluginSupervisor {
     sender: mpsc::SyncSender<Message>,
     next_job_id: Arc<AtomicU64>,
+    session_instance: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeScope {
+    pub(crate) session_instance: String,
+    pub(crate) plugin_id: String,
+    pub(crate) plugin_instance: String,
+    pub(crate) permissions: Vec<Permission>,
+}
+
+#[derive(Clone)]
+pub(crate) struct HostBroker {
+    actor: mpsc::SyncSender<ActorEvent>,
+    session_instance: String,
+    tokens: Arc<Mutex<HashMap<String, RuntimeScope>>>,
+}
+
+pub(crate) struct BrokerLease {
+    token: String,
+    scope: RuntimeScope,
+    broker: HostBroker,
+}
+
+impl HostBroker {
+    pub(crate) fn issue(
+        &self,
+        plugin_id: &str,
+        plugin_instance: &str,
+        permissions: &[Permission],
+    ) -> io::Result<BrokerLease> {
+        let token = random_token()?;
+        let scope = RuntimeScope {
+            session_instance: self.session_instance.clone(),
+            plugin_id: plugin_id.to_owned(),
+            plugin_instance: plugin_instance.to_owned(),
+            permissions: permissions.to_vec(),
+        };
+        self.tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(token.clone(), scope.clone());
+        Ok(BrokerLease {
+            token,
+            scope,
+            broker: self.clone(),
+        })
+    }
+
+    fn call(
+        &self,
+        token: &str,
+        scope: &RuntimeScope,
+        call: HostCall,
+        deadline: Instant,
+    ) -> io::Result<Value> {
+        let valid = self
+            .tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(token)
+            .is_some_and(|registered| registered == scope);
+        if !valid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "scope_denied: stale plugin broker token",
+            ));
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.actor
+            .try_send(ActorEvent::PluginHostCall {
+                scope: scope.clone(),
+                call,
+                reply: sender,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => {
+                    io::Error::other("busy: session actor queue is full")
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    io::Error::other("runtime_unavailable: session actor stopped")
+                }
+            })?;
+        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{}: {}", error.code, error.message),
+            )),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timeout: host call expired",
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+                "runtime_unavailable: host call reply dropped",
+            )),
+        }
+    }
+}
+
+impl BrokerLease {
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub(crate) fn call(&self, call: HostCall, deadline: Instant) -> io::Result<Value> {
+        self.broker.call(&self.token, &self.scope, call, deadline)
+    }
+}
+
+impl Drop for BrokerLease {
+    fn drop(&mut self) {
+        self.broker
+            .tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.token);
+    }
 }
 
 enum Completion {
@@ -92,8 +212,14 @@ impl PluginSupervisor {
         actor: mpsc::SyncSender<ActorEvent>,
     ) -> io::Result<Self> {
         let session_instance = random_identity()?;
+        let broker = HostBroker {
+            actor: actor.clone(),
+            session_instance: session_instance.clone(),
+            tokens: Arc::new(Mutex::new(HashMap::new())),
+        };
         let (sender, receiver) = mpsc::sync_channel(COMMAND_QUEUE);
         let manager_sender = sender.clone();
+        let manager_session_instance = session_instance.clone();
         thread::Builder::new()
             .name(format!("vvmux-plugin-supervisor-{session_name}"))
             .spawn(move || {
@@ -102,12 +228,14 @@ impl PluginSupervisor {
                     manager_sender,
                     actor,
                     session_name,
-                    session_instance,
+                    manager_session_instance,
+                    broker,
                 );
             })?;
         Ok(Self {
             sender,
             next_job_id: Arc::new(AtomicU64::new(1)),
+            session_instance,
         })
     }
 
@@ -167,6 +295,10 @@ impl PluginSupervisor {
     pub(crate) fn shutdown(&self) {
         let _ = self.sender.try_send(Message::Shutdown);
     }
+
+    pub(crate) fn session_instance(&self) -> &str {
+        &self.session_instance
+    }
 }
 
 fn run_manager(
@@ -175,6 +307,7 @@ fn run_manager(
     actor: mpsc::SyncSender<ActorEvent>,
     session_name: String,
     session_instance: String,
+    broker: HostBroker,
 ) {
     let mut workers = HashMap::<String, mpsc::SyncSender<WorkerMessage>>::new();
     let mut active = HashMap::<u64, ActiveJob>::new();
@@ -197,6 +330,7 @@ fn run_manager(
                         &job.plugin_id,
                         &session_name,
                         &session_instance,
+                        broker.clone(),
                         sender.clone(),
                     ) {
                         Ok(worker) => {
@@ -273,6 +407,7 @@ fn spawn_worker(
     plugin_id: &str,
     session_name: &str,
     session_instance: &str,
+    broker: HostBroker,
     manager: mpsc::SyncSender<Message>,
 ) -> io::Result<mpsc::SyncSender<WorkerMessage>> {
     let (sender, receiver) = mpsc::sync_channel(PLUGIN_QUEUE);
@@ -283,6 +418,7 @@ fn spawn_worker(
         session_name,
         session_instance,
         plugin_id.clone(),
+        broker,
     )?;
     thread::Builder::new()
         .name(format!("vvmux-plugin-{plugin_id}"))
@@ -326,6 +462,12 @@ fn random_identity() -> io::Result<String> {
     Ok(hex::encode(bytes))
 }
 
+fn random_token() -> io::Result<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+    Ok(hex::encode(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +479,29 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.len(), 32);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn broker_tokens_are_scoped_and_revoked_with_the_runtime() {
+        let (actor, _events) = mpsc::sync_channel(1);
+        let tokens = Arc::new(Mutex::new(HashMap::new()));
+        let broker = HostBroker {
+            actor,
+            session_instance: "session-a".into(),
+            tokens: tokens.clone(),
+        };
+        let lease = broker
+            .issue("dev.example", "instance-a", &[Permission::PaneRead])
+            .unwrap();
+        assert_eq!(lease.token().len(), 64);
+        let registered = tokens.lock().unwrap().get(lease.token()).cloned().unwrap();
+        assert_eq!(registered.session_instance, "session-a");
+        assert_eq!(registered.plugin_id, "dev.example");
+        assert_eq!(registered.plugin_instance, "instance-a");
+        assert_eq!(registered.permissions, vec![Permission::PaneRead]);
+        let token = lease.token().to_owned();
+        drop(lease);
+        assert!(!tokens.lock().unwrap().contains_key(&token));
     }
 
     #[test]

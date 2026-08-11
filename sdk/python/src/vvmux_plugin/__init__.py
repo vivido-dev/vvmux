@@ -16,6 +16,46 @@ class ProtocolError(Exception):
     """A malformed or oversized native protocol frame."""
 
 
+class HostCallError(Exception):
+    """A typed rejection returned by the vvmux plugin broker."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class NativeHost:
+    """Scoped broker client available only while a service invocation is active."""
+
+    def __init__(self, reader: BinaryIO, writer: BinaryIO) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._next_request_id = 1
+
+    def call(self, method: str, params: Any) -> Any:
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        write_frame(
+            self._writer,
+            {
+                "type": "host_call",
+                "request_id": request_id,
+                "method": method,
+                "params": params,
+            },
+        )
+        reply = read_frame(self._reader)
+        if reply.get("request_id") != request_id:
+            raise ProtocolError("host call reply ID does not match")
+        match reply.get("type"):
+            case "host_call_result":
+                return reply.get("result")
+            case "host_call_error":
+                raise HostCallError(str(reply.get("code")), str(reply.get("message")))
+            case other:
+                raise ProtocolError(f"unexpected host call reply: {other!r}")
+
+
 def read_frame(stream: BinaryIO) -> dict[str, Any]:
     prefix = stream.read(4)
     if len(prefix) != 4:
@@ -48,6 +88,20 @@ def serve(
 ) -> None:
     """Serve serialized invocations on stdin/stdout; use stderr only for logs."""
 
+    serve_with_host(
+        plugin_id,
+        instance_id,
+        lambda action, value, context, _host: handler(action, value, context),
+    )
+
+
+def serve_with_host(
+    plugin_id: str,
+    instance_id: str,
+    handler: Callable[[str, Any, dict[str, Any], NativeHost], Any],
+) -> None:
+    """Serve serialized invocations with access to scoped brokered host calls."""
+
     reader = sys.stdin.buffer
     writer = sys.stdout.buffer
     write_frame(
@@ -68,18 +122,25 @@ def serve(
                 write_frame(writer, {"type": "ready", "request_id": request_id})
             case "invoke":
                 try:
-                    result = handler(message["action"], message["input"], message["context"])
+                    host = NativeHost(reader, writer)
+                    result = handler(
+                        message["action"], message["input"], message["context"], host
+                    )
                     write_frame(
                         writer,
                         {"type": "result", "request_id": request_id, "result": result},
                     )
-                except Exception as error:  # plugin errors cross as typed data
+                except Exception as error:  # noqa: BLE001 - plugin errors cross as typed data
                     write_frame(
                         writer,
                         {
                             "type": "error",
                             "request_id": request_id,
-                            "code": "runtime_crashed",
+                            "code": (
+                                error.code
+                                if isinstance(error, HostCallError)
+                                else "runtime_crashed"
+                            ),
                             "message": str(error),
                         },
                     )
@@ -95,8 +156,11 @@ def serve(
 __all__ = [
     "MAX_FRAME_BYTES",
     "PROTOCOL_VERSION",
+    "HostCallError",
+    "NativeHost",
     "ProtocolError",
     "read_frame",
     "serve",
+    "serve_with_host",
     "write_frame",
 ]
