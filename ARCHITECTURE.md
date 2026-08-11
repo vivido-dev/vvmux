@@ -122,12 +122,24 @@ manifest commands out of shell parsing. Native plugins are trusted same-user cod
 Components receive a sandbox claim. Plugin media continues through the existing pane-scoped Vivid
 capability path and never through terminal bytes.
 
-Each session owns a bounded plugin supervisor outside the actor. Native services receive an exact
-session/plugin-instance identity and a short-lived broker token through their scrubbed environment;
-the token is revoked when that runtime stops and is never an argv value or protocol payload. Native
-protocol handlers may issue correlated `host_call` replies. The supervisor validates the live token
-and the actor enforces manifest capabilities before serving `session.inspect`, `pane.get_text`, or
-`pane.input`. Native code remains trusted because it can bypass this broker as the same OS user.
+The session owns its collision-resistant instance identity independently of plugin enablement. When
+`plugins.enabled` is false, it starts neither a plugin supervisor nor a registry watcher; disabling
+plugins in a live session immediately removes the supervisor from the actor's acceptance path,
+cancels its jobs, revokes runtime identities, and stops its watcher. Enabling plugins creates those
+workers without replacing the session identity. The disabled and no-package paths therefore add no
+plugin-originated actor wakeups.
+
+When enabled, each session owns one bounded plugin supervisor outside the actor. Catalog and
+capability discovery come from that supervisor's applied registry snapshot, carry its generation,
+and include only actions currently invocable in the exact target session. Native services and
+Components receive an exact session/plugin-instance identity and a short-lived broker token through
+their scrubbed environment; the token is revoked when that runtime stops and is never an argv value
+or protocol payload. Native protocol handlers may issue correlated `host_call` replies. One-shot
+actions receive no broker token and expose no typed host-call transport. The supervisor validates a
+live service or Component token, and the actor lowers both automation and broker requests through
+typed `SessionCommand`/`CallerContext` authorization before serving `session.inspect`,
+`pane.get_text`, or `pane.input`. Native code remains trusted because it can bypass this broker as
+the same OS user.
 
 The inner presenter accepts Control and Track only, verifies root and channel authentication,
 consumes marker-v3 anchors, and grants cumulative flow per track. The outer producer allocates all

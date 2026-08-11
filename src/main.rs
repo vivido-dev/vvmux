@@ -383,6 +383,23 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["vvmux", "--skill"]).is_ok());
         assert!(
+            Cli::try_parse_from(["vvmux", "plugin", "catalog", "--target", "work", "--json",])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["vvmux", "plugin", "catalog", "--json"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "vvmux",
+                "plugin",
+                "invoke",
+                "dev.example/run",
+                "--target",
+                "work",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["vvmux", "plugin", "invoke", "dev.example/run"]).is_err());
+        assert!(
             Cli::try_parse_from([
                 "vvmux",
                 "msg",

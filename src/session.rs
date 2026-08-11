@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -72,6 +72,38 @@ const MAX_RUN_COMMAND_BYTES: usize = 64 * 1024;
 const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
 #[cfg(windows)]
 const DISABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004l";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallerOrigin {
+    Automation {
+        client_id: u64,
+    },
+    Plugin {
+        plugin_id: String,
+        plugin_instance: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct CallerContext {
+    origin: CallerOrigin,
+    session_instance: String,
+    focused_fallback: bool,
+    capabilities: BTreeSet<vvmux_plugin_api::Permission>,
+}
+
+enum SessionCommand {
+    InspectSession,
+    ReadPaneText {
+        pane_id: Option<PaneId>,
+        rows: Option<usize>,
+        max_bytes: usize,
+    },
+    WritePaneInput {
+        pane_id: Option<PaneId>,
+        bytes: Vec<u8>,
+    },
+}
 
 pub enum ActorEvent {
     Client {
@@ -148,10 +180,14 @@ pub struct ActorHandle {
 /// rather than assuming the whole file applied.
 struct ReloadReport {
     path: String,
+    /// Sections whose live behavior changed before the report was returned.
+    applied: Vec<String>,
     /// Sections that cannot change in a live session and were carried forward.
     ignored: Vec<String>,
     /// Sections that were adopted but only affect future panes, clients, or processes.
     deferred: Vec<String>,
+    /// Sections that retained their previous live value because activation failed.
+    failed: BTreeMap<String, String>,
 }
 
 impl ReloadReport {
@@ -159,8 +195,10 @@ impl ReloadReport {
         serde_json::json!({
             "reloaded": true,
             "path": self.path,
+            "applied": self.applied,
             "ignored": self.ignored,
             "deferred": self.deferred,
+            "failed": self.failed,
         })
     }
 }
@@ -722,6 +760,8 @@ fn next_outer_compatibility_revision(current: u64, incoming_bridge_revision: u64
 
 struct SessionActor {
     name: String,
+    /// Stable for this exact daemon lifetime, independent of whether plugins are enabled.
+    session_instance: String,
     config: Config,
     /// The config file backing `config`, re-read on reload. `None` when none could be resolved.
     // Read by the config reload path.
@@ -776,7 +816,7 @@ struct SessionActor {
     response_sender: mpsc::SyncSender<AutomationResponseJob>,
     automation_inflight: HashMap<u64, HashSet<u64>>,
     pending_actor_work: HashSet<(u64, u64)>,
-    plugin_supervisor: crate::plugin_supervisor::PluginSupervisor,
+    plugin_supervisor: Option<crate::plugin_supervisor::PluginSupervisor>,
     automation_waiters: Vec<AutomationWaiter>,
     exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
@@ -787,6 +827,8 @@ struct SessionActor {
     config_reload_pending: Arc<AtomicBool>,
     /// Coalesces global plugin-registry watcher wakes until the actor submits one reload.
     plugin_reload_pending: Arc<AtomicBool>,
+    /// Stops only the plugin registry watcher when the live global kill switch is disabled.
+    plugin_watch_shutdown: Option<Arc<AtomicBool>>,
     /// Latest foreground-bridge counter report. Diagnostic only; retained across a detach so
     /// `inspect-media` still describes the last live bridge.
     bridge_metrics: crate::metrics::BridgeMetrics,
@@ -845,12 +887,6 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         )?;
     }
     let plugin_reload_pending = Arc::new(AtomicBool::new(false));
-    crate::config_watch::spawn_plugin_registry(
-        crate::plugin::registry_path()?,
-        sender.clone(),
-        shutdown.clone(),
-        plugin_reload_pending.clone(),
-    )?;
     let (response_sender, response_receiver) =
         mpsc::sync_channel::<AutomationResponseJob>(AUTOMATION_RESPONSE_QUEUE);
     let response_receiver = Arc::new(std::sync::Mutex::new(response_receiver));
@@ -889,10 +925,30 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
     let agent_detector = crate::agent::start_detector(move |updates| {
         let _ = detector_sender.send(ActorEvent::AgentProcesses(updates));
     })?;
-    let plugin_supervisor =
-        crate::plugin_supervisor::PluginSupervisor::start(name.clone(), sender.clone())?;
+    let session_instance = crate::plugin::random_id()?;
+    let (plugin_supervisor, plugin_watch_shutdown) = if config.plugins.enabled {
+        let supervisor = crate::plugin_supervisor::PluginSupervisor::start(
+            name.clone(),
+            session_instance.clone(),
+            sender.clone(),
+        )?;
+        let watcher_shutdown = Arc::new(AtomicBool::new(false));
+        if let Err(error) = crate::config_watch::spawn_plugin_registry(
+            crate::plugin::registry_path()?,
+            sender.clone(),
+            watcher_shutdown.clone(),
+            plugin_reload_pending.clone(),
+        ) {
+            supervisor.shutdown();
+            return Err(error);
+        }
+        (Some(supervisor), Some(watcher_shutdown))
+    } else {
+        (None, None)
+    };
     let mut actor = SessionActor {
         name,
+        session_instance,
         config,
         config_path,
         sender: sender.clone(),
@@ -947,6 +1003,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         media_projection_pending,
         config_reload_pending,
         plugin_reload_pending,
+        plugin_watch_shutdown,
         bridge_metrics: crate::metrics::BridgeMetrics::default(),
         client_ipc: None,
     };
@@ -1019,7 +1076,12 @@ impl SessionActor {
             }
         }
         self.terminate_children();
-        self.plugin_supervisor.shutdown();
+        if let Some(stop) = self.plugin_watch_shutdown.take() {
+            stop.store(true, Ordering::Release);
+        }
+        if let Some(supervisor) = self.plugin_supervisor.take() {
+            supervisor.shutdown();
+        }
         self.shutdown.store(true, Ordering::Release);
     }
 
@@ -1104,7 +1166,9 @@ impl SessionActor {
                 self.handle_client(id, writer, cancel, message)?;
             }
             ActorEvent::Disconnected(id) => {
-                self.plugin_supervisor.cancel_client(id);
+                if let Some(supervisor) = &self.plugin_supervisor {
+                    supervisor.cancel_client(id);
+                }
                 self.automation_inflight.remove(&id);
                 self.pending_actor_work
                     .retain(|(client_id, _)| *client_id != id);
@@ -1302,7 +1366,9 @@ impl SessionActor {
             }
             ActorEvent::PluginsChanged => {
                 self.plugin_reload_pending.store(false, Ordering::Release);
-                if let Err(error) = self.plugin_supervisor.reload_notice() {
+                if let Some(supervisor) = &self.plugin_supervisor
+                    && let Err(error) = supervisor.reload_notice()
+                {
                     self.status(&format!("plugin registry reload failed: {}", error.message));
                 }
             }
@@ -1788,6 +1854,12 @@ impl SessionActor {
             self.reply_automation_error(target, error);
             return;
         }
+        let caller = CallerContext {
+            origin: CallerOrigin::Automation { client_id },
+            session_instance: self.session_instance.clone(),
+            focused_fallback: request.allow_focused,
+            capabilities: plugin_enforceable_permissions().into_iter().collect(),
+        };
 
         let pane_id = if method_needs_pane(&request.method) {
             let resolved = if matches!(&request.method, AutomationMethod::WaitExit { .. })
@@ -1811,7 +1883,26 @@ impl SessionActor {
 
         match request.method {
             AutomationMethod::Capabilities => {
-                self.reply_automation(target, automation_capabilities());
+                let Some(supervisor) = self.plugin_supervisor.clone() else {
+                    self.reply_automation(
+                        target,
+                        automation_capabilities(disabled_plugin_capabilities(
+                            &self.session_instance,
+                        )),
+                    );
+                    return;
+                };
+                if !self.register_pending_actor_work(&target) {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("busy", "session pending-work quota is exhausted"),
+                    );
+                    return;
+                }
+                if let Err(error) = supervisor.capabilities(target.clone()) {
+                    self.complete_pending_actor_work(&target);
+                    self.reply_automation_error(target, error);
+                }
             }
             AutomationMethod::ReloadConfig => match self.reload_config() {
                 Ok(report) => self.reply_automation(target, report.to_json()),
@@ -1823,21 +1914,10 @@ impl SessionActor {
                 }
             },
             AutomationMethod::ListPanes => {
-                let panes = self
-                    .panes
-                    .keys()
-                    .copied()
-                    .filter_map(|pane| self.pane_description(pane))
-                    .collect::<Vec<_>>();
-                self.reply_automation(
-                    target,
-                    serde_json::json!({
-                        "session": self.name,
-                        "session_sequence": self.session_sequence,
-                        "rendered_session_sequence": self.rendered_session_sequence(),
-                        "panes": panes,
-                    }),
-                );
+                match self.execute_session_command(&caller, SessionCommand::InspectSession) {
+                    Ok(value) => self.reply_automation(target, value),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
             }
             AutomationMethod::ReportAgent {
                 agent,
@@ -2027,24 +2107,17 @@ impl SessionActor {
                 self.automation_input(target, pane_id, bytes);
             }
             AutomationMethod::GetText { rows } => {
-                let pane = &self.panes[&pane_id.unwrap()];
-                let text = match rows {
-                    Some(rows) => pane.terminal.latest_text(usize::from(rows)),
-                    None => pane
-                        .terminal
-                        .visible_text(pane.copy.as_ref().map_or(0, |copy| copy.offset)),
-                };
-                if text.len() > AUTOMATION_REPLY_LIMIT {
-                    self.reply_automation_error(
-                        target,
-                        AutomationError::new(
-                            "limit_exceeded",
-                            "pane text exceeds the 16 MiB reply limit",
-                        ),
-                    );
-                    return;
+                match self.execute_session_command(
+                    &caller,
+                    SessionCommand::ReadPaneText {
+                        pane_id,
+                        rows: rows.map(usize::from),
+                        max_bytes: AUTOMATION_REPLY_LIMIT,
+                    },
+                ) {
+                    Ok(value) => self.reply_automation(target, value),
+                    Err(error) => self.reply_automation_error(target, error),
                 }
-                self.reply_automation(target, serde_json::Value::String(text));
             }
             AutomationMethod::GetGrid {
                 start_line,
@@ -2125,8 +2198,12 @@ impl SessionActor {
                 input,
                 detach,
             }) => {
+                let Some(supervisor) = self.plugin_supervisor.clone() else {
+                    self.reply_automation_error(target, plugin_disabled_error());
+                    return;
+                };
                 if detach {
-                    match self.plugin_supervisor.invoke_detached(reference, input) {
+                    match supervisor.invoke_detached(reference, input) {
                         Ok(job_id) => self.reply_automation(
                             target,
                             serde_json::json!({"job_id": job_id, "status": "queued"}),
@@ -2142,15 +2219,16 @@ impl SessionActor {
                     );
                     return;
                 }
-                if let Err(error) =
-                    self.plugin_supervisor
-                        .invoke_automation(reference, input, target.clone())
-                {
+                if let Err(error) = supervisor.invoke_automation(reference, input, target.clone()) {
                     self.complete_pending_actor_work(&target);
                     self.reply_automation_error(target, error);
                 }
             }
             AutomationMethod::Plugin(crate::ipc::PluginMethod::JobStatus { job_id }) => {
+                let Some(supervisor) = self.plugin_supervisor.clone() else {
+                    self.reply_automation_error(target, plugin_disabled_error());
+                    return;
+                };
                 if !self.register_pending_actor_work(&target) {
                     self.reply_automation_error(
                         target,
@@ -2158,12 +2236,16 @@ impl SessionActor {
                     );
                     return;
                 }
-                if let Err(error) = self.plugin_supervisor.job_status(job_id, target.clone()) {
+                if let Err(error) = supervisor.job_status(job_id, target.clone()) {
                     self.complete_pending_actor_work(&target);
                     self.reply_automation_error(target, error);
                 }
             }
             AutomationMethod::Plugin(crate::ipc::PluginMethod::JobCancel { job_id }) => {
+                let Some(supervisor) = self.plugin_supervisor.clone() else {
+                    self.reply_automation_error(target, plugin_disabled_error());
+                    return;
+                };
                 if !self.register_pending_actor_work(&target) {
                     self.reply_automation_error(
                         target,
@@ -2171,12 +2253,16 @@ impl SessionActor {
                     );
                     return;
                 }
-                if let Err(error) = self.plugin_supervisor.job_cancel(job_id, target.clone()) {
+                if let Err(error) = supervisor.job_cancel(job_id, target.clone()) {
                     self.complete_pending_actor_work(&target);
                     self.reply_automation_error(target, error);
                 }
             }
             AutomationMethod::Plugin(crate::ipc::PluginMethod::JobLogs { job_id }) => {
+                let Some(supervisor) = self.plugin_supervisor.clone() else {
+                    self.reply_automation_error(target, plugin_disabled_error());
+                    return;
+                };
                 if !self.register_pending_actor_work(&target) {
                     self.reply_automation_error(
                         target,
@@ -2184,12 +2270,25 @@ impl SessionActor {
                     );
                     return;
                 }
-                if let Err(error) = self.plugin_supervisor.job_logs(job_id, target.clone()) {
+                if let Err(error) = supervisor.job_logs(job_id, target.clone()) {
                     self.complete_pending_actor_work(&target);
                     self.reply_automation_error(target, error);
                 }
             }
             AutomationMethod::Plugin(crate::ipc::PluginMethod::Reload) => {
+                let Some(supervisor) = self.plugin_supervisor.clone() else {
+                    self.reply_automation(
+                        target,
+                        serde_json::json!({
+                            "disabled": true,
+                            "generation": null,
+                            "applied": [],
+                            "deferred": [],
+                            "failed": {},
+                        }),
+                    );
+                    return;
+                };
                 if !self.register_pending_actor_work(&target) {
                     self.reply_automation_error(
                         target,
@@ -2197,7 +2296,7 @@ impl SessionActor {
                     );
                     return;
                 }
-                if let Err(error) = self.plugin_supervisor.reload_automation(target.clone()) {
+                if let Err(error) = supervisor.reload_automation(target.clone()) {
                     self.complete_pending_actor_work(&target);
                     self.reply_automation_error(target, error);
                 }
@@ -3960,24 +4059,24 @@ impl SessionActor {
             self.status("invalid plugin action reference");
             return;
         }
-        if let Err(error) =
-            self.plugin_supervisor
-                .invoke_notice(invocation, serde_json::json!({}), reference)
-        {
+        let Some(supervisor) = self.plugin_supervisor.clone() else {
+            self.status("plugin action rejected: plugins are disabled in this session");
+            return;
+        };
+        if let Err(error) = supervisor.invoke_notice(invocation, serde_json::json!({}), reference) {
             self.status(&format!("plugin action rejected: {}", error.message));
         }
     }
 
-    fn handle_plugin_host_call(
+    fn execute_session_command(
         &mut self,
-        scope: &crate::plugin_supervisor::RuntimeScope,
-        method: &str,
-        params: serde_json::Value,
+        caller: &CallerContext,
+        command: SessionCommand,
     ) -> Result<serde_json::Value, AutomationError> {
-        authorize_plugin_host_call(scope, self.plugin_supervisor.session_instance(), method)?;
-        match method {
-            "session.inspect" => {
-                require_plugin_params(&params, &[])?;
+        authorize_session_scope(caller, &self.session_instance)?;
+        match command {
+            SessionCommand::InspectSession => {
+                authorize_session_capability(caller, vvmux_plugin_api::Permission::SessionRead)?;
                 let panes = self
                     .panes
                     .keys()
@@ -3986,11 +4085,107 @@ impl SessionActor {
                     .collect::<Vec<_>>();
                 Ok(serde_json::json!({
                     "session": self.name,
-                    "session_instance": scope.session_instance,
+                    "session_instance": self.session_instance,
                     "session_sequence": self.session_sequence,
                     "layout_sequence": self.layout_revision,
+                    "rendered_session_sequence": self.rendered_session_sequence(),
                     "panes": panes,
                 }))
+            }
+            SessionCommand::ReadPaneText {
+                pane_id,
+                rows,
+                max_bytes,
+            } => {
+                authorize_session_capability(caller, vvmux_plugin_api::Permission::PaneRead)?;
+                let pane_id = self.resolve_session_command_pane(caller, pane_id)?;
+                let pane = self.panes.get(&pane_id).ok_or_else(|| {
+                    AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
+                })?;
+                let text = rows.map_or_else(
+                    || {
+                        pane.terminal
+                            .visible_text(pane.copy.as_ref().map_or(0, |copy| copy.offset))
+                    },
+                    |rows| pane.terminal.latest_text(rows),
+                );
+                if text.len() > max_bytes {
+                    return Err(AutomationError::new(
+                        "limit_exceeded",
+                        "pane text exceeds the bounded command result",
+                    ));
+                }
+                Ok(serde_json::Value::String(text))
+            }
+            SessionCommand::WritePaneInput { pane_id, bytes } => {
+                authorize_session_capability(caller, vvmux_plugin_api::Permission::PaneInput)?;
+                let pane_id = self.resolve_session_command_pane(caller, pane_id)?;
+                if bytes.len() > 1024 * 1024 {
+                    return Err(AutomationError::new(
+                        "limit_exceeded",
+                        "PTY input exceeds 1 MiB",
+                    ));
+                }
+                let pane = self.panes.get_mut(&pane_id).ok_or_else(|| {
+                    AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
+                })?;
+                pane.input.send(&bytes).map_err(|error| {
+                    AutomationError::new("runtime_unavailable", error.to_string())
+                })?;
+                Ok(serde_json::Value::Null)
+            }
+        }
+    }
+
+    fn resolve_session_command_pane(
+        &self,
+        caller: &CallerContext,
+        pane_id: Option<PaneId>,
+    ) -> Result<PaneId, AutomationError> {
+        pane_id
+            .or_else(|| {
+                caller
+                    .focused_fallback
+                    .then(|| self.active_tab().map(|tab| tab.focused))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                AutomationError::new(
+                    "pane_required",
+                    "command requires an explicit pane or focused fallback",
+                )
+            })
+    }
+
+    fn handle_plugin_host_call(
+        &mut self,
+        scope: &crate::plugin_supervisor::RuntimeScope,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, AutomationError> {
+        if !self.config.plugins.enabled || self.plugin_supervisor.is_none() {
+            return Err(plugin_disabled_error());
+        }
+        let caller = CallerContext {
+            origin: CallerOrigin::Plugin {
+                plugin_id: scope.plugin_id.clone(),
+                plugin_instance: scope.plugin_instance.clone(),
+            },
+            session_instance: scope.session_instance.clone(),
+            focused_fallback: false,
+            capabilities: scope.permissions.iter().copied().collect(),
+        };
+        let required = plugin_host_permission(method).ok_or_else(|| {
+            AutomationError::new(
+                "action_not_found",
+                format!("unknown plugin host call `{method}`"),
+            )
+        })?;
+        authorize_session_capability(&caller, required)?;
+        match method {
+            "session.inspect" => {
+                require_plugin_params(&params, &[])?;
+                self.execute_session_command(&caller, SessionCommand::InspectSession)
             }
             "pane.get_text" => {
                 require_plugin_params(&params, &["pane_id", "rows"])?;
@@ -4003,23 +4198,14 @@ impl SessionActor {
                         "rows must be from 1 through 1000",
                     ));
                 }
-                let pane = self.panes.get(&pane_id).ok_or_else(|| {
-                    AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
-                })?;
-                let text = rows.map_or_else(
-                    || {
-                        pane.terminal
-                            .visible_text(pane.copy.as_ref().map_or(0, |copy| copy.offset))
+                self.execute_session_command(
+                    &caller,
+                    SessionCommand::ReadPaneText {
+                        pane_id: Some(pane_id),
+                        rows,
+                        max_bytes: vvmux_plugin_api::MAX_FRAME_BYTES / 2,
                     },
-                    |rows| pane.terminal.latest_text(rows),
-                );
-                if text.len() > vvmux_plugin_api::MAX_FRAME_BYTES / 2 {
-                    return Err(AutomationError::new(
-                        "limit_exceeded",
-                        "pane text exceeds the bounded host-call result",
-                    ));
-                }
-                Ok(serde_json::Value::String(text))
+                )
             }
             "pane.input" => {
                 require_plugin_params(&params, &["pane_id", "text"])?;
@@ -4030,21 +4216,18 @@ impl SessionActor {
                     .ok_or_else(|| {
                         AutomationError::new("invalid_params", "text must be a string")
                     })?;
-                if text.len() > 1024 * 1024 {
-                    return Err(AutomationError::new(
-                        "limit_exceeded",
-                        "PTY input exceeds 1 MiB",
-                    ));
-                }
-                let pane = self.panes.get_mut(&pane_id).ok_or_else(|| {
-                    AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
-                })?;
-                pane.input.send(text.as_bytes()).map_err(|error| {
-                    AutomationError::new("runtime_unavailable", error.to_string())
-                })?;
-                Ok(serde_json::Value::Null)
+                self.execute_session_command(
+                    &caller,
+                    SessionCommand::WritePaneInput {
+                        pane_id: Some(pane_id),
+                        bytes: text.as_bytes().to_vec(),
+                    },
+                )
             }
-            _ => unreachable!("host-call method was validated above"),
+            _ => Err(AutomationError::new(
+                "action_not_found",
+                format!("unknown plugin host call `{method}`"),
+            )),
         }
     }
 
@@ -4837,6 +5020,45 @@ impl SessionActor {
         self.relayout();
     }
 
+    /// Start the session-scoped plugin machinery after a live false-to-true config transition.
+    fn enable_plugin_runtime(&mut self) -> Result<(), String> {
+        if self.plugin_supervisor.is_some() {
+            return Ok(());
+        }
+        let supervisor = crate::plugin_supervisor::PluginSupervisor::start(
+            self.name.clone(),
+            self.session_instance.clone(),
+            self.sender.clone(),
+        )
+        .map_err(|error| format!("could not start plugin supervisor: {error}"))?;
+        let watcher_shutdown = Arc::new(AtomicBool::new(false));
+        if let Err(error) = crate::plugin::registry_path().and_then(|path| {
+            crate::config_watch::spawn_plugin_registry(
+                path,
+                self.sender.clone(),
+                watcher_shutdown.clone(),
+                self.plugin_reload_pending.clone(),
+            )
+        }) {
+            watcher_shutdown.store(true, Ordering::Release);
+            supervisor.shutdown();
+            return Err(format!("could not start plugin registry watcher: {error}"));
+        }
+        self.plugin_supervisor = Some(supervisor);
+        self.plugin_watch_shutdown = Some(watcher_shutdown);
+        Ok(())
+    }
+
+    fn disable_plugin_runtime(&mut self) {
+        if let Some(stop) = self.plugin_watch_shutdown.take() {
+            stop.store(true, Ordering::Release);
+        }
+        self.plugin_reload_pending.store(false, Ordering::Release);
+        if let Some(supervisor) = self.plugin_supervisor.take() {
+            supervisor.shutdown();
+        }
+    }
+
     /// Re-read the config file and adopt what can be adopted without disturbing live state.
     ///
     /// Three settings resist reloading, and each is handled rather than ignored:
@@ -4871,8 +5093,10 @@ impl SessionActor {
 
         let mut report = ReloadReport {
             path: path.display().to_string(),
+            applied: Vec::new(),
             ignored: Vec::new(),
             deferred: Vec::new(),
+            failed: BTreeMap::new(),
         };
 
         // MediaConfig comes from vivid_gateway and does not derive PartialEq; comparing the
@@ -4903,6 +5127,20 @@ impl SessionActor {
         if server_changed {
             next.server = self.config.server.clone();
             report.ignored.push("server".to_owned());
+        }
+
+        if next.plugins.enabled != self.config.plugins.enabled {
+            if next.plugins.enabled {
+                if let Err(error) = self.enable_plugin_runtime() {
+                    next.plugins.enabled = false;
+                    report.failed.insert("plugins.enabled".into(), error);
+                } else {
+                    report.applied.push("plugins.enabled".into());
+                }
+            } else {
+                self.disable_plugin_runtime();
+                report.applied.push("plugins.enabled".into());
+            }
         }
 
         let status_changed = next.general.status_visible != self.config.general.status_visible;
@@ -6352,7 +6590,7 @@ fn valid_invocation_reference(reference: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn automation_capabilities() -> serde_json::Value {
+pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "protocol": "VVMX",
         "protocol_version": crate::ipc::VERSION,
@@ -6364,12 +6602,22 @@ fn automation_capabilities() -> serde_json::Value {
         ],
         "limits": automation_limits(),
         "render_acknowledgment": "attached_client_write",
-        "plugins": {
-            "protocol_version": vvmux_plugin_api::PROTOCOL_VERSION,
-            "methods": ["invoke", "job_status", "job_cancel", "job_logs", "reload"],
-            "native_trust": "full_user_authority",
-            "component_sandbox": true,
-        },
+        "plugins": plugin,
+    })
+}
+
+fn disabled_plugin_capabilities(session_instance: &str) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": false,
+        "protocol_version": vvmux_plugin_api::PROTOCOL_VERSION,
+        "session_instance": session_instance,
+        "applied_generation": null,
+        "methods": ["catalog", "invoke", "job_status", "job_cancel", "job_logs", "reload"],
+        "native_trust": "full_user_authority",
+        "component_sandbox": true,
+        "enforceable_capabilities": plugin_enforceable_capabilities(),
+        "actions": [],
+        "failed": {},
     })
 }
 
@@ -6426,30 +6674,67 @@ fn plugin_host_permission(method: &str) -> Option<vvmux_plugin_api::Permission> 
     }
 }
 
-fn authorize_plugin_host_call(
-    scope: &crate::plugin_supervisor::RuntimeScope,
-    session_instance: &str,
-    method: &str,
+fn authorize_session_capability(
+    caller: &CallerContext,
+    required: vvmux_plugin_api::Permission,
 ) -> Result<(), AutomationError> {
-    if scope.session_instance != session_instance {
-        return Err(AutomationError::new(
-            "scope_denied",
-            "plugin runtime belongs to a different session instance",
-        ));
-    }
-    let required = plugin_host_permission(method).ok_or_else(|| {
-        AutomationError::new(
-            "action_not_found",
-            format!("unknown plugin host call `{method}`"),
-        )
-    })?;
-    if !scope.permissions.contains(&required) {
+    if !caller.capabilities.contains(&required) {
+        let identity = match &caller.origin {
+            CallerOrigin::Automation { client_id } => format!("automation client {client_id}"),
+            CallerOrigin::Plugin {
+                plugin_id,
+                plugin_instance,
+            } => format!("plugin {plugin_id} instance {plugin_instance}"),
+        };
+        let capability = serde_json::to_value(required)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| "unknown".into());
         return Err(AutomationError::new(
             "capability_denied",
-            format!("plugin `{}` lacks `{method}` capability", scope.plugin_id),
+            format!("{identity} lacks `{capability}` capability"),
         ));
     }
     Ok(())
+}
+
+fn authorize_session_scope(
+    caller: &CallerContext,
+    session_instance: &str,
+) -> Result<(), AutomationError> {
+    if caller.session_instance == session_instance {
+        Ok(())
+    } else {
+        Err(AutomationError::new(
+            "scope_denied",
+            "caller belongs to a different session instance",
+        ))
+    }
+}
+
+pub(crate) fn plugin_enforceable_permissions() -> [vvmux_plugin_api::Permission; 3] {
+    use vvmux_plugin_api::Permission;
+    [
+        Permission::SessionRead,
+        Permission::PaneRead,
+        Permission::PaneInput,
+    ]
+}
+
+pub(crate) fn plugin_enforceable_capabilities() -> Vec<String> {
+    plugin_enforceable_permissions()
+        .into_iter()
+        .filter_map(|permission| {
+            serde_json::to_value(permission)
+                .ok()?
+                .as_str()
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+fn plugin_disabled_error() -> AutomationError {
+    AutomationError::new("plugin_disabled", "plugins are disabled in this session")
 }
 
 fn plugin_u64_param(params: &serde_json::Value, name: &str) -> Result<u64, AutomationError> {
@@ -7663,24 +7948,32 @@ mod tests {
             Some(Permission::PaneInput)
         );
         assert_eq!(plugin_host_permission("pane.delete_anything"), None);
-        let scope = crate::plugin_supervisor::RuntimeScope {
+        let caller = CallerContext {
+            origin: CallerOrigin::Plugin {
+                plugin_id: "dev.example".into(),
+                plugin_instance: "instance-a".into(),
+            },
             session_instance: "session-a".into(),
-            plugin_id: "dev.example".into(),
-            plugin_instance: "instance-a".into(),
-            permissions: vec![Permission::PaneRead],
+            focused_fallback: false,
+            capabilities: [Permission::PaneRead].into_iter().collect(),
         };
-        assert!(authorize_plugin_host_call(&scope, "session-a", "pane.get_text").is_ok());
+        assert!(authorize_session_scope(&caller, "session-a").is_ok());
+        assert!(authorize_session_capability(&caller, Permission::PaneRead).is_ok());
         assert_eq!(
-            authorize_plugin_host_call(&scope, "session-a", "pane.input")
+            authorize_session_capability(&caller, Permission::PaneInput)
                 .unwrap_err()
                 .code,
             "capability_denied"
         );
         assert_eq!(
-            authorize_plugin_host_call(&scope, "session-b", "pane.get_text")
+            authorize_session_scope(&caller, "session-b")
                 .unwrap_err()
                 .code,
             "scope_denied"
+        );
+        assert_eq!(
+            plugin_enforceable_capabilities(),
+            ["session.read", "pane.read", "pane.input"]
         );
         assert!(require_plugin_params(&serde_json::json!({"pane_id": 1}), &["pane_id"]).is_ok());
         assert!(

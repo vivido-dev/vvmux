@@ -89,7 +89,7 @@ pub enum PluginCommand {
 #[derive(Debug, Args)]
 pub struct CatalogArgs {
     #[arg(long)]
-    target: Option<String>,
+    target: String,
     #[arg(long)]
     json: bool,
 }
@@ -99,7 +99,7 @@ pub struct InvokeArgs {
     /// Plugin and action as ID/ACTION.
     reference: String,
     #[arg(long)]
-    target: Option<String>,
+    target: String,
     /// JSON, @FILE, or - for stdin.
     #[arg(long, default_value = "{}")]
     input: String,
@@ -192,6 +192,8 @@ pub(crate) struct RuntimePlugin {
 pub(crate) struct RegistryCandidate {
     pub(crate) generation: u64,
     pub(crate) plugins: BTreeMap<String, RuntimePlugin>,
+    /// Agent-visible actions grouped by plugin so draining runtimes can be omitted atomically.
+    pub(crate) catalog: BTreeMap<String, Vec<Value>>,
     pub(crate) failed: BTreeMap<String, String>,
 }
 
@@ -265,6 +267,7 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
     let paths = PluginPaths::new()?;
     let registry = load_registry(&paths)?;
     let mut plugins = BTreeMap::new();
+    let mut catalog = BTreeMap::new();
     let mut failed = BTreeMap::new();
     for entry in registry.plugins.values() {
         if !entry.enabled {
@@ -293,17 +296,52 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
             if !entry.linked && actual_manifest != entry.manifest_digest {
                 return Err(invalid("installed manifest digest differs from registry"));
             }
-            Ok(RuntimePlugin {
-                id: entry.id.clone(),
-                root: entry.root.clone(),
-                digest: actual_digest,
-                manifest_digest: actual_manifest,
-                enabled: true,
-            })
+            let enforceable = crate::session::plugin_enforceable_capabilities()
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let effective_permissions = entry
+                .permissions
+                .iter()
+                .filter(|permission| enforceable.contains(*permission))
+                .cloned()
+                .collect::<Vec<_>>();
+            let actions = loaded
+                .manifest
+                .actions
+                .iter()
+                .filter(|action| action.agent_visible)
+                .map(|action| {
+                    serde_json::json!({
+                        "reference": format!("{}/{}", entry.id, action.id),
+                        "title": action.title,
+                        "description": action.description,
+                        "input_schema": loaded.schemas[&action.input_schema].value,
+                        "output_schema": loaded.schemas[&action.output_schema].value,
+                        "permissions": effective_permissions,
+                        "declared_permissions": entry.permissions,
+                        "runtime_tier": entry.runtime_tier,
+                        "source": entry.source,
+                        "digest": actual_digest,
+                        "manifest_digest": actual_manifest,
+                        "timeout_ms": action.timeout_ms,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((
+                RuntimePlugin {
+                    id: entry.id.clone(),
+                    root: entry.root.clone(),
+                    digest: actual_digest,
+                    manifest_digest: actual_manifest,
+                    enabled: true,
+                },
+                actions,
+            ))
         })();
         match validated {
-            Ok(plugin) => {
+            Ok((plugin, actions)) => {
                 plugins.insert(entry.id.clone(), plugin);
+                catalog.insert(entry.id.clone(), actions);
             }
             Err(error) => {
                 failed.insert(entry.id.clone(), error.to_string());
@@ -313,6 +351,7 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
     Ok(RegistryCandidate {
         generation: registry.generation,
         plugins,
+        catalog,
         failed,
     })
 }
@@ -753,53 +792,33 @@ fn permissions(paths: &PluginPaths, id: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn catalog(paths: &PluginPaths, args: CatalogArgs) -> io::Result<()> {
-    if let Some(target) = &args.target {
-        crate::runtime::validate_session_name(target)?;
+fn catalog(_paths: &PluginPaths, args: CatalogArgs) -> io::Result<()> {
+    let capabilities = session_capabilities(&args.target)?;
+    let plugins = capabilities
+        .get("plugins")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("target session returned no plugin capabilities"))?;
+    if plugins.get("enabled") != Some(&Value::Bool(true)) {
+        return Err(invalid(
+            "plugin_disabled: plugins are disabled in the target session",
+        ));
     }
-    let registry = load_registry(paths)?;
-    let mut actions = Vec::new();
-    for entry in registry.plugins.values().filter(|entry| entry.enabled) {
-        let loaded = load_package(&entry.root)?;
-        for action in loaded
-            .manifest
-            .actions
-            .iter()
-            .filter(|action| action.agent_visible)
-        {
-            actions.push(serde_json::json!({
-                "reference": format!("{}/{}", entry.id, action.id),
-                "title": action.title,
-                "description": action.description,
-                "input_schema": loaded.schemas[&action.input_schema].value,
-                "output_schema": loaded.schemas[&action.output_schema].value,
-                "permissions": entry.permissions,
-                "runtime_tier": entry.runtime_tier,
-                "source": entry.source,
-                "digest": entry.digest,
-                "timeout_ms": action.timeout_ms,
-            }));
-        }
-        for workflow in loaded
-            .manifest
-            .workflows
-            .iter()
-            .filter(|workflow| workflow.agent_visible)
-        {
-            actions.push(serde_json::json!({
-                "reference": format!("{}/{}", entry.id, workflow.id),
-                "title": workflow.title,
-                "description": "manifest workflow",
-                "runtime_tier": "workflow",
-                "source": entry.source,
-                "digest": entry.digest,
-            }));
-        }
-    }
+    let actions = plugins
+        .get("actions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let output = serde_json::json!({
+        "target": args.target,
+        "session_instance": plugins.get("session_instance"),
+        "generation": plugins.get("applied_generation"),
+        "failed": plugins.get("failed"),
+        "actions": actions,
+    });
     if args.json {
-        print_json(&serde_json::json!({"target": args.target, "actions": actions}))
+        print_json(&output)
     } else {
-        for action in actions {
+        for action in output["actions"].as_array().into_iter().flatten() {
             println!(
                 "{}\t{}",
                 action["reference"].as_str().unwrap(),
@@ -810,16 +829,27 @@ fn catalog(paths: &PluginPaths, args: CatalogArgs) -> io::Result<()> {
     }
 }
 
-fn invoke(paths: &PluginPaths, args: InvokeArgs) -> io::Result<()> {
+fn invoke(_paths: &PluginPaths, args: InvokeArgs) -> io::Result<()> {
     let input = read_json_input(&args.input)?;
-    let output = if let Some(target) = args.target.as_deref() {
-        invoke_via_session(target, args.reference, input, args.detach)?
-    } else if args.detach {
-        return Err(invalid("--detach requires --target SESSION"));
-    } else {
-        invoke_reference(paths, &args.reference, None, input)?
-    };
+    let output = invoke_via_session(&args.target, args.reference, input, args.detach)?;
     print_json(&output)
+}
+
+fn session_capabilities(target: &str) -> io::Result<Value> {
+    use crate::ipc::{AutomationMethod, AutomationRequest, ClientMessage};
+
+    crate::runtime::validate_session_name(target)?;
+    let (mut reader, writer) = crate::server::connect(target)?;
+    writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .send(&ClientMessage::Automation(AutomationRequest {
+            id: 1,
+            pane_id: None,
+            allow_focused: false,
+            method: AutomationMethod::Capabilities,
+        }))?;
+    crate::automation::response_result(crate::automation::receive_response(&mut reader, 1)?)
 }
 
 fn invoke_via_session(
@@ -916,99 +946,6 @@ fn plugin_session_request(target: &str, method: crate::ipc::PluginMethod) -> io:
     crate::automation::response_result(crate::automation::receive_response(&mut reader, 1)?)
 }
 
-fn invoke_reference(
-    paths: &PluginPaths,
-    reference: &str,
-    target: Option<&str>,
-    input: Value,
-) -> io::Result<Value> {
-    let (plugin_id, action_id) = reference
-        .split_once('/')
-        .ok_or_else(|| invalid("plugin reference must be ID/ACTION"))?;
-    if let Some(target) = target {
-        crate::runtime::validate_session_name(target)?;
-    }
-    let registry = load_registry(paths)?;
-    let entry = registry
-        .plugins
-        .get(plugin_id)
-        .ok_or_else(|| not_found(plugin_id))?;
-    if !entry.enabled {
-        return Err(invalid("plugin_disabled: plugin is disabled"));
-    }
-    let loaded = load_package(&entry.root)?;
-    let action = loaded
-        .action(action_id)
-        .ok_or_else(|| invalid("action_not_found: action does not exist"))?;
-    loaded
-        .validate_input(action, &input)
-        .map_err(|errors| invalid(format!("schema_invalid: {}", errors.join("; "))))?;
-    let output = if let Some(argv) = action.command.as_deref() {
-        run_one_shot(
-            &loaded.root,
-            argv,
-            &input,
-            Duration::from_millis(action.timeout_ms),
-            OneShotContext {
-                session: target,
-                plugin_id,
-                cancel: None,
-                session_instance: None,
-                broker: None,
-                permissions: &[],
-            },
-        )?
-    } else if let (Some(handler), Some(runtime)) =
-        (action.handler.as_deref(), loaded.manifest.runtime.as_ref())
-    {
-        match runtime.kind {
-            RuntimeKind::Process => run_native_service(
-                &loaded.root,
-                runtime.command.as_deref().unwrap(),
-                plugin_id,
-                handler,
-                input,
-                Duration::from_millis(action.timeout_ms),
-                target,
-            )?,
-            RuntimeKind::Component => {
-                let cancel = Arc::new(AtomicBool::new(false));
-                let deadline = Instant::now() + Duration::from_millis(action.timeout_ms);
-                let mut component = crate::plugin_component::ComponentRuntime::start(
-                    &loaded.root,
-                    runtime.artifact.as_deref().unwrap(),
-                    plugin_id,
-                    None,
-                    None,
-                    &loaded.manifest.plugin.permissions,
-                    &runtime.preopens,
-                    cancel.clone(),
-                    deadline,
-                )?;
-                component.invoke(
-                    handler,
-                    &input,
-                    &serde_json::json!({
-                        "source": "automation",
-                        "session_instance": null,
-                        "deadline_ms": action.timeout_ms,
-                    }),
-                    cancel,
-                    deadline,
-                )?
-            }
-        }
-    } else {
-        return Err(invalid(
-            "runtime_unavailable: action has no executable runtime",
-        ));
-    };
-    loaded
-        .validate_output(action, &output)
-        .map_err(|errors| invalid(format!("output_invalid: {}", errors.join("; "))))?;
-    Ok(output)
-}
-
 pub(crate) struct SessionPluginRuntime {
     session_name: String,
     session_instance: String,
@@ -1084,8 +1021,6 @@ impl SessionPluginRuntime {
                     plugin_id,
                     cancel: Some(&cancel),
                     session_instance: Some(&self.session_instance),
-                    broker: Some(&self.broker),
-                    permissions: &self.loaded.manifest.plugin.permissions,
                 },
             )?
         } else if let (Some(handler), Some(runtime)) = (
@@ -1219,31 +1154,6 @@ impl SessionPluginRuntime {
 fn crash_backoff(consecutive_crashes: u32) -> Duration {
     let exponent = consecutive_crashes.saturating_sub(1).min(8);
     Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent)).min(Duration::from_secs(30))
-}
-
-fn run_native_service(
-    root: &Path,
-    argv: &[String],
-    plugin_id: &str,
-    handler: &str,
-    input: Value,
-    timeout: Duration,
-    session: Option<&str>,
-) -> io::Result<Value> {
-    let session_instance = session.unwrap_or("direct");
-    let mut service = NativeService::start(
-        root,
-        argv,
-        timeout,
-        NativeServiceContext {
-            plugin_id,
-            session,
-            session_instance,
-            broker: None,
-            permissions: &[],
-        },
-    )?;
-    service.invoke(handler, input, timeout, session_instance, None)
 }
 
 struct NativeService {
@@ -1728,8 +1638,6 @@ struct OneShotContext<'a> {
     plugin_id: &'a str,
     cancel: Option<&'a AtomicBool>,
     session_instance: Option<&'a str>,
-    broker: Option<&'a crate::plugin_supervisor::HostBroker>,
-    permissions: &'a [Permission],
 }
 
 fn run_one_shot(
@@ -1740,17 +1648,10 @@ fn run_one_shot(
     context: OneShotContext<'_>,
 ) -> io::Result<Value> {
     let instance_id = random_id()?;
-    let broker_lease = context
-        .broker
-        .map(|broker| broker.issue(context.plugin_id, &instance_id, context.permissions))
-        .transpose()?;
     let mut command = trusted_command(root, argv, context.session, context.plugin_id);
     command.env("VVMUX_PLUGIN_INSTANCE", &instance_id);
     if let Some(session_instance) = context.session_instance {
         command.env("VVMUX_SESSION_INSTANCE", session_instance);
-    }
-    if let Some(lease) = &broker_lease {
-        command.env("VVMUX_PLUGIN_BROKER_TOKEN", lease.token());
     }
     let mut child = command.spawn()?;
     let process_id = child.id();
@@ -2227,6 +2128,29 @@ agent_visible = true
 
     #[cfg(unix)]
     #[test]
+    fn one_shot_actions_receive_no_broker_authority() {
+        let output = run_one_shot(
+            Path::new("/"),
+            &[
+                "sh".into(),
+                "-c".into(),
+                "if test -n \"$VVMUX_PLUGIN_BROKER_TOKEN\"; then printf '{\"token\":true}'; else printf '{\"token\":false}'; fi".into(),
+            ],
+            &serde_json::json!({}),
+            Duration::from_secs(5),
+            OneShotContext {
+                session: Some("test"),
+                plugin_id: "dev.example",
+                cancel: None,
+                session_instance: Some("session-instance"),
+            },
+        )
+        .unwrap();
+        assert_eq!(output, serde_json::json!({"token": false}));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cancelling_one_shot_terminates_its_process_group() {
         let cancelled = std::sync::Arc::new(AtomicBool::new(false));
         let setter = cancelled.clone();
@@ -2245,8 +2169,6 @@ agent_visible = true
                 plugin_id: "dev.example",
                 cancel: Some(cancelled.as_ref()),
                 session_instance: Some("session-instance"),
-                broker: None,
-                permissions: &[],
             },
         );
         cancel_thread.join().unwrap();

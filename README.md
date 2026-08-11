@@ -372,6 +372,7 @@ Not everything can change under a live session, and `msg reload-config` names wh
 | `general.status_visible` | Applied; every pane is resized around the status row |
 | `general.render_interval_ms` | Applied on the next loop iteration |
 | `[floating]`, `[keys.copy]` | Applied the next time they are used |
+| `plugins.enabled` | Applied immediately; disabling stops plugin acceptance, runtimes, and registry watching |
 | `general.shell`, `default_cwd`, `scrollback_lines` | Reported as `deferred`: they apply to panes spawned afterwards |
 | `general.default_layout` | Reported as `deferred`: it applies to the next session created |
 | `general.prefix`, `[keys.prefix]` | Reported as `deferred`: the attached client owns the prefix parser until it reattaches |
@@ -466,18 +467,20 @@ and machine-wide PATH changes. `run` and a layout `command` take one shell comma
 the shell with `-c`; plugin panes and runtimes use exact argument vectors without a shell.
 
 Plugin packages use a strict `vvmux-plugin.toml` and JSON Schema Draft 2020-12 action contracts.
-Discover agent-visible actions with `vvmux plugin catalog --json`; `vvmux --skill` prints the
-release-matched automation guidance. WebAssembly Components are the sandboxed tier. Native process,
-one-shot, and PTY-pane plugins are trusted user code and run with the user's full OS authority.
-Native service SDKs expose scoped host calls for session inspection, bounded pane text, and pane
-input. These calls enforce the manifest's `session.read`, `pane.read`, and `pane.input` declarations;
-their short-lived broker tokens provide attribution and revocation, not an OS security boundary.
+Discover agent-visible actions with `vvmux plugin catalog --target SESSION --json`; `vvmux --skill`
+prints the release-matched automation guidance. WebAssembly Components are the sandboxed tier.
+Native process, one-shot, and PTY-pane plugins are trusted user code and run with the user's full OS
+authority. Native service SDKs expose scoped host calls for session inspection, bounded pane text,
+and pane input. These calls enforce the manifest's `session.read`, `pane.read`, and `pane.input`
+declarations; service and Component broker tokens provide attribution and revocation, not an OS
+security boundary. One-shot actions receive no broker token.
 `vvmux plugin invoke ID/ACTION --target SESSION --detach` returns a session-bound job ID. Use
 `vvmux plugin job status JOB`, `cancel JOB`, and `logs JOB` to inspect or stop it. Sessions retain
 the newest 200 detached completions and at most 256 KiB each of result/error log text; detached work
 survives the invoking CLI client, while synchronous work remains client-scoped.
 
-The global plugin registry carries a monotonic generation and is watched by every live session.
+The global plugin registry carries a monotonic generation and is watched by every plugin-enabled
+live session.
 Install, update, enable, disable, and uninstall publish an atomic generation, wait for every live
 session to accept it, and publish a newer rollback generation if any session rejects it. Changed
 artifacts use immutable content-addressed package directories: existing calls drain on their pinned

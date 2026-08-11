@@ -30,6 +30,7 @@ pub(crate) struct PluginSupervisor {
     sender: mpsc::SyncSender<Message>,
     next_job_id: Arc<AtomicU64>,
     reload_requested: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
     session_name: String,
     session_instance: String,
 }
@@ -200,6 +201,24 @@ struct ReloadWaiter {
     completion: ReloadCompletion,
 }
 
+struct ManagerInputs {
+    receiver: mpsc::Receiver<Message>,
+    sender: mpsc::SyncSender<Message>,
+    actor: mpsc::SyncSender<ActorEvent>,
+    session_name: String,
+    session_instance: String,
+    broker: HostBroker,
+    reload_requested: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
+}
+
+struct AppliedRegistry {
+    generation: u64,
+    plugins: BTreeMap<String, crate::plugin::RuntimePlugin>,
+    catalog: BTreeMap<String, Vec<Value>>,
+    failures: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Serialize)]
 struct RetainedJob {
     job_id: String,
@@ -362,6 +381,9 @@ enum Message {
         job_id: String,
         reply: AutomationReplyTarget,
     },
+    Capabilities {
+        reply: AutomationReplyTarget,
+    },
     Reload {
         completion: ReloadCompletion,
     },
@@ -385,9 +407,9 @@ enum WorkerMessage {
 impl PluginSupervisor {
     pub(crate) fn start(
         session_name: String,
+        session_instance: String,
         actor: mpsc::SyncSender<ActorEvent>,
     ) -> io::Result<Self> {
-        let session_instance = random_identity()?;
         let broker = HostBroker {
             actor: actor.clone(),
             session_instance: session_instance.clone(),
@@ -397,25 +419,29 @@ impl PluginSupervisor {
         let manager_sender = sender.clone();
         let reload_requested = Arc::new(AtomicBool::new(false));
         let manager_reload_requested = reload_requested.clone();
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let manager_shutdown_requested = shutdown_requested.clone();
         let manager_session_name = session_name.clone();
         let manager_session_instance = session_instance.clone();
         thread::Builder::new()
             .name(format!("vvmux-plugin-supervisor-{session_name}"))
             .spawn(move || {
-                run_manager(
+                run_manager(ManagerInputs {
                     receiver,
-                    manager_sender,
+                    sender: manager_sender,
                     actor,
-                    manager_session_name,
-                    manager_session_instance,
+                    session_name: manager_session_name,
+                    session_instance: manager_session_instance,
                     broker,
-                    manager_reload_requested,
-                );
+                    reload_requested: manager_reload_requested,
+                    shutdown_requested: manager_shutdown_requested,
+                });
             })?;
         Ok(Self {
             sender,
             next_job_id: Arc::new(AtomicU64::new(1)),
             reload_requested,
+            shutdown_requested,
             session_name,
             session_instance,
         })
@@ -469,6 +495,10 @@ impl PluginSupervisor {
         reply: AutomationReplyTarget,
     ) -> Result<(), AutomationError> {
         self.send_control(Message::JobLogs { job_id, reply })
+    }
+
+    pub(crate) fn capabilities(&self, reply: AutomationReplyTarget) -> Result<(), AutomationError> {
+        self.send_control(Message::Capabilities { reply })
     }
 
     pub(crate) fn reload_automation(
@@ -560,30 +590,39 @@ impl PluginSupervisor {
     }
 
     pub(crate) fn shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
         let _ = self.sender.try_send(Message::Shutdown);
-    }
-
-    pub(crate) fn session_instance(&self) -> &str {
-        &self.session_instance
     }
 }
 
-fn run_manager(
-    receiver: mpsc::Receiver<Message>,
-    sender: mpsc::SyncSender<Message>,
-    actor: mpsc::SyncSender<ActorEvent>,
-    session_name: String,
-    session_instance: String,
-    broker: HostBroker,
-    reload_requested: Arc<AtomicBool>,
-) {
+fn run_manager(inputs: ManagerInputs) {
+    let ManagerInputs {
+        receiver,
+        sender,
+        actor,
+        session_name,
+        session_instance,
+        broker,
+        reload_requested,
+        shutdown_requested,
+    } = inputs;
     let initial = crate::plugin::load_registry_candidate();
-    let (mut generation, mut plugins, mut registry_failures) = match initial {
-        Ok(candidate) => (candidate.generation, candidate.plugins, candidate.failed),
+    let mut registry = match initial {
+        Ok(candidate) => AppliedRegistry {
+            generation: candidate.generation,
+            plugins: candidate.plugins,
+            catalog: candidate.catalog,
+            failures: candidate.failed,
+        },
         Err(error) => {
             let mut failures = BTreeMap::new();
             failures.insert("registry".into(), error.to_string());
-            (0, BTreeMap::new(), failures)
+            AppliedRegistry {
+                generation: 0,
+                plugins: BTreeMap::new(),
+                catalog: BTreeMap::new(),
+                failures,
+            }
         }
     };
     let mut workers = HashMap::<String, WorkerHandle>::new();
@@ -598,8 +637,8 @@ fn run_manager(
         match message {
             Message::Invoke(job) => {
                 retained.start(&job);
-                let Some(plugin) = plugins.get(&job.plugin_id).cloned() else {
-                    let result = if let Some(error) = registry_failures.get(&job.plugin_id) {
+                let Some(plugin) = registry.plugins.get(&job.plugin_id).cloned() else {
+                    let result = if let Some(error) = registry.failures.get(&job.plugin_id) {
                         Err(io::Error::other(format!(
                             "runtime_unavailable: registry entry is invalid: {error}"
                         )))
@@ -720,6 +759,37 @@ fn run_manager(
             Message::JobLogs { job_id, reply } => {
                 deliver_query(&actor, reply, retained.logs(&job_id));
             }
+            Message::Capabilities { reply } => {
+                let actions = registry
+                    .catalog
+                    .iter()
+                    .filter(|(plugin_id, _)| {
+                        !transitions.contains(*plugin_id)
+                            && registry
+                                .plugins
+                                .get(*plugin_id)
+                                .is_some_and(|plugin| plugin.enabled)
+                    })
+                    .flat_map(|(_, actions)| actions.iter().cloned())
+                    .collect::<Vec<_>>();
+                let plugin = serde_json::json!({
+                    "enabled": true,
+                    "protocol_version": vvmux_plugin_api::PROTOCOL_VERSION,
+                    "session_instance": session_instance,
+                    "applied_generation": registry.generation,
+                    "methods": ["catalog", "invoke", "job_status", "job_cancel", "job_logs", "reload"],
+                    "native_trust": "full_user_authority",
+                    "component_sandbox": true,
+                    "enforceable_capabilities": crate::session::plugin_enforceable_capabilities(),
+                    "actions": actions,
+                    "failed": registry.failures,
+                });
+                deliver_query(
+                    &actor,
+                    reply,
+                    Ok(crate::session::automation_capabilities(plugin)),
+                );
+            }
             Message::Reload { completion } => {
                 if reload_loading {
                     queued_reloads.push(completion);
@@ -741,12 +811,12 @@ fn run_manager(
             } => {
                 reload_loading = false;
                 match result {
-                    Ok(candidate) if candidate.generation < generation => {
+                    Ok(candidate) if candidate.generation < registry.generation => {
                         let error = AutomationError::new(
                             "dependency_failed",
                             format!(
-                                "plugin registry generation {} is older than applied generation {generation}",
-                                candidate.generation
+                                "plugin registry generation {} is older than applied generation {}",
+                                candidate.generation, registry.generation
                             ),
                         );
                         for completion in completions {
@@ -756,9 +826,7 @@ fn run_manager(
                     Ok(candidate) => {
                         let report = apply_registry_candidate(
                             candidate,
-                            &mut generation,
-                            &mut plugins,
-                            &mut registry_failures,
+                            &mut registry,
                             &active,
                             &mut workers,
                             &mut transitions,
@@ -853,6 +921,15 @@ fn run_manager(
                 }
             }
         }
+        if shutdown_requested.load(Ordering::Acquire) {
+            for job in active.values() {
+                job.cancel.store(true, Ordering::Release);
+            }
+            for worker in workers.values() {
+                let _ = worker.sender.try_send(WorkerMessage::Shutdown);
+            }
+            break;
+        }
     }
 }
 
@@ -930,15 +1007,13 @@ fn spawn_registry_load(
 
 fn apply_registry_candidate(
     candidate: crate::plugin::RegistryCandidate,
-    generation: &mut u64,
-    plugins: &mut BTreeMap<String, crate::plugin::RuntimePlugin>,
-    failures: &mut BTreeMap<String, String>,
+    registry: &mut AppliedRegistry,
     active: &HashMap<u64, ActiveJob>,
     workers: &mut HashMap<String, WorkerHandle>,
     transitions: &mut BTreeSet<String>,
 ) -> RegistryReloadReport {
     let mut ids = BTreeSet::new();
-    ids.extend(plugins.keys().cloned());
+    ids.extend(registry.plugins.keys().cloned());
     ids.extend(candidate.plugins.keys().cloned());
     ids.extend(candidate.failed.keys().cloned());
     let mut report = RegistryReloadReport {
@@ -951,16 +1026,21 @@ fn apply_registry_candidate(
         if candidate.failed.contains_key(&id) {
             continue;
         }
-        let previous = plugins.get(&id);
+        let previous = registry.plugins.get(&id);
         let next = candidate.plugins.get(&id);
-        let changed = previous != next;
+        let changed = previous != next || registry.catalog.get(&id) != candidate.catalog.get(&id);
         if changed {
             match next {
                 Some(plugin) => {
-                    plugins.insert(id.clone(), plugin.clone());
+                    registry.plugins.insert(id.clone(), plugin.clone());
+                    registry.catalog.insert(
+                        id.clone(),
+                        candidate.catalog.get(&id).cloned().unwrap_or_default(),
+                    );
                 }
                 None => {
-                    plugins.remove(&id);
+                    registry.plugins.remove(&id);
+                    registry.catalog.remove(&id);
                 }
             }
         }
@@ -981,8 +1061,8 @@ fn apply_registry_candidate(
             report.applied.push(id);
         }
     }
-    *generation = candidate.generation.max(*generation);
-    *failures = candidate.failed;
+    registry.generation = candidate.generation.max(registry.generation);
+    registry.failures = candidate.failed;
     report
 }
 
@@ -1095,6 +1175,7 @@ fn truncate_log(mut value: String, limit: usize) -> (String, bool) {
     (value, true)
 }
 
+#[cfg(test)]
 fn random_identity() -> io::Result<String> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(io::Error::other)?;
