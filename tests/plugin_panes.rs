@@ -30,6 +30,7 @@ fn plugin_panes_use_real_pty_placement_identity_vivid_and_owner_scoped_cleanup()
     let config_home = directory.path().join("config");
     private_directory(&runtime);
     private_directory(&config_home);
+    let vivi_helper = write_vivi_helper(directory.path());
     let config = write_config(directory.path());
     let package = write_package(directory.path());
     assert_success(
@@ -66,6 +67,14 @@ fn plugin_panes_use_real_pty_placement_identity_vivid_and_owner_scoped_cleanup()
         "each pane gets an exact, collision-resistant plugin instance"
     );
     wait_text(binary, &runtime, &config_home, &first, 2, "PLUGIN split");
+    wait_text(
+        binary,
+        &runtime,
+        &config_home,
+        &first,
+        2,
+        &format!("vivi={} protocol=1.5", vivi_helper.display()),
+    );
     wait_text(binary, &runtime, &config_home, &second, 2, "PLUGIN split");
 
     let first_inspect = inspect(binary, &runtime, &config_home, &first, 2);
@@ -171,7 +180,7 @@ fn write_package(root: &Path) -> PathBuf {
         &script,
         br#"#!/bin/sh
 label=$1
-printf 'PLUGIN %s id=%s instance=%s vivid=%s\r\n' "$label" "$VVMUX_PLUGIN_ID" "$VVMUX_PLUGIN_INSTANCE" "${VIVID_ROOT_SECRET:+yes}"
+printf 'PLUGIN %s id=%s instance=%s vivid=%s vivi=%s protocol=%s\r\n' "$label" "$VVMUX_PLUGIN_ID" "$VVMUX_PLUGIN_INSTANCE" "${VIVID_ROOT_SECRET:+yes}" "$VVMUX_VIVI_BIN" "$VVMUX_VIVI_PROTOCOL_VERSION"
 if test "$label" = exit; then exit 9; fi
 while IFS= read -r line; do printf 'INPUT %s\r\n' "$line"; done
 "#,
@@ -218,6 +227,13 @@ command = ["./pane.sh", "exit"]
     )
     .unwrap();
     package
+}
+
+fn write_vivi_helper(root: &Path) -> PathBuf {
+    let helper = root.join("vivi");
+    fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    helper
 }
 
 fn write_config(root: &Path) -> PathBuf {
@@ -352,6 +368,7 @@ fn command(binary: &str, runtime: &Path, config_home: &Path) -> Command {
     command
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", config_home)
+        .env("VVMUX_VIVI_BIN", runtime.parent().unwrap().join("vivi"))
         .env_remove("VIVID_ENDPOINT")
         .env_remove("VIVID_TOKEN")
         .env_remove("VIVID_ROOT_SECRET");

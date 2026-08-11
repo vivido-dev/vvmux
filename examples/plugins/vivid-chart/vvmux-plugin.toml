@@ -1,0 +1,28 @@
+manifest_version = 1
+
+[plugin]
+id = "dev.vivido.reference.chart"
+name = "Vivid Chart"
+version = "0.1.0"
+min_vvmux_version = "0.4.0"
+description = "Typed chart statistics and an off-PTY Vivid chart pane"
+platforms = ["linux", "macos"]
+permissions = ["pane.create", "pane.manage_own", "media.produce"]
+
+[[actions]]
+id = "statistics"
+title = "Chart statistics"
+description = "Calculate bounded series statistics"
+command = ["python3", "chart.py", "action"]
+input_schema = "schemas/statistics-input.json"
+output_schema = "schemas/statistics-output.json"
+agent_visible = true
+timeout_ms = 5000
+
+[[panes]]
+id = "chart"
+title = "Vivid chart"
+placement = "split"
+command = ["python3", "chart.py", "pane"]
+hold_on_exit = true
+accept_sync_input = false

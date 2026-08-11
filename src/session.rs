@@ -108,7 +108,7 @@ enum SessionCommand {
         bytes: Vec<u8>,
     },
     OpenPluginPane {
-        launch: PluginPaneLaunch,
+        launch: Box<PluginPaneLaunch>,
     },
     ClosePane {
         pane_id: PaneId,
@@ -120,6 +120,7 @@ pub(crate) struct PluginPaneLaunch {
     pub(crate) scope: crate::plugin_supervisor::RuntimeScope,
     pub(crate) package_digest: String,
     pub(crate) package_root: PathBuf,
+    pub(crate) vivi_helper: Option<PathBuf>,
     pub(crate) pane: vvmux_plugin_api::Pane,
 }
 
@@ -1629,8 +1630,12 @@ impl SessionActor {
                     focused_fallback: false,
                     capabilities: launch.scope.permissions.iter().copied().collect(),
                 };
-                let result = self
-                    .execute_session_command(&caller, SessionCommand::OpenPluginPane { launch });
+                let result = self.execute_session_command(
+                    &caller,
+                    SessionCommand::OpenPluginPane {
+                        launch: Box::new(launch),
+                    },
+                );
                 self.complete_pending_actor_work(&reply);
                 match result {
                     Ok(value) => self.reply_automation(reply, value),
@@ -4750,16 +4755,26 @@ impl SessionActor {
                 let vivid_capability = caller
                     .capabilities
                     .contains(&vvmux_plugin_api::Permission::MediaProduce);
+                let mut extra_env = vec![
+                    ("VVMUX_PLUGIN_ID".into(), plugin_id.clone()),
+                    ("VVMUX_PLUGIN_INSTANCE".into(), plugin_instance.clone()),
+                    ("VVMUX_PLUGIN_PANE".into(), launch.pane.id.clone()),
+                ];
+                if vivid_capability && let Some(helper) = launch.vivi_helper.as_ref() {
+                    extra_env.extend([
+                        (
+                            "VVMUX_VIVI_BIN".into(),
+                            helper.to_string_lossy().into_owned(),
+                        ),
+                        ("VVMUX_VIVI_PROTOCOL_VERSION".into(), "1.5".into()),
+                    ]);
+                }
                 let spec = PaneSpawn {
                     command: None,
                     argv: Some(launch.pane.command.iter().map(OsString::from).collect()),
                     cwd: Some(launch.package_root),
                     hold_on_exit: launch.pane.hold_on_exit,
-                    extra_env: vec![
-                        ("VVMUX_PLUGIN_ID".into(), plugin_id.clone()),
-                        ("VVMUX_PLUGIN_INSTANCE".into(), plugin_instance.clone()),
-                        ("VVMUX_PLUGIN_PANE".into(), launch.pane.id.clone()),
-                    ],
+                    extra_env,
                     role: PaneRole::Plugin(identity),
                     vivid_capability,
                 };

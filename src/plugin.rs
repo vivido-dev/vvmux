@@ -2403,6 +2403,7 @@ struct NativeService {
     plugin_id: String,
     child: std::process::Child,
     process_id: u32,
+    process_tree: ProcessTree,
     writer: Option<std::process::ChildStdin>,
     receiver: std::sync::mpsc::Receiver<io::Result<NativeReply>>,
     reader: Option<thread::JoinHandle<()>>,
@@ -2441,6 +2442,7 @@ impl NativeService {
         }
         let mut child = command.spawn()?;
         let process_id = child.id();
+        let process_tree = attach_process_tree(&mut child)?;
         let writer = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -2466,6 +2468,7 @@ impl NativeService {
             plugin_id: context.plugin_id.to_owned(),
             child,
             process_id,
+            process_tree,
             writer: Some(writer),
             receiver,
             reader: Some(reader),
@@ -2734,7 +2737,7 @@ impl NativeService {
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 self.healthy = false;
-                terminate_process_tree(&mut self.child, self.process_id);
+                terminate_process_tree(&mut self.child, self.process_id, &self.process_tree);
                 Err(invalid(message))
             }
         }
@@ -2750,10 +2753,10 @@ impl NativeService {
                 .flatten()
                 .is_none()
             {
-                terminate_process_tree(&mut self.child, self.process_id);
+                terminate_process_tree(&mut self.child, self.process_id, &self.process_tree);
             }
         } else if self.child.try_wait().ok().flatten().is_none() {
-            terminate_process_tree(&mut self.child, self.process_id);
+            terminate_process_tree(&mut self.child, self.process_id, &self.process_tree);
         }
         self.writer.take();
         if let Some(reader) = self.reader.take() {
@@ -3085,10 +3088,11 @@ fn run_one_shot(
     }
     let mut child = command.spawn()?;
     let process_id = child.id();
+    let process_tree = attach_process_tree(&mut child)?;
     let mut stdin = child.stdin.take().unwrap();
     let body = serde_json::to_vec(input).map_err(io::Error::other)?;
     if body.len() > MAX_ACTION_OUTPUT {
-        terminate_process_tree(&mut child, process_id);
+        terminate_process_tree(&mut child, process_id, &process_tree);
         return Err(invalid("schema_invalid: action input exceeds 1 MiB"));
     }
     stdin.write_all(&body)?;
@@ -3106,13 +3110,13 @@ fn run_one_shot(
             .cancel
             .is_some_and(|cancel| cancel.load(Ordering::Acquire))
         {
-            terminate_process_tree(&mut child, process_id);
+            terminate_process_tree(&mut child, process_id, &process_tree);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(invalid("cancelled: plugin invocation was cancelled"));
         }
         if Instant::now() >= deadline {
-            terminate_process_tree(&mut child, process_id);
+            terminate_process_tree(&mut child, process_id, &process_tree);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(invalid("timeout: plugin action exceeded its deadline"));
@@ -3213,7 +3217,79 @@ fn read_capped(mut reader: impl Read, limit: usize) -> io::Result<CappedOutput> 
     Ok(CappedOutput { bytes, truncated })
 }
 
-fn terminate_process_tree(child: &mut std::process::Child, process_id: u32) {
+#[cfg(unix)]
+struct ProcessTree;
+
+#[cfg(unix)]
+fn attach_process_tree(_child: &mut std::process::Child) -> io::Result<ProcessTree> {
+    Ok(ProcessTree)
+}
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for ProcessTree {}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if !self.job.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.job);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn attach_process_tree(child: &mut std::process::Child) -> io::Result<ProcessTree> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+    if job.is_null() {
+        let error = io::Error::last_os_error();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    let assigned = configured != 0
+        && unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) } != 0;
+    if !assigned {
+        let error = io::Error::last_os_error();
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(job);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(ProcessTree { job })
+}
+
+fn terminate_process_tree(
+    child: &mut std::process::Child,
+    process_id: u32,
+    _process_tree: &ProcessTree,
+) {
     #[cfg(unix)]
     unsafe {
         libc::kill(-(process_id as i32), libc::SIGTERM);
@@ -3229,7 +3305,9 @@ fn terminate_process_tree(child: &mut std::process::Child, process_id: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = child.kill();
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(_process_tree.job, 1);
+        }
         let _ = child.wait();
     }
 }

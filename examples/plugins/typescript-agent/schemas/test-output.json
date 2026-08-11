@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["success", "status", "stdout", "stderr", "duration_ms"],
+  "properties": {
+    "success": { "type": "boolean" },
+    "status": { "type": ["integer", "null"] },
+    "stdout": { "type": "string", "maxLength": 131072 },
+    "stderr": { "type": "string", "maxLength": 131072 },
+    "duration_ms": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

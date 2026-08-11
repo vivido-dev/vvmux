@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -933,6 +934,7 @@ fn run_manager(inputs: ManagerInputs) {
     let mut pending_event_workflows = BTreeMap::<(String, String), PendingEventWorkflow>::new();
     let mut next_dependency_job_id = 1_u64 << 62;
     let mut next_event_workflow_id = 1_u64 << 63;
+    let vivi_helper = resolve_vivi_helper();
     activate_session_plugins(
         &registry,
         &mut workers,
@@ -1450,8 +1452,13 @@ fn run_manager(inputs: ManagerInputs) {
                 deliver_query(&actor, reply, retained.logs(&job_id));
             }
             Message::OpenPane { reference, reply } => {
-                let result =
-                    resolve_pane_launch(&registry, &transitions, &session_instance, &reference);
+                let result = resolve_pane_launch(
+                    &registry,
+                    &transitions,
+                    &session_instance,
+                    &reference,
+                    vivi_helper.as_ref(),
+                );
                 match result {
                     Ok(launch) => {
                         let _ = actor.send(ActorEvent::PluginPaneOpen { launch, reply });
@@ -2727,6 +2734,7 @@ fn resolve_pane_launch(
     transitions: &BTreeSet<String>,
     session_instance: &str,
     reference: &str,
+    vivi_helper: Option<&PathBuf>,
 ) -> Result<crate::session::PluginPaneLaunch, AutomationError> {
     let (plugin_id, pane_id) = reference.split_once('/').ok_or_else(|| {
         AutomationError::new("action_not_found", "plugin pane reference must be ID/PANE")
@@ -2787,8 +2795,59 @@ fn resolve_pane_launch(
         },
         package_digest: plugin.digest.clone(),
         package_root: plugin.root.clone(),
+        vivi_helper: plugin
+            .permissions
+            .contains(&Permission::MediaProduce)
+            .then(|| vivi_helper.cloned())
+            .flatten(),
         pane,
     })
+}
+
+/// Resolve a stable executable path once on the supervisor thread. The session actor only copies
+/// the result into a pane environment and never performs path lookup or process I/O.
+fn resolve_vivi_helper() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("VVMUX_VIVI_BIN") {
+        return usable_vivi_path(PathBuf::from(explicit));
+    }
+    if let Ok(current) = std::env::current_exe()
+        && let Some(sibling) = current
+            .parent()
+            .map(|parent| parent.join(vivi_executable_name()))
+        && let Some(path) = usable_vivi_path(sibling)
+    {
+        return Some(path);
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|directory| directory.join(vivi_executable_name()))
+            .find_map(usable_vivi_path)
+    })
+}
+
+fn usable_vivi_path(path: PathBuf) -> Option<PathBuf> {
+    if !path.is_absolute() || path.to_str().is_none() || !path.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.metadata().ok()?.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    path.canonicalize().ok()
+}
+
+fn vivi_executable_name() -> &'static Path {
+    #[cfg(windows)]
+    {
+        Path::new("vivi.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        Path::new("vivi")
+    }
 }
 
 fn request_worker_stop_if_drained(
@@ -3050,6 +3109,7 @@ mod tests {
             &BTreeSet::new(),
             "session-a",
             "dev.example/dashboard",
+            Some(&PathBuf::from("/usr/bin/vivi")),
         )
         .unwrap();
         assert_eq!(launch.scope.session_instance, "session-a");
@@ -3057,6 +3117,7 @@ mod tests {
         assert_eq!(launch.scope.plugin_instance.len(), 32);
         assert_eq!(launch.package_digest, "digest-a");
         assert_eq!(launch.pane.id, "dashboard");
+        assert_eq!(launch.vivi_helper, Some(PathBuf::from("/usr/bin/vivi")));
 
         let mut denied = registry;
         denied
@@ -3071,6 +3132,7 @@ mod tests {
                 &BTreeSet::new(),
                 "session-a",
                 "dev.example/dashboard",
+                None,
             )
             .unwrap_err()
             .code,

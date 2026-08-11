@@ -1,0 +1,28 @@
+manifest_version = 1
+
+[plugin]
+id = "dev.vivido.reference.dashboard"
+name = "Python Dashboard"
+version = "0.1.0"
+min_vvmux_version = "0.4.0"
+description = "A trusted Python action and native PTY dashboard"
+platforms = ["linux", "macos"]
+permissions = ["pane.create", "pane.manage_own"]
+
+[[actions]]
+id = "model"
+title = "Build dashboard model"
+description = "Turn workflow summary and chart data into dashboard lines"
+command = ["python3", "dashboard.py", "action"]
+input_schema = "schemas/model-input.json"
+output_schema = "schemas/model-output.json"
+agent_visible = true
+timeout_ms = 5000
+
+[[panes]]
+id = "dashboard"
+title = "Verification dashboard"
+placement = "float"
+command = ["python3", "dashboard.py", "pane"]
+hold_on_exit = true
+accept_sync_input = false

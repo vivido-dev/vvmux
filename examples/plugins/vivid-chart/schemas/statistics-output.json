@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["count", "minimum", "maximum"],
+  "properties": {
+    "count": { "type": "integer", "minimum": 1 },
+    "minimum": { "type": "number" },
+    "maximum": { "type": "number" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,25 @@
+manifest_version = 1
+
+[plugin]
+id = "dev.vivido.reference.hello"
+name = "Rust Component Hello"
+version = "0.1.0"
+min_vvmux_version = "0.4.0"
+description = "A sandboxed Rust WebAssembly Component action"
+platforms = ["linux", "macos", "windows"]
+permissions = []
+
+[runtime]
+kind = "component"
+artifact = "dist/hello.wasm"
+activation = "on_demand"
+
+[[actions]]
+id = "greet"
+title = "Greet"
+description = "Return a typed greeting"
+handler = "greet"
+input_schema = "schemas/greet-input.json"
+output_schema = "schemas/greet-output.json"
+agent_visible = true
+timeout_ms = 5000
