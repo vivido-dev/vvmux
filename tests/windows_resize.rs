@@ -23,7 +23,7 @@ fn attached_split_panes_relayout_without_followup_input() {
     );
 
     let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-    let parts = PtyProcess::spawn(&shell, cwd, 100, 30, &[]).unwrap();
+    let parts = PtyProcess::spawn(&shell, None, cwd, 100, 30, &[]).unwrap();
     let control = parts.control.clone();
     let mut reader = parts.reader;
     let (sender, receiver) = mpsc::channel();

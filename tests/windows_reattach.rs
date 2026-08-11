@@ -35,7 +35,7 @@ fn detach_then_immediate_reattach_repaints_the_session() {
         .any(|(name, _)| name == "VIVID_ENDPOINT_CONTROL");
 
     let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-    let parts = PtyProcess::spawn(&shell, cwd, 100, 30, &vivid_environment).unwrap();
+    let parts = PtyProcess::spawn(&shell, None, cwd, 100, 30, &vivid_environment).unwrap();
     let control = parts.control.clone();
     let mut reader = parts.reader;
     let (sender, receiver) = mpsc::channel();

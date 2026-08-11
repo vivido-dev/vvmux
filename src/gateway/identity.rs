@@ -6,11 +6,13 @@
 //! owner-only parent, a `0600` file opened with `O_NOFOLLOW`, owner and mode
 //! re-checked after open, and `atomic_replace` on write.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 

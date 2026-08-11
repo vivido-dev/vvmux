@@ -22,7 +22,7 @@ fn ctrl_c_interrupts_pane_process_through_attached_session() {
     );
 
     let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-    let parts = PtyProcess::spawn(&shell, &cwd, 100, 30, &[]).unwrap();
+    let parts = PtyProcess::spawn(&shell, None, &cwd, 100, 30, &[]).unwrap();
     let control = parts.control.clone();
     let mut reader = parts.reader;
     let (sender, receiver) = mpsc::channel();
@@ -83,11 +83,9 @@ fn ctrl_c_interrupts_pane_process_through_attached_session() {
     drop(receiver);
     reader_thread.join().unwrap();
 
-    let text = String::from_utf8_lossy(&transcript);
-    println!(
-        "=== transcript tail ===\n{}",
-        &text[text.len().saturating_sub(2000)..]
-    );
+    let tail_start = transcript.len().saturating_sub(2000);
+    let tail = String::from_utf8_lossy(&transcript[tail_start..]);
+    println!("=== transcript tail ===\n{}", tail);
     assert!(attached && pinging, "session did not reach a running ping");
     assert!(interrupted, "Ctrl+C did not interrupt the pane process");
 }

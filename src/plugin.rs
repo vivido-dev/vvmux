@@ -3497,12 +3497,12 @@ fn attach_process_tree(child: &mut std::process::Child) -> io::Result<ProcessTre
 
 fn terminate_process_tree(
     child: &mut std::process::Child,
-    process_id: u32,
+    _process_id: u32,
     _process_tree: &ProcessTree,
 ) {
     #[cfg(unix)]
     unsafe {
-        libc::kill(-(process_id as i32), libc::SIGTERM);
+        libc::kill(-(_process_id as i32), libc::SIGTERM);
         let grace = Instant::now() + Duration::from_secs(2);
         while Instant::now() < grace {
             if child.try_wait().ok().flatten().is_some() {
@@ -3510,7 +3510,7 @@ fn terminate_process_tree(
             }
             thread::sleep(Duration::from_millis(20));
         }
-        libc::kill(-(process_id as i32), libc::SIGKILL);
+        libc::kill(-(_process_id as i32), libc::SIGKILL);
         let _ = child.wait();
     }
     #[cfg(windows)]

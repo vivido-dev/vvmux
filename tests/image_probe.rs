@@ -57,7 +57,7 @@ fn probe_first_image_after_cls() {
     );
 
     let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-    let parts = PtyProcess::spawn(&shell, &PathBuf::from("C:\\"), 110, 32, &[]).unwrap();
+    let parts = PtyProcess::spawn(&shell, None, &PathBuf::from("C:\\"), 110, 32, &[]).unwrap();
     let control = parts.control.clone();
     let mut reader = parts.reader;
     let (sender, receiver) = mpsc::channel();

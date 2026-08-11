@@ -24,6 +24,7 @@ const IDLE_CONFIRMATION_LIMIT: Duration = Duration::from_millis(700);
 const IDLE_CONFIRMATION_RECHECK: Duration = Duration::from_millis(100);
 const STARTUP_GRACE: Duration = Duration::from_secs(3);
 const FULL_PROCESS_RECHECK: Duration = Duration::from_secs(5);
+#[cfg(unix)]
 const MAX_PROCESS_ARGV_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1249,7 +1250,7 @@ fn foreground_processes(child_pid: u32, _group: Option<u32>) -> Vec<ProcessInfo>
         ok = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
     }
     unsafe { CloseHandle(snapshot) };
-    let mut children = HashMap::<u32, Vec<(u32, String)>>::new();
+    let mut children = HashMap::<u32, Vec<(u32, String, Vec<String>)>>::new();
     let mut root = None;
     for (pid, parent, name, command_line) in rows {
         let argv = command_line

@@ -10,7 +10,7 @@ use vvmux_terminal::pty::PtyProcess;
 #[test]
 fn ctrl_c_interrupts_conpty_child_process() {
     let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-    let parts = PtyProcess::spawn(&shell, &PathBuf::from("C:\\"), 100, 30, &[]).unwrap();
+    let parts = PtyProcess::spawn(&shell, None, &PathBuf::from("C:\\"), 100, 30, &[]).unwrap();
     let control = parts.control.clone();
     let mut reader = parts.reader;
     let (sender, receiver) = mpsc::channel();

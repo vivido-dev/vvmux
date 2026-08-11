@@ -22,7 +22,7 @@ fn detached_server_reports_readiness_from_a_conpty_shell() {
             .unwrap()
             .as_nanos()
     );
-    let parts = PtyProcess::spawn(&shell, cwd, 80, 24, &[]).unwrap();
+    let parts = PtyProcess::spawn(&shell, None, cwd, 80, 24, &[]).unwrap();
     let control = parts.control.clone();
     let mut reader = parts.reader;
     let (sender, receiver) = mpsc::channel();

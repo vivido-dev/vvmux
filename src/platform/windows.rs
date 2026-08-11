@@ -252,10 +252,6 @@ impl ClientTerminal {
         Ok(terminal)
     }
 
-    pub fn display_metrics(&self) -> io::Result<DisplayMetrics> {
-        current_display_metrics()
-    }
-
     pub fn output(&self) -> io::Result<Box<dyn Write + Send>> {
         Ok(Box::new(self.output.try_clone()?))
     }
