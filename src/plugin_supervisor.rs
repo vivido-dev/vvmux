@@ -399,6 +399,7 @@ struct AppliedRegistry {
     plugins: BTreeMap<String, crate::plugin::RuntimePlugin>,
     catalog: BTreeMap<String, Vec<Value>>,
     failures: BTreeMap<String, String>,
+    agent_catalog: Arc<crate::agent::AgentCatalog>,
 }
 
 #[derive(Clone, Serialize)]
@@ -907,6 +908,7 @@ fn run_manager(inputs: ManagerInputs) {
             plugins: candidate.plugins,
             catalog: candidate.catalog,
             failures: candidate.failed,
+            agent_catalog: candidate.agent_catalog,
         },
         Err(error) => {
             let mut failures = BTreeMap::new();
@@ -916,9 +918,14 @@ fn run_manager(inputs: ManagerInputs) {
                 plugins: BTreeMap::new(),
                 catalog: BTreeMap::new(),
                 failures,
+                agent_catalog: Arc::new(crate::agent::AgentCatalog::default()),
             }
         }
     };
+    let _ = actor.send(ActorEvent::AgentCatalogApplied {
+        generation: registry.generation,
+        catalog: registry.agent_catalog.clone(),
+    });
     let mut workers = HashMap::<String, WorkerHandle>::new();
     let mut active = HashMap::<u64, ActiveJob>::new();
     let mut accounting = JobAccounting::default();
@@ -1489,6 +1496,7 @@ fn run_manager(inputs: ManagerInputs) {
                     "component_sandbox": true,
                     "enforceable_capabilities": crate::session::plugin_enforceable_capabilities(),
                     "actions": actions,
+                    "agents": registry.agent_catalog.describe(),
                     "failed": registry.failures,
                 });
                 deliver_query(
@@ -2725,6 +2733,13 @@ fn apply_registry_candidate(
         }
     }
     registry.generation = candidate.generation.max(registry.generation);
+    if candidate.failed.is_empty() {
+        registry.agent_catalog = candidate.agent_catalog;
+        let _ = actor.send(ActorEvent::AgentCatalogApplied {
+            generation: registry.generation,
+            catalog: registry.agent_catalog.clone(),
+        });
+    }
     registry.failures = candidate.failed;
     report
 }
@@ -3103,6 +3118,7 @@ mod tests {
             plugins: [(plugin.id.clone(), plugin)].into_iter().collect(),
             catalog: BTreeMap::new(),
             failures: BTreeMap::new(),
+            agent_catalog: Arc::new(crate::agent::AgentCatalog::default()),
         };
         let launch = resolve_pane_launch(
             &registry,

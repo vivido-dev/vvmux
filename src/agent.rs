@@ -4,12 +4,15 @@
 //! 6c6ddcd49384d6ea9f0ee2e63bf7b2643dfd5bcf (Apache-2.0). See
 //! `agent/PROVENANCE.md` for the source inventory and adaptation notes.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::OnceLock;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use vvmux_plugin_api::{Agent as AgentDefinition, AgentGate, AgentRuleState};
 use vvmux_terminal::Terminal;
 use vvmux_terminal::pty::PtyControl;
 
@@ -23,24 +26,60 @@ const STARTUP_GRACE: Duration = Duration::from_secs(3);
 const FULL_PROCESS_RECHECK: Duration = Duration::from_secs(5);
 const MAX_PROCESS_ARGV_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
-#[clap(rename_all = "snake_case")]
-pub enum AgentKind {
-    Claude,
-    Codex,
-    Opencode,
-    Hermes,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentId(String);
+
+impl AgentId {
+    pub fn new(value: impl Into<String>) -> Result<Self, &'static str> {
+        let value = value.into();
+        let valid = !value.is_empty()
+            && value.len() <= 64
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && value
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+        valid
+            .then_some(Self(value))
+            .ok_or("agent ID must be a local identifier of 1..=64 bytes")
+    }
 }
 
-impl AgentKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Opencode => "opencode",
-            Self::Hermes => "hermes",
-        }
+impl fmt::Display for AgentId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for AgentId {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for AgentId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -89,9 +128,19 @@ pub enum AgentSource {
     Report,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentIdentity {
+    pub id: AgentId,
+    pub name: String,
+    pub provider: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSnapshot {
-    pub kind: AgentKind,
+    pub kind: AgentId,
+    pub label: String,
+    pub provider: String,
     pub state: AgentState,
     pub status: AgentStatus,
     pub source: AgentSource,
@@ -106,7 +155,7 @@ struct ReportedState {
 
 #[derive(Debug)]
 pub struct AgentRuntime {
-    kind: Option<AgentKind>,
+    identity: Option<AgentIdentity>,
     process_group: Option<u32>,
     state: AgentState,
     source: AgentSource,
@@ -120,7 +169,7 @@ pub struct AgentRuntime {
 impl AgentRuntime {
     pub fn new() -> Self {
         Self {
-            kind: None,
+            identity: None,
             process_group: None,
             state: AgentState::Idle,
             source: AgentSource::Screen,
@@ -133,7 +182,7 @@ impl AgentRuntime {
     }
 
     pub fn snapshot(&self) -> Option<AgentSnapshot> {
-        let kind = self.kind?;
+        let identity = self.identity.as_ref()?;
         let status = match self.state {
             AgentState::Idle if self.done => AgentStatus::Done,
             AgentState::Idle => AgentStatus::Idle,
@@ -141,7 +190,9 @@ impl AgentRuntime {
             AgentState::Blocked => AgentStatus::Blocked,
         };
         Some(AgentSnapshot {
-            kind,
+            kind: identity.id.clone(),
+            label: identity.name.clone(),
+            provider: identity.provider.clone(),
             state: self.state,
             status,
             source: self.source,
@@ -149,7 +200,7 @@ impl AgentRuntime {
     }
 
     pub fn next_evaluation_delay(&self, now: Instant) -> Option<Duration> {
-        self.kind?;
+        self.identity.as_ref()?;
         if self.report.is_some() {
             return None;
         }
@@ -163,13 +214,14 @@ impl AgentRuntime {
     }
 
     /// Returns true when stale OSC evidence must be discarded.
-    pub fn observe_process(&mut self, group: Option<u32>, kind: Option<AgentKind>) -> bool {
+    pub fn observe_process(&mut self, group: Option<u32>, identity: Option<AgentIdentity>) -> bool {
         let changed_group = self.process_group != group;
         if changed_group {
             let startup_report_matches = self.process_group.is_none()
                 && self.report.is_some()
-                && kind.is_some()
-                && kind == self.kind
+                && identity.is_some()
+                && identity.as_ref().map(|value| &value.id)
+                    == self.identity.as_ref().map(|value| &value.id)
                 && self.identified_at.elapsed() < STARTUP_GRACE;
             if startup_report_matches {
                 self.process_group = group;
@@ -180,14 +232,14 @@ impl AgentRuntime {
             self.report_sequences.clear();
             self.pending_idle = None;
             self.done = false;
-            self.kind = kind;
+            self.identity = identity;
             self.state = AgentState::Idle;
             self.source = AgentSource::Screen;
             self.identified_at = Instant::now();
             return true;
         }
-        if let Some(kind) = kind {
-            if self.kind != Some(kind) {
+        if let Some(identity) = identity {
+            if self.identity.as_ref() != Some(&identity) {
                 self.report = None;
                 self.pending_idle = None;
                 self.done = false;
@@ -195,12 +247,12 @@ impl AgentRuntime {
                 self.source = AgentSource::Screen;
                 self.identified_at = Instant::now();
             }
-            self.kind = Some(kind);
-        } else if self.kind.is_some() {
+            self.identity = Some(identity);
+        } else if self.identity.is_some() {
             self.report = None;
             self.report_sequences.clear();
             self.pending_idle = None;
-            self.kind = None;
+            self.identity = None;
             self.done = false;
             self.state = AgentState::Idle;
             self.source = AgentSource::Screen;
@@ -210,7 +262,7 @@ impl AgentRuntime {
 
     pub fn report(
         &mut self,
-        kind: AgentKind,
+        identity: AgentIdentity,
         state: AgentState,
         source: String,
         sequence: u64,
@@ -226,10 +278,14 @@ impl AgentRuntime {
         {
             return Err("agent report sequence is stale");
         }
-        if self.kind.is_some_and(|detected| detected != kind) {
+        if self
+            .identity
+            .as_ref()
+            .is_some_and(|detected| detected.id != identity.id)
+        {
             return Err("reported agent does not match the pane foreground process");
         }
-        self.kind = Some(kind);
+        self.identity = Some(identity);
         self.report_sequences.insert(source.clone(), sequence);
         self.report = Some(ReportedState {
             source,
@@ -264,8 +320,16 @@ impl AgentRuntime {
         Ok(())
     }
 
-    pub fn evaluate_terminal(&mut self, terminal: &Terminal, visible: bool, now: Instant) {
-        let Some(kind) = self.kind else { return };
+    pub fn evaluate_terminal(
+        &mut self,
+        catalog: &AgentCatalog,
+        terminal: &Terminal,
+        visible: bool,
+        now: Instant,
+    ) {
+        let Some(identity) = self.identity.as_ref() else {
+            return;
+        };
         if let Some(report) = &self.report {
             let state = report.state;
             self.commit(state, AgentSource::Report, visible);
@@ -281,7 +345,8 @@ impl AgentRuntime {
             screen = screen[start..].to_owned();
         }
         let Some(candidate) = detect_candidate(
-            kind,
+            catalog,
+            &identity.id,
             &screen,
             terminal.agent_osc_title(),
             terminal.agent_osc_progress(),
@@ -317,6 +382,24 @@ impl AgentRuntime {
         }
     }
 
+    pub fn reconcile_catalog(&mut self, catalog: &AgentCatalog) -> bool {
+        let stale = self.identity.as_ref().is_some_and(|current| {
+            catalog
+                .identity(&current.id)
+                .is_none_or(|next| next != *current)
+        });
+        if stale {
+            self.report = None;
+            self.report_sequences.clear();
+            self.pending_idle = None;
+            self.identity = None;
+            self.done = false;
+            self.state = AgentState::Idle;
+            self.source = AgentSource::Screen;
+        }
+        stale
+    }
+
     fn commit(&mut self, state: AgentState, source: AgentSource, visible: bool) {
         if state != self.state {
             self.done = state == AgentState::Idle
@@ -331,51 +414,139 @@ impl AgentRuntime {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ManifestDefinition {
-    rules: Vec<RuleDefinition>,
+#[derive(Debug, Clone)]
+pub struct AgentCatalogSource {
+    pub provider: String,
+    pub fingerprint: String,
+    pub definition: AgentDefinition,
 }
 
-#[derive(Debug, Deserialize)]
-struct RuleDefinition {
-    #[allow(dead_code)]
-    id: Option<String>,
-    state: ManifestState,
-    priority: u16,
-    #[serde(default = "default_rule_region")]
-    region: String,
-    #[serde(default)]
-    visible_idle: bool,
-    #[serde(default)]
-    skip_state_update: bool,
-    #[serde(flatten)]
-    gate: GateDefinition,
+#[derive(Debug, Clone, Default)]
+pub struct AgentCatalog {
+    definitions: BTreeMap<AgentId, CompiledAgent>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct GateDefinition {
-    #[serde(default)]
-    contains: Vec<String>,
-    #[serde(default)]
-    regex: Vec<String>,
-    #[serde(default)]
-    line_regex: Vec<String>,
-    #[serde(default)]
-    all: Vec<GateDefinition>,
-    #[serde(default)]
-    any: Vec<GateDefinition>,
-    #[serde(default, rename = "not")]
-    not_gate: Vec<GateDefinition>,
+#[derive(Debug, Clone)]
+struct CompiledAgent {
+    identity: AgentIdentity,
+    executables: BTreeSet<String>,
+    argv_contains: Vec<String>,
+    manifest: CompiledManifest,
 }
 
-#[derive(Debug)]
+impl AgentCatalog {
+    pub const MAX_ENABLED_AGENTS: usize = 64;
+
+    pub fn compile(sources: Vec<AgentCatalogSource>) -> Result<Self, String> {
+        if sources.len() > Self::MAX_ENABLED_AGENTS {
+            return Err("enabled plugin catalog exceeds 64 agent definitions".into());
+        }
+        let mut definitions = BTreeMap::new();
+        let mut executable_owners = BTreeMap::<String, AgentId>::new();
+        for source in sources {
+            let id = AgentId::new(source.definition.id.clone()).map_err(str::to_owned)?;
+            if definitions.contains_key(&id) {
+                return Err(format!("duplicate enabled agent ID `{id}`"));
+            }
+            let executables = source
+                .definition
+                .process
+                .executables
+                .iter()
+                .map(|value| normalized_program_name(value))
+                .collect::<BTreeSet<_>>();
+            for executable in &executables {
+                if let Some(owner) = executable_owners.insert(executable.clone(), id.clone()) {
+                    return Err(format!(
+                        "agent `{id}` executable `{executable}` conflicts with agent `{owner}`"
+                    ));
+                }
+            }
+            let identity = AgentIdentity {
+                id: id.clone(),
+                name: source.definition.name.clone(),
+                provider: source.provider,
+                fingerprint: source.fingerprint,
+            };
+            definitions.insert(
+                id,
+                CompiledAgent {
+                    identity,
+                    executables,
+                    argv_contains: source
+                        .definition
+                        .process
+                        .argv_contains
+                        .iter()
+                        .map(|value| value.to_ascii_lowercase())
+                        .collect(),
+                    manifest: CompiledManifest::compile(&source.definition),
+                },
+            );
+        }
+        Ok(Self { definitions })
+    }
+
+    pub fn identity(&self, id: &AgentId) -> Option<AgentIdentity> {
+        self.definitions.get(id).map(|value| value.identity.clone())
+    }
+
+    pub fn describe(&self) -> Vec<serde_json::Value> {
+        self.definitions
+            .values()
+            .map(|definition| {
+                serde_json::json!({
+                    "id": definition.identity.id,
+                    "name": definition.identity.name,
+                    "provider": definition.identity.provider,
+                    "fingerprint": definition.identity.fingerprint,
+                })
+            })
+            .collect()
+    }
+
+    fn identify(&self, process: &ProcessInfo) -> Option<AgentIdentity> {
+        let runtime = normalized_program_name(&process.name);
+        let token = invocation_token(process).map(normalized_program_name);
+        let exact = self
+            .definitions
+            .values()
+            .filter(|definition| {
+                definition.executables.contains(&runtime)
+                    || token
+                        .as_ref()
+                        .is_some_and(|token| definition.executables.contains(token))
+            })
+            .collect::<Vec<_>>();
+        if exact.len() == 1 {
+            return Some(exact[0].identity.clone());
+        }
+        if !exact.is_empty() {
+            return None;
+        }
+        let arguments = process.argv.join("\n").to_ascii_lowercase();
+        let marker = self
+            .definitions
+            .values()
+            .filter(|definition| {
+                definition
+                    .argv_contains
+                    .iter()
+                    .any(|needle| arguments.contains(needle))
+            })
+            .collect::<Vec<_>>();
+        (marker.len() == 1).then(|| marker[0].identity.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
 struct CompiledManifest {
     rules: Vec<CompiledRule>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CompiledRule {
-    state: ManifestState,
+    state: AgentRuleState,
     priority: u16,
     region: String,
     visible_idle: bool,
@@ -383,7 +554,7 @@ struct CompiledRule {
     gate: CompiledGate,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CompiledGate {
     contains: Vec<String>,
     regex: Vec<regex::Regex>,
@@ -393,23 +564,12 @@ struct CompiledGate {
     not_gate: Vec<CompiledGate>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ManifestState {
-    Idle,
-    Working,
-    Blocked,
-    Unknown,
-}
-
-impl ManifestState {
-    fn agent_state(self) -> Option<AgentState> {
-        match self {
-            Self::Idle => Some(AgentState::Idle),
-            Self::Working => Some(AgentState::Working),
-            Self::Blocked => Some(AgentState::Blocked),
-            Self::Unknown => None,
-        }
+fn agent_rule_state(state: AgentRuleState) -> Option<AgentState> {
+    match state {
+        AgentRuleState::Idle => Some(AgentState::Idle),
+        AgentRuleState::Working => Some(AgentState::Working),
+        AgentRuleState::Blocked => Some(AgentState::Blocked),
+        AgentRuleState::Unknown => None,
     }
 }
 
@@ -420,11 +580,10 @@ struct DetectionCandidate {
 }
 
 impl CompiledManifest {
-    fn compile(source: &str) -> Self {
-        let definition: ManifestDefinition =
-            toml::from_str(source).expect("embedded agent manifest must parse");
+    fn compile(definition: &AgentDefinition) -> Self {
         let mut rules = definition
             .rules
+            .clone()
             .into_iter()
             .map(|rule| CompiledRule {
                 state: rule.state,
@@ -448,7 +607,7 @@ impl CompiledManifest {
             if rule.skip_state_update {
                 return None;
             }
-            return rule.state.agent_state().map(|state| DetectionCandidate {
+            return agent_rule_state(rule.state).map(|state| DetectionCandidate {
                 state,
                 visible_idle: rule.visible_idle,
             });
@@ -461,7 +620,7 @@ impl CompiledManifest {
 }
 
 impl CompiledGate {
-    fn compile(gate: GateDefinition) -> Self {
+    fn compile(gate: AgentGate) -> Self {
         Self {
             contains: gate
                 .contains
@@ -504,37 +663,28 @@ fn compile_regexes(patterns: Vec<String>) -> Vec<regex::Regex> {
         .collect()
 }
 
-fn default_rule_region() -> String {
-    "whole_recent".into()
-}
-
 fn detect_candidate(
-    kind: AgentKind,
+    catalog: &AgentCatalog,
+    kind: &AgentId,
     screen: &str,
     osc_title: &str,
     osc_progress: &str,
 ) -> Option<DetectionCandidate> {
-    static CLAUDE: OnceLock<CompiledManifest> = OnceLock::new();
-    static CODEX: OnceLock<CompiledManifest> = OnceLock::new();
-    static OPENCODE: OnceLock<CompiledManifest> = OnceLock::new();
-    static HERMES: OnceLock<CompiledManifest> = OnceLock::new();
-    let manifest = match kind {
-        AgentKind::Claude => CLAUDE
-            .get_or_init(|| CompiledManifest::compile(include_str!("agent/manifests/claude.toml"))),
-        AgentKind::Codex => CODEX
-            .get_or_init(|| CompiledManifest::compile(include_str!("agent/manifests/codex.toml"))),
-        AgentKind::Opencode => OPENCODE.get_or_init(|| {
-            CompiledManifest::compile(include_str!("agent/manifests/opencode.toml"))
-        }),
-        AgentKind::Hermes => HERMES
-            .get_or_init(|| CompiledManifest::compile(include_str!("agent/manifests/hermes.toml"))),
-    };
-    manifest.detect(screen, osc_title, osc_progress)
+    catalog
+        .definitions
+        .get(kind)
+        .and_then(|definition| definition.manifest.detect(screen, osc_title, osc_progress))
 }
 
 #[cfg(test)]
-fn detect_state(kind: AgentKind, screen: &str, osc_title: &str, osc_progress: &str) -> AgentState {
-    detect_candidate(kind, screen, osc_title, osc_progress)
+fn detect_state(
+    catalog: &AgentCatalog,
+    kind: &AgentId,
+    screen: &str,
+    osc_title: &str,
+    osc_progress: &str,
+) -> AgentState {
+    detect_candidate(catalog, kind, screen, osc_title, osc_progress)
         .map_or(AgentState::Idle, |candidate| candidate.state)
 }
 
@@ -647,40 +797,61 @@ pub struct ProbeTarget {
     pub control: PtyControl,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessUpdate {
     pub pane_id: PaneId,
     pub process_group: Option<u32>,
-    pub kind: Option<AgentKind>,
+    pub identity: Option<AgentIdentity>,
 }
 
 pub struct DetectorHandle {
-    targets: mpsc::Sender<Vec<ProbeTarget>>,
+    commands: mpsc::Sender<DetectorCommand>,
+}
+
+enum DetectorCommand {
+    Targets(Vec<ProbeTarget>),
+    Catalog(Arc<AgentCatalog>),
 }
 
 impl DetectorHandle {
     pub fn replace_targets(&self, targets: Vec<ProbeTarget>) {
-        let _ = self.targets.send(targets);
+        let _ = self.commands.send(DetectorCommand::Targets(targets));
+    }
+
+    pub fn replace_catalog(&self, catalog: Arc<AgentCatalog>) {
+        let _ = self.commands.send(DetectorCommand::Catalog(catalog));
     }
 }
 
 pub fn start_detector(
     mut notify: impl FnMut(Vec<ProcessUpdate>) + Send + 'static,
 ) -> std::io::Result<DetectorHandle> {
-    let (sender, receiver) = mpsc::channel::<Vec<ProbeTarget>>();
+    let (sender, receiver) = mpsc::channel::<DetectorCommand>();
     std::thread::Builder::new()
         .name("vvmux-agent-detector".into())
         .spawn(move || {
             let mut targets = Vec::new();
-            let mut cached = BTreeMap::<PaneId, (Option<u32>, Option<AgentKind>, Instant)>::new();
+            let mut catalog = Arc::new(AgentCatalog::default());
+            let mut cached =
+                BTreeMap::<PaneId, (Option<u32>, Option<AgentIdentity>, Instant)>::new();
             loop {
                 match receiver.recv_timeout(Duration::from_millis(400)) {
-                    Ok(next) => targets = next,
+                    Ok(DetectorCommand::Targets(next)) => targets = next,
+                    Ok(DetectorCommand::Catalog(next)) => {
+                        catalog = next;
+                        cached.clear();
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                while let Ok(next) = receiver.try_recv() {
-                    targets = next;
+                while let Ok(command) = receiver.try_recv() {
+                    match command {
+                        DetectorCommand::Targets(next) => targets = next,
+                        DetectorCommand::Catalog(next) => {
+                            catalog = next;
+                            cached.clear();
+                        }
+                    }
                 }
                 let mut updates = Vec::new();
                 let live = targets
@@ -690,28 +861,31 @@ pub fn start_detector(
                 cached.retain(|pane, _| live.contains(pane));
                 for target in &targets {
                     let group = target.control.foreground_process_group_id();
-                    let previous = cached.get(&target.pane_id).copied();
-                    let needs_full = previous.is_none_or(|(old_group, old_kind, checked)| {
-                        old_group != group
-                            || checked.elapsed()
-                                >= if old_kind.is_some() {
-                                    FULL_PROCESS_RECHECK
-                                } else {
-                                    Duration::from_millis(500)
-                                }
-                    });
+                    let previous = cached.get(&target.pane_id).cloned();
+                    let needs_full =
+                        previous
+                            .as_ref()
+                            .is_none_or(|(old_group, old_kind, checked)| {
+                                *old_group != group
+                                    || checked.elapsed()
+                                        >= if old_kind.is_some() {
+                                            FULL_PROCESS_RECHECK
+                                        } else {
+                                            Duration::from_millis(500)
+                                        }
+                            });
                     if !needs_full {
                         continue;
                     }
-                    let kind = identify_foreground_agent(target.child_pid, group);
-                    let next = (group, kind, Instant::now());
+                    let identity = identify_foreground_agent(&catalog, target.child_pid, group);
+                    let next = (group, identity.clone(), Instant::now());
                     if previous.is_none_or(|(old_group, old_kind, _)| {
-                        old_group != group || old_kind != kind
+                        old_group != group || old_kind != identity
                     }) {
                         updates.push(ProcessUpdate {
                             pane_id: target.pane_id,
                             process_group: group,
-                            kind,
+                            identity,
                         });
                     }
                     cached.insert(target.pane_id, next);
@@ -721,13 +895,17 @@ pub fn start_detector(
                 }
             }
         })?;
-    Ok(DetectorHandle { targets: sender })
+    Ok(DetectorHandle { commands: sender })
 }
 
-fn identify_foreground_agent(child_pid: u32, group: Option<u32>) -> Option<AgentKind> {
+fn identify_foreground_agent(
+    catalog: &AgentCatalog,
+    child_pid: u32,
+    group: Option<u32>,
+) -> Option<AgentIdentity> {
     foreground_processes(child_pid, group)
         .into_iter()
-        .find_map(|process| identify_agent(&process))
+        .find_map(|process| catalog.identify(&process))
 }
 
 #[derive(Debug)]
@@ -736,12 +914,9 @@ struct ProcessInfo {
     argv: Vec<String>,
 }
 
-fn identify_agent(process: &ProcessInfo) -> Option<AgentKind> {
-    if let Some(kind) = agent_from_token(&process.name) {
-        return Some(kind);
-    }
+fn invocation_token(process: &ProcessInfo) -> Option<&str> {
     let runtime = normalized_program_name(&process.name);
-    let token = match runtime.as_str() {
+    match runtime.as_str() {
         "node" | "bun" => script_argument(&process.argv, &["-e", "--eval", "-p", "--print"]),
         runtime if runtime == "python" || runtime.starts_with("python3") => {
             python_script_argument(&process.argv)
@@ -750,8 +925,7 @@ fn identify_agent(process: &ProcessInfo) -> Option<AgentKind> {
         "cmd" => windows_command_argument(&process.argv),
         "powershell" | "pwsh" => powershell_command_argument(&process.argv),
         _ => process.argv.first().map(String::as_str),
-    };
-    token.and_then(agent_from_token)
+    }
 }
 
 fn normalized_program_name(value: &str) -> String {
@@ -770,21 +944,6 @@ fn path_basename(value: &str) -> &str {
         .rsplit(['/', '\\'])
         .find(|part| !part.is_empty())
         .unwrap_or(value)
-}
-
-fn agent_from_token(value: &str) -> Option<AgentKind> {
-    let trimmed = value.trim_matches(|character| matches!(character, '\'' | '"'));
-    let lowered = trimmed.to_ascii_lowercase();
-    match normalized_program_name(trimmed).as_str() {
-        "claude" | "claude-code" => Some(AgentKind::Claude),
-        "codex" => Some(AgentKind::Codex),
-        "opencode" | "opencode2" | "open-code" => Some(AgentKind::Opencode),
-        "hermes" | "hermes-agent" | "hermes_agent" => Some(AgentKind::Hermes),
-        _ if lowered.contains("@anthropic-ai/claude-code") => Some(AgentKind::Claude),
-        _ if lowered.contains("@openai/codex") => Some(AgentKind::Codex),
-        _ if lowered.contains("opencode-ai/bin/opencode") => Some(AgentKind::Opencode),
-        _ => None,
-    }
 }
 
 fn script_argument<'a>(argv: &'a [String], eval_flags: &[&str]) -> Option<&'a str> {
@@ -1237,31 +1396,104 @@ fn foreground_processes(_child_pid: u32, _group: Option<u32>) -> Vec<ProcessInfo
 mod tests {
     use super::*;
 
+    fn catalog() -> AgentCatalog {
+        let manifests = [
+            (
+                "dev.vivido.agent.claude",
+                include_str!("../builtin-plugins/agent-claude/vvmux-plugin.toml"),
+            ),
+            (
+                "dev.vivido.agent.codex",
+                include_str!("../builtin-plugins/agent-codex/vvmux-plugin.toml"),
+            ),
+            (
+                "dev.vivido.agent.opencode",
+                include_str!("../builtin-plugins/agent-opencode/vvmux-plugin.toml"),
+            ),
+            (
+                "dev.vivido.agent.hermes",
+                include_str!("../builtin-plugins/agent-hermes/vvmux-plugin.toml"),
+            ),
+        ];
+        AgentCatalog::compile(
+            manifests
+                .into_iter()
+                .flat_map(|(provider, source)| {
+                    let manifest: vvmux_plugin_api::Manifest = toml::from_str(source).unwrap();
+                    manifest
+                        .agents
+                        .into_iter()
+                        .map(move |definition| AgentCatalogSource {
+                            provider: provider.into(),
+                            fingerprint: "test".into(),
+                            definition,
+                        })
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn id(value: &str) -> AgentId {
+        AgentId::new(value).unwrap()
+    }
+
+    fn identity(catalog: &AgentCatalog, value: &str) -> AgentIdentity {
+        catalog.identity(&id(value)).unwrap()
+    }
+
+    fn custom_catalog() -> AgentCatalog {
+        let manifest: vvmux_plugin_api::Manifest = toml::from_str(
+            r#"manifest_version = 2
+[plugin]
+id = "com.example.openclaw"
+name = "OpenClaw"
+version = "1.0.0"
+min_vvmux_version = "0.4.0"
+description = "test"
+platforms = ["linux"]
+permissions = []
+[[agents]]
+id = "openclaw"
+name = "OpenClaw"
+process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openclaw/cli"] }
+"#,
+        )
+        .unwrap();
+        AgentCatalog::compile(vec![AgentCatalogSource {
+            provider: "com.example.openclaw".into(),
+            fingerprint: "custom".into(),
+            definition: manifest.agents.into_iter().next().unwrap(),
+        }])
+        .unwrap()
+    }
+
     #[test]
     fn identifies_wrapped_agents() {
+        let catalog = catalog();
         assert_eq!(
-            identify_agent(&ProcessInfo {
+            catalog.identify(&ProcessInfo {
                 name: "node".into(),
                 argv: vec!["node".into(), "/x/@anthropic-ai/claude-code/cli.js".into()]
             }),
-            Some(AgentKind::Claude)
+            Some(identity(&catalog, "claude"))
         );
         assert_eq!(
-            identify_agent(&ProcessInfo {
+            catalog.identify(&ProcessInfo {
                 name: "python".into(),
                 argv: vec!["python".into(), "hermes_agent.py".into()]
             }),
-            Some(AgentKind::Hermes)
+            Some(identity(&catalog, "hermes"))
         );
         assert_eq!(
-            identify_agent(&ProcessInfo {
+            catalog.identify(&ProcessInfo {
                 name: "bash".into(),
                 argv: vec!["bash".into(), "-lc".into(), "exec codex --full-auto".into()]
             }),
-            Some(AgentKind::Codex)
+            Some(identity(&catalog, "codex"))
         );
         assert_eq!(
-            identify_agent(&ProcessInfo {
+            catalog.identify(&ProcessInfo {
                 name: "powershell.exe".into(),
                 argv: vec![
                     "powershell.exe".into(),
@@ -1272,10 +1504,10 @@ mod tests {
                     "& 'C:\\tools\\opencode.cmd' --continue".into(),
                 ]
             }),
-            Some(AgentKind::Opencode)
+            Some(identity(&catalog, "opencode"))
         );
         assert_eq!(
-            identify_agent(&ProcessInfo {
+            catalog.identify(&ProcessInfo {
                 name: "node".into(),
                 argv: vec![
                     "node".into(),
@@ -1293,17 +1525,80 @@ mod tests {
     }
 
     #[test]
-    fn codex_live_confirmation_is_blocked() {
+    fn custom_agent_matches_exact_executables_and_packaged_argv() {
+        let catalog = custom_catalog();
+        for process in [
+            ProcessInfo {
+                name: "/usr/local/bin/openclaw".into(),
+                argv: vec!["/usr/local/bin/openclaw".into()],
+            },
+            ProcessInfo {
+                name: "node".into(),
+                argv: vec!["node".into(), "/opt/@openclaw/cli/main.js".into()],
+            },
+        ] {
+            assert_eq!(
+                catalog.identify(&process).unwrap().id,
+                AgentId::new("openclaw").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_removal_clears_only_the_removed_providers_runtime() {
+        let full = catalog();
+        let retained = custom_catalog();
+        let mut removed_runtime = AgentRuntime::new();
+        let mut retained_runtime = AgentRuntime::new();
+        removed_runtime
+            .report(
+                identity(&full, "codex"),
+                AgentState::Blocked,
+                "codex-hook".into(),
+                1,
+                false,
+            )
+            .unwrap();
+        retained_runtime
+            .report(
+                identity(&retained, "openclaw"),
+                AgentState::Working,
+                "openclaw-hook".into(),
+                1,
+                false,
+            )
+            .unwrap();
+
+        assert!(removed_runtime.reconcile_catalog(&retained));
+        assert!(!retained_runtime.reconcile_catalog(&retained));
+        assert!(removed_runtime.snapshot().is_none());
         assert_eq!(
-            detect_state(AgentKind::Codex, "Allow command? esc to interrupt", "", ""),
+            retained_runtime.snapshot().unwrap().state,
+            AgentState::Working
+        );
+        retained_runtime.clear_report("openclaw-hook", 2).unwrap();
+    }
+
+    #[test]
+    fn codex_live_confirmation_is_blocked() {
+        let catalog = catalog();
+        assert_eq!(
+            detect_state(
+                &catalog,
+                &id("codex"),
+                "Allow command? esc to interrupt",
+                "",
+                ""
+            ),
             AgentState::Blocked
         );
     }
 
     #[test]
     fn hidden_completion_becomes_done_until_seen() {
+        let catalog = catalog();
         let mut runtime = AgentRuntime::new();
-        runtime.kind = Some(AgentKind::Codex);
+        runtime.identity = Some(identity(&catalog, "codex"));
         runtime.identified_at = Instant::now() - STARTUP_GRACE;
         runtime.commit(AgentState::Working, AgentSource::Screen, false);
         runtime.commit(AgentState::Idle, AgentSource::Screen, false);
@@ -1314,11 +1609,12 @@ mod tests {
 
     #[test]
     fn reports_are_ordered_and_scoped_per_runtime() {
+        let catalog = catalog();
         let mut first = AgentRuntime::new();
         let mut second = AgentRuntime::new();
         first
             .report(
-                AgentKind::Opencode,
+                identity(&catalog, "opencode"),
                 AgentState::Working,
                 "test".into(),
                 2,
@@ -1327,7 +1623,7 @@ mod tests {
             .unwrap();
         second
             .report(
-                AgentKind::Opencode,
+                identity(&catalog, "opencode"),
                 AgentState::Idle,
                 "test".into(),
                 2,
@@ -1337,7 +1633,7 @@ mod tests {
         assert!(
             first
                 .report(
-                    AgentKind::Opencode,
+                    identity(&catalog, "opencode"),
                     AgentState::Blocked,
                     "test".into(),
                     1,
@@ -1352,13 +1648,15 @@ mod tests {
 
     #[test]
     fn opencode_progress_and_hermes_prompts_are_detected() {
+        let catalog = catalog();
         assert_eq!(
-            detect_state(AgentKind::Opencode, "■■■■", "", ""),
+            detect_state(&catalog, &id("opencode"), "■■■■", "", ""),
             AgentState::Working
         );
         assert_eq!(
             detect_state(
-                AgentKind::Hermes,
+                &catalog,
+                &id("hermes"),
                 "Dangerous command — enter to confirm",
                 "",
                 ""
@@ -1369,9 +1667,11 @@ mod tests {
 
     #[test]
     fn live_regions_do_not_reclassify_misleading_transcript_text() {
+        let catalog = catalog();
         assert_eq!(
             detect_state(
-                AgentKind::Codex,
+                &catalog,
+                &id("codex"),
                 "Allow command?\n› explain that old output",
                 "",
                 ""
@@ -1380,7 +1680,8 @@ mod tests {
         );
         assert!(
             detect_candidate(
-                AgentKind::Claude,
+                &catalog,
+                &id("claude"),
                 "showing detailed transcript\nctrl+o to toggle\n? for shortcuts",
                 "",
                 ""
@@ -1391,35 +1692,38 @@ mod tests {
 
     #[test]
     fn visible_prompt_box_idle_is_distinct_from_fallback_idle() {
+        let catalog = catalog();
         let visible =
-            detect_candidate(AgentKind::Claude, "────────\n❯ \n────────", "", "").unwrap();
+            detect_candidate(&catalog, &id("claude"), "────────\n❯ \n────────", "", "").unwrap();
         assert_eq!(visible.state, AgentState::Idle);
         assert!(visible.visible_idle);
-        let fallback = detect_candidate(AgentKind::Claude, "ordinary output", "", "").unwrap();
+        let fallback =
+            detect_candidate(&catalog, &id("claude"), "ordinary output", "", "").unwrap();
         assert_eq!(fallback.state, AgentState::Idle);
         assert!(!fallback.visible_idle);
     }
 
     #[test]
     fn foreground_replacement_clears_only_that_panes_report_authority() {
+        let catalog = catalog();
         let mut runtime = AgentRuntime::new();
         runtime
             .report(
-                AgentKind::Opencode,
+                identity(&catalog, "opencode"),
                 AgentState::Working,
                 "plugin".into(),
                 1,
                 false,
             )
             .unwrap();
-        assert!(!runtime.observe_process(Some(10), Some(AgentKind::Opencode)));
+        assert!(!runtime.observe_process(Some(10), Some(identity(&catalog, "opencode"))));
         assert_eq!(runtime.snapshot().unwrap().source, AgentSource::Report);
-        assert!(runtime.observe_process(Some(11), Some(AgentKind::Opencode)));
+        assert!(runtime.observe_process(Some(11), Some(identity(&catalog, "opencode"))));
         assert_eq!(runtime.snapshot().unwrap().source, AgentSource::Screen);
         assert!(
             runtime
                 .report(
-                    AgentKind::Codex,
+                    identity(&catalog, "codex"),
                     AgentState::Blocked,
                     "plugin".into(),
                     2,
@@ -1430,7 +1734,7 @@ mod tests {
 
         runtime
             .report(
-                AgentKind::Opencode,
+                identity(&catalog, "opencode"),
                 AgentState::Working,
                 "plugin".into(),
                 3,

@@ -130,7 +130,61 @@ queue is no longer available.
 Agent reports are authoritative for their pane until cleared or the foreground process group
 changes. They require an explicit pane ID or a same-session `VVMUX_PANE_ID`; they never guess the
 focused pane. Sequence numbers are monotonic per pane and source, and `done` is derived by vvmux
-rather than accepted from reporters. `list-panes` and `inspect` expose the effective agent state.
+rather than accepted from reporters. The agent ID must come from an enabled provider.
+`list-panes` and `inspect` expose the effective agent state, display label, and provider plugin.
+
+Agent detection is plugin-provided. vvmux bundles four immutable data-only providers: Claude Code
+and Codex are enabled by default, while OpenCode and Hermes are disabled by default. They use the
+ordinary plugin controls and appear in `vvmux plugin list`:
+
+```sh
+vvmux plugin disable dev.vivido.agent.claude
+vvmux plugin enable dev.vivido.agent.opencode
+vvmux plugin inspect dev.vivido.agent.codex
+```
+
+Third-party plugins use `manifest_version = 2` and may declare one or more passive agents without
+an executable runtime or permissions. Executable names are normalized and matched exactly;
+`argv_contains` covers packaged script paths. Exact executable matches win over argv markers, and
+an equal-strength ambiguity is left undetected rather than guessed.
+
+```toml
+manifest_version = 2
+
+[plugin]
+id = "com.example.openclaw"
+name = "OpenClaw Agent Support"
+version = "1.0.0"
+min_vvmux_version = "0.4.0"
+description = "Passive OpenClaw state detection"
+platforms = ["linux", "macos", "windows"]
+permissions = []
+
+[[agents]]
+id = "openclaw"
+name = "OpenClaw"
+process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openclaw/cli"] }
+
+[[agents.rules]]
+id = "approval"
+state = "blocked"
+priority = 900
+region = "bottom_non_empty_lines(12)"
+contains = ["approval required"]
+
+[[agents.rules]]
+id = "working"
+state = "working"
+priority = 500
+region = "whole_recent"
+contains = ["esc to interrupt"]
+```
+
+Rules run by descending priority and support `idle`, `working`, `blocked`, and state-preserving
+`unknown`, the screen/OSC regions used by the bundled providers, and nested `contains`, `regex`,
+`line_regex`, `all`, `any`, and `not` gates. Agent IDs are globally unique among enabled plugins;
+disable the current provider before enabling a replacement with the same ID. Manifests are bounded
+to 16 agents and 64 rules per agent, and the live catalog is bounded to 64 agents.
 
 OpenCode can report lifecycle events directly through the managed optional plugin:
 
@@ -140,9 +194,11 @@ vvmux integration status opencode
 vvmux integration uninstall opencode
 ```
 
-The installer owns only `~/.config/opencode/plugins/vvmux-agent-state.js` and refuses to replace
-or remove a file without the vvmux ownership marker. Claude Code, Codex CLI, and Hermes need no
-installation; vvmux identifies their foreground processes and terminal UI signals passively.
+The installer owns only `~/.config/opencode/plugins/vvmux-agent-state.js`, refuses to replace or
+remove a file without the vvmux ownership marker, and enables the bundled OpenCode provider.
+Uninstalling the adapter leaves the provider's chosen enable state unchanged. Claude Code and
+Codex need no installation; Hermes can be enabled for passive detection with the plugin command
+above.
 
 ## Startup layouts
 
@@ -469,6 +525,7 @@ and machine-wide PATH changes. `run` and a layout `command` take one shell comma
 the shell with `-c`; plugin panes and runtimes use exact argument vectors without a shell.
 
 Plugin packages use a strict `vvmux-plugin.toml` and JSON Schema Draft 2020-12 action contracts.
+Manifest version 1 remains supported; version 2 adds declarative agent providers.
 Discover agent-visible actions with `vvmux plugin catalog --target SESSION --json`; `vvmux --skill`
 prints the release-matched automation guidance. WebAssembly Components are the sandboxed tier.
 Native process, one-shot, and PTY-pane plugins are trusted user code and run with the user's full OS

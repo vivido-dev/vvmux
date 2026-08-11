@@ -163,6 +163,10 @@ pub enum ActorEvent {
     PluginReloaded {
         result: Result<serde_json::Value, AutomationError>,
     },
+    AgentCatalogApplied {
+        generation: u64,
+        catalog: Arc<crate::agent::AgentCatalog>,
+    },
     PluginLifecycle {
         name: String,
         payload: serde_json::Value,
@@ -1016,6 +1020,8 @@ struct SessionActor {
     mouse_click_tracker: Option<MouseClickTracker>,
     float_modal: Option<FloatModal>,
     agent_navigator: Option<AgentNavigator>,
+    agent_catalog: Arc<crate::agent::AgentCatalog>,
+    agent_catalog_generation: u64,
     next_float_mode: u64,
     session_sequence: u64,
     /// Direct count of general-queue actor wakeups for fairness/compatibility diagnostics.
@@ -1206,6 +1212,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         mouse_click_tracker: None,
         float_modal: None,
         agent_navigator: None,
+        agent_catalog: Arc::new(crate::agent::AgentCatalog::default()),
+        agent_catalog_generation: 0,
         next_float_mode: 0,
         session_sequence: 1,
         actor_wakeups: 0,
@@ -1661,6 +1669,22 @@ impl SessionActor {
                     self.status(&format!("plugin registry reload failed: {}", error.message))
                 }
             },
+            ActorEvent::AgentCatalogApplied {
+                generation,
+                catalog,
+            } => {
+                if self.config.plugins.enabled && generation >= self.agent_catalog_generation {
+                    self.agent_catalog_generation = generation;
+                    self.agent_catalog = catalog.clone();
+                    self.agent_detector.replace_catalog(catalog);
+                    for pane in self.panes.values_mut() {
+                        if pane.agent.reconcile_catalog(&self.agent_catalog) {
+                            pane.terminal.clear_agent_osc();
+                        }
+                    }
+                    self.evaluate_agent_states();
+                }
+            }
             ActorEvent::PluginLifecycle {
                 name,
                 payload,
@@ -1691,7 +1715,7 @@ impl SessionActor {
                     if let Some(pane) = self.panes.get_mut(&update.pane_id)
                         && pane
                             .agent
-                            .observe_process(update.process_group, update.kind)
+                            .observe_process(update.process_group, update.identity)
                     {
                         pane.terminal.clear_agent_osc();
                     }
@@ -2242,10 +2266,18 @@ impl SessionActor {
                 let pane_id = pane_id.unwrap();
                 let visible = self.pane_is_visibly_present(pane_id);
                 let result = self
-                    .panes
-                    .get_mut(&pane_id)
-                    .ok_or("pane no longer exists")
-                    .and_then(|pane| pane.agent.report(agent, state, source, sequence, visible));
+                    .agent_catalog
+                    .identity(&agent)
+                    .ok_or("agent definition is not enabled")
+                    .and_then(|identity| {
+                        self.panes
+                            .get_mut(&pane_id)
+                            .ok_or("pane no longer exists")
+                            .and_then(|pane| {
+                                pane.agent
+                                    .report(identity, state, source, sequence, visible)
+                            })
+                    });
                 match result {
                     Ok(()) => {
                         self.session_sequence = self.session_sequence.wrapping_add(1);
@@ -3891,8 +3923,12 @@ impl SessionActor {
         let mut changed = false;
         for pane in self.panes.values_mut() {
             let before = pane.agent.snapshot();
-            pane.agent
-                .evaluate_terminal(&pane.terminal, visible.contains(&pane.id), now);
+            pane.agent.evaluate_terminal(
+                &self.agent_catalog,
+                &pane.terminal,
+                visible.contains(&pane.id),
+                now,
+            );
             changed |= before != pane.agent.snapshot();
         }
         if changed {
@@ -5166,7 +5202,7 @@ impl SessionActor {
                 let text = format!(
                     "[{:<7}] {:<8} {} · pane {} · {}",
                     row.agent.status.label().to_ascii_uppercase(),
-                    row.agent.kind.label(),
+                    row.agent.label,
                     single_line(&row.tab_label),
                     row.pane_id,
                     single_line(&row.title),
@@ -5818,6 +5854,14 @@ impl SessionActor {
         self.close_all_plugin_panes();
         if let Some(supervisor) = self.plugin_supervisor.take() {
             supervisor.shutdown();
+        }
+        self.agent_catalog = Arc::new(crate::agent::AgentCatalog::default());
+        self.agent_detector
+            .replace_catalog(self.agent_catalog.clone());
+        for pane in self.panes.values_mut() {
+            if pane.agent.reconcile_catalog(&self.agent_catalog) {
+                pane.terminal.clear_agent_osc();
+            }
         }
         for (_, subscription) in self.plugin_event_subscriptions.drain() {
             subscription.cancel.cancel();
@@ -7658,6 +7702,8 @@ fn rect_json(rect: Rect) -> serde_json::Value {
 fn agent_json(agent: AgentSnapshot) -> serde_json::Value {
     serde_json::json!({
         "kind": agent.kind,
+        "label": agent.label,
+        "provider": agent.provider,
         "state": agent.state,
         "status": agent.status,
         "source": agent.source,

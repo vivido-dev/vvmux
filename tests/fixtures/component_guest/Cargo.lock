@@ -901,6 +901,7 @@ name = "vvmux-plugin-api"
 version = "0.1.0"
 dependencies = [
  "jsonschema",
+ "regex",
  "semver",
  "serde",
  "serde_json",

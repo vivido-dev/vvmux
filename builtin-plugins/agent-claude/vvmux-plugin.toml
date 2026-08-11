@@ -1,22 +1,34 @@
-id = "claude"
-version = "2026.08.04.1"
-aliases = ["claude-code"]
+manifest_version = 2
 
-[[rules]]
+[plugin]
+id = "dev.vivido.agent.claude"
+name = "Claude Code Agent Support"
+version = "2026.8.4"
+min_vvmux_version = "0.4.0"
+description = "Bundled passive state detection for Claude Code"
+platforms = ["linux", "macos", "windows"]
+permissions = []
+
+[[agents]]
+id = "claude"
+name = "Claude Code"
+process = { executables = ["claude", "claude-code"], argv_contains = ["@anthropic-ai/claude-code"] }
+
+[[agents.rules]]
 id = "osc_title_working"
 state = "working"
 priority = 1100
 region = "osc_title"
 regex = ['^[\x{2800}-\x{28FF}] ']
 
-[[rules]]
+[[agents.rules]]
 id = "btw_overlay_working"
 state = "working"
 priority = 975
 region = "bottom_non_empty_lines(5)"
 line_regex = ['^\s*/btw(?:\s|$)', '(?i)esc to close\s*$']
 
-[[rules]]
+[[agents.rules]]
 id = "transcript_viewer"
 state = "unknown"
 priority = 1000
@@ -31,7 +43,7 @@ any = [
   { contains = ["? for shortcuts"] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "live_blocked_form"
 state = "blocked"
 priority = 980
@@ -48,14 +60,14 @@ any = [
   ] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "dynamic_workflow_prompt"
 state = "blocked"
 priority = 980
 region = "whole_recent"
 contains = ["run a dynamic workflow?", "esc to cancel"]
 
-[[rules]]
+[[agents.rules]]
 id = "live_prompt_box"
 state = "idle"
 priority = 950
@@ -70,7 +82,7 @@ not = [
   { contains = ["↑/↓ to navigate"] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "model_picker_menu"
 state = "unknown"
 priority = 900
@@ -82,7 +94,7 @@ not = [
   { contains = ["enter to select"] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "bash_permission_prompt"
 state = "blocked"
 priority = 850
@@ -99,7 +111,7 @@ all = [
   { any = [{ line_regex = ['(?i)^\s*❯?\s*yes\b'] }, { line_regex = ['(?i)^\s*1\.\s*yes\b'] }, { line_regex = ['(?i)^\s*2\.\s*no\b'] }] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "generic_permission_prompt"
 state = "blocked"
 priority = 840
@@ -114,7 +126,7 @@ all = [
   ] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "legacy_no_prompt_blocker"
 state = "blocked"
 priority = 300
@@ -132,7 +144,7 @@ any = [
 ]
 not = [{ regex = ['(?m)^\s*❯\s*$'] }]
 
-[[rules]]
+[[agents.rules]]
 id = "osc_title_idle"
 state = "idle"
 priority = 250
@@ -140,7 +152,7 @@ region = "osc_title"
 visible_idle = true
 regex = ['^\x{2733} ']
 
-[[rules]]
+[[agents.rules]]
 id = "osc_progress_idle"
 state = "idle"
 priority = 250

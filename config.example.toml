@@ -61,6 +61,8 @@ border_drag_margin = 1
 
 [plugins]
 # Live global kill switch. Disabling stops runtimes and the registry watcher for this session.
+# It also disables bundled and installed agent detection. Toggle individual bundled providers with
+# `vvmux plugin enable|disable dev.vivido.agent.NAME`.
 enabled = true
 
 [server]

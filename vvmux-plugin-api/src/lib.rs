@@ -7,9 +7,10 @@ mod manifest;
 mod protocol;
 
 pub use manifest::{
-    Action, Activation, ComponentPreopen, Dependency, EventHook, LoadedManifest, Manifest,
-    ManifestError, Pane, Permission, Placement, Plugin, Runtime, RuntimeKind, SchemaDocument,
-    Workflow, WorkflowStep, validate_schema_instance,
+    Action, Activation, Agent, AgentGate, AgentProcess, AgentRule, AgentRuleState,
+    ComponentPreopen, Dependency, EventHook, LoadedManifest, Manifest, ManifestError, Pane,
+    Permission, Placement, Plugin, Runtime, RuntimeKind, SchemaDocument, Workflow, WorkflowStep,
+    validate_schema_instance,
 };
 pub use protocol::{
     ErrorCode, Event, FrameError, Hello, HostCall, HostCallResult, Invocation, InvocationContext,

@@ -16,8 +16,9 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Bumped to 14 when the independently developed VVMX 13 plugin-control and agent-state
-/// vocabularies were merged. The combined encoding must not alias either branch's version 13.
+/// Version 15 is the current hard cutover for plugin control and complete media-track identity.
+/// Agent IDs remain strings on this wire, so replacing the closed Rust enum with validated plugin
+/// IDs does not change its encoding.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
@@ -78,7 +79,7 @@ pub enum AutomationMethod {
     Capabilities,
     ListPanes,
     ReportAgent {
-        agent: crate::agent::AgentKind,
+        agent: crate::agent::AgentId,
         state: crate::agent::AgentState,
         source: String,
         sequence: u64,

@@ -158,8 +158,8 @@ pub enum MsgCommand {
     ListPanes,
     /// Report authoritative AI-agent state for one pane.
     ReportAgent {
-        #[arg(long, value_enum)]
-        agent: crate::agent::AgentKind,
+        #[arg(long)]
+        agent: crate::agent::AgentId,
         #[arg(long, value_enum)]
         state: crate::agent::AgentState,
         #[arg(long)]

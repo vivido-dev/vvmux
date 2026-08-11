@@ -130,7 +130,7 @@ done
         &[
             "report-agent",
             "--agent",
-            "opencode",
+            "codex",
             "--state",
             "working",
             "--source",
@@ -142,7 +142,9 @@ done
         ],
     ));
     assert_eq!(reported["pane_id"], 2);
-    assert_eq!(reported["agent"]["kind"], "opencode");
+    assert_eq!(reported["agent"]["kind"], "codex");
+    assert_eq!(reported["agent"]["label"], "Codex");
+    assert_eq!(reported["agent"]["provider"], "dev.vivido.agent.codex");
     assert_eq!(reported["agent"]["state"], "working");
     assert_eq!(reported["agent"]["status"], "working");
     assert_eq!(reported["agent"]["source"], "report");
@@ -155,7 +157,7 @@ done
         "working"
     );
     let inspected = json(command(binary, &name, &["inspect", "--pane-id", "2"]));
-    assert_eq!(inspected["pane"]["agent"]["kind"], "opencode");
+    assert_eq!(inspected["pane"]["agent"]["kind"], "codex");
     assert_eq!(inspected["pane"]["agent"]["source"], "report");
 
     let stale_report = command(
@@ -164,7 +166,7 @@ done
         &[
             "report-agent",
             "--agent",
-            "opencode",
+            "codex",
             "--state",
             "blocked",
             "--source",
@@ -184,7 +186,7 @@ done
         &[
             "report-agent",
             "--agent",
-            "opencode",
+            "codex",
             "--state",
             "idle",
             "--source",

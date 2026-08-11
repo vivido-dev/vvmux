@@ -141,6 +141,13 @@ typed `SessionCommand`/`CallerContext` authorization before serving `session.ins
 `pane.get_text`, or `pane.input`. Native code remains trusted because it can bypass this broker as
 the same OS user.
 
+The same validated registry snapshot compiles a bounded agent catalog from bundled and installed
+manifest-version-2 providers. The supervisor publishes the immutable catalog and its generation to
+the actor, which shares it with the process detector and uses it for screen/OSC evaluation. Catalog
+replacement invalidates process caches and clears only reports whose provider identity or manifest
+fingerprint disappeared. Claude and Codex are default-enabled bundled data providers; OpenCode and
+Hermes default off. The global plugin kill switch also removes this catalog.
+
 Manifest PTY panes are resolved by the supervisor, then lowered as exact-argv `pane.create` commands
 through the same actor service. The actor attaches complete session/plugin-instance/package
 generation ownership before spawn and alone commits split, float, or tab placement. Sync keyboard

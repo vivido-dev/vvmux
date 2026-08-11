@@ -14,3 +14,6 @@ Source areas consulted:
 HerdR is licensed under Apache License 2.0. The adapted implementation uses vvmux's own PTY,
 session actor, terminal emulator, IPC, and rendering abstractions rather than retaining HerdR's
 UI or server architecture.
+
+The adapted first-party rules are now shipped as the four data-only plugin manifests under
+`builtin-plugins/`; user agent providers use the same public manifest schema.

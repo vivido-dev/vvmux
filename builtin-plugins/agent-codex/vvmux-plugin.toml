@@ -1,21 +1,34 @@
-id = "codex"
-version = "2026.07.18.1"
+manifest_version = 2
 
-[[rules]]
+[plugin]
+id = "dev.vivido.agent.codex"
+name = "Codex Agent Support"
+version = "2026.7.18"
+min_vvmux_version = "0.4.0"
+description = "Bundled passive state detection for Codex"
+platforms = ["linux", "macos", "windows"]
+permissions = []
+
+[[agents]]
+id = "codex"
+name = "Codex"
+process = { executables = ["codex"], argv_contains = ["@openai/codex"] }
+
+[[agents.rules]]
 id = "osc_title_blocked"
 state = "blocked"
 priority = 1100
 region = "osc_title"
 contains = ["Action Required"]
 
-[[rules]]
+[[agents.rules]]
 id = "osc_title_working"
 state = "working"
 priority = 1050
 region = "osc_title"
 regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)']
 
-[[rules]]
+[[agents.rules]]
 id = "transcript_viewer"
 state = "unknown"
 priority = 1000
@@ -27,7 +40,7 @@ any = [
   { contains = ["esc/← to edit prev"] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "live_strong_blocker"
 state = "blocked"
 priority = 900
@@ -39,7 +52,7 @@ any = [
   { contains = ["allow command?"] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "weak_blocker"
 state = "blocked"
 priority = 600
@@ -51,7 +64,7 @@ any = [
   { contains = ["would you like to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "screen_working_fallback"
 state = "working"
 priority = 500
@@ -59,7 +72,7 @@ region = "bottom_non_empty_lines(3)"
 line_regex = ['^[•◦]\s+Working \([^)]*esc to interrupt\)(?: · .*)?$']
 not = [{ contains = ["■ Conversation interrupted"] }]
 
-[[rules]]
+[[agents.rules]]
 id = "osc_title_idle"
 state = "idle"
 priority = 100

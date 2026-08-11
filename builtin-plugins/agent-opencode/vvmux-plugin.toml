@@ -1,8 +1,20 @@
-id = "opencode"
-version = "2026.06.10.1"
-aliases = ["open-code"]
+manifest_version = 2
 
-[[rules]]
+[plugin]
+id = "dev.vivido.agent.opencode"
+name = "OpenCode Agent Support"
+version = "2026.6.10"
+min_vvmux_version = "0.4.0"
+description = "Bundled passive state detection for OpenCode"
+platforms = ["linux", "macos", "windows"]
+permissions = []
+
+[[agents]]
+id = "opencode"
+name = "OpenCode"
+process = { executables = ["opencode", "opencode2", "open-code"], argv_contains = ["opencode-ai/bin/opencode"] }
+
+[[agents.rules]]
 id = "permission_required"
 state = "blocked"
 priority = 300
@@ -12,7 +24,7 @@ any = [
   { contains = ["esc dismiss"], any = [{ contains = ["enter confirm"] }, { contains = ["enter submit"] }, { contains = ["enter toggle"] }], all = [{ any = [{ contains = ["↑↓ select"] }, { contains = ["⇆ tab"] }] }] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "interrupt_hint_working"
 state = "working"
 priority = 110
@@ -24,7 +36,7 @@ any = [
   { line_regex = ['(?i).*opencode.*esc (again to )?interrupt'] },
 ]
 
-[[rules]]
+[[agents.rules]]
 id = "progress_bar_working"
 state = "working"
 priority = 100

@@ -13,6 +13,12 @@ pub const MAX_SCHEMA_BYTES: u64 = 64 * 1024;
 pub const MAX_SCHEMA_DEPTH: usize = 32;
 pub const MAX_WORKFLOWS: usize = 128;
 pub const MAX_WORKFLOW_STEPS: usize = 32;
+pub const MAX_AGENTS_PER_PLUGIN: usize = 16;
+pub const MAX_AGENT_EXECUTABLES: usize = 32;
+pub const MAX_AGENT_ARGV_MARKERS: usize = 16;
+pub const MAX_AGENT_RULES: usize = 64;
+pub const MAX_AGENT_GATE_DEPTH: usize = 8;
+pub const MAX_AGENT_MATCHER_BYTES: usize = 4 * 1024;
 
 #[derive(Debug)]
 pub enum ManifestError {
@@ -66,6 +72,8 @@ pub struct Manifest {
     pub dependencies: Vec<Dependency>,
     #[serde(default)]
     pub workflows: Vec<Workflow>,
+    #[serde(default)]
+    pub agents: Vec<Agent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -263,6 +271,71 @@ pub struct WorkflowStep {
     pub needs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Agent {
+    pub id: String,
+    pub name: String,
+    pub process: AgentProcess,
+    #[serde(default)]
+    pub rules: Vec<AgentRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProcess {
+    #[serde(default)]
+    pub executables: Vec<String>,
+    #[serde(default)]
+    pub argv_contains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRule {
+    pub id: String,
+    pub state: AgentRuleState,
+    pub priority: u16,
+    #[serde(default = "default_agent_rule_region")]
+    pub region: String,
+    #[serde(default)]
+    pub visible_idle: bool,
+    #[serde(default)]
+    pub skip_state_update: bool,
+    #[serde(flatten)]
+    pub gate: AgentGate,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentGate {
+    #[serde(default)]
+    pub contains: Vec<String>,
+    #[serde(default)]
+    pub regex: Vec<String>,
+    #[serde(default)]
+    pub line_regex: Vec<String>,
+    #[serde(default)]
+    pub all: Vec<AgentGate>,
+    #[serde(default)]
+    pub any: Vec<AgentGate>,
+    #[serde(default, rename = "not")]
+    pub not_gate: Vec<AgentGate>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRuleState {
+    Idle,
+    Working,
+    Blocked,
+    Unknown,
+}
+
+fn default_agent_rule_region() -> String {
+    "whole_recent".into()
+}
+
 pub struct SchemaDocument {
     pub path: PathBuf,
     pub value: Value,
@@ -436,8 +509,11 @@ impl LoadedManifest {
 
 impl Manifest {
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.manifest_version != 1 {
-            return invalid("unsupported manifest_version (expected 1)");
+        if !matches!(self.manifest_version, 1 | 2) {
+            return invalid("unsupported manifest_version (expected 1 or 2)");
+        }
+        if self.manifest_version == 1 && !self.agents.is_empty() {
+            return invalid("agent definitions require manifest_version = 2");
         }
         validate_plugin_id(&self.plugin.id)?;
         if self.plugin.name.is_empty() || self.plugin.name.len() > 128 {
@@ -533,8 +609,147 @@ impl Manifest {
             return invalid("plugin exceeds 128 workflows");
         }
         validate_workflows(&self.workflows, &aliases, &action_ids)?;
+        validate_agents(&self.agents)?;
         Ok(())
     }
+}
+
+fn validate_agents(agents: &[Agent]) -> Result<(), ManifestError> {
+    if agents.len() > MAX_AGENTS_PER_PLUGIN {
+        return invalid("plugin exceeds 16 agent definitions");
+    }
+    let mut agent_ids = BTreeSet::new();
+    for agent in agents {
+        validate_local_id(&agent.id, "agent")?;
+        if !agent_ids.insert(agent.id.as_str()) {
+            return invalid(format!("duplicate agent id `{}`", agent.id));
+        }
+        if agent.name.is_empty()
+            || agent.name.len() > 128
+            || agent.name.chars().any(char::is_control)
+        {
+            return invalid(format!(
+                "agent `{}` name must contain 1 through 128 printable bytes",
+                agent.id
+            ));
+        }
+        if agent.process.executables.is_empty() && agent.process.argv_contains.is_empty() {
+            return invalid(format!(
+                "agent `{}` requires at least one process matcher",
+                agent.id
+            ));
+        }
+        validate_agent_matchers(
+            &agent.process.executables,
+            MAX_AGENT_EXECUTABLES,
+            "executable",
+            &agent.id,
+        )?;
+        validate_agent_matchers(
+            &agent.process.argv_contains,
+            MAX_AGENT_ARGV_MARKERS,
+            "argv marker",
+            &agent.id,
+        )?;
+        if agent.rules.len() > MAX_AGENT_RULES {
+            return invalid(format!("agent `{}` exceeds 64 rules", agent.id));
+        }
+        let mut rule_ids = BTreeSet::new();
+        for rule in &agent.rules {
+            validate_local_id(&rule.id, "agent rule")?;
+            if !rule_ids.insert(rule.id.as_str()) {
+                return invalid(format!(
+                    "agent `{}` has duplicate rule `{}`",
+                    agent.id, rule.id
+                ));
+            }
+            validate_agent_region(&rule.region, &agent.id, &rule.id)?;
+            validate_agent_gate(&rule.gate, 0, &agent.id, &rule.id)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_agent_matchers(
+    values: &[String],
+    limit: usize,
+    kind: &str,
+    agent: &str,
+) -> Result<(), ManifestError> {
+    if values.len() > limit {
+        return invalid(format!("agent `{agent}` has too many {kind} matchers"));
+    }
+    let mut unique = BTreeSet::new();
+    for value in values {
+        if value.is_empty()
+            || value.len() > MAX_AGENT_MATCHER_BYTES
+            || value.contains('\0')
+            || !unique.insert(value.to_ascii_lowercase())
+        {
+            return invalid(format!("agent `{agent}` has an invalid {kind} matcher"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_agent_region(region: &str, agent: &str, rule: &str) -> Result<(), ManifestError> {
+    let named = matches!(
+        region,
+        "osc_title"
+            | "osc_progress"
+            | "whole_recent"
+            | "after_last_prompt_marker"
+            | "prompt_box_body"
+            | "after_last_horizontal_rule"
+    );
+    let bottom = region
+        .strip_prefix("bottom_non_empty_lines(")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|count| (1..=64).contains(&count));
+    if named || bottom {
+        Ok(())
+    } else {
+        invalid(format!(
+            "agent `{agent}` rule `{rule}` has an invalid region"
+        ))
+    }
+}
+
+fn validate_agent_gate(
+    gate: &AgentGate,
+    depth: usize,
+    agent: &str,
+    rule: &str,
+) -> Result<(), ManifestError> {
+    if depth > MAX_AGENT_GATE_DEPTH {
+        return invalid(format!(
+            "agent `{agent}` rule `{rule}` exceeds eight nested gate levels"
+        ));
+    }
+    for matcher in gate
+        .contains
+        .iter()
+        .chain(&gate.regex)
+        .chain(&gate.line_regex)
+    {
+        if matcher.is_empty() || matcher.len() > MAX_AGENT_MATCHER_BYTES || matcher.contains('\0') {
+            return invalid(format!(
+                "agent `{agent}` rule `{rule}` has an invalid matcher"
+            ));
+        }
+    }
+    for pattern in gate.regex.iter().chain(&gate.line_regex) {
+        regex::Regex::new(pattern).map_err(|error| {
+            ManifestError::Invalid(format!(
+                "agent `{agent}` rule `{rule}` has an invalid regex: {error}"
+            ))
+        })?;
+    }
+    for nested in gate.all.iter().chain(&gate.any).chain(&gate.not_gate) {
+        validate_agent_gate(nested, depth + 1, agent, rule)?;
+    }
+    Ok(())
 }
 
 impl Runtime {
@@ -884,6 +1099,7 @@ mod tests {
             panes: Vec::new(),
             dependencies: Vec::new(),
             workflows: Vec::new(),
+            agents: Vec::new(),
         }
     }
 
@@ -902,6 +1118,67 @@ mod tests {
         let mut manifest = valid_manifest();
         manifest.actions[0].id = "not.local".into();
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn version_two_agents_are_strict_bounded_and_version_gated() {
+        let source = r#"
+manifest_version = 2
+[plugin]
+id = "com.example.openclaw"
+name = "OpenClaw"
+version = "1.0.0"
+min_vvmux_version = "0.4.0"
+description = "OpenClaw detection"
+platforms = ["linux"]
+permissions = []
+[[agents]]
+id = "openclaw"
+name = "OpenClaw"
+process = { executables = ["openclaw"], argv_contains = ["@openclaw/cli"] }
+[[agents.rules]]
+id = "approval"
+state = "blocked"
+priority = 900
+region = "bottom_non_empty_lines(12)"
+contains = ["approval required"]
+"#;
+        let manifest: Manifest = toml::from_str(source).unwrap();
+        manifest.validate().unwrap();
+
+        let version_one: Manifest =
+            toml::from_str(&source.replace("manifest_version = 2", "manifest_version = 1"))
+                .unwrap();
+        assert!(
+            version_one
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("version")
+        );
+
+        let bad_region: Manifest =
+            toml::from_str(&source.replace("bottom_non_empty_lines(12)", "viewport")).unwrap();
+        assert!(
+            bad_region
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("region")
+        );
+
+        let bad_regex: Manifest = toml::from_str(&source.replace(
+            "contains = [\"approval required\"]",
+            "regex = [\"(unterminated\"]",
+        ))
+        .unwrap();
+        assert!(
+            bad_regex
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("regex")
+        );
     }
 
     #[test]

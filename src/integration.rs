@@ -30,6 +30,7 @@ pub fn run(command: IntegrationCommand) -> io::Result<()> {
         IntegrationCommand::Install { target } => {
             ensure_opencode(target)?;
             install_at(&path)?;
+            crate::plugin::enable_builtin("dev.vivido.agent.opencode")?;
             println!("installed OpenCode integration at {}", path.display());
         }
         IntegrationCommand::Status { target } => {

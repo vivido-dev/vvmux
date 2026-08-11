@@ -62,7 +62,7 @@ fn recursive_git_dependencies_and_bounded_workflows_execute_end_to_end() {
         .unwrap();
     assert_success(&listed);
     let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(listed.as_array().unwrap().len(), 3);
+    assert_eq!(listed.as_array().unwrap().len(), 7);
     assert!(
         listed
             .as_array()
@@ -105,7 +105,7 @@ fn recursive_git_dependencies_and_bounded_workflows_execute_end_to_end() {
     assert_eq!(fs::read_to_string(&lock).unwrap(), lock_text);
     let after_rejection =
         json_command(command(binary, &runtime, &config_home).args(["plugin", "list", "--json"]));
-    assert_eq!(after_rejection.as_array().unwrap().len(), 3);
+    assert_eq!(after_rejection.as_array().unwrap().len(), 7);
     let caller = write_dependency_caller(directory.path());
     assert_success(
         &command(binary, &runtime, &config_home)
