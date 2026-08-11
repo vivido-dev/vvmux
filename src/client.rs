@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 #[cfg(test)]
 use crate::client_input::parse_configured_action;
 use crate::client_input::{self, FloatEditScanner, MouseCoordinates, ParsedInput, PrefixParser};
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use crate::ipc::DisplayMetrics;
 #[cfg(test)]
 use crate::ipc::{Action, Axis, Direction, MouseEvent, MouseKind};
@@ -1930,15 +1930,11 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
 
-    #[cfg(unix)]
     use crate::config::Media as MediaConfig;
     #[cfg(unix)]
-    use crate::ipc::{BridgeSourceKind, ChannelKind, establish};
-    #[cfg(unix)]
+    use crate::ipc::{ChannelKind, establish};
     use crate::media::VirtualVivid;
-    #[cfg(unix)]
     use image::ImageEncoder;
-    #[cfg(unix)]
     use vivid_protocol::media::{self, AudioPacket, VideoPacket};
 
     fn test_surface(key: BridgeSourceKey) -> BridgeSurface {
@@ -2037,7 +2033,6 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
     fn receive_bridge_message_until(
         receiver: &mpsc::Receiver<ClientMessage>,
         seen: &mut Vec<ClientMessage>,
@@ -2058,7 +2053,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn project_outer_timed_sources(
         presenter: &crate::media::VirtualVivid,
         expected_sources: usize,
@@ -3536,7 +3530,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn two_three_pane_tabs_restore_video_and_audio_after_showing_an_image() {
         for iteration in 0..3 {
             let directory = tempfile::tempdir().unwrap();
@@ -3554,30 +3547,23 @@ mod tests {
             let token = presenter.issue_pane_capability(7).unwrap();
             presenter.update_metrics(7, 80, 22, (10, 20));
             let bridge = crate::bridge::OuterBridge::connect(
-                format!("unix:{}", socket.display()),
+                presenter.endpoint(),
                 Zeroizing::new(token),
                 DisplayMetrics::default(),
             )
             .unwrap();
 
-            let (client, server) = UnixStream::pair().unwrap();
-            let client_establish = thread::spawn(move || {
-                crate::ipc::establish(test_transport(client), ChannelKind::Control)
-            });
-            let (mut server_reader, _server_writer) =
-                establish(test_transport(server), ChannelKind::Control).unwrap();
-            let (_client_reader, client_writer) = client_establish.join().unwrap().unwrap();
-            let presenter_cell_size =
-                Arc::new(AtomicU32::new(pack_cell_size(bridge.display_metrics())));
-            let mut worker =
-                BridgeWorker::spawn(bridge, client_writer, 8, presenter_cell_size).unwrap();
-
             let (message_sender, message_receiver) = mpsc::channel();
-            thread::spawn(move || {
-                while let Ok(message) = server_reader.recv::<ClientMessage>() {
-                    let _ = message_sender.send(message);
-                }
-            });
+            let mut worker = BridgeWorker::spawn_with_sender(
+                bridge,
+                BridgeClientSender::new(move |message| {
+                    message_sender.send(message).map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "test message receiver closed")
+                    })
+                }),
+                8,
+            )
+            .unwrap();
             let mut seen = Vec::new();
 
             let tabs = [[1_u64, 2, 3], [4_u64, 5, 6]];
