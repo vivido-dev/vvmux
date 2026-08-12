@@ -67,7 +67,7 @@ vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
 zeroize = { version = "1.9", features = ["serde"] }
-vvmux-plugin-api = { path = "vvmux-plugin-api" }
+vvmux-plugin-api = { version = "0.4", path = "vvmux-plugin-api" }
 # 38.0.4 was the original design pin but now has applicable RustSec sandbox/WASI advisories.
 # 36.0.13 is the fully patched maintenance line that still supports this workspace's Rust 1.88.
 wasmtime = { version = "=36.0.13", default-features = false, features = [
