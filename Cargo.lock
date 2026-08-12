@@ -3308,7 +3308,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vivid_gateway"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "getrandom 0.4.3",
  "log",
@@ -3335,7 +3335,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_sdk"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "crossterm",
  "getrandom 0.4.3",
