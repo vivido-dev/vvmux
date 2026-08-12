@@ -11,8 +11,13 @@ pub use vvmux_plugin_api::*;
 /// that the host exposes; plugin code never speaks private VVMX.
 #[cfg(target_arch = "wasm32")]
 pub mod component {
+    // `generate!` resolves `path` against this package's own directory, and `cargo package` never
+    // carries files from a sibling package into the tarball, so the world cannot be read out of
+    // `vvmux-plugin-api/`. The canonical world stays in that crate, published as
+    // `vvmux_plugin_api::COMPONENT_WIT`; this mirror is proved byte-identical to it by
+    // `wit_mirror_matches_the_published_world`.
     wit_bindgen::generate!({
-        path: "../vvmux-plugin-api/wit",
+        path: "wit",
         world: "plugin",
         pub_export_macro: true,
     });
@@ -210,6 +215,18 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    /// The guest bindings are generated from a package-local copy, because a published tarball
+    /// cannot reach into `vvmux-plugin-api/`. A drifted copy would let a plugin and its host
+    /// speak different worlds, so the copy is not allowed to differ by a byte.
+    #[test]
+    fn wit_mirror_matches_the_published_world() {
+        assert_eq!(
+            include_str!("../wit/vvmux-plugin.wit"),
+            vvmux_plugin_api::COMPONENT_WIT,
+            "wit/vvmux-plugin.wit drifted from vvmux-plugin-api/wit/vvmux-plugin.wit"
+        );
+    }
 
     #[test]
     fn native_host_correlates_broker_calls() {

@@ -36,8 +36,13 @@ const CACHE_MAGIC: &[u8; 8] = b"VVCWASM1";
 const CACHE_KEY_VERSION: &str = "vvmux-component-cache-v1";
 
 mod bindings {
+    // `bindgen!` resolves `path` against this package's own directory, and `cargo package` never
+    // carries files from a nested package into the tarball, so the world cannot be read out of
+    // `vvmux-plugin-api/`. The canonical world stays in that crate, published as
+    // `vvmux_plugin_api::COMPONENT_WIT`; this mirror is proved byte-identical to it by
+    // `wit_mirror_matches_the_published_world`.
     wasmtime::component::bindgen!({
-        path: "vvmux-plugin-api/wit",
+        path: "wit",
         world: "plugin",
     });
 }
@@ -779,6 +784,18 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host generates its bindings from a package-local copy, because a published tarball
+    /// cannot reach into `vvmux-plugin-api/`. A drifted copy would let the host and the SDKs
+    /// speak different worlds, so the copy is not allowed to differ by a byte.
+    #[test]
+    fn wit_mirror_matches_the_published_world() {
+        assert_eq!(
+            include_str!("../wit/vvmux-plugin.wit"),
+            vvmux_plugin_api::COMPONENT_WIT,
+            "wit/vvmux-plugin.wit drifted from vvmux-plugin-api/wit/vvmux-plugin.wit"
+        );
+    }
 
     fn test_state(cancel: Arc<AtomicBool>, deadline: Instant) -> ComponentState {
         ComponentState {
