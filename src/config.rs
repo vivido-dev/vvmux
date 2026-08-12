@@ -157,7 +157,11 @@ impl Config {
         let config: Self = toml::from_str(source).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid vvmux config {}: {error}", path.display()),
+                format!(
+                    "invalid vvmux config {}: {}",
+                    path.display(),
+                    single_line_toml_error(&error, source)
+                ),
             )
         })?;
         config.validate()?;
@@ -286,6 +290,47 @@ impl Config {
     }
 }
 
+/// Collapse a `toml` parse error onto one line, keeping where it happened.
+///
+/// The crate's `Display` is a multi-line snippet: a header with the position, a caret diagram, and
+/// the reason last. A config failure is reported on the single-line status bar, which showed only
+/// the tail — so `[theme]:` surfaced as "unexpected key or value, expected newline, `#`" and read
+/// like the file's `#` comments had been rejected, when the stray colon was the whole problem.
+/// Keeping the position and the offending text with the reason makes the real line obvious.
+fn single_line_toml_error(error: &toml::de::Error, source: &str) -> String {
+    let message = error.message().replace('\n', " ");
+    let Some(start) = error
+        .span()
+        .map(|span| span.start)
+        .filter(|start| source.is_char_boundary(*start))
+    else {
+        return message;
+    };
+    let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+    let line_end = source[line_start..]
+        .find('\n')
+        .map_or(source.len(), |offset| line_start + offset);
+    let line = source[line_start..line_end].trim();
+    let mut snippet: String = line.chars().take(SNIPPET_CHARS).collect();
+    if line.chars().count() > SNIPPET_CHARS {
+        snippet.push('…');
+    }
+    format!(
+        "line {}, column {}: {message}{}",
+        source[..start].matches('\n').count() + 1,
+        source[line_start..start].chars().count() + 1,
+        if snippet.is_empty() {
+            String::new()
+        } else {
+            format!(" (in `{snippet}`)")
+        }
+    )
+}
+
+/// How much of the offending line the status bar quotes back. Long enough to recognize the line,
+/// short enough that the reason still fits beside it.
+const SNIPPET_CHARS: usize = 40;
+
 pub fn parse_control_chord(chord: &str) -> Option<u8> {
     let bytes = chord.as_bytes();
     (bytes.len() == 3 && bytes[0] == b'C' && bytes[1] == b'-')
@@ -321,6 +366,64 @@ mod tests {
     #[test]
     fn unknown_fields_are_rejected() {
         assert!(toml::from_str::<Config>("[general]\nunknown = true").is_err());
+    }
+
+    /// Comments are ordinary TOML and must survive everywhere a user writes them: above a table,
+    /// above a key, and trailing one.
+    #[test]
+    fn comments_are_accepted_anywhere() {
+        let config = Config::parse(
+            "# vvmux config\n\
+             [theme]\n\
+             # default, mono, nord, solarized-dark, gruvbox-dark\n\
+             preset = \"nord\" # trailing\n\
+             \n\
+             [general] # trailing on a header\n\
+             mouse = false\n",
+            Path::new("config.toml"),
+        )
+        .expect("comments must not be a parse error");
+        assert_eq!(config.theme.preset.as_deref(), Some("nord"));
+        assert!(!config.general.mouse);
+    }
+
+    /// A syntax error is reported on the one-line status bar. The `toml` crate's own `Display` is
+    /// a multi-line caret diagram whose *last* line is the reason, so the bar showed only
+    /// "unexpected key or value, expected newline, `#`" for a stray `[theme]:` — which reads like
+    /// the comments were rejected. The position and the offending line have to survive.
+    #[test]
+    fn a_syntax_error_names_its_line_on_one_line() {
+        let error = Config::parse(
+            "[theme]:\n# default, mono, nord\npreset = \"nord\"\n",
+            Path::new("/tmp/config.toml"),
+        )
+        .expect_err("a stray colon must not parse");
+        let message = error.to_string();
+        assert!(
+            !message.contains('\n'),
+            "the status bar shows one line: {message}"
+        );
+        assert!(
+            message.contains("line 1, column 8") && message.contains("in `[theme]:`"),
+            "the error must point at the colon, not the comment: {message}"
+        );
+        assert!(
+            message.contains("/tmp/config.toml"),
+            "the failing file is still named: {message}"
+        );
+    }
+
+    /// A key error is reported against the key's own line, not the start of the file.
+    #[test]
+    fn an_unknown_key_is_located_after_a_comment_block() {
+        let error = Config::parse(
+            "# one\n# two\n[general]\nunknown = true\n",
+            Path::new("config.toml"),
+        )
+        .expect_err("an unknown key must not parse");
+        let message = error.to_string();
+        assert!(message.contains("line 4"), "{message}");
+        assert!(message.contains("unknown field `unknown`"), "{message}");
     }
 
     #[test]
@@ -411,6 +514,7 @@ mod tests {
             "enter-floating-move-mode",
             "enter-floating-resize-mode",
             "agent-navigator",
+            "save-layout",
         ];
         const DOCUMENTED_COPY_ACTIONS: &[&str] = &[
             "up",

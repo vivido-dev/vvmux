@@ -276,6 +276,14 @@ pub enum MsgCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Write the current tab and pane layout to a startup layout file.
+    ///
+    /// A bare name lands in the config directory as `<name>.toml`; a path is used as given.
+    /// Defaults to the conventional `startup.toml`, and replaces an existing file.
+    SaveLayout {
+        #[arg(long)]
+        path: Option<String>,
+    },
     /// Split a tiled pane without changing the active tab.
     Split {
         #[arg(value_enum)]
@@ -760,6 +768,12 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             AutomationMethod::Split { axis: axis.into() },
             pane_id,
             true,
+            Output::Json,
+        ),
+        MsgCommand::SaveLayout { path } => (
+            AutomationMethod::SaveLayout { path },
+            None,
+            false,
             Output::Json,
         ),
         MsgCommand::Run {

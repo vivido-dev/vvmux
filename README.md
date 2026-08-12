@@ -217,10 +217,15 @@ above.
 
 ## Startup layouts
 
+A session created without `--layout` starts from `~/.config/vvmux/startup.toml` when that file
+exists, so `vvmux` alone comes up in the layout you saved. The full order is `--layout NAME`, then
+`startup.toml`, then `[general].default_layout`, then the usual one-shell tab.
+
 `vvmux new --layout NAME` loads `~/.config/vvmux/layouts/NAME.toml`; an existing path can be
 passed instead. `[general].default_layout` supplies the name or path when `--layout` is omitted.
-An explicitly requested missing or invalid layout fails before the daemon forks. A missing default
-layout prints a warning and starts the usual one-shell tab.
+An explicitly requested missing or invalid layout fails before the daemon forks. The two implicit
+sources never do: a missing default layout, or a `startup.toml` that fails to parse, prints a
+warning and falls through to the next candidate.
 
 ```toml
 [[tabs]]
@@ -253,6 +258,17 @@ Floating-only tabs are valid. `command` is one shell command line passed to `she
 accepts `~/`, and `hold = true` preserves command output after exit. If one pane cannot spawn, its
 leaf is removed and its siblings keep their exact owner-scoped layout; a layout where every pane
 fails falls back to one shell tab.
+
+`Ctrl-b s` writes the live layout back out in this format. The status row prompts for a target,
+prefilled with `startup.toml`; Enter accepts it, Escape cancels, and a bare name becomes
+`~/.config/vvmux/<name>.toml` while a path is used as written. Replacing an existing file asks
+first. `vvmux msg save-layout [--path X]` does the same without a terminal and always replaces.
+
+A save records tab names, split axes, exact split weights, floating size and pin state, the focused
+pane, and each pane's `cwd`. That `cwd` is where the pane's process was started, not wherever its
+shell has since `cd`-ed. Commands are deliberately not recorded, so a saved layout reopens plain
+shells rather than re-running whatever was in the pane. Plugin panes are skipped, and zoom and
+synchronized input are session state rather than layout.
 
 `get-text` writes exact Unicode without adding a newline. Its default view is the pane as vvmux is
 currently displaying it, including copy-mode scroll position. `--rows N` instead returns the newest
@@ -372,6 +388,7 @@ The prefix is `Ctrl-b`.
 | `Ctrl-b ,` | Rename the active tab |
 | `Ctrl-b x`, then `y` / `n` | Confirm or cancel closing the focused pane |
 | `Ctrl-b z` | Toggle zoom |
+| `Ctrl-b s` | Save the current layout, prefilled with `startup.toml` |
 | `Ctrl-b S` | Toggle synchronized input for the active tab |
 | `Ctrl-b a` | Open or close the AI-agent navigator |
 | `Ctrl-b f` / `Ctrl-b F` | Create a floating pane / show or hide ordinary floats |

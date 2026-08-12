@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ipc::Axis;
 use crate::layout::{PaneId, TiledNode};
@@ -14,35 +14,52 @@ pub const MAX_LAYOUT_TABS: usize = 16;
 pub const MAX_LAYOUT_PANES: usize = 64;
 const MAX_SPLIT_CHILDREN: usize = 16;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
+/// The conventional startup layout, applied when a session is created without `--layout`.
+pub const STARTUP_FILE: &str = "startup.toml";
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LayoutFile {
     tabs: Vec<LayoutTab>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct LayoutTab {
+pub struct LayoutTab {
+    #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     focus: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     layout: Option<LayoutNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     floating: Vec<LayoutFloat>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// A layout node is a leaf or a split, never both; the constructors are what keep that true on
+/// the writing side, exactly as `lower_node` enforces it on the reading side.
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct LayoutNode {
+pub struct LayoutNode {
+    #[serde(skip_serializing_if = "Option::is_none")]
     split: Option<LayoutSplit>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     sizes: Vec<u32>,
-    children: Vec<LayoutNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
     hold: bool,
+    // Arrays of tables must follow every scalar and inline value in the same table, so `children`
+    // stays last: TOML serialization order is part of this struct's contract.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children: Vec<LayoutNode>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum LayoutSplit {
     Vertical,
@@ -58,16 +75,34 @@ impl From<LayoutSplit> for Axis {
     }
 }
 
-#[derive(Debug, Deserialize)]
+impl From<Axis> for LayoutSplit {
+    fn from(axis: Axis) -> Self {
+        match axis {
+            Axis::Vertical => Self::Vertical,
+            Axis::Horizontal => Self::Horizontal,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct LayoutFloat {
+pub struct LayoutFloat {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
     hold: bool,
     width_percent: u16,
     height_percent: u16,
+    #[serde(skip_serializing_if = "is_false")]
     pinned: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Default for LayoutFloat {
@@ -231,6 +266,137 @@ impl LayoutFile {
         }
         Ok(LayoutPlan { tabs: planned })
     }
+}
+
+impl LayoutNode {
+    pub fn leaf(pane: String, cwd: Option<String>) -> Self {
+        Self {
+            pane: Some(pane),
+            cwd,
+            ..Self::default()
+        }
+    }
+
+    pub fn split(axis: Axis, sizes: Vec<u32>, children: Vec<LayoutNode>) -> Self {
+        Self {
+            split: Some(axis.into()),
+            sizes,
+            children,
+            ..Self::default()
+        }
+    }
+}
+
+impl LayoutFloat {
+    pub fn new(
+        pane: String,
+        cwd: Option<String>,
+        width_percent: u16,
+        height_percent: u16,
+        pinned: bool,
+    ) -> Self {
+        Self {
+            pane: Some(pane),
+            command: None,
+            cwd,
+            hold: false,
+            width_percent,
+            height_percent,
+            pinned,
+        }
+    }
+}
+
+impl LayoutNode {
+    fn pane_count(&self) -> usize {
+        if self.pane.is_some() {
+            1
+        } else {
+            self.children.iter().map(Self::pane_count).sum()
+        }
+    }
+}
+
+impl LayoutTab {
+    fn pane_count(&self) -> usize {
+        self.layout.as_ref().map_or(0, LayoutNode::pane_count) + self.floating.len()
+    }
+
+    pub fn new(
+        name: Option<String>,
+        focus: Option<String>,
+        layout: Option<LayoutNode>,
+        floating: Vec<LayoutFloat>,
+    ) -> Self {
+        Self {
+            name,
+            focus,
+            layout,
+            floating,
+        }
+    }
+}
+
+impl LayoutFile {
+    pub fn from_tabs(tabs: Vec<LayoutTab>) -> Self {
+        Self { tabs }
+    }
+
+    /// Tab and pane counts, so a save can report what it wrote.
+    pub fn counts(&self) -> (usize, usize) {
+        let panes = self.tabs.iter().map(LayoutTab::pane_count).sum();
+        (self.tabs.len(), panes)
+    }
+
+    /// Render this layout as TOML, proving it loads before the caller writes it anywhere.
+    ///
+    /// The captured session and the parser share these structs, so the round trip is what turns a
+    /// capture bug into an error at save time instead of a session that will not start.
+    pub fn render(&self) -> io::Result<String> {
+        let rendered = toml::to_string_pretty(self)
+            .map_err(|error| invalid(format!("could not render layout: {error}")))?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Self::parse(&rendered, Path::new("<generated>"), home.as_deref())?;
+        Ok(rendered)
+    }
+}
+
+/// The conventional startup layout path, when the file exists.
+///
+/// Canonicalized because the daemon re-reads it after detaching from the caller's directory.
+pub fn startup_path() -> Option<PathBuf> {
+    fs::canonicalize(crate::config::config_dir()?.join(STARTUP_FILE)).ok()
+}
+
+/// Resolve a save target the user typed.
+///
+/// A bare name lands in the config directory and gains a `.toml` extension; anything path-like is
+/// used as written, with `~/` expanded. The file need not exist yet, so this never canonicalizes.
+pub fn resolve_save_path(value: &str) -> io::Result<PathBuf> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(invalid("layout name is empty"));
+    }
+    if !validate_default_name(value) {
+        return Err(invalid("layout path must not contain .."));
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| invalid("layout path uses ~/ but HOME is unset"))?;
+        return Ok(home.join(rest));
+    }
+    let direct = PathBuf::from(value);
+    if direct.is_absolute() || value.contains('/') || value.contains('\\') {
+        return Ok(direct);
+    }
+    let mut name = direct;
+    if name.extension().is_none() {
+        name.set_extension("toml");
+    }
+    Ok(crate::config::config_dir()
+        .ok_or_else(|| invalid("could not resolve the vvmux config directory"))?
+        .join(name))
 }
 
 fn lower_node(
@@ -512,6 +678,141 @@ hold = true
         );
         assert_eq!(tab.floating[0].width_percent, 60);
         assert_eq!(tab.floating[0].height_percent, 60);
+    }
+
+    /// The writer and the parser share one schema, so a captured layout must load back with the
+    /// same weights, focus, and float geometry it was built from.
+    #[test]
+    fn rendered_layout_round_trips_through_the_parser() {
+        let file = LayoutFile::from_tabs(vec![
+            LayoutTab::new(
+                Some("dev".to_owned()),
+                Some("p2".to_owned()),
+                Some(LayoutNode::split(
+                    Axis::Vertical,
+                    vec![30, 70],
+                    vec![
+                        LayoutNode::leaf("p1".to_owned(), Some("~/src/vvmux".to_owned())),
+                        LayoutNode::leaf("p2".to_owned(), None),
+                    ],
+                )),
+                Vec::new(),
+            ),
+            LayoutTab::new(
+                None,
+                Some("p2".to_owned()),
+                Some(LayoutNode::split(
+                    Axis::Horizontal,
+                    vec![1, 3],
+                    vec![
+                        LayoutNode::leaf("p1".to_owned(), None),
+                        LayoutNode::leaf("p2".to_owned(), None),
+                    ],
+                )),
+                vec![LayoutFloat::new("p3".to_owned(), None, 40, 50, true)],
+            ),
+        ]);
+        let rendered = file.render().unwrap();
+        // A capture never replays a command, and the absent-by-default fields stay out of the file.
+        assert!(!rendered.contains("command"), "{rendered}");
+        assert!(!rendered.contains("hold"), "{rendered}");
+
+        let plan = parse(&rendered).unwrap();
+        assert_eq!(plan.tabs.len(), 2);
+        let first = &plan.tabs[0];
+        assert_eq!(first.name.as_deref(), Some("dev"));
+        assert_eq!(first.focus_slot, Some(1));
+        assert_eq!(
+            first.spawns[0].cwd.as_deref(),
+            Some(Path::new("/home/test/src/vvmux"))
+        );
+        let geometry = first
+            .tiled
+            .as_ref()
+            .unwrap()
+            .to_tiled(&[1, 2])
+            .geometry(Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30,
+            });
+        assert_eq!(geometry[&1].width, 30);
+        assert_eq!(geometry[&2].width, 70);
+
+        let second = &plan.tabs[1];
+        assert_eq!(second.spawns.len(), 3);
+        assert_eq!(second.floating[0].slot, 2);
+        assert_eq!(second.floating[0].width_percent, 40);
+        assert_eq!(second.floating[0].height_percent, 50);
+        assert!(second.floating[0].pinned);
+        let geometry = second
+            .tiled
+            .as_ref()
+            .unwrap()
+            .to_tiled(&[1, 2])
+            .geometry(Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 40,
+            });
+        assert_eq!(geometry[&1].height, 10);
+        assert_eq!(geometry[&2].height, 30);
+    }
+
+    /// The save prompt accepts a file name or a path; only a bare name means "in the config
+    /// directory", and a parent-directory escape is refused before anything is written.
+    #[test]
+    fn save_targets_separate_bare_names_from_paths() {
+        assert_eq!(
+            resolve_save_path("/tmp/custom.toml").unwrap(),
+            PathBuf::from("/tmp/custom.toml")
+        );
+        assert_eq!(
+            resolve_save_path("nested/dev").unwrap(),
+            PathBuf::from("nested/dev"),
+            "a path keeps its exact spelling, extension included"
+        );
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            assert_eq!(
+                resolve_save_path("~/layouts/dev.toml").unwrap(),
+                home.join("layouts/dev.toml")
+            );
+        }
+        for rejected in ["", "   ", "../escape.toml", "~/../escape.toml"] {
+            assert!(
+                resolve_save_path(rejected).is_err(),
+                "{rejected:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rendered_leaves_and_splits_stay_disjoint() {
+        let file = LayoutFile::from_tabs(vec![LayoutTab::new(
+            None,
+            None,
+            Some(LayoutNode::split(
+                Axis::Vertical,
+                vec![1, 1],
+                vec![
+                    LayoutNode::leaf("p1".to_owned(), Some("/tmp".to_owned())),
+                    LayoutNode::leaf("p2".to_owned(), None),
+                ],
+            )),
+            Vec::new(),
+        )]);
+        let rendered = file.render().unwrap();
+        let value: toml::Value = toml::from_str(&rendered).unwrap();
+        let root = &value["tabs"][0]["layout"];
+        assert!(root.get("pane").is_none(), "{rendered}");
+        assert!(root.get("cwd").is_none(), "{rendered}");
+        let leaf = &root["children"][0];
+        assert!(leaf.get("split").is_none(), "{rendered}");
+        assert!(leaf.get("sizes").is_none(), "{rendered}");
+        assert!(leaf.get("children").is_none(), "{rendered}");
+        assert_eq!(leaf["cwd"].as_str(), Some("/tmp"));
     }
 
     #[test]

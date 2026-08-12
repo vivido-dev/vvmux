@@ -435,6 +435,7 @@ impl PrefixParser {
             b'w' => output.push(ParsedInput::Action(Action::ToggleTabNavigator)),
             b',' => output.push(ParsedInput::Action(Action::BeginRenameTab)),
             b'z' => output.push(ParsedInput::Action(Action::ToggleZoom)),
+            b's' => output.push(ParsedInput::Action(Action::BeginSaveLayout)),
             b'S' => output.push(ParsedInput::Action(Action::ToggleSyncInput)),
             b'f' => output.push(ParsedInput::Action(Action::NewFloatingPane)),
             b'F' => output.push(ParsedInput::Action(Action::ToggleFloatingPanes)),
@@ -494,6 +495,7 @@ pub(crate) fn parse_configured_action(action: &str) -> Option<Action> {
         "enter-floating-move-mode" => Some(Action::EnterFloatingMoveMode),
         "enter-floating-resize-mode" => Some(Action::EnterFloatingResizeMode),
         "agent-navigator" => Some(Action::ToggleAgentNavigator),
+        "save-layout" => Some(Action::BeginSaveLayout),
         _ => None,
     }
 }
@@ -687,6 +689,14 @@ mod tests {
             [
                 ParsedInput::Action(Action::ToggleTabNavigator),
                 ParsedInput::Action(Action::BeginRenameTab),
+            ]
+        );
+        // Save and synchronized input differ only by case, so both must stay reachable.
+        assert_eq!(
+            parser.feed(b"\x02s\x02S"),
+            [
+                ParsedInput::Action(Action::BeginSaveLayout),
+                ParsedInput::Action(Action::ToggleSyncInput),
             ]
         );
     }
