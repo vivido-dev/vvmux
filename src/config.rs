@@ -411,6 +411,7 @@ mod tests {
             "enter-floating-move-mode",
             "enter-floating-resize-mode",
             "agent-navigator",
+            "save-layout",
         ];
         const DOCUMENTED_COPY_ACTIONS: &[&str] = &[
             "up",

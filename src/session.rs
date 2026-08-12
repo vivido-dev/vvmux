@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
+use std::fs;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -23,7 +24,9 @@ use crate::ipc::{
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
 };
-use crate::layout_file::LayoutPlan;
+use crate::layout_file::{
+    LayoutFile, LayoutFloat, LayoutNode, LayoutPlan, LayoutTab, MAX_LAYOUT_PANES, MAX_LAYOUT_TABS,
+};
 use crate::media::VirtualVivid;
 use crate::media_trace::{MediaKeyframeStage, MediaTraceFilter, MediaTraceJournal, MediaTraceKind};
 use crate::platform::VirtualPresenterEndpoint;
@@ -74,6 +77,10 @@ const AUTOMATION_REPLY_LIMIT: usize = 16 * 1024 * 1024;
 /// A `run` command is one shell command line, not a script; this only has to be generous.
 const MAX_RUN_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_TAB_NAME_BYTES: usize = 128;
+/// A save target is a file name or a path, never a document; this only has to be generous.
+const MAX_LAYOUT_NAME_BYTES: usize = 512;
+/// How long a save result stays in the status row before the tab list returns.
+const STATUS_NOTICE_DURATION: Duration = Duration::from_secs(4);
 #[cfg(windows)]
 const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
 #[cfg(windows)]
@@ -411,6 +418,9 @@ struct Pane {
     input: PtyInput,
     control: PtyControl,
     child_pid: u32,
+    /// The directory this pane's process was started in. A saved layout reopens the pane here;
+    /// it deliberately does not follow the shell's later `cd`.
+    spawn_cwd: PathBuf,
     agent: AgentRuntime,
     copy: Option<CopyState>,
     mouse_selection: Option<MouseSelection>,
@@ -620,7 +630,7 @@ struct TabRename {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TabRenameInput {
+enum LineEditInput {
     Editing,
     Commit,
     Cancel,
@@ -630,6 +640,27 @@ enum TabRenameInput {
 struct ClosePaneConfirmation {
     tab_id: u64,
     pane_id: PaneId,
+}
+
+/// The status-row save-layout prompt: first the target name, then an overwrite question when the
+/// resolved file already exists.
+#[derive(Debug, Clone)]
+struct SaveLayoutPrompt {
+    stage: SaveLayoutStage,
+    pending_utf8: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+enum SaveLayoutStage {
+    Editing { value: String },
+    Confirm { path: PathBuf },
+}
+
+/// A short-lived status-row message, used to report what a save wrote or why it failed.
+#[derive(Debug, Clone)]
+struct StatusNotice {
+    message: String,
+    expires: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -1074,6 +1105,8 @@ struct SessionActor {
     tab_navigator: Option<TabNavigator>,
     tab_rename: Option<TabRename>,
     close_pane_confirmation: Option<ClosePaneConfirmation>,
+    save_layout_prompt: Option<SaveLayoutPrompt>,
+    status_notice: Option<StatusNotice>,
     agent_catalog: Arc<crate::agent::AgentCatalog>,
     agent_catalog_generation: u64,
     next_float_mode: u64,
@@ -1269,6 +1302,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         tab_navigator: None,
         tab_rename: None,
         close_pane_confirmation: None,
+        save_layout_prompt: None,
+        status_notice: None,
         agent_catalog: Arc::new(crate::agent::AgentCatalog::default()),
         agent_catalog_generation: 0,
         next_float_mode: 0,
@@ -1326,6 +1361,7 @@ impl SessionActor {
             };
             timeout = timeout.min(self.next_automation_deadline());
             timeout = timeout.min(self.next_agent_evaluation_delay());
+            timeout = timeout.min(self.next_notice_deadline());
             // Give ready media low-latency service, but force a general-queue turn after a bounded
             // batch. A bounded channel is not a bounded drain when its producer can refill it.
             if self.drain_media(&media_receiver) {
@@ -1339,6 +1375,7 @@ impl SessionActor {
                     }
                     self.drain_media(&media_receiver);
                     self.sync_pending_media_projection();
+                    self.expire_status_notice();
                     if self.pending_render && render_at <= Instant::now() {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -1353,6 +1390,7 @@ impl SessionActor {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.drain_media(&media_receiver);
                     self.sync_pending_media_projection();
+                    self.expire_status_notice();
                     if self.pending_render {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -2505,6 +2543,10 @@ impl SessionActor {
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
+            AutomationMethod::SaveLayout { path } => match self.automation_save_layout(path) {
+                Ok(result) => self.reply_automation(target, result),
+                Err(error) => self.reply_automation_error(target, error),
+            },
             AutomationMethod::Run {
                 command,
                 placement,
@@ -3286,6 +3328,29 @@ impl SessionActor {
             "pane_id": pane_id,
             "new_pane_id": new_pane_id,
             "tab_id": tab_id,
+            "session_sequence": self.session_sequence,
+        }))
+    }
+
+    /// Write the current layout to a startup layout file.
+    ///
+    /// Unlike the interactive prompt this never asks before replacing an existing file: an
+    /// automation caller named the path itself.
+    fn automation_save_layout(
+        &mut self,
+        path: Option<String>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let path = crate::layout_file::resolve_save_path(
+            path.as_deref().unwrap_or(crate::layout_file::STARTUP_FILE),
+        )
+        .map_err(|error| AutomationError::new("invalid_argument", error.to_string()))?;
+        let (tabs, panes) = self
+            .save_layout(&path)
+            .map_err(|error| AutomationError::new("save_failed", error.to_string()))?;
+        Ok(serde_json::json!({
+            "path": path.display().to_string(),
+            "tabs": tabs,
+            "panes": panes,
             "session_sequence": self.session_sequence,
         }))
     }
@@ -4378,6 +4443,10 @@ impl SessionActor {
             self.close_pane_confirmation_input(&bytes);
             return;
         }
+        if self.save_layout_prompt.is_some() {
+            self.save_layout_prompt_input(&bytes);
+            return;
+        }
         if self.invalidate_mouse_selection_state() {
             self.schedule_render();
         }
@@ -5019,6 +5088,10 @@ impl SessionActor {
                 self.begin_close_pane_confirmation();
                 return;
             }
+            Action::BeginSaveLayout => {
+                self.begin_save_layout();
+                return;
+            }
             Action::ResolveClosePaneConfirmation(confirmed) => {
                 self.resolve_close_pane_confirmation(confirmed);
                 return;
@@ -5426,6 +5499,7 @@ impl SessionActor {
             || self.tab_navigator.is_some()
             || self.tab_rename.is_some()
             || self.close_pane_confirmation.is_some()
+            || self.save_layout_prompt.is_some()
     }
 
     fn clear_transient_ui(&mut self) -> bool {
@@ -5434,6 +5508,7 @@ impl SessionActor {
         self.tab_navigator = None;
         self.tab_rename = None;
         self.close_pane_confirmation = None;
+        self.save_layout_prompt = None;
         active
     }
 
@@ -5941,17 +6016,17 @@ impl SessionActor {
         };
         let action = apply_tab_rename_input(&mut rename, bytes);
         match action {
-            TabRenameInput::Editing => {
+            LineEditInput::Editing => {
                 if self.tabs.iter().any(|tab| tab.id == rename.tab_id) {
                     self.tab_rename = Some(rename);
                 }
                 self.schedule_render();
             }
-            TabRenameInput::Cancel => {
+            LineEditInput::Cancel => {
                 self.force_full = true;
                 self.schedule_render();
             }
-            TabRenameInput::Commit => {
+            LineEditInput::Commit => {
                 let name = rename.value.trim();
                 let next = (!name.is_empty()).then(|| name.to_owned());
                 if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == rename.tab_id)
@@ -5991,6 +6066,135 @@ impl SessionActor {
             self.force_full = true;
             self.schedule_render();
         }
+    }
+
+    fn begin_save_layout(&mut self) {
+        self.clear_transient_ui();
+        self.save_layout_prompt = Some(SaveLayoutPrompt {
+            stage: SaveLayoutStage::Editing {
+                value: crate::layout_file::STARTUP_FILE.to_owned(),
+            },
+            pending_utf8: Vec::new(),
+        });
+        self.force_full = true;
+        self.schedule_render();
+    }
+
+    fn save_layout_prompt_input(&mut self, bytes: &[u8]) {
+        let Some(mut prompt) = self.save_layout_prompt.take() else {
+            return;
+        };
+        match &mut prompt.stage {
+            SaveLayoutStage::Editing { value } => {
+                match apply_line_edit(
+                    value,
+                    &mut prompt.pending_utf8,
+                    MAX_LAYOUT_NAME_BYTES,
+                    bytes,
+                ) {
+                    LineEditInput::Editing => {
+                        self.save_layout_prompt = Some(prompt);
+                        self.schedule_render();
+                    }
+                    LineEditInput::Cancel => {
+                        self.force_full = true;
+                        self.schedule_render();
+                    }
+                    LineEditInput::Commit => {
+                        let target = crate::layout_file::resolve_save_path(value);
+                        self.force_full = true;
+                        match target {
+                            // Replacing a layout the user already has is the one destructive part
+                            // of this flow, so it asks first.
+                            Ok(path) if path.exists() => {
+                                self.save_layout_prompt = Some(SaveLayoutPrompt {
+                                    stage: SaveLayoutStage::Confirm { path },
+                                    pending_utf8: Vec::new(),
+                                });
+                                self.schedule_render();
+                            }
+                            Ok(path) => self.commit_save_layout(&path),
+                            Err(error) => self.notice(format!("save failed: {error}")),
+                        }
+                    }
+                }
+            }
+            SaveLayoutStage::Confirm { path } => {
+                let path = path.clone();
+                for byte in bytes {
+                    match byte {
+                        b'y' | b'Y' => {
+                            self.force_full = true;
+                            self.commit_save_layout(&path);
+                            return;
+                        }
+                        b'n' | b'N' | 0x1b => {
+                            self.force_full = true;
+                            self.notice("save canceled");
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                self.save_layout_prompt = Some(prompt);
+            }
+        }
+    }
+
+    fn commit_save_layout(&mut self, path: &Path) {
+        self.save_layout_prompt = None;
+        match self.save_layout(path) {
+            Ok((tabs, panes)) => {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let tab_word = if tabs == 1 { "tab" } else { "tabs" };
+                let pane_word = if panes == 1 { "pane" } else { "panes" };
+                self.notice(format!(
+                    "saved {tabs} {tab_word}, {panes} {pane_word} to {name}"
+                ));
+            }
+            Err(error) => self.notice(format!("save failed: {error}")),
+        }
+    }
+
+    /// Show a short-lived status-row message. Nothing else about the session changes.
+    fn notice(&mut self, message: impl Into<String>) {
+        self.status_notice = Some(StatusNotice {
+            message: single_line(&message.into()),
+            expires: Instant::now() + STATUS_NOTICE_DURATION,
+        });
+        self.force_full = true;
+        self.schedule_render();
+    }
+
+    fn active_status_notice(&self) -> Option<&str> {
+        self.status_notice
+            .as_ref()
+            .filter(|notice| notice.expires > Instant::now())
+            .map(|notice| notice.message.as_str())
+    }
+
+    /// Drop an expired notice and repaint once, so the status row returns to the tab list without
+    /// waiting for unrelated activity.
+    fn expire_status_notice(&mut self) {
+        if self
+            .status_notice
+            .as_ref()
+            .is_some_and(|notice| notice.expires <= Instant::now())
+        {
+            self.status_notice = None;
+            self.force_full = true;
+            self.schedule_render();
+        }
+    }
+
+    fn next_notice_deadline(&self) -> Duration {
+        self.status_notice
+            .as_ref()
+            .map(|notice| notice.expires.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::MAX)
     }
 
     fn close_pane_confirmation_input(&mut self, bytes: &[u8]) {
@@ -6388,6 +6592,133 @@ impl SessionActor {
         Ok(())
     }
 
+    /// Describe the live session in the startup-layout schema.
+    ///
+    /// Only core shell panes are captured: plugin panes are host-owned and must never be revived
+    /// as shells, and zoom and synchronized input are projection/tab state rather than layout.
+    /// Weights are rescaled into the parser's accepted range while preserving their ratio.
+    fn capture_layout(&self) -> io::Result<LayoutFile> {
+        let area = self.content_area();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let mut tabs = Vec::new();
+        let mut total_panes = 0_usize;
+        for tab in &self.tabs {
+            let mut labels: Vec<(PaneId, String)> = Vec::new();
+            let tiled = tab
+                .tree
+                .as_ref()
+                .and_then(|tree| self.capture_node(tree, home.as_deref(), &mut labels));
+            let mut floating = Vec::new();
+            for float in tab.floating.panes() {
+                let Some(pane) = self.core_pane(float.pane_id) else {
+                    continue;
+                };
+                let label = format!("p{}", labels.len() + 1);
+                labels.push((float.pane_id, label.clone()));
+                floating.push(LayoutFloat::new(
+                    label,
+                    saved_cwd(&pane.spawn_cwd, home.as_deref()),
+                    saved_percent(float.rect.width, area.width),
+                    saved_percent(float.rect.height, area.height),
+                    float.pinned,
+                ));
+            }
+            if tiled.is_none() && floating.is_empty() {
+                continue;
+            }
+            let focus = labels
+                .iter()
+                .find(|(pane_id, _)| *pane_id == tab.focused)
+                .map(|(_, label)| label.clone());
+            total_panes = total_panes.saturating_add(labels.len());
+            if total_panes > MAX_LAYOUT_PANES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("a saved layout holds at most {MAX_LAYOUT_PANES} panes"),
+                ));
+            }
+            tabs.push(LayoutTab::new(tab.name.clone(), focus, tiled, floating));
+            if tabs.len() > MAX_LAYOUT_TABS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("a saved layout holds at most {MAX_LAYOUT_TABS} tabs"),
+                ));
+            }
+        }
+        if tabs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "this session has no shell panes to save",
+            ));
+        }
+        Ok(LayoutFile::from_tabs(tabs))
+    }
+
+    /// Capture one tiled subtree, collapsing away branches whose panes are not saveable so the
+    /// surviving siblings keep their own shape.
+    fn capture_node(
+        &self,
+        node: &TiledNode,
+        home: Option<&Path>,
+        labels: &mut Vec<(PaneId, String)>,
+    ) -> Option<LayoutNode> {
+        match node {
+            TiledNode::Leaf(pane_id) => {
+                let pane = self.core_pane(*pane_id)?;
+                let label = format!("p{}", labels.len() + 1);
+                labels.push((*pane_id, label.clone()));
+                Some(LayoutNode::leaf(label, saved_cwd(&pane.spawn_cwd, home)))
+            }
+            TiledNode::Split {
+                axis,
+                first,
+                second,
+                first_weight,
+                second_weight,
+            } => {
+                let captured_first = self.capture_node(first, home, labels);
+                let captured_second = self.capture_node(second, home, labels);
+                match (captured_first, captured_second) {
+                    (Some(first), Some(second)) => Some(LayoutNode::split(
+                        *axis,
+                        saved_sizes(*first_weight, *second_weight),
+                        vec![first, second],
+                    )),
+                    (Some(only), None) | (None, Some(only)) => Some(only),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
+
+    fn core_pane(&self, pane_id: PaneId) -> Option<&Pane> {
+        self.panes
+            .get(&pane_id)
+            .filter(|pane| matches!(pane.role, PaneRole::Core))
+    }
+
+    /// Capture the session and replace `path` atomically, reporting the saved tab and pane counts.
+    ///
+    /// The rendered file is small and bounded by the layout caps, and the writer stays on the
+    /// actor for the same reason config reload does: one parse-render-write path, no shared state.
+    fn save_layout(&self, path: &Path) -> io::Result<(usize, usize)> {
+        let layout = self.capture_layout()?;
+        let rendered = layout.render()?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        if let Some(parent) = parent {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        fs::write(&temporary, rendered.as_bytes())?;
+        if let Err(error) = crate::runtime::atomic_replace(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(layout.counts())
+    }
+
     fn spawn_pane(&mut self, pane_id: PaneId, tab_id: u64, spec: &PaneSpawn) -> io::Result<()> {
         let shell = self
             .config
@@ -6497,6 +6828,7 @@ impl SessionActor {
                 input: parts.input,
                 control: parts.control,
                 child_pid,
+                spawn_cwd: cwd,
                 agent: AgentRuntime::new(),
                 copy: None,
                 mouse_selection: None,
@@ -7023,6 +7355,15 @@ impl SessionActor {
             let close_prompt = self
                 .close_pane_confirmation
                 .map(|confirmation| format!("kill pane {}? (y/n)", confirmation.pane_id));
+            let save_prompt = self
+                .save_layout_prompt
+                .as_ref()
+                .map(|prompt| match &prompt.stage {
+                    SaveLayoutStage::Editing { value } => format!("save layout: {value}"),
+                    SaveLayoutStage::Confirm { path } => {
+                        format!("overwrite {}? (y/n)", path.display())
+                    }
+                });
             let search_prompt = self.active_tab().and_then(|tab| {
                 self.panes
                     .get(&tab.focused)
@@ -7038,11 +7379,15 @@ impl SessionActor {
                         })
                     })
             });
-            let prompt_active =
-                rename_prompt.is_some() || close_prompt.is_some() || search_prompt.is_some();
+            let prompt_active = rename_prompt.is_some()
+                || close_prompt.is_some()
+                || save_prompt.is_some()
+                || search_prompt.is_some();
             let status = rename_prompt
                 .or(close_prompt)
+                .or(save_prompt)
                 .or(search_prompt)
+                .or_else(|| self.active_status_notice().map(ToOwned::to_owned))
                 .unwrap_or_else(|| tab_status_text(&self.tabs, self.active_tab, screen.columns));
             let style = theme.status();
             let row = screen.rows - 1;
@@ -8058,6 +8403,7 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
             | AutomationMethod::Diagnose { .. }
             | AutomationMethod::WaitRendered { .. }
             | AutomationMethod::ReloadConfig
+            | AutomationMethod::SaveLayout { .. }
             | AutomationMethod::Plugin(_)
     )
 }
@@ -8285,7 +8631,8 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "typing", "key", "paste", "get_text", "get_grid", "search", "set_sync_input", "wait_text",
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
             "wait_media_track",
-            "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report"
+            "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report",
+            "save_layout"
         ],
         "limits": automation_limits(),
         "completion_waits": {
@@ -8895,6 +9242,36 @@ fn fallback_cwd() -> PathBuf {
     std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\"))
+}
+
+/// A pane's directory as a saved layout should spell it: `~/`-relative when it is under `$HOME`,
+/// so the file stays portable, and omitted when the path is not valid UTF-8.
+fn saved_cwd(cwd: &Path, home: Option<&Path>) -> Option<String> {
+    if let Some(home) = home
+        && let Ok(rest) = cwd.strip_prefix(home)
+        && !rest.as_os_str().is_empty()
+    {
+        return rest.to_str().map(|rest| format!("~/{rest}"));
+    }
+    cwd.to_str().map(str::to_owned)
+}
+
+/// Rescale a live split's weights into the 1..=1000 the layout parser accepts, preserving ratio.
+fn saved_sizes(first: u32, second: u32) -> Vec<u32> {
+    let total = u64::from(first) + u64::from(second);
+    if total == 0 {
+        return vec![1, 1];
+    }
+    let scaled = ((u64::from(first) * 1000) / total).clamp(1, 999) as u32;
+    vec![scaled, 1000 - scaled]
+}
+
+/// A float's size as a percentage of the content area, inside the parser's accepted range.
+fn saved_percent(extent: u16, available: u16) -> u16 {
+    if available == 0 {
+        return 60;
+    }
+    ((u32::from(extent) * 100) / u32::from(available)).clamp(10, 100) as u16
 }
 
 fn bridge_play_request(request: crate::media::PlayRequest) -> BridgePlayRequest {
@@ -9561,27 +9938,44 @@ fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
     value
 }
 
-fn apply_tab_rename_input(rename: &mut TabRename, bytes: &[u8]) -> TabRenameInput {
-    rename.pending_utf8.extend_from_slice(bytes);
+fn apply_tab_rename_input(rename: &mut TabRename, bytes: &[u8]) -> LineEditInput {
+    apply_line_edit(
+        &mut rename.value,
+        &mut rename.pending_utf8,
+        MAX_TAB_NAME_BYTES,
+        bytes,
+    )
+}
+
+/// The shared status-row line editor: Enter commits, Escape cancels, Backspace deletes, and
+/// printable input accumulates until `max_bytes`. Multi-byte input may arrive split across reads,
+/// so an incomplete sequence stays pending rather than being interpreted.
+fn apply_line_edit(
+    value: &mut String,
+    pending_utf8: &mut Vec<u8>,
+    max_bytes: usize,
+    bytes: &[u8],
+) -> LineEditInput {
+    pending_utf8.extend_from_slice(bytes);
     let mut offset = 0;
-    while offset < rename.pending_utf8.len() {
-        let byte = rename.pending_utf8[offset];
+    while offset < pending_utf8.len() {
+        let byte = pending_utf8[offset];
         if byte.is_ascii() {
             offset += 1;
             match byte {
                 0x1b => {
-                    rename.pending_utf8.clear();
-                    return TabRenameInput::Cancel;
+                    pending_utf8.clear();
+                    return LineEditInput::Cancel;
                 }
                 b'\r' | b'\n' => {
-                    rename.pending_utf8.clear();
-                    return TabRenameInput::Commit;
+                    pending_utf8.clear();
+                    return LineEditInput::Commit;
                 }
                 0x08 | 0x7f => {
-                    rename.value.pop();
+                    value.pop();
                 }
-                value if !value.is_ascii_control() && rename.value.len() < MAX_TAB_NAME_BYTES => {
-                    rename.value.push(char::from(value));
+                printable if !printable.is_ascii_control() && value.len() < max_bytes => {
+                    value.push(char::from(printable));
                 }
                 _ => {}
             }
@@ -9597,16 +9991,16 @@ fn apply_tab_rename_input(rename: &mut TabRename, bytes: &[u8]) -> TabRenameInpu
                 continue;
             }
         };
-        if rename.pending_utf8.len() - offset < width {
+        if pending_utf8.len() - offset < width {
             break;
         }
-        let candidate = &rename.pending_utf8[offset..offset + width];
+        let candidate = &pending_utf8[offset..offset + width];
         if let Ok(text) = std::str::from_utf8(candidate) {
             if let Some(character) = text.chars().next()
                 && !character.is_control()
-                && rename.value.len().saturating_add(width) <= MAX_TAB_NAME_BYTES
+                && value.len().saturating_add(width) <= max_bytes
             {
-                rename.value.push(character);
+                value.push(character);
             }
             offset += width;
         } else {
@@ -9615,8 +10009,8 @@ fn apply_tab_rename_input(rename: &mut TabRename, bytes: &[u8]) -> TabRenameInpu
             offset += 1;
         }
     }
-    rename.pending_utf8.drain(..offset);
-    TabRenameInput::Editing
+    pending_utf8.drain(..offset);
+    LineEditInput::Editing
 }
 
 fn tab_navigator_rect(area: Rect, row_count: usize) -> Option<Rect> {
@@ -10483,33 +10877,33 @@ mod tests {
         };
         assert_eq!(
             apply_tab_rename_input(&mut rename, &[0xc3]),
-            TabRenameInput::Editing
+            LineEditInput::Editing
         );
         assert_eq!(
             apply_tab_rename_input(&mut rename, &[0xa9, 0x7f, b'X']),
-            TabRenameInput::Editing
+            LineEditInput::Editing
         );
         assert_eq!(rename.value, "devX");
         assert_eq!(
             apply_tab_rename_input(&mut rename, b"\r"),
-            TabRenameInput::Commit
+            LineEditInput::Commit
         );
 
         rename.value = "x".repeat(MAX_TAB_NAME_BYTES);
         assert_eq!(
             apply_tab_rename_input(&mut rename, b"ignored"),
-            TabRenameInput::Editing
+            LineEditInput::Editing
         );
         assert_eq!(rename.value.len(), MAX_TAB_NAME_BYTES);
         assert_eq!(
             apply_tab_rename_input(&mut rename, b"\x1b"),
-            TabRenameInput::Cancel
+            LineEditInput::Cancel
         );
 
         rename.pending_utf8.clear();
         assert_eq!(
             apply_tab_rename_input(&mut rename, &[0xc3, b'\r']),
-            TabRenameInput::Commit,
+            LineEditInput::Commit,
             "an invalid UTF-8 lead byte must not swallow Enter"
         );
     }

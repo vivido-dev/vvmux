@@ -112,6 +112,10 @@ pub enum AutomationMethod {
     Split {
         axis: Axis,
     },
+    /// Write the session's current tab and pane layout to a startup layout file.
+    SaveLayout {
+        path: Option<String>,
+    },
     Focus,
     FocusWait {
         wait: AutomationCompletion,
@@ -395,6 +399,8 @@ pub enum Action {
     /// Invoke a configured plugin action. The host resolves and validates this reference.
     Plugin(String),
     ToggleAgentNavigator,
+    /// Open the status-row prompt that writes the current layout to a startup layout file.
+    BeginSaveLayout,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

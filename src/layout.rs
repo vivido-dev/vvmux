@@ -193,7 +193,6 @@ impl FloatingLayer {
     }
 
     /// All floats in bottom-to-top order, regardless of visibility.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn panes(&self) -> &[FloatingPane] {
         &self.panes
     }

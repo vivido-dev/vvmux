@@ -1700,25 +1700,35 @@ pub fn create_detached(
     }
 }
 
+/// Pick the startup layout for a session that is about to be created.
+///
+/// Order: `--layout`, then the conventional `startup.toml`, then `[general].default_layout`.
+/// Only the explicit request is fatal; the two implicit sources report a problem and fall through
+/// so a stale or broken file in the config directory can never make `vvmux` unlaunchable.
 fn resolve_startup_layout(
     config_path: Option<&Path>,
     explicit: Option<&str>,
 ) -> io::Result<Option<PathBuf>> {
-    let (value, required) = match explicit {
-        Some(value) => (Some(value.to_owned()), true),
-        None => (
-            crate::config::Config::load(config_path)?
-                .general
-                .default_layout,
-            false,
-        ),
-    };
-    let Some(value) = value else {
+    if let Some(value) = explicit {
+        let path = crate::layout_file::resolve_path(value)?;
+        crate::layout_file::LayoutFile::load(&path)?;
+        return Ok(Some(path));
+    }
+    if let Some(path) = crate::layout_file::startup_path() {
+        match crate::layout_file::LayoutFile::load(&path) {
+            Ok(_) => return Ok(Some(path)),
+            Err(error) => eprintln!("vvmux: ignoring {}: {error}", path.display()),
+        }
+    }
+    let Some(value) = crate::config::Config::load(config_path)?
+        .general
+        .default_layout
+    else {
         return Ok(None);
     };
     let path = match crate::layout_file::resolve_path(&value) {
         Ok(path) => path,
-        Err(error) if !required && error.kind() == io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             eprintln!(
                 "vvmux: default layout {value:?} was not found; starting with one shell pane"
             );

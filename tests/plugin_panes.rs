@@ -137,6 +137,21 @@ fn plugin_panes_use_real_pty_placement_identity_vivid_and_owner_scoped_cleanup()
         "exited"
     );
 
+    // A saved layout reopens plain shells, so plugin panes must not appear in it at all: the
+    // tabbed and floating plugin panes are dropped, and the plugin-only tab disappears with them.
+    let saved = json(msg(
+        binary,
+        &runtime,
+        &config_home,
+        &first,
+        &["save-layout", "--path", "captured.toml"],
+    ));
+    assert_eq!(saved["tabs"], 1, "the plugin-only tab is not saved");
+    assert_eq!(saved["panes"], 1, "only the ordinary shell pane is saved");
+    let captured = fs::read_to_string(config_home.join("vvmux/captured.toml")).unwrap();
+    assert!(!captured.contains("Plugin tab"), "{captured}");
+    assert_eq!(captured.matches("pane = ").count(), 1, "{captured}");
+
     // Closing owner A's numeric pane 2 cannot affect owner B's pane 2 or its next valid update.
     assert_success(&msg(
         binary,

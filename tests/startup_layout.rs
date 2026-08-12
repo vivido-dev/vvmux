@@ -77,6 +77,49 @@ while IFS= read -r line; do :; done
             .unwrap()
     }
 
+    /// Install the conventional `<config dir>/startup.toml`. `vvmux_command` points
+    /// `XDG_CONFIG_HOME` at the runtime directory, so the config directory is `<runtime>/vvmux`.
+    fn write_startup_layout(&self, source: &str) -> PathBuf {
+        let directory = self.runtime.path().join("vvmux");
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("startup.toml");
+        fs::write(&path, source).unwrap();
+        path
+    }
+
+    fn set_default_layout(&self, name: &str) {
+        let original = fs::read_to_string(&self.config).unwrap();
+        fs::write(
+            &self.config,
+            original.replace(
+                "[general]\n",
+                &format!("[general]\ndefault_layout = '{name}'\n"),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_named_layout(&self, name: &str, source: &str) -> PathBuf {
+        let layouts = self.runtime.path().join("vvmux/layouts");
+        fs::create_dir_all(&layouts).unwrap();
+        fs::set_permissions(
+            self.runtime.path().join("vvmux"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let path = layouts.join(format!("{name}.toml"));
+        fs::write(&path, source).unwrap();
+        path
+    }
+
+    fn tabs(&self) -> Vec<Value> {
+        json(self.msg(&["list-tabs"]))["tabs"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
     fn msg(&self, arguments: &[&str]) -> Output {
         common::vvmux_command(self.runtime.path())
             .args(["msg", "--target", &self.name])
@@ -298,24 +341,11 @@ fn four_pane_stack_starts_before_a_real_display_is_attached() {
 #[test]
 fn named_default_layout_resolves_from_the_config_directory() {
     let fixture = Fixture::new("default");
-    let layouts = fixture.runtime.path().join("vvmux/layouts");
-    fs::create_dir_all(&layouts).unwrap();
-    fs::set_permissions(
-        fixture.runtime.path().join("vvmux"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
-    fs::write(
-        layouts.join("dev.toml"),
+    fixture.write_named_layout(
+        "dev",
         "[[tabs]]\nname='default-dev'\n[[tabs.floating]]\npane='notes'\ncommand=\"printf 'DEFAULT_LAYOUT\\n'; sleep 30\"\n",
-    )
-    .unwrap();
-    let original = fs::read_to_string(&fixture.config).unwrap();
-    fs::write(
-        &fixture.config,
-        original.replace("[general]\n", "[general]\ndefault_layout = 'dev'\n"),
-    )
-    .unwrap();
+    );
+    fixture.set_default_layout("dev");
 
     assert_success(&fixture.start_without_layout());
     let panes = fixture.panes();
@@ -394,6 +424,160 @@ command = "printf 'TAB two\n'; sleep 30"
     assert_eq!(panes[1]["tab_name"], "two");
     fixture.wait_text(1, "TAB one");
     fixture.wait_text(2, "TAB two");
+}
+
+#[test]
+fn startup_toml_applies_to_a_session_created_without_a_layout() {
+    let fixture = Fixture::new("startup");
+    fixture.write_startup_layout(
+        r#"
+[[tabs]]
+name = "left-right"
+focus = "right"
+[tabs.layout]
+split = "vertical"
+sizes = [40, 60]
+[[tabs.layout.children]]
+pane = "left"
+command = "printf 'STARTUP left\n'; sleep 30"
+[[tabs.layout.children]]
+pane = "right"
+command = "printf 'STARTUP right\n'; sleep 30"
+
+[[tabs]]
+name = "top-bottom"
+[tabs.layout]
+split = "horizontal"
+[[tabs.layout.children]]
+pane = "top"
+command = "printf 'STARTUP top\n'; sleep 30"
+[[tabs.layout.children]]
+pane = "bottom"
+command = "printf 'STARTUP bottom\n'; sleep 30"
+"#,
+    );
+
+    assert_success(&fixture.start_without_layout());
+    let panes = fixture.panes();
+    assert_eq!(panes.len(), 4);
+    assert_eq!(panes[0]["tab_name"], "left-right");
+    assert_eq!(panes[3]["tab_name"], "top-bottom");
+    assert_eq!(
+        panes.iter().find(|pane| pane["focused"] == true).unwrap()["pane_id"],
+        2
+    );
+    fixture.wait_text(1, "STARTUP left");
+    fixture.wait_text(4, "STARTUP bottom");
+}
+
+#[test]
+fn startup_toml_outranks_the_default_layout_but_not_an_explicit_one() {
+    let fixture = Fixture::new("startup-precedence");
+    fixture.write_startup_layout(
+        "[[tabs]]\nname='from-startup'\n[[tabs.floating]]\npane='p1'\ncommand=\"sleep 30\"\n",
+    );
+    fixture.write_named_layout(
+        "dev",
+        "[[tabs]]\nname='from-default'\n[[tabs.floating]]\npane='p1'\ncommand=\"sleep 30\"\n",
+    );
+    fixture.set_default_layout("dev");
+    assert_success(&fixture.start_without_layout());
+    assert_eq!(fixture.panes()[0]["tab_name"], "from-startup");
+
+    let explicit = Fixture::new("startup-explicit");
+    explicit.write_startup_layout(
+        "[[tabs]]\nname='from-startup'\n[[tabs.floating]]\npane='p1'\ncommand=\"sleep 30\"\n",
+    );
+    let named = explicit.write_named_layout(
+        "chosen",
+        "[[tabs]]\nname='from-flag'\n[[tabs.floating]]\npane='p1'\ncommand=\"sleep 30\"\n",
+    );
+    assert_success(&explicit.start(&named));
+    assert_eq!(explicit.panes()[0]["tab_name"], "from-flag");
+}
+
+/// `startup.toml` is implicit and has no bypass flag, so a broken one must never make a session
+/// unlaunchable.
+#[test]
+fn invalid_startup_toml_warns_and_falls_back_to_one_shell() {
+    let fixture = Fixture::new("startup-invalid");
+    fixture.write_startup_layout("[[tabs]]\n[tabs.layout]\npane='a'\nsplit='vertical'\n");
+
+    let created = fixture.start_without_layout();
+    assert_success(&created);
+    let stderr = String::from_utf8_lossy(&created.stderr);
+    assert!(stderr.contains("startup.toml"), "stderr was {stderr}");
+    assert!(stderr.contains("ignoring"), "stderr was {stderr}");
+    assert_eq!(fixture.panes().len(), 1);
+    fixture.wait_text(1, "READY pane=1 tab=1");
+}
+
+#[test]
+fn a_saved_layout_reproduces_the_live_tabs_and_panes() {
+    let source = Fixture::new("save");
+    assert_success(&source.start_without_layout());
+    assert_eq!(
+        json(source.msg(&["split", "vertical", "--pane-id", "1"]))["new_pane_id"],
+        2
+    );
+    assert_success(&source.msg(&["action", "new-tab"]));
+    let before = source.panes();
+    assert_eq!(before.len(), 3);
+
+    let saved = json(source.msg(&["save-layout"]));
+    assert_eq!(saved["tabs"], 2);
+    assert_eq!(saved["panes"], 3);
+    let path = PathBuf::from(saved["path"].as_str().unwrap());
+    assert_eq!(path, source.runtime.path().join("vvmux/startup.toml"));
+    let captured = fs::read_to_string(&path).unwrap();
+
+    // Saving reports the session; it must not touch it. The panes, their tabs, and focus are
+    // unchanged, and the next ordinary mutation still lands.
+    assert_eq!(source.panes(), before);
+    assert_eq!(
+        json(source.msg(&["split", "vertical", "--pane-id", "1"]))["new_pane_id"],
+        4
+    );
+
+    let replayed = Fixture::new("save-replay");
+    replayed.write_startup_layout(&captured);
+    assert_success(&replayed.start_without_layout());
+    let panes = replayed.panes();
+    assert_eq!(panes.len(), 3);
+    let tabs = replayed.tabs();
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(tabs[0]["pane_ids"], serde_json::json!([1, 2]));
+    assert_eq!(tabs[1]["pane_ids"], serde_json::json!([3]));
+    assert_eq!(
+        tabs[0]["focused_pane_id"], 2,
+        "the saved focus is restored per tab"
+    );
+    assert_eq!(tabs[1]["focused_pane_id"], 3);
+}
+
+#[test]
+fn a_failed_save_reports_the_error_and_leaves_the_session_intact() {
+    let fixture = Fixture::new("save-failure");
+    assert_success(&fixture.start_without_layout());
+    let before = fixture.panes();
+
+    let blocked = fixture.runtime.path().join("blocked");
+    fs::write(&blocked, b"not a directory").unwrap();
+    let target = blocked.join("layout.toml");
+    let failed = fixture.msg(&["save-layout", "--path", target.to_str().unwrap()]);
+    assert!(!failed.status.success());
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("save_failed"),
+        "stderr was {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(!target.exists());
+
+    assert_eq!(fixture.panes(), before);
+    assert_eq!(
+        json(fixture.msg(&["split", "vertical", "--pane-id", "1"]))["new_pane_id"],
+        2
+    );
 }
 
 fn json(output: Output) -> Value {
