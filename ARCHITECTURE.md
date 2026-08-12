@@ -95,7 +95,7 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 17 is a hard cutover. In addition to complete track identity and binary media,
+Private VVMX version 18 is a hard cutover. In addition to complete track identity and binary media,
 it adds deterministic outer/rendered completion waits, stable tab-ID selection, correlated
 diagnostics, PTY-write reports, and process-anchored recovery traces. Its binary media header carries complete track identity
 and bounded binary render/media records,
@@ -104,11 +104,15 @@ traces. Host terminal focus, pixel mouse input, and focused-pane Kitty keyboard 
 coordinate and mode semantics across the nested terminal boundary. Focus reaches only a pane whose
 program enabled focus reporting. Media snapshots also preserve each inner track's live/timed mode
 and whether the authoritative surface slot map currently activates it, so live raster/audio groups
-are reactivated without inventing a PLAY transition. Mixed VVMX versions are rejected with restart
-guidance.
+are reactivated without inventing a PLAY transition. Applied projections report recreated retained
+tracks explicitly, allowing the actor to rehydrate a fresh outer image/raster attachment even when
+the preceding snapshot still described an older attachment as resident. The inner presenter
+terminates raster delta chains into a retained latest framebuffer; restoration re-encodes those
+composed pixels as a hop-local full frame, so an interactive canvas does not fall back to its old
+pre-drawing full frame. Mixed VVMX versions are rejected with restart guidance.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 17 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 18 → outer vvmux producer → Vivido
 ```
 
 ## Plugin boundary

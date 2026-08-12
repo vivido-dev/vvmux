@@ -990,6 +990,9 @@ struct MediaProjectionKey {
 
 struct PendingMediaProjection {
     sources: HashSet<BridgeSourceKey>,
+    /// Previously presented retained sources for which a fresh outer track would be blank.
+    retained_replay_candidates: HashSet<BridgeSourceKey>,
+    retained_replays: HashSet<BridgeSourceKey>,
     gateway_revision: u64,
 }
 
@@ -1061,6 +1064,10 @@ struct SessionActor {
     outer_projection_revision: u64,
     outer_apply_sequence: u64,
     outer_attachment_generations: HashMap<BridgeSourceKey, u64>,
+    /// Recreated outer image/raster tracks whose retained body must cross VVMX once.
+    retained_replay_requests: HashSet<BridgeSourceKey>,
+    /// Forced retained replays sent but not yet confirmed by the outer presenter.
+    retained_replay_inflight: HashSet<BridgeSourceKey>,
     traced_projected_sources: HashSet<BridgeSourceKey>,
     traced_recovery_deliveries: HashMap<u64, (BridgeSourceKey, Option<u64>, u32, i64)>,
     media_trace: MediaTraceJournal,
@@ -1256,6 +1263,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         outer_projection_revision: 0,
         outer_apply_sequence: 0,
         outer_attachment_generations: HashMap::new(),
+        retained_replay_requests: HashSet::new(),
+        retained_replay_inflight: HashSet::new(),
         traced_projected_sources: HashSet::new(),
         traced_recovery_deliveries: HashMap::new(),
         media_trace: MediaTraceJournal::default(),
@@ -1482,6 +1491,8 @@ impl SessionActor {
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
                     self.pending_media_projections.clear();
+                    self.retained_replay_requests.clear();
+                    self.retained_replay_inflight.clear();
                     self.traced_recovery_deliveries.clear();
                     self.record_projection_sources(&HashSet::new(), self.vivid.revision());
                     self.last_screen = None;
@@ -1855,6 +1866,8 @@ impl SessionActor {
                 self.bridge_instance_id = None;
                 self.bridge_local_revision = 0;
                 self.outer_attachment_generations.clear();
+                self.retained_replay_requests.clear();
+                self.retained_replay_inflight.clear();
                 self.traced_recovery_deliveries.clear();
                 self.attached = Some(AttachedClient {
                     id,
@@ -2060,6 +2073,8 @@ impl SessionActor {
             }
             ClientMessage::BridgeRetainedHydrated { source } => {
                 if self.client_is(id) {
+                    self.retained_replay_requests.remove(&source);
+                    self.retained_replay_inflight.remove(&source);
                     self.vivid.complete_retained_hydration(source);
                 }
             }
@@ -2079,6 +2094,12 @@ impl SessionActor {
                         // mappings; only a confirmed replacement invalidates all of them.
                         self.fragment_assignments.clear();
                         self.outer_attachment_generations.clear();
+                        self.retained_replay_requests.clear();
+                        self.retained_replay_inflight.clear();
+                        self.last_media_projection = None;
+                    } else {
+                        self.retained_replay_requests
+                            .extend(self.retained_replay_inflight.iter().copied());
                         self.last_media_projection = None;
                     }
                     self.sync_media(true);
@@ -2089,6 +2110,7 @@ impl SessionActor {
                 virtual_revision,
                 outer_revision,
                 outer_attachment_generations,
+                recreated_retained_sources,
             } => {
                 let instance_changed = self.bridge_instance_id != Some(bridge_instance_id);
                 if self.client_is(id)
@@ -2104,6 +2126,8 @@ impl SessionActor {
                     if instance_changed {
                         self.bridge_local_revision = 0;
                         self.outer_attachment_generations.clear();
+                        self.retained_replay_requests.clear();
+                        self.retained_replay_inflight.clear();
                     }
                     self.bridge_instance_id = Some(bridge_instance_id);
                     self.outer_virtual_revision = virtual_revision;
@@ -2117,6 +2141,15 @@ impl SessionActor {
                         u16::try_from(outer_attachment_generations.len()).unwrap_or(u16::MAX);
                     self.outer_attachment_generations =
                         outer_attachment_generations.into_iter().collect();
+                    let resident_sources = self
+                        .outer_attachment_generations
+                        .keys()
+                        .copied()
+                        .collect::<HashSet<_>>();
+                    self.retained_replay_requests
+                        .retain(|source| resident_sources.contains(source));
+                    self.retained_replay_inflight
+                        .retain(|source| resident_sources.contains(source));
                     self.record_media_trace(
                         None,
                         Some(bridge_instance_id),
@@ -2127,14 +2160,30 @@ impl SessionActor {
                             attachment_count,
                         },
                     );
+                    let mut retry_retained = false;
                     if let Some(applied) = self.pending_media_projections.remove(&virtual_revision)
                     {
                         self.pending_media_projections
                             .retain(|revision, _| *revision > virtual_revision);
+                        let requests = retained_replays_after_apply(
+                            &recreated_retained_sources,
+                            &applied.retained_replay_candidates,
+                            &applied.retained_replays,
+                            &self.retained_replay_inflight,
+                        );
+                        retry_retained = !requests.is_empty();
+                        self.retained_replay_requests.extend(requests);
                         self.record_projection_sources(&applied.sources, applied.gateway_revision);
                         self.vivid.activate_bridge_projection(&applied.sources);
                     }
                     self.check_automation_waiters();
+                    if retry_retained {
+                        // The just-applied outer projection recreated a retained track after the
+                        // snapshot was prepared against stale residency. Publish the same
+                        // projection once more and force only those missing bodies across VVMX.
+                        self.last_media_projection = None;
+                        self.sync_media(true);
+                    }
                 }
             }
             ClientMessage::BridgeTrace {
@@ -2148,6 +2197,8 @@ impl SessionActor {
                         if self.bridge_instance_id != Some(bridge_instance_id) {
                             self.bridge_local_revision = 0;
                             self.outer_attachment_generations.clear();
+                            self.retained_replay_requests.clear();
+                            self.retained_replay_inflight.clear();
                         }
                         self.bridge_instance_id = Some(bridge_instance_id);
                     }
@@ -2202,6 +2253,8 @@ impl SessionActor {
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
                     self.pending_media_projections.clear();
+                    self.retained_replay_requests.clear();
+                    self.retained_replay_inflight.clear();
                     self.traced_recovery_deliveries.clear();
                     self.record_projection_sources(&HashSet::new(), self.vivid.revision());
                     self.last_screen = None;
@@ -7143,6 +7196,8 @@ impl SessionActor {
         }
         let Some(client) = &self.attached else {
             self.pending_media_projections.clear();
+            self.retained_replay_requests.clear();
+            self.retained_replay_inflight.clear();
             self.record_projection_sources(&HashSet::new(), self.vivid.revision());
             self.traced_recovery_deliveries.clear();
             self.vivid.deactivate_bridge();
@@ -7150,6 +7205,8 @@ impl SessionActor {
         };
         if !client.vivid {
             self.pending_media_projections.clear();
+            self.retained_replay_requests.clear();
+            self.retained_replay_inflight.clear();
             self.record_projection_sources(&HashSet::new(), self.vivid.revision());
             self.traced_recovery_deliveries.clear();
             self.vivid.deactivate_bridge();
@@ -7354,6 +7411,15 @@ impl SessionActor {
             .iter()
             .map(|source| source.key)
             .collect::<HashSet<_>>();
+        let retained_replay_candidates = snapshot
+            .sources
+            .iter()
+            .filter(|source| {
+                source.first_visible_presented
+                    && (source.retained.is_some() || source.retained_raster.is_some())
+            })
+            .map(|source| bridge_key(source.key))
+            .collect::<HashSet<_>>();
         let surface_count = u16::try_from(surfaces.len()).unwrap_or(u16::MAX);
         let track_count = u16::try_from(sources.len()).unwrap_or(u16::MAX);
         let node_count = u16::try_from(nodes.len()).unwrap_or(u16::MAX);
@@ -7382,6 +7448,8 @@ impl SessionActor {
             projection_revision,
             PendingMediaProjection {
                 sources: projected_source_keys,
+                retained_replay_candidates,
+                retained_replays: HashSet::new(),
                 gateway_revision: projection_key.virtual_revision,
             },
         );
@@ -7400,12 +7468,14 @@ impl SessionActor {
             },
         );
         for source in snapshot.sources {
+            let source_key = bridge_key(source.key);
+            let forced_replay = self.retained_replay_requests.contains(&source_key);
             if !should_replay_retained(
                 source.key,
                 live_delivery_source,
                 source.first_visible_presented,
-                self.outer_attachment_generations
-                    .contains_key(&bridge_key(source.key)),
+                self.outer_attachment_generations.contains_key(&source_key),
+                forced_replay,
             ) {
                 // The MediaEvent that triggered this projection sync follows immediately. Do not
                 // also send the same retained raster body as delivery 0: the outer source would
@@ -7414,18 +7484,44 @@ impl SessionActor {
                 // remains resident.
                 continue;
             }
-            if let Some(body) = source.retained {
-                let record_type = match source.descriptor {
-                    crate::media::SourceDescriptor::Raster(_) => {
-                        vivid_protocol::messages::RASTER_FRAME
-                    }
-                    crate::media::SourceDescriptor::Image(_) => {
-                        vivid_protocol::messages::IMAGE_DATA
-                    }
-                    _ => continue,
-                };
-                if !send_media_body(&writer, 0, bridge_key(source.key), record_type, &body) {
-                    return;
+            let sent = match source.descriptor {
+                crate::media::SourceDescriptor::Raster(_) => {
+                    let Some(raster) = source.retained_raster else {
+                        continue;
+                    };
+                    let Ok(body) = retained_raster_body(&raster) else {
+                        continue;
+                    };
+                    send_media_body(
+                        &writer,
+                        0,
+                        source_key,
+                        vivid_protocol::messages::RASTER_FRAME,
+                        &body,
+                    )
+                }
+                crate::media::SourceDescriptor::Image(_) => source.retained.is_some_and(|body| {
+                    send_media_body(
+                        &writer,
+                        0,
+                        source_key,
+                        vivid_protocol::messages::IMAGE_DATA,
+                        &body,
+                    )
+                }),
+                _ => continue,
+            };
+            if !sent {
+                return;
+            }
+            {
+                if let Some(pending) = self.pending_media_projections.get_mut(&projection_revision)
+                {
+                    pending.retained_replays.insert(source_key);
+                }
+                if forced_replay {
+                    self.retained_replay_requests.remove(&source_key);
+                    self.retained_replay_inflight.insert(source_key);
                 }
             }
         }
@@ -8848,8 +8944,34 @@ fn should_replay_retained(
     live_delivery_source: Option<crate::media::SourceKey>,
     presented: bool,
     outer_attachment_resident: bool,
+    forced_replay: bool,
 ) -> bool {
-    Some(source) != live_delivery_source && (!presented || !outer_attachment_resident)
+    Some(source) != live_delivery_source
+        && (forced_replay || !presented || !outer_attachment_resident)
+}
+
+/// Select recreated retained tracks whose bodies were not part of the applied projection.
+///
+/// The client owns outer identities, so its recreation report is authoritative. Intersecting it
+/// with previously presented retained sources from the exact acknowledged projection prevents an
+/// initial live frame or a stale/malformed report from replaying an unrelated owner's source. A
+/// body already submitted with that projection, or already awaiting outer confirmation from an
+/// earlier forced replay, must not be duplicated.
+fn retained_replays_after_apply(
+    recreated_retained_sources: &[BridgeSourceKey],
+    replay_candidates: &HashSet<BridgeSourceKey>,
+    submitted_retained_replays: &HashSet<BridgeSourceKey>,
+    forced_replays_inflight: &HashSet<BridgeSourceKey>,
+) -> HashSet<BridgeSourceKey> {
+    recreated_retained_sources
+        .iter()
+        .copied()
+        .filter(|source| {
+            replay_candidates.contains(source)
+                && !submitted_retained_replays.contains(source)
+                && !forced_replays_inflight.contains(source)
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -9251,6 +9373,16 @@ fn send_media_body(
     body: &[u8],
 ) -> bool {
     crate::ipc::send_media_record(writer, delivery_id, source, record_type, body).is_ok()
+}
+
+fn retained_raster_body(raster: &crate::media::RetainedRaster) -> io::Result<Vec<u8>> {
+    vivid_protocol::media::raster_frame_body(
+        raster.epoch,
+        raster.frame_id,
+        raster.width,
+        raster.height,
+        &raster.pixels,
+    )
 }
 
 /// Mark media/projection work pending and enqueue at most one coalesced actor wake.
@@ -10771,18 +10903,110 @@ mod tests {
             surface: 7,
             track: 7,
         };
-        assert!(!should_replay_retained(raster, Some(raster), false, false));
-        assert!(should_replay_retained(raster, None, false, true));
+        assert!(!should_replay_retained(
+            raster,
+            Some(raster),
+            false,
+            false,
+            false
+        ));
+        assert!(should_replay_retained(raster, None, false, true, false));
         assert!(should_replay_retained(
             raster,
             Some(BridgeSourceKey { track: 8, ..raster }),
             true,
+            false,
             false
         ));
         assert!(
-            !should_replay_retained(raster, None, true, true),
+            !should_replay_retained(raster, None, true, true, false),
             "an already-presented retained body must not cross IPC again while its outer source \
              remains resident"
+        );
+        assert!(
+            should_replay_retained(raster, None, true, true, true),
+            "a recreated outer raster has no pixels even when an older attachment was presented"
+        );
+    }
+
+    #[test]
+    fn recreated_retained_replay_is_projection_and_owner_scoped() {
+        let raster = BridgeSourceKey {
+            producer: 3,
+            context: 1,
+            surface: 7,
+            track: 7,
+        };
+        let other_owner = BridgeSourceKey {
+            producer: 4,
+            ..raster
+        };
+        let candidates = HashSet::from([raster, other_owner]);
+
+        assert_eq!(
+            retained_replays_after_apply(&[raster], &candidates, &HashSet::new(), &HashSet::new()),
+            HashSet::from([raster])
+        );
+        assert!(
+            retained_replays_after_apply(
+                &[raster],
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new()
+            )
+            .is_empty(),
+            "initial outer creation must wait for its following live raster instead of replaying it"
+        );
+        assert!(
+            retained_replays_after_apply(
+                &[raster],
+                &candidates,
+                &HashSet::from([raster]),
+                &HashSet::new()
+            )
+            .is_empty()
+        );
+        assert!(
+            retained_replays_after_apply(
+                &[raster],
+                &candidates,
+                &HashSet::new(),
+                &HashSet::from([raster])
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            retained_replays_after_apply(
+                &[raster],
+                &HashSet::from([other_owner]),
+                &HashSet::new(),
+                &HashSet::new()
+            ),
+            HashSet::new(),
+            "a same-numbered source from another producer cannot authorize replay"
+        );
+    }
+
+    #[test]
+    fn composed_retained_raster_becomes_a_self_contained_replay_body() {
+        let pixels = Arc::<[u8]>::from([0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff]);
+        let retained = crate::media::RetainedRaster {
+            epoch: 3,
+            frame_id: 19,
+            width: 2,
+            height: 1,
+            pixels: pixels.clone(),
+        };
+
+        let body = retained_raster_body(&retained).unwrap();
+        let frame = vivid_protocol::media::parse_full_raster_frame(&body).unwrap();
+        assert_eq!(frame.epoch, 3);
+        assert_eq!(frame.frame_id, 19);
+        assert_eq!(frame.width, 2);
+        assert_eq!(frame.height, 1);
+        assert_eq!(
+            vivid_protocol::media::decode_raster_pixels(frame).unwrap(),
+            &*pixels
         );
     }
 

@@ -289,8 +289,11 @@ to advance; when both
 
 Requests and input are limited to 1 MiB, decoded replies to 16 MiB, row requests and key repeats to
 1,000, and regular expressions to 8 KiB. The server bounds connections, in-flight requests,
-waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 17 is a hard
-private-protocol cutover, so sessions created by older binaries must be restarted after upgrading.
+waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 18 is a hard
+private-protocol cutover; it reports recreated retained tracks so tab restoration can rehydrate
+their image/raster bodies. Raster deltas are composed into the retained latest framebuffer before
+that replay, preserving interactive drawings across tab switches. Sessions created by older
+binaries must be restarted after upgrading.
 
 ## Network session gateway
 

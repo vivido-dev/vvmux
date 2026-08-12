@@ -1122,13 +1122,26 @@ fn run_bridge_worker(
             );
             let outer_revision = bridge.mark_projection_applied();
             let outer_attachment_generations = bridge.attachment_generations();
-            let _ = client_writer.send(ClientMessage::BridgeApplied {
-                bridge_instance_id,
-                virtual_revision: pending.virtual_revision,
-                outer_revision,
-                outer_attachment_generations,
+            let mut recreated_retained_sources = pending
+                .tracks
+                .iter()
+                .filter(|source| {
+                    recreated.contains(&source.key)
+                        && matches!(
+                            source.kind,
+                            BridgeSourceKind::Raster { .. } | BridgeSourceKind::Image { .. }
+                        )
+                })
+                .map(|source| source.key)
+                .collect::<Vec<_>>();
+            recreated_retained_sources.sort_by_key(|source| {
+                (
+                    source.producer,
+                    source.context,
+                    source.surface,
+                    source.track,
+                )
             });
-
             if change == ProjectionChange::Sources {
                 let current = pending
                     .tracks
@@ -1156,6 +1169,15 @@ fn run_bridge_worker(
                 started_sources.retain(|source| current.contains(source));
                 requested_virtual_keyframes.retain(|source| current.contains(source));
             }
+            // Arm retained acceptance before acknowledging the projection. The session can answer
+            // this acknowledgement immediately with a source-scoped retained replay.
+            let _ = client_writer.send(ClientMessage::BridgeApplied {
+                bridge_instance_id,
+                virtual_revision: pending.virtual_revision,
+                outer_revision,
+                outer_attachment_generations,
+                recreated_retained_sources,
+            });
             force_sources = false;
             force_replacement = false;
             active_generation = pending.generation;
@@ -2731,8 +2753,8 @@ mod tests {
                 if snapshot
                     .sources
                     .first()
-                    .and_then(|source| source.retained.as_deref())
-                    == Some(frame.as_slice())
+                    .and_then(|source| source.retained_raster.as_ref())
+                    .is_some_and(|raster| raster.frame_id == 1 + index as u64)
                 {
                     break;
                 }
@@ -2743,6 +2765,226 @@ mod tests {
                 thread::sleep(Duration::from_millis(2));
             }
         }
+    }
+
+    #[test]
+    fn recreated_raster_track_accepts_retained_canvas_after_tab_return() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("outer-raster-tab-return.sock");
+        let presenter = match VirtualVivid::start(socket, MediaConfig::default()) {
+            Ok(presenter) => presenter,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping raster tab-return socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("virtual outer presenter start failed: {error}"),
+        };
+        let token = presenter.issue_pane_capability(7).unwrap();
+        presenter.update_metrics(7, 80, 22, (10, 20));
+        let bridge = crate::bridge::OuterBridge::connect(
+            presenter.endpoint(),
+            Zeroizing::new(token),
+            DisplayMetrics::default(),
+        )
+        .unwrap();
+        let (message_sender, message_receiver) = mpsc::channel();
+        let mut worker = BridgeWorker::spawn_with_sender(
+            bridge,
+            BridgeClientSender::new(move |message| {
+                message_sender.send(message).map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "test message receiver closed")
+                })
+            }),
+            8,
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        let key = BridgeSourceKey {
+            producer: 3,
+            context: 1,
+            surface: 7,
+            track: 7,
+        };
+        let source = BridgeSource {
+            key,
+            kind: BridgeSourceKind::Raster {
+                width: 2,
+                height: 1,
+                alpha_mode: 1,
+                compression_mode: 1,
+                delta_operation_limit: Some(8),
+            },
+            live: true,
+            active: true,
+            audio_gain: None,
+            capture_policy: 0,
+            descriptor: None,
+            playing: false,
+            eos_epoch: None,
+            causation_id: None,
+            play_request: crate::ipc::BridgePlayRequest {
+                start_pts_us: 0,
+                minimum_buffer_us: 0,
+                maximum_latency_us: 500_000,
+                rate_32_32: 1_i64 << 32,
+                late_policy: 1,
+                loop_count: 0,
+                start_policy: 1,
+            },
+        };
+        let node = BridgeNode {
+            producer: key.producer,
+            node: 1,
+            fragment: 0,
+            surface: test_surface(key).key,
+            x: 0,
+            y: 0,
+            width: 2_i64 << 32,
+            height: 1_i64 << 32,
+            z_index: 0,
+            visible: true,
+            clip: crate::ipc::BridgeClipRect {
+                x: 0,
+                y: 0,
+                width: 2_i64 << 32,
+                height: 1_i64 << 32,
+            },
+        };
+        let visible_snapshot = |virtual_revision| BridgeSnapshot {
+            generation: 0,
+            virtual_revision,
+            surfaces: vec![test_surface(key)],
+            tracks: vec![source.clone()],
+            nodes: vec![node.clone()],
+            videos_needing_keyframes: Vec::new(),
+        };
+
+        worker.replace_snapshot(visible_snapshot(1));
+        let initial_applied = receive_bridge_message_until(
+            &message_receiver,
+            &mut seen,
+            "initial raster tab projection",
+            |message| {
+                matches!(
+                    message,
+                    ClientMessage::BridgeApplied {
+                        virtual_revision: 1,
+                        ..
+                    }
+                )
+            },
+        );
+        assert!(matches!(
+            &seen[initial_applied],
+            ClientMessage::BridgeApplied {
+                recreated_retained_sources,
+                ..
+            } if recreated_retained_sources == std::slice::from_ref(&key)
+        ));
+        let pixels = [0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff];
+        let canvas = media::raster_frame_body(1, 9, 2, 1, &pixels).unwrap();
+        assert!(worker.queue_media(BridgeMedia {
+            generation: 0,
+            delivery_id: 41,
+            source: key,
+            record_type: vivid_protocol::messages::RASTER_FRAME,
+            offset: 0,
+            total: u32::try_from(canvas.len()).unwrap(),
+            last: true,
+            bytes: canvas.clone(),
+        }));
+        receive_bridge_message_until(
+            &message_receiver,
+            &mut seen,
+            "initial raster canvas delivery",
+            |message| {
+                matches!(
+                    message,
+                    ClientMessage::BridgeMediaAck {
+                        delivery_id: 41,
+                        delivered: true
+                    }
+                )
+            },
+        );
+        assert!(presenter.wait_for_retained_media(7, Duration::from_secs(2)));
+
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            virtual_revision: 2,
+            surfaces: Vec::new(),
+            tracks: Vec::new(),
+            nodes: Vec::new(),
+            videos_needing_keyframes: Vec::new(),
+        });
+        receive_bridge_message_until(
+            &message_receiver,
+            &mut seen,
+            "hidden raster tab projection",
+            |message| {
+                matches!(
+                    message,
+                    ClientMessage::BridgeApplied {
+                        virtual_revision: 2,
+                        ..
+                    }
+                )
+            },
+        );
+
+        worker.replace_snapshot(visible_snapshot(3));
+        let restored_applied = receive_bridge_message_until(
+            &message_receiver,
+            &mut seen,
+            "restored raster tab projection",
+            |message| {
+                matches!(
+                    message,
+                    ClientMessage::BridgeApplied {
+                        virtual_revision: 3,
+                        ..
+                    }
+                )
+            },
+        );
+        assert!(matches!(
+            &seen[restored_applied],
+            ClientMessage::BridgeApplied {
+                recreated_retained_sources,
+                ..
+            } if recreated_retained_sources == std::slice::from_ref(&key)
+        ));
+        let blank = presenter.projection_snapshot(&HashSet::from([7]));
+        assert_eq!(blank.sources.len(), 1);
+        assert!(blank.sources[0].retained_raster.is_none());
+
+        assert!(worker.queue_media(BridgeMedia {
+            generation: 0,
+            delivery_id: 0,
+            source: key,
+            record_type: vivid_protocol::messages::RASTER_FRAME,
+            offset: 0,
+            total: u32::try_from(canvas.len()).unwrap(),
+            last: true,
+            bytes: canvas,
+        }));
+        receive_bridge_message_until(
+            &message_receiver,
+            &mut seen,
+            "retained canvas hydration after tab return",
+            |message| {
+                matches!(
+                    message,
+                    ClientMessage::BridgeRetainedHydrated { source } if *source == key
+                )
+            },
+        );
+        let restored = presenter.projection_snapshot(&HashSet::from([7]));
+        let retained = restored.sources[0]
+            .retained_raster
+            .as_ref()
+            .expect("restored raster track remained blank");
+        assert_eq!(&*retained.pixels, pixels);
     }
 
     /// A page-sized raster relay: geometry, compression, and one page turn's worth of pixels.

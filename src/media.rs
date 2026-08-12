@@ -8,8 +8,9 @@ use crate::platform::{VirtualPresenterEndpoint, VirtualPresenterListener};
 #[allow(unused_imports)]
 pub use vivid_gateway::{
     AudioSourceConfig, ClipRect, KeyframeRequestOutcome, MediaEvent, NodeConfig,
-    OuterMediaProjection, PlayRequest, ProducerId, ProjectionSnapshot, SceneNode, SceneNodeConfig,
-    SemanticDescriptor, SnapshotSource, SnapshotSurface, SourceDescriptor, SourceKey,
+    OuterMediaProjection, PlayRequest, ProducerId, ProjectionSnapshot, RetainedRaster, SceneNode,
+    SceneNodeConfig, SemanticDescriptor, SnapshotSource, SnapshotSurface, SourceDescriptor,
+    SourceKey,
 };
 
 impl vivid_gateway::PresenterListener for VirtualPresenterListener {
