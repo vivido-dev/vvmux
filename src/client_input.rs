@@ -216,9 +216,20 @@ impl PrefixParser {
         let mut ordinary = Vec::new();
         for &byte in bytes {
             if self.confirm_close && self.keyboard_flags == 0 {
-                self.confirm_close = false;
-                if matches!(byte, b'y' | b'Y') {
-                    output.push(ParsedInput::Action(Action::ClosePane));
+                match byte {
+                    b'y' | b'Y' => {
+                        self.confirm_close = false;
+                        output.push(ParsedInput::Action(Action::ResolveClosePaneConfirmation(
+                            true,
+                        )));
+                    }
+                    b'n' | b'N' | 0x1b => {
+                        self.confirm_close = false;
+                        output.push(ParsedInput::Action(Action::ResolveClosePaneConfirmation(
+                            false,
+                        )));
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -380,9 +391,20 @@ impl PrefixParser {
 
     fn handle_prefix_byte(&mut self, byte: u8, literal: &[u8], output: &mut Vec<ParsedInput>) {
         if self.confirm_close {
-            self.confirm_close = false;
-            if matches!(byte, b'y' | b'Y') {
-                output.push(ParsedInput::Action(Action::ClosePane));
+            match byte {
+                b'y' | b'Y' => {
+                    self.confirm_close = false;
+                    output.push(ParsedInput::Action(Action::ResolveClosePaneConfirmation(
+                        true,
+                    )));
+                }
+                b'n' | b'N' | 0x1b => {
+                    self.confirm_close = false;
+                    output.push(ParsedInput::Action(Action::ResolveClosePaneConfirmation(
+                        false,
+                    )));
+                }
+                _ => {}
             }
             return;
         }
@@ -392,6 +414,9 @@ impl PrefixParser {
             return;
         }
         if let Some(action) = self.bindings.get(&byte).cloned() {
+            if matches!(action, Action::BeginClosePaneConfirmation) {
+                self.confirm_close = true;
+            }
             output.push(ParsedInput::Action(action));
             self.prefix = false;
             return;
@@ -403,6 +428,12 @@ impl PrefixParser {
             b'c' => output.push(ParsedInput::Action(Action::NewTab)),
             b'n' => output.push(ParsedInput::Action(Action::NextTab)),
             b'p' => output.push(ParsedInput::Action(Action::PreviousTab)),
+            b'h' => output.push(ParsedInput::Action(Action::Focus(Direction::Left))),
+            b'j' => output.push(ParsedInput::Action(Action::Focus(Direction::Down))),
+            b'k' => output.push(ParsedInput::Action(Action::Focus(Direction::Up))),
+            b'l' => output.push(ParsedInput::Action(Action::Focus(Direction::Right))),
+            b'w' => output.push(ParsedInput::Action(Action::ToggleTabNavigator)),
+            b',' => output.push(ParsedInput::Action(Action::BeginRenameTab)),
             b'z' => output.push(ParsedInput::Action(Action::ToggleZoom)),
             b'S' => output.push(ParsedInput::Action(Action::ToggleSyncInput)),
             b'f' => output.push(ParsedInput::Action(Action::NewFloatingPane)),
@@ -414,9 +445,12 @@ impl PrefixParser {
             b'd' => output.push(ParsedInput::Detach),
             b'[' => output.push(ParsedInput::Action(Action::EnterCopyMode)),
             b']' => output.push(ParsedInput::Action(Action::Paste)),
-            b'x' => self.confirm_close = true,
-            b'0'..=b'9' => output.push(ParsedInput::Action(Action::SelectTab(
-                (byte - b'0') as usize,
+            b'x' => {
+                self.confirm_close = true;
+                output.push(ParsedInput::Action(Action::BeginClosePaneConfirmation));
+            }
+            b'1'..=b'9' => output.push(ParsedInput::Action(Action::SelectTab(
+                (byte - b'1') as usize,
             ))),
             0x1b => {
                 self.sequence.push(byte);
@@ -446,6 +480,9 @@ pub(crate) fn parse_configured_action(action: &str) -> Option<Action> {
         "new-tab" => Some(Action::NewTab),
         "next-tab" => Some(Action::NextTab),
         "previous-tab" => Some(Action::PreviousTab),
+        "tab-navigator" => Some(Action::ToggleTabNavigator),
+        "rename-tab" => Some(Action::BeginRenameTab),
+        "confirm-close-pane" => Some(Action::BeginClosePaneConfirmation),
         "close-pane" => Some(Action::ClosePane),
         "toggle-zoom" => Some(Action::ToggleZoom),
         "toggle-sync-input" => Some(Action::ToggleSyncInput),
@@ -623,6 +660,81 @@ mod tests {
                 MouseCoordinates::Cells
             )]
         );
+    }
+
+    #[test]
+    fn tmux_navigation_and_one_based_tab_keys_are_default_bindings() {
+        let mut parser = PrefixParser::default();
+        assert_eq!(
+            parser.feed(b"\x02h\x02j\x02k\x02l"),
+            [
+                ParsedInput::Action(Action::Focus(Direction::Left)),
+                ParsedInput::Action(Action::Focus(Direction::Down)),
+                ParsedInput::Action(Action::Focus(Direction::Up)),
+                ParsedInput::Action(Action::Focus(Direction::Right)),
+            ]
+        );
+        assert_eq!(
+            parser.feed(b"\x021\x029"),
+            [
+                ParsedInput::Action(Action::SelectTab(0)),
+                ParsedInput::Action(Action::SelectTab(8)),
+            ]
+        );
+        assert!(parser.feed(b"\x020").is_empty());
+        assert_eq!(
+            parser.feed(b"\x02w\x02,"),
+            [
+                ParsedInput::Action(Action::ToggleTabNavigator),
+                ParsedInput::Action(Action::BeginRenameTab),
+            ]
+        );
+    }
+
+    #[test]
+    fn close_confirmation_is_visible_and_consumes_until_yes_or_no() {
+        let mut parser = PrefixParser::default();
+        assert_eq!(
+            parser.feed(b"\x02x"),
+            [ParsedInput::Action(Action::BeginClosePaneConfirmation)]
+        );
+        assert!(
+            parser.feed(b"?").is_empty(),
+            "unrelated input stays consumed"
+        );
+        assert_eq!(
+            parser.feed(b"n"),
+            [ParsedInput::Action(Action::ResolveClosePaneConfirmation(
+                false
+            ))]
+        );
+        assert_eq!(
+            parser.feed(b"\x02xY"),
+            [
+                ParsedInput::Action(Action::BeginClosePaneConfirmation),
+                ParsedInput::Action(Action::ResolveClosePaneConfirmation(true)),
+            ]
+        );
+    }
+
+    #[test]
+    fn kitty_close_confirmation_suppresses_command_releases() {
+        let mut parser = PrefixParser::default();
+        parser.set_keyboard_flags(31);
+        assert!(parser.feed(b"\x1b[98;5u").is_empty());
+        assert!(parser.feed(b"\x1b[98;5:3u").is_empty());
+        assert_eq!(
+            parser.feed(b"\x1b[120u"),
+            [ParsedInput::Action(Action::BeginClosePaneConfirmation)]
+        );
+        assert!(parser.feed(b"\x1b[120;1:3u").is_empty());
+        assert_eq!(
+            parser.feed(b"\x1b[121u"),
+            [ParsedInput::Action(Action::ResolveClosePaneConfirmation(
+                true
+            ))]
+        );
+        assert!(parser.feed(b"\x1b[121;1:3u").is_empty());
     }
 
     #[test]

@@ -88,13 +88,13 @@ remote deployments use an SSH tunnel or a trusted TLS reverse proxy.
 
 ### Private IPC compatibility
 
-VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 12,
+VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 17,
 which is a hard cutover from every earlier VVMX version. VVMX 7 moved render and media byte
 payloads out of JSON into bounded binary records. VVMX 8 added transport-loss recovery without
 inventing a new producer epoch. VVMX 9 added bridge-instance correlation and bounded,
 metadata-only media recovery traces. VVMX 10 is the hard Vivid 1.5 surface/track/channel cutover.
 VVMX 11 reports host terminal focus as its own client message instead of pane input.
-VVMX 12 distinguishes cell and pixel mouse reports and mirrors the focused pane's Kitty keyboard
+VVMX 17 distinguishes cell and pixel mouse reports and mirrors the focused pane's Kitty keyboard
 mode flags into native host terminals. Media snapshots preserve live/timed plus active-slot state
 for relayed tracks. It remains a hard cutover: mixed client/server versions are rejected.
 

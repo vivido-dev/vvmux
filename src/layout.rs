@@ -58,9 +58,10 @@ pub struct PaneProjection {
     pub focused: bool,
 }
 
-/// Directional focus across visible floats and tiled panes together: candidates whose center
-/// lies strictly in the requested half-plane, ranked by forward edge distance, then descending
-/// perpendicular overlap, then ascending pane ID.
+/// Directional focus across visible floats and tiled panes together. Candidates whose center lies
+/// strictly in the requested half-plane and overlaps the current pane on the perpendicular axis
+/// beat diagonal candidates. Remaining ties use forward gap, perpendicular gap/overlap, and pane
+/// ID so asymmetric tiled layouts and overlapping floats remain deterministic.
 pub fn directional_focus(
     projections: &[PaneProjection],
     focused: PaneId,
@@ -100,20 +101,40 @@ pub fn directional_focus(
                     span_overlap(current.x, current.width, rect.x, rect.width)
                 }
             };
+            let perpendicular_gap = match direction {
+                Direction::Left | Direction::Right => {
+                    span_gap(current.y, current.height, rect.y, rect.height)
+                }
+                Direction::Up | Direction::Down => {
+                    span_gap(current.x, current.width, rect.x, rect.width)
+                }
+            };
             Some((
-                edge_distance,
+                overlap == 0,
+                edge_distance.max(0),
+                perpendicular_gap,
                 std::cmp::Reverse(overlap),
                 projection.pane_id,
             ))
         })
         .min()
-        .map(|(_, _, pane_id)| pane_id)
+        .map(|(_, _, _, _, pane_id)| pane_id)
 }
 
 fn span_overlap(a_start: u16, a_len: u16, b_start: u16, b_len: u16) -> u16 {
     let start = a_start.max(b_start);
     let end = (a_start + a_len).min(b_start + b_len);
     end.saturating_sub(start)
+}
+
+fn span_gap(a_start: u16, a_len: u16, b_start: u16, b_len: u16) -> u16 {
+    let a_end = a_start.saturating_add(a_len);
+    let b_end = b_start.saturating_add(b_len);
+    if a_end < b_start {
+        b_start - a_end
+    } else {
+        a_start.saturating_sub(b_end)
+    }
 }
 
 pub const MIN_FLOAT_WIDTH: u16 = MIN_CONTENT_COLUMNS + FRAME_COLUMNS;
@@ -767,6 +788,33 @@ mod tests {
         tree = tree.close(2).unwrap();
         assert_eq!(tree.pane_ids(), [1, 3]);
         assert_eq!(before.pane_ids(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn horizontal_focus_stays_with_bottom_siblings_in_a_t_layout() {
+        let tree = TiledNode::from_children(
+            Axis::Horizontal,
+            vec![
+                TiledNode::leaf(1),
+                TiledNode::from_children(
+                    Axis::Vertical,
+                    vec![TiledNode::leaf(2), TiledNode::leaf(3)],
+                    &[1, 1],
+                ),
+            ],
+            &[1, 1],
+        );
+        let projections = tiled_projections(&tree, 2, area());
+        assert_eq!(
+            directional_focus(&projections, 2, Direction::Right),
+            Some(3),
+            "right from the bottom-left pane must stay in the bottom row"
+        );
+        assert_eq!(
+            directional_focus(&projections, 3, Direction::Left),
+            Some(2),
+            "left from the bottom-right pane must stay in the bottom row"
+        );
     }
 
     #[test]

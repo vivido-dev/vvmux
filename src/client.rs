@@ -2224,13 +2224,20 @@ mod tests {
 
     #[test]
     fn configured_prefix_binding_overrides_default_key() {
-        let bindings =
-            std::collections::BTreeMap::from([("f".to_owned(), "split-horizontal".to_owned())]);
+        let bindings = std::collections::BTreeMap::from([
+            ("f".to_owned(), "split-horizontal".to_owned()),
+            ("h".to_owned(), "new-tab".to_owned()),
+        ]);
         let mut parser = PrefixParser::new(0x01, &bindings);
         assert!(matches!(
             parser.feed(b"\x01f").as_slice(),
             [ParsedInput::Action(Action::Split(Axis::Horizontal))]
         ));
+        assert_eq!(
+            parser.feed(b"\x01h"),
+            [ParsedInput::Action(Action::NewTab)],
+            "configured bindings override tmux-compatible defaults"
+        );
     }
 
     #[test]
@@ -2243,6 +2250,8 @@ mod tests {
             (b"\x02m", Action::EnterFloatingMoveMode),
             (b"\x02r", Action::EnterFloatingResizeMode),
             (b"\x02a", Action::ToggleAgentNavigator),
+            (b"\x02w", Action::ToggleTabNavigator),
+            (b"\x02,", Action::BeginRenameTab),
         ] {
             let commands = parser.feed(byte);
             assert_eq!(commands.len(), 1, "one action per chord");
@@ -2262,6 +2271,9 @@ mod tests {
             "enter-floating-move-mode",
             "enter-floating-resize-mode",
             "agent-navigator",
+            "tab-navigator",
+            "rename-tab",
+            "confirm-close-pane",
         ] {
             assert!(parse_configured_action(name).is_some());
         }

@@ -73,6 +73,7 @@ const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTOMATION_REPLY_LIMIT: usize = 16 * 1024 * 1024;
 /// A `run` command is one shell command line, not a script; this only has to be generous.
 const MAX_RUN_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_TAB_NAME_BYTES: usize = 128;
 #[cfg(windows)]
 const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
 #[cfg(windows)]
@@ -604,6 +605,42 @@ struct AgentNavigator {
     scroll: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TabNavigator {
+    selected: Option<u64>,
+    selected_index: usize,
+    scroll: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TabRename {
+    tab_id: u64,
+    value: String,
+    pending_utf8: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabRenameInput {
+    Editing,
+    Commit,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClosePaneConfirmation {
+    tab_id: u64,
+    pane_id: PaneId,
+}
+
+#[derive(Debug, Clone)]
+struct TabNavigatorRow {
+    tab_id: u64,
+    display_index: usize,
+    name: Option<String>,
+    pane_count: usize,
+    active: bool,
+}
+
 #[derive(Debug, Clone)]
 struct AgentNavigatorRow {
     pane_id: PaneId,
@@ -1034,6 +1071,9 @@ struct SessionActor {
     mouse_click_tracker: Option<MouseClickTracker>,
     float_modal: Option<FloatModal>,
     agent_navigator: Option<AgentNavigator>,
+    tab_navigator: Option<TabNavigator>,
+    tab_rename: Option<TabRename>,
+    close_pane_confirmation: Option<ClosePaneConfirmation>,
     agent_catalog: Arc<crate::agent::AgentCatalog>,
     agent_catalog_generation: u64,
     next_float_mode: u64,
@@ -1226,6 +1266,9 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         mouse_click_tracker: None,
         float_modal: None,
         agent_navigator: None,
+        tab_navigator: None,
+        tab_rename: None,
+        close_pane_confirmation: None,
         agent_catalog: Arc::new(crate::agent::AgentCatalog::default()),
         agent_catalog_generation: 0,
         next_float_mode: 0,
@@ -1448,7 +1491,7 @@ impl SessionActor {
                     }
                     self.force_full = true;
                     self.end_float_mode(true);
-                    self.agent_navigator = None;
+                    self.clear_transient_ui();
                     self.vivid.deactivate_bridge();
                 }
             }
@@ -1791,7 +1834,7 @@ impl SessionActor {
                 self.cancel_pointer_drag(true);
                 self.invalidate_mouse_selection_state();
                 self.end_float_mode(true);
-                self.agent_navigator = None;
+                self.clear_transient_ui();
                 // Even a clean client replacement owns a different physical presenter and fresh
                 // decoder/audio devices. Park timed ingress until that client applies its first
                 // authoritative projection.
@@ -1893,7 +1936,7 @@ impl SessionActor {
                         self.cancel_pointer_drag(true);
                         self.invalidate_mouse_selection_state();
                         self.end_float_mode(true);
-                        self.agent_navigator = None;
+                        self.clear_transient_ui();
                         if let Some(client) = &mut self.attached {
                             client.display = display;
                             self.last_display = client.display;
@@ -4323,6 +4366,18 @@ impl SessionActor {
             self.agent_navigator_input(&bytes);
             return;
         }
+        if self.tab_navigator.is_some() {
+            self.tab_navigator_input(&bytes);
+            return;
+        }
+        if self.tab_rename.is_some() {
+            self.tab_rename_input(&bytes);
+            return;
+        }
+        if self.close_pane_confirmation.is_some() {
+            self.close_pane_confirmation_input(&bytes);
+            return;
+        }
         if self.invalidate_mouse_selection_state() {
             self.schedule_render();
         }
@@ -4497,6 +4552,13 @@ impl SessionActor {
         }
         if self.agent_navigator.is_some() {
             self.agent_navigator_mouse(mouse);
+            return;
+        }
+        if self.tab_navigator.is_some() {
+            self.tab_navigator_mouse(mouse);
+            return;
+        }
+        if self.tab_rename.is_some() || self.close_pane_confirmation.is_some() {
             return;
         }
         if self.mouse_selection_drag.is_some() {
@@ -4933,9 +4995,6 @@ impl SessionActor {
     }
 
     fn action(&mut self, action: Action) {
-        if self.agent_navigator.is_some() && !matches!(action, Action::ToggleAgentNavigator) {
-            return;
-        }
         self.cancel_pointer_drag(true);
         if self.invalidate_mouse_selection_state() {
             self.schedule_render();
@@ -4943,6 +5002,32 @@ impl SessionActor {
         // Any prefix action during a float-edit mode invalidates it (focus, tab, zoom, and
         // layout changes are all cancellation triggers); restore the entry rectangle first.
         self.end_float_mode(true);
+        match action {
+            Action::ToggleAgentNavigator => {
+                self.toggle_agent_navigator();
+                return;
+            }
+            Action::ToggleTabNavigator => {
+                self.toggle_tab_navigator();
+                return;
+            }
+            Action::BeginRenameTab => {
+                self.begin_tab_rename();
+                return;
+            }
+            Action::BeginClosePaneConfirmation => {
+                self.begin_close_pane_confirmation();
+                return;
+            }
+            Action::ResolveClosePaneConfirmation(confirmed) => {
+                self.resolve_close_pane_confirmation(confirmed);
+                return;
+            }
+            _ => {}
+        }
+        if self.transient_ui_active() {
+            return;
+        }
         match action {
             Action::Split(axis) => self.split(axis),
             Action::Focus(direction) => self.focus(direction),
@@ -5020,7 +5105,6 @@ impl SessionActor {
             Action::EnterFloatingMoveMode => self.enter_float_mode(FloatingEditKind::Move),
             Action::EnterFloatingResizeMode => self.enter_float_mode(FloatingEditKind::Resize),
             Action::Plugin(reference) => self.start_plugin_action(reference),
-            Action::ToggleAgentNavigator => self.toggle_agent_navigator(),
             _ => {}
         }
     }
@@ -5337,6 +5421,22 @@ impl SessionActor {
         }
     }
 
+    fn transient_ui_active(&self) -> bool {
+        self.agent_navigator.is_some()
+            || self.tab_navigator.is_some()
+            || self.tab_rename.is_some()
+            || self.close_pane_confirmation.is_some()
+    }
+
+    fn clear_transient_ui(&mut self) -> bool {
+        let active = self.transient_ui_active();
+        self.agent_navigator = None;
+        self.tab_navigator = None;
+        self.tab_rename = None;
+        self.close_pane_confirmation = None;
+        active
+    }
+
     fn agent_navigator_rows(&self) -> Vec<AgentNavigatorRow> {
         let mut rows = Vec::new();
         for (tab_index, tab) in self.tabs.iter().enumerate() {
@@ -5377,6 +5477,7 @@ impl SessionActor {
             self.schedule_render();
             return;
         }
+        self.clear_transient_ui();
         let rows = self.agent_navigator_rows();
         let focused = self.active_tab().map(|tab| tab.focused);
         let selected = focused
@@ -5589,6 +5690,323 @@ impl SessionActor {
             }
         }
         screen.cursor = None;
+    }
+
+    fn tab_navigator_rows(&self) -> Vec<TabNavigatorRow> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(display_index, tab)| {
+                let tiled = tab.tree.as_ref().map_or(0, |tree| tree.pane_ids().len());
+                TabNavigatorRow {
+                    tab_id: tab.id,
+                    display_index,
+                    name: tab.name.clone(),
+                    pane_count: tiled + tab.floating.pane_ids().len(),
+                    active: display_index == self.active_tab,
+                }
+            })
+            .collect()
+    }
+
+    fn toggle_tab_navigator(&mut self) {
+        if self.tab_navigator.take().is_some() {
+            self.force_full = true;
+            self.schedule_render();
+            return;
+        }
+        self.clear_transient_ui();
+        let selected = self.active_tab().map(|tab| tab.id);
+        self.tab_navigator = Some(TabNavigator {
+            selected,
+            selected_index: self.active_tab,
+            scroll: 0,
+        });
+        self.force_full = true;
+        self.schedule_render();
+    }
+
+    fn tab_navigator_input(&mut self, bytes: &[u8]) {
+        let mut offset = 0;
+        while offset < bytes.len() && self.tab_navigator.is_some() {
+            let (consumed, key) = decode_agent_navigator_key(&bytes[offset..]);
+            offset += consumed;
+            match key {
+                Some(AgentNavigatorKey::Up) => self.move_tab_navigator(-1),
+                Some(AgentNavigatorKey::Down) => self.move_tab_navigator(1),
+                Some(AgentNavigatorKey::Home) => self.move_tab_navigator_to(false),
+                Some(AgentNavigatorKey::End) => self.move_tab_navigator_to(true),
+                Some(AgentNavigatorKey::PageUp) => self.page_tab_navigator(false),
+                Some(AgentNavigatorKey::PageDown) => self.page_tab_navigator(true),
+                Some(AgentNavigatorKey::Activate) => self.activate_tab_navigator(),
+                Some(AgentNavigatorKey::Close) => {
+                    self.tab_navigator = None;
+                    self.force_full = true;
+                    self.schedule_render();
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn move_tab_navigator(&mut self, delta: isize) {
+        let rows = self.tab_navigator_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let current = self
+            .tab_navigator
+            .and_then(|navigator| navigator.selected)
+            .and_then(|tab_id| rows.iter().position(|row| row.tab_id == tab_id))
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(rows.len().saturating_sub(1));
+        if let Some(navigator) = &mut self.tab_navigator {
+            navigator.selected = Some(rows[next].tab_id);
+            navigator.selected_index = next;
+        }
+        self.reveal_tab_navigator_selection(rows.len(), next);
+    }
+
+    fn move_tab_navigator_to(&mut self, end: bool) {
+        let rows = self.tab_navigator_rows();
+        let Some(index) = (!rows.is_empty()).then(|| if end { rows.len() - 1 } else { 0 }) else {
+            return;
+        };
+        if let Some(navigator) = &mut self.tab_navigator {
+            navigator.selected = Some(rows[index].tab_id);
+            navigator.selected_index = index;
+        }
+        self.reveal_tab_navigator_selection(rows.len(), index);
+    }
+
+    fn page_tab_navigator(&mut self, down: bool) {
+        let page = tab_navigator_rect(self.content_area(), self.tabs.len())
+            .map_or(1, |rect| usize::from(rect.height.saturating_sub(2)).max(1));
+        self.move_tab_navigator(if down {
+            page as isize
+        } else {
+            -(page as isize)
+        });
+    }
+
+    fn reveal_tab_navigator_selection(&mut self, row_count: usize, index: usize) {
+        let page = tab_navigator_rect(self.content_area(), row_count)
+            .map_or(1, |rect| usize::from(rect.height.saturating_sub(2)).max(1));
+        if let Some(navigator) = &mut self.tab_navigator {
+            if index < navigator.scroll {
+                navigator.scroll = index;
+            } else if index >= navigator.scroll.saturating_add(page) {
+                navigator.scroll = index + 1 - page;
+            }
+            navigator.scroll = navigator.scroll.min(row_count.saturating_sub(page));
+        }
+        self.schedule_render();
+    }
+
+    fn activate_tab_navigator(&mut self) {
+        let selected = self.tab_navigator.and_then(|navigator| navigator.selected);
+        self.tab_navigator = None;
+        let Some(index) =
+            selected.and_then(|tab_id| self.tabs.iter().position(|tab| tab.id == tab_id))
+        else {
+            self.force_full = true;
+            self.schedule_render();
+            return;
+        };
+        if index == self.active_tab {
+            self.force_full = true;
+            self.schedule_render();
+        } else {
+            self.active_tab = index;
+            self.force_full = true;
+            self.relayout();
+        }
+    }
+
+    fn tab_navigator_mouse(&mut self, mouse: MouseEvent) {
+        let rows = self.tab_navigator_rows();
+        let Some(rect) = tab_navigator_rect(self.content_area(), rows.len()) else {
+            self.tab_navigator = None;
+            return;
+        };
+        if mouse.kind == MouseKind::Wheel {
+            self.move_tab_navigator(if mouse.button == 0 { -1 } else { 1 });
+            return;
+        }
+        if mouse.kind != MouseKind::Press || mouse.button != 0 {
+            return;
+        }
+        if !rect.contains(mouse.x, mouse.y) {
+            self.tab_navigator = None;
+            self.force_full = true;
+            self.schedule_render();
+            return;
+        }
+        if mouse.y <= rect.y || mouse.y + 1 >= rect.y + rect.height {
+            return;
+        }
+        let scroll = self.tab_navigator.map_or(0, |navigator| navigator.scroll);
+        let index = scroll + usize::from(mouse.y - rect.y - 1);
+        let Some(row) = rows.get(index) else { return };
+        if let Some(navigator) = &mut self.tab_navigator {
+            navigator.selected = Some(row.tab_id);
+            navigator.selected_index = index;
+        }
+        self.activate_tab_navigator();
+    }
+
+    fn draw_tab_navigator(
+        &mut self,
+        screen: &mut ScreenBuffer,
+        theme: crate::theme::ResolvedTheme,
+    ) {
+        let rows = self.tab_navigator_rows();
+        let Some(rect) = tab_navigator_rect(self.content_area(), rows.len()) else {
+            self.tab_navigator = None;
+            return;
+        };
+        let page = usize::from(rect.height.saturating_sub(2)).max(1);
+        let selected_index = self.tab_navigator.and_then(|navigator| {
+            navigator
+                .selected
+                .and_then(|tab_id| rows.iter().position(|row| row.tab_id == tab_id))
+                .or_else(|| {
+                    (!rows.is_empty()).then_some(navigator.selected_index.min(rows.len() - 1))
+                })
+        });
+        if let Some(navigator) = &mut self.tab_navigator {
+            navigator.selected = selected_index.map(|index| rows[index].tab_id);
+            navigator.selected_index = selected_index.unwrap_or(0);
+            navigator.scroll = navigator.scroll.min(rows.len().saturating_sub(page));
+            if let Some(index) = selected_index {
+                if index < navigator.scroll {
+                    navigator.scroll = index;
+                } else if index >= navigator.scroll + page {
+                    navigator.scroll = index + 1 - page;
+                }
+            }
+        }
+        screen.draw_frame(rect, " Tabs ", theme.frame(true));
+        let style = theme.status();
+        let inner_width = usize::from(rect.width.saturating_sub(2));
+        let blank = " ".repeat(inner_width);
+        for offset in 0..page {
+            screen.draw_text(rect.x + 1, rect.y + 1 + offset as u16, &blank, style);
+        }
+        let scroll = self.tab_navigator.map_or(0, |navigator| navigator.scroll);
+        for (offset, row) in rows.iter().skip(scroll).take(page).enumerate() {
+            let marker = if row.active { '*' } else { ' ' };
+            let name = row
+                .name
+                .as_deref()
+                .map(single_line)
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "(unnamed)".to_owned());
+            let text = format!(
+                "{marker} {:>2}: {name} · panes:{}",
+                row.display_index + 1,
+                row.pane_count
+            );
+            let y = rect.y + 1 + offset as u16;
+            screen.draw_text(rect.x + 1, y, &text, style);
+            if self.tab_navigator.and_then(|navigator| navigator.selected) == Some(row.tab_id) {
+                screen.invert(rect.x + 1, y, rect.width.saturating_sub(2));
+            }
+        }
+        screen.cursor = None;
+    }
+
+    fn begin_tab_rename(&mut self) {
+        let Some((tab_id, name)) = self
+            .active_tab()
+            .map(|tab| (tab.id, tab.name.clone().unwrap_or_default()))
+        else {
+            return;
+        };
+        self.clear_transient_ui();
+        self.tab_rename = Some(TabRename {
+            tab_id,
+            value: truncate_utf8(single_line(&name), MAX_TAB_NAME_BYTES),
+            pending_utf8: Vec::new(),
+        });
+        self.force_full = true;
+        self.schedule_render();
+    }
+
+    fn tab_rename_input(&mut self, bytes: &[u8]) {
+        let Some(mut rename) = self.tab_rename.take() else {
+            return;
+        };
+        let action = apply_tab_rename_input(&mut rename, bytes);
+        match action {
+            TabRenameInput::Editing => {
+                if self.tabs.iter().any(|tab| tab.id == rename.tab_id) {
+                    self.tab_rename = Some(rename);
+                }
+                self.schedule_render();
+            }
+            TabRenameInput::Cancel => {
+                self.force_full = true;
+                self.schedule_render();
+            }
+            TabRenameInput::Commit => {
+                let name = rename.value.trim();
+                let next = (!name.is_empty()).then(|| name.to_owned());
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == rename.tab_id)
+                    && tab.name != next
+                {
+                    tab.name = next;
+                    self.session_sequence = self.session_sequence.wrapping_add(1);
+                }
+                self.force_full = true;
+                self.schedule_render();
+            }
+        }
+    }
+
+    fn begin_close_pane_confirmation(&mut self) {
+        let Some((tab_id, pane_id)) = self.active_tab().map(|tab| (tab.id, tab.focused)) else {
+            return;
+        };
+        self.clear_transient_ui();
+        self.close_pane_confirmation = Some(ClosePaneConfirmation { tab_id, pane_id });
+        self.force_full = true;
+        self.schedule_render();
+    }
+
+    fn resolve_close_pane_confirmation(&mut self, confirmed: bool) {
+        let Some(confirmation) = self.close_pane_confirmation.take() else {
+            return;
+        };
+        if confirmed
+            && self
+                .tabs
+                .iter()
+                .any(|tab| tab.id == confirmation.tab_id && tab.contains(confirmation.pane_id))
+        {
+            self.close_pane(confirmation.pane_id);
+        } else {
+            self.force_full = true;
+            self.schedule_render();
+        }
+    }
+
+    fn close_pane_confirmation_input(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            match byte {
+                b'y' | b'Y' => {
+                    self.resolve_close_pane_confirmation(true);
+                    return;
+                }
+                b'n' | b'N' | 0x1b => {
+                    self.resolve_close_pane_confirmation(false);
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
 
     fn enter_float_mode(&mut self, kind: FloatingEditKind) {
@@ -6145,6 +6563,15 @@ impl SessionActor {
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len().saturating_sub(1);
         }
+        self.tab_rename = self
+            .tab_rename
+            .take()
+            .filter(|rename| self.tabs.iter().any(|tab| tab.id == rename.tab_id));
+        self.close_pane_confirmation = self.close_pane_confirmation.take().filter(|confirmation| {
+            self.tabs
+                .iter()
+                .any(|tab| tab.id == confirmation.tab_id && tab.contains(confirmation.pane_id))
+        });
         self.force_full = true;
         self.relayout();
         self.publish_plugin_event(
@@ -6583,20 +7010,20 @@ impl SessionActor {
         }
         if self.agent_navigator.is_some() {
             self.draw_agent_navigator(&mut screen, theme);
+        } else if self.tab_navigator.is_some() {
+            self.draw_tab_navigator(&mut screen, theme);
         }
         if self.config.general.status_visible && screen.rows > 0 {
-            let tab_number = self.active_tab + 1;
-            let tab_id = self.active_tab().map_or(0, |tab| tab.id);
-            let tab_name = self
-                .active_tab()
-                .and_then(|tab| tab.name.as_deref())
-                .map_or_else(String::new, |name| format!(" ({name})"));
-            let sync = if self.active_tab().is_some_and(|tab| tab.sync_input) {
-                "  sync"
-            } else {
-                ""
-            };
-            let prompt = self.active_tab().and_then(|tab| {
+            let rename_prompt = self.tab_rename.as_ref().and_then(|rename| {
+                self.tabs
+                    .iter()
+                    .position(|tab| tab.id == rename.tab_id)
+                    .map(|index| format!("rename tab {}: {}", index + 1, rename.value))
+            });
+            let close_prompt = self
+                .close_pane_confirmation
+                .map(|confirmation| format!("kill pane {}? (y/n)", confirmation.pane_id));
+            let search_prompt = self.active_tab().and_then(|tab| {
                 self.panes
                     .get(&tab.focused)
                     .and_then(|pane| pane.copy.as_ref())
@@ -6611,20 +7038,12 @@ impl SessionActor {
                         })
                     })
             });
-            let prompt_active = prompt.is_some();
-            let status = prompt.unwrap_or_else(|| {
-                format!(
-                    " vvmux:{}  tab {}/{}{} (id:{})  panes:{}  rev:{}{} ",
-                    self.name,
-                    tab_number,
-                    self.tabs.len(),
-                    tab_name,
-                    tab_id,
-                    self.panes.len(),
-                    self.layout_revision,
-                    sync
-                )
-            });
+            let prompt_active =
+                rename_prompt.is_some() || close_prompt.is_some() || search_prompt.is_some();
+            let status = rename_prompt
+                .or(close_prompt)
+                .or(search_prompt)
+                .unwrap_or_else(|| tab_status_text(&self.tabs, self.active_tab, screen.columns));
             let style = theme.status();
             let row = screen.rows - 1;
             if theme.status_fill {
@@ -6633,13 +7052,7 @@ impl SessionActor {
                 screen.fill_row(row, style);
             }
             screen.draw_text(0, row, &status, style);
-            if !prompt_active && !sync.is_empty() {
-                let start = status.chars().count().saturating_sub(5);
-                screen.restyle(start as u16, row, 4, theme.sync_indicator());
-            }
-            if self.agent_navigator.is_none()
-                && (status.starts_with('/') || status.starts_with('?'))
-            {
+            if self.agent_navigator.is_none() && self.tab_navigator.is_none() && prompt_active {
                 screen.cursor = Some((
                     status.chars().count().min(usize::from(screen.columns - 1)) as u16,
                     row,
@@ -9044,6 +9457,172 @@ fn mouse_selection_runs(
     runs
 }
 
+fn tab_status_text(tabs: &[Tab], active: usize, columns: u16) -> String {
+    let width = usize::from(columns);
+    if width == 0 || tabs.is_empty() {
+        return String::new();
+    }
+    let active = active.min(tabs.len() - 1);
+    let segments = tabs
+        .iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            let number = index + 1;
+            let label = tab
+                .name
+                .as_deref()
+                .map(single_line)
+                .filter(|name| !name.trim().is_empty())
+                .map_or_else(|| number.to_string(), |name| format!("{number}:{name}"));
+            if index == active {
+                format!("[{label}]")
+            } else {
+                label
+            }
+        })
+        .collect::<Vec<_>>();
+    let all = render_tab_status_window(&segments, 0, segments.len());
+    if all.chars().count() <= width {
+        return all;
+    }
+
+    let mut start = active;
+    let mut end = active + 1;
+    loop {
+        let mut changed = false;
+        if start > 0 {
+            let candidate = render_tab_status_window(&segments, start - 1, end);
+            if candidate.chars().count() <= width {
+                start -= 1;
+                changed = true;
+            }
+        }
+        if end < segments.len() {
+            let candidate = render_tab_status_window(&segments, start, end + 1);
+            if candidate.chars().count() <= width {
+                end += 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let visible = render_tab_status_window(&segments, start, end);
+    if visible.chars().count() <= width {
+        visible
+    } else {
+        render_narrow_active_tab(&segments[active], start > 0, end < segments.len(), width)
+    }
+}
+
+fn render_tab_status_window(segments: &[String], start: usize, end: usize) -> String {
+    let mut visible = Vec::with_capacity(end.saturating_sub(start) + 2);
+    if start > 0 {
+        visible.push("<".to_owned());
+    }
+    visible.extend_from_slice(&segments[start..end]);
+    if end < segments.len() {
+        visible.push(">".to_owned());
+    }
+    format!(" {} ", visible.join(" "))
+}
+
+fn clip_chars(text: &str, width: usize) -> String {
+    text.chars().take(width).collect()
+}
+
+fn render_narrow_active_tab(segment: &str, left: bool, right: bool, width: usize) -> String {
+    let prefix = if left { " < " } else { " " };
+    let suffix = if right { " >" } else { " " };
+    let fixed = prefix.chars().count() + suffix.chars().count();
+    if fixed >= width {
+        return clip_chars(&format!("{prefix}{suffix}"), width);
+    }
+    let available = width - fixed;
+    let clipped = if segment.starts_with('[') && segment.ends_with(']') && available >= 2 {
+        let inner = &segment[1..segment.len() - 1];
+        format!("[{}]", clip_chars(inner, available - 2))
+    } else {
+        clip_chars(segment, available)
+    };
+    format!("{prefix}{clipped}{suffix}")
+}
+
+fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
+fn apply_tab_rename_input(rename: &mut TabRename, bytes: &[u8]) -> TabRenameInput {
+    rename.pending_utf8.extend_from_slice(bytes);
+    let mut offset = 0;
+    while offset < rename.pending_utf8.len() {
+        let byte = rename.pending_utf8[offset];
+        if byte.is_ascii() {
+            offset += 1;
+            match byte {
+                0x1b => {
+                    rename.pending_utf8.clear();
+                    return TabRenameInput::Cancel;
+                }
+                b'\r' | b'\n' => {
+                    rename.pending_utf8.clear();
+                    return TabRenameInput::Commit;
+                }
+                0x08 | 0x7f => {
+                    rename.value.pop();
+                }
+                value if !value.is_ascii_control() && rename.value.len() < MAX_TAB_NAME_BYTES => {
+                    rename.value.push(char::from(value));
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        let width = match byte {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => {
+                offset += 1;
+                continue;
+            }
+        };
+        if rename.pending_utf8.len() - offset < width {
+            break;
+        }
+        let candidate = &rename.pending_utf8[offset..offset + width];
+        if let Ok(text) = std::str::from_utf8(candidate) {
+            if let Some(character) = text.chars().next()
+                && !character.is_control()
+                && rename.value.len().saturating_add(width) <= MAX_TAB_NAME_BYTES
+            {
+                rename.value.push(character);
+            }
+            offset += width;
+        } else {
+            // Discard only the invalid lead byte so a following ASCII Enter/Escape is still
+            // interpreted as prompt control rather than swallowed as a fake continuation.
+            offset += 1;
+        }
+    }
+    rename.pending_utf8.drain(..offset);
+    TabRenameInput::Editing
+}
+
+fn tab_navigator_rect(area: Rect, row_count: usize) -> Option<Rect> {
+    agent_navigator_rect(area, row_count)
+}
+
 fn agent_navigator_rect(area: Rect, row_count: usize) -> Option<Rect> {
     if area.width < 20 || area.height < 3 {
         return None;
@@ -9834,6 +10413,105 @@ mod tests {
             zoomed: None,
             sync_input: false,
         }
+    }
+
+    fn status_tab(id: u64, name: Option<&str>) -> Tab {
+        Tab {
+            id,
+            name: name.map(ToOwned::to_owned),
+            tree: Some(TiledNode::leaf(id)),
+            floating: FloatingLayer::default(),
+            focused: id,
+            last_focused_tiled: Some(id),
+            zoomed: None,
+            sync_input: false,
+        }
+    }
+
+    #[test]
+    fn status_lists_only_numbered_tabs_and_marks_the_active_one() {
+        let tabs = [
+            status_tab(41, Some("dev")),
+            status_tab(99, None),
+            status_tab(7, Some("logs\nprod")),
+        ];
+        let status = tab_status_text(&tabs, 1, 80);
+        assert_eq!(status, " 1:dev [2] 3:logs prod ");
+        assert!(!status.contains("id:"));
+        assert!(!status.contains("rev:"));
+        assert!(!status.contains("vvmux:"));
+    }
+
+    #[test]
+    fn narrow_tab_status_keeps_the_active_segment_visible() {
+        let tabs = [
+            status_tab(1, Some("one")),
+            status_tab(2, Some("two")),
+            status_tab(3, Some("three")),
+            status_tab(4, Some("four")),
+        ];
+        let status = tab_status_text(&tabs, 2, 14);
+        assert!(status.contains("[3:three]"), "{status:?}");
+        assert!(
+            status.contains('<'),
+            "left overflow must be visible: {status:?}"
+        );
+        assert!(
+            status.contains('>'),
+            "right overflow must be visible: {status:?}"
+        );
+        assert!(status.chars().count() <= 14);
+
+        let long = [
+            status_tab(1, Some("one")),
+            status_tab(2, Some("a-name-that-is-much-too-long")),
+            status_tab(3, Some("three")),
+        ];
+        let status = tab_status_text(&long, 1, 14);
+        assert!(status.contains('<'), "{status:?}");
+        assert!(status.contains('>'), "{status:?}");
+        assert!(status.contains('[') && status.contains(']'), "{status:?}");
+        assert!(status.chars().count() <= 14);
+    }
+
+    #[test]
+    fn tab_rename_input_is_bounded_fragment_safe_and_editable() {
+        let mut rename = TabRename {
+            tab_id: 1,
+            value: "dev".into(),
+            pending_utf8: Vec::new(),
+        };
+        assert_eq!(
+            apply_tab_rename_input(&mut rename, &[0xc3]),
+            TabRenameInput::Editing
+        );
+        assert_eq!(
+            apply_tab_rename_input(&mut rename, &[0xa9, 0x7f, b'X']),
+            TabRenameInput::Editing
+        );
+        assert_eq!(rename.value, "devX");
+        assert_eq!(
+            apply_tab_rename_input(&mut rename, b"\r"),
+            TabRenameInput::Commit
+        );
+
+        rename.value = "x".repeat(MAX_TAB_NAME_BYTES);
+        assert_eq!(
+            apply_tab_rename_input(&mut rename, b"ignored"),
+            TabRenameInput::Editing
+        );
+        assert_eq!(rename.value.len(), MAX_TAB_NAME_BYTES);
+        assert_eq!(
+            apply_tab_rename_input(&mut rename, b"\x1b"),
+            TabRenameInput::Cancel
+        );
+
+        rename.pending_utf8.clear();
+        assert_eq!(
+            apply_tab_rename_input(&mut rename, &[0xc3, b'\r']),
+            TabRenameInput::Commit,
+            "an invalid UTF-8 lead byte must not swallow Enter"
+        );
     }
 
     #[test]

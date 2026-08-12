@@ -42,6 +42,7 @@ status_background = "blue"
 # search_current_foreground = "bright-white"
 # search_current_background = "magenta"
 # Status-row indicator color for synchronized input; frame titles use their normal title color.
+# Legacy compatibility key; the tabs-only status row has no separate sync segment.
 # sync_indicator = "bright-cyan"
 # The status bar paints its background across the full width. Set false for the
 # older look, where the background stopped where the text did.
@@ -75,6 +76,13 @@ outbound_queue_bytes = 4194304
 
 [keys.prefix]
 a = "agent-navigator"
+h = "focus-left"
+j = "focus-down"
+k = "focus-up"
+l = "focus-right"
+w = "tab-navigator"
+"," = "rename-tab"
+x = "confirm-close-pane"
 S = "toggle-sync-input"
 f = "new-floating-pane"
 F = "toggle-floating-panes"

@@ -289,7 +289,7 @@ to advance; when both
 
 Requests and input are limited to 1 MiB, decoded replies to 16 MiB, row requests and key repeats to
 1,000, and regular expressions to 8 KiB. The server bounds connections, in-flight requests,
-waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 16 is a hard
+waiters, response work, screen-delta history, and recent process-exit tombstones. VVMX 17 is a hard
 private-protocol cutover, so sessions created by older binaries must be restarted after upgrading.
 
 ## Network session gateway
@@ -361,9 +361,13 @@ The prefix is `Ctrl-b`.
 | `Ctrl-b Ctrl-b` | Send a literal `Ctrl-b` |
 | `Ctrl-b %` / `Ctrl-b "` | Split left/right or top/bottom |
 | `Ctrl-b Arrow` | Focus direction |
+| `Ctrl-b h` / `j` / `k` / `l` | Focus left/down/up/right |
 | `Ctrl-b Ctrl-Arrow` | Resize by one cell |
-| `Ctrl-b c`, `n`, `p`, `0`–`9` | Create/cycle/select tabs |
-| `Ctrl-b x`, then `y` | Close the focused pane |
+| `Ctrl-b c`, `n`, `p` | Create/cycle tabs |
+| `Ctrl-b 1`–`9` | Select tabs 1–9 |
+| `Ctrl-b w` | Open or close the tab navigator |
+| `Ctrl-b ,` | Rename the active tab |
+| `Ctrl-b x`, then `y` / `n` | Confirm or cancel closing the focused pane |
 | `Ctrl-b z` | Toggle zoom |
 | `Ctrl-b S` | Toggle synchronized input for the active tab |
 | `Ctrl-b a` | Open or close the AI-agent navigator |
@@ -377,6 +381,11 @@ The agent navigator includes detected agents from every tab and orders them bloc
 working, then idle. Arrows or `j`/`k` select, Home/End and Page Up/Down scroll, Enter jumps to the
 pane, and `q` or Escape closes it. Mouse wheel and row clicks are supported. The popup is a
 transient compositor overlay, not a shell pane, so it never changes layout or media ownership.
+
+The tab navigator is the corresponding tab-scoped popup. Arrows or `j`/`k` select, Enter jumps to
+the tab, and `q` or Escape closes it. Mouse wheel and row clicks are supported. Tab rename uses the
+status row, starts with the current name, commits with Enter, cancels with Escape, and clears the
+custom name when submitted empty.
 
 Copy mode accepts arrows, Page Up/Down, Space to start selection, Enter to copy, and `q` or Escape
 to cancel. `/` and `?` open forward and backward smart-case regular-expression search; `n` repeats
@@ -395,7 +404,7 @@ focus.
 Synchronized input fans ordinary typing and paste out to every live tiled and floating pane in the
 active tab, including hidden floats and panes hidden by zoom. Copy-mode panes are excluded, and a
 focused copy-mode pane suppresses fan-out entirely. The setting belongs to one tab and does not
-follow tab switches. Every frame title and the status row show `sync` while it is enabled.
+follow tab switches. Every frame title shows `sync` while it is enabled.
 
 Mouse clicks focus panes. Tiled border drags resize. On a floating pane, the top title frame moves
 the pane, while side/bottom frames and corners resize it; drag geometry is based on the press-time
@@ -475,12 +484,18 @@ active_frame = "#ff8800"
 The keys are `preset`, `active_frame`, `inactive_frame`, `active_title`, `inactive_title`,
 `frame_background`, `status_foreground`, `status_background`, `status_fill`,
 `search_match_foreground`, `search_match_background`, `search_current_foreground`, and
-`search_current_background`, plus the status-row `sync_indicator`. Titles default to their frame
+`search_current_background`. The legacy `sync_indicator` key remains accepted, although the
+tabs-only status row no longer renders a separate sync segment. Titles default to their frame
 color. An unknown preset name or
 malformed color is rejected at startup with a message listing the accepted values.
 
 The status bar paints its background across the full width. Set `status_fill = false` for the
 earlier behavior, where the background stopped where the text did.
+
+The ordinary status text is the complete numbered tab list: unnamed tabs appear as `1`, named tabs
+as `1:name`, and the active tab as `[1:name]`. On a narrow display the list windows around the active
+tab and uses `<` / `>` overflow markers. Search, rename, and close-confirmation prompts temporarily
+replace that list.
 
 `[appearance]` is deprecated in favor of `[theme]`. It still works, still takes palette indexes
 only, and still overrides a `preset`, so existing configs render exactly as before.

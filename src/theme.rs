@@ -187,13 +187,6 @@ impl ResolvedTheme {
             background: self.search_current_background,
         }
     }
-
-    pub fn sync_indicator(&self) -> TextStyle {
-        TextStyle {
-            foreground: self.sync_indicator,
-            background: self.status_background,
-        }
-    }
 }
 
 /// The built-in look: exactly the colors vvmux used before themes existed.
@@ -522,13 +515,5 @@ mod tests {
             "both focus states share the frame background"
         );
         assert_eq!(resolved.status().foreground, resolved.status_foreground);
-        assert_eq!(
-            resolved.sync_indicator().foreground,
-            resolved.sync_indicator
-        );
-        assert_eq!(
-            resolved.sync_indicator().background,
-            resolved.status_background
-        );
     }
 }

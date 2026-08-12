@@ -95,7 +95,7 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 16 is a hard cutover. In addition to complete track identity and binary media,
+Private VVMX version 17 is a hard cutover. In addition to complete track identity and binary media,
 it adds deterministic outer/rendered completion waits, stable tab-ID selection, correlated
 diagnostics, PTY-write reports, and process-anchored recovery traces. Its binary media header carries complete track identity
 and bounded binary render/media records,
@@ -108,7 +108,7 @@ are reactivated without inventing a PLAY transition. Mixed VVMX versions are rej
 guidance.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 16 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 17 → outer vvmux producer → Vivido
 ```
 
 ## Plugin boundary

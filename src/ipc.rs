@@ -16,13 +16,14 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Version 16 is the hard cutover for deterministic automation waits and correlated diagnostics.
+/// Version 17 adds actor-owned tab-navigation, rename, and close-confirmation actions.
+/// Version 16 was the hard cutover for deterministic automation waits and correlated diagnostics.
 /// Agent IDs remain strings on this wire, so replacing the closed Rust enum with validated plugin
 /// IDs does not change its encoding.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 16;
+pub const VERSION: u16 = 17;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -376,6 +377,10 @@ pub enum Action {
     NextTab,
     PreviousTab,
     SelectTab(usize),
+    ToggleTabNavigator,
+    BeginRenameTab,
+    BeginClosePaneConfirmation,
+    ResolveClosePaneConfirmation(bool),
     ClosePane,
     ToggleZoom,
     ToggleSyncInput,
