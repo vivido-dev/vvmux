@@ -6,6 +6,7 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use vvmux_terminal::pty::PtyProcess;
 
 fn normalized(transcript: &[u8]) -> String {
@@ -42,11 +43,16 @@ fn probe_first_image_after_cls() {
         .parent()
         .unwrap()
         .join("vivi/target/debug/vivi.exe");
-    let test_png = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("vivi/test.png");
-    assert!(vivi.exists() && test_png.exists());
+    assert!(vivi.exists());
+    let image_directory = tempfile::tempdir().unwrap();
+    let test_png = image_directory.path().join("test.png");
+    std::fs::write(
+        &test_png,
+        base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .unwrap(),
+    )
+    .unwrap();
     let session = format!(
         "imgprobe-{}-{}",
         std::process::id(),
@@ -96,7 +102,11 @@ fn probe_first_image_after_cls() {
     assert!(wait_for(">", 10_000, &mut transcript));
     let attach = format!("\"{}\" new -s {session}\r\n", executable.display());
     parts.input.send(attach.as_bytes()).unwrap();
-    assert!(wait_for("\u{1b}[?1049h", 15_000, &mut transcript));
+    assert!(
+        wait_for("\u{1b}[?1049h", 15_000, &mut transcript),
+        "vvmux did not enter its alternate screen: {}",
+        normalized(&transcript)
+    );
     wait_quiet(&mut transcript, 1500);
 
     parts

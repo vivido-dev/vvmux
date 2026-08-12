@@ -7,8 +7,9 @@ use base64::Engine;
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::ipc::{
-    Action, AutomationMethod, AutomationRequest, AutomationResponse, Axis, ClientMessage,
-    Direction, PluginMethod, RunPlacement, ServerMessage,
+    Action, AutomationCompletion, AutomationMethod, AutomationRequest, AutomationResponse, Axis,
+    ClientMessage, Direction, MediaTrackIdentity, MediaTrackWaitCondition, PluginMethod,
+    RunPlacement, ServerMessage,
 };
 use crate::media_trace::{
     MAX_MEDIA_TRACE_QUERY_EVENTS, MediaTraceBatch, MediaTraceCategory, MediaTraceFilter,
@@ -46,6 +47,52 @@ pub enum DirectionArg {
     Right,
     Up,
     Down,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CompletionArg {
+    Outer,
+    Rendered,
+}
+
+impl From<CompletionArg> for AutomationCompletion {
+    fn from(value: CompletionArg) -> Self {
+        match value {
+            CompletionArg::Outer => Self::Outer,
+            CompletionArg::Rendered => Self::Rendered,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MediaTrackConditionArg {
+    Visible,
+    Hidden,
+    OuterAttached,
+    KeyframeNeeded,
+    KeyframeRecovered,
+    Playing,
+    Paused,
+    Eos,
+    Lost,
+    QueueDrained,
+}
+
+impl From<MediaTrackConditionArg> for MediaTrackWaitCondition {
+    fn from(value: MediaTrackConditionArg) -> Self {
+        match value {
+            MediaTrackConditionArg::Visible => Self::Visible,
+            MediaTrackConditionArg::Hidden => Self::Hidden,
+            MediaTrackConditionArg::OuterAttached => Self::OuterAttached,
+            MediaTrackConditionArg::KeyframeNeeded => Self::KeyframeNeeded,
+            MediaTrackConditionArg::KeyframeRecovered => Self::KeyframeRecovered,
+            MediaTrackConditionArg::Playing => Self::Playing,
+            MediaTrackConditionArg::Paused => Self::Paused,
+            MediaTrackConditionArg::Eos => Self::Eos,
+            MediaTrackConditionArg::Lost => Self::Lost,
+            MediaTrackConditionArg::QueueDrained => Self::QueueDrained,
+        }
+    }
 }
 
 impl From<DirectionArg> for Direction {
@@ -156,6 +203,28 @@ pub enum MsgCommand {
     },
     /// List every pane in deterministic pane-ID order.
     ListPanes,
+    /// Inspect attachment, active selection, revisions, pending work, bridge, and queues.
+    SessionInspect,
+    /// List tabs with stable IDs in display order.
+    ListTabs,
+    /// Select a tab by its stable ID.
+    SelectTab {
+        #[arg(long)]
+        tab_id: u64,
+        #[arg(long, value_enum)]
+        wait: Option<CompletionArg>,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
+    },
+    /// Capture one non-blocking correlated diagnostic snapshot.
+    Diagnose {
+        #[arg(long, conflicts_with = "all_panes")]
+        pane_id: Option<u64>,
+        #[arg(long)]
+        all_panes: bool,
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(1..=512))]
+        trace_limit: u16,
+    },
     /// Report authoritative AI-agent state for one pane.
     ReportAgent {
         #[arg(long)]
@@ -237,7 +306,14 @@ pub enum MsgCommand {
         pane_id: Option<u64>,
     },
     /// Activate and focus one pane.
-    Focus(PaneTarget),
+    Focus {
+        #[arg(long)]
+        pane_id: Option<u64>,
+        #[arg(long, value_enum)]
+        wait: Option<CompletionArg>,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
+    },
     /// Close one explicitly identified pane.
     ClosePane {
         #[arg(long)]
@@ -248,6 +324,8 @@ pub enum MsgCommand {
         text: String,
         #[arg(long)]
         pane_id: Option<u64>,
+        #[arg(long)]
+        report: bool,
     },
     /// Encode and write a terminal key.
     Key {
@@ -258,12 +336,16 @@ pub enum MsgCommand {
         repeat: u16,
         #[arg(long)]
         pane_id: Option<u64>,
+        #[arg(long)]
+        report: bool,
     },
     /// Paste text, honoring the pane's bracketed-paste mode.
     Paste {
         text: String,
         #[arg(long)]
         pane_id: Option<u64>,
+        #[arg(long)]
+        report: bool,
     },
     /// Print pane text exactly, without a trailing newline.
     GetText {
@@ -380,6 +462,23 @@ pub enum WaitCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Wait for a named state on one completely identified virtual media track.
+    MediaTrack {
+        #[arg(value_enum)]
+        condition: MediaTrackConditionArg,
+        #[arg(long)]
+        producer_id: u64,
+        #[arg(long)]
+        context_id: u64,
+        #[arg(long)]
+        surface_id: u64,
+        #[arg(long)]
+        track_id: u64,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
 }
 
 pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()> {
@@ -439,6 +538,25 @@ pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()>
         }
         Output::TraceFollow => unreachable!(),
     }
+}
+
+/// Execute one structured automation request without printing it.
+pub(crate) fn request_json(
+    target: &str,
+    method: AutomationMethod,
+    pane_id: Option<u64>,
+    allow_focused: bool,
+) -> io::Result<serde_json::Value> {
+    crate::runtime::validate_session_name(target)?;
+    let request = AutomationRequest {
+        id: 1,
+        pane_id,
+        allow_focused,
+        method,
+    };
+    let (mut reader, writer) = crate::server::connect(target)?;
+    send_automation_request(&writer, request.clone())?;
+    response_result(receive_response(&mut reader, request.id)?)
 }
 
 fn send_automation_request(
@@ -535,6 +653,36 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             Output::Json,
         ),
         MsgCommand::ListPanes => (AutomationMethod::ListPanes, None, false, Output::Json),
+        MsgCommand::SessionInspect => (AutomationMethod::SessionInspect, None, false, Output::Json),
+        MsgCommand::ListTabs => (AutomationMethod::ListTabs, None, false, Output::Json),
+        MsgCommand::SelectTab {
+            tab_id,
+            wait,
+            timeout,
+        } => (
+            AutomationMethod::SelectTab {
+                tab_id,
+                wait: wait.map(Into::into),
+                timeout_ms: millis(timeout),
+            },
+            None,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::Diagnose {
+            pane_id,
+            all_panes,
+            trace_limit,
+        } => (
+            AutomationMethod::Diagnose {
+                pane_id,
+                all_panes,
+                trace_limit,
+            },
+            None,
+            false,
+            Output::Json,
+        ),
         MsgCommand::ReportAgent {
             agent,
             state,
@@ -656,22 +804,39 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 Output::Json,
             )
         }
-        MsgCommand::Focus(target) => (
-            AutomationMethod::Focus,
-            target.pane_id,
+        MsgCommand::Focus {
+            pane_id,
+            wait,
+            timeout,
+        } => (
+            wait.map_or(AutomationMethod::Focus, |wait| {
+                AutomationMethod::FocusWait {
+                    wait: wait.into(),
+                    timeout_ms: millis(timeout),
+                }
+            }),
+            pane_id,
             true,
-            Output::Silent,
+            if wait.is_some() {
+                Output::Json
+            } else {
+                Output::Silent
+            },
         ),
         MsgCommand::ClosePane { pane_id } => {
             (AutomationMethod::ClosePane, pane_id, false, Output::Silent)
         }
-        MsgCommand::Typing { text, pane_id } => {
+        MsgCommand::Typing {
+            text,
+            pane_id,
+            report,
+        } => {
             validate_input(&text)?;
             (
-                AutomationMethod::Typing { text },
+                AutomationMethod::Typing { text, report },
                 pane_id,
                 true,
-                Output::Silent,
+                if report { Output::Json } else { Output::Silent },
             )
         }
         MsgCommand::Key {
@@ -679,23 +844,29 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             mods,
             repeat,
             pane_id,
+            report,
         } => (
             AutomationMethod::Key {
                 key,
                 modifiers: mods,
                 repeat,
+                report,
             },
             pane_id,
             true,
-            Output::Silent,
+            if report { Output::Json } else { Output::Silent },
         ),
-        MsgCommand::Paste { text, pane_id } => {
+        MsgCommand::Paste {
+            text,
+            pane_id,
+            report,
+        } => {
             validate_input(&text)?;
             (
-                AutomationMethod::Paste { text },
+                AutomationMethod::Paste { text, report },
                 pane_id,
                 true,
-                Output::Silent,
+                if report { Output::Json } else { Output::Silent },
             )
         }
         MsgCommand::GetText { rows, pane_id } => (
@@ -833,6 +1004,29 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 AutomationMethod::WaitMedia {
                     after_virtual_revision: after_virtual,
                     after_outer_revision: after_outer,
+                    timeout_ms: millis(timeout),
+                },
+                pane_id,
+                true,
+                Output::Json,
+            ),
+            WaitCommand::MediaTrack {
+                condition,
+                producer_id,
+                context_id,
+                surface_id,
+                track_id,
+                timeout,
+                pane_id,
+            } => (
+                AutomationMethod::WaitMediaTrack {
+                    identity: MediaTrackIdentity {
+                        producer_id,
+                        context_id,
+                        surface_id,
+                        track_id,
+                    },
+                    condition: condition.into(),
                     timeout_ms: millis(timeout),
                 },
                 pane_id,

@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,8 @@ pub enum MediaPlaybackControl {
 #[serde(rename_all = "snake_case")]
 pub enum MediaKeyframeStage {
     OuterRequested,
+    ProducerQueued,
+    ProducerWritten,
     ProducerForwarded,
     ProducerDamped,
     ProducerIgnored,
@@ -147,6 +149,9 @@ pub struct BridgeMediaTraceEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaTraceEvent {
     pub sequence: u64,
+    pub process_id: u32,
+    pub process_instance_id: String,
+    pub startup_wall_clock_unix_ms: u64,
     pub monotonic_us: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_monotonic_us: Option<u64>,
@@ -157,6 +162,8 @@ pub struct MediaTraceEvent {
     pub virtual_source: Option<BridgeSourceKey>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_instance_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_sequence: Option<u64>,
     pub kind: MediaTraceKind,
 }
 
@@ -228,6 +235,7 @@ struct StoredEvent {
 
 pub struct MediaTraceJournal {
     started: Instant,
+    startup_wall_clock_unix_ms: u64,
     next_sequence: u64,
     bytes: usize,
     events: VecDeque<StoredEvent>,
@@ -245,6 +253,11 @@ impl MediaTraceJournal {
     fn with_limits(maximum_events: usize, maximum_bytes: usize) -> Self {
         Self {
             started: Instant::now(),
+            startup_wall_clock_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+                }),
             next_sequence: 0,
             bytes: 0,
             events: VecDeque::new(),
@@ -255,6 +268,7 @@ impl MediaTraceJournal {
 
     pub fn push(
         &mut self,
+        process_instance_id: &str,
         pane_id: Option<u64>,
         virtual_source: Option<BridgeSourceKey>,
         bridge_instance_id: Option<u64>,
@@ -262,13 +276,18 @@ impl MediaTraceJournal {
         kind: MediaTraceKind,
     ) {
         self.next_sequence = self.next_sequence.saturating_add(1);
+        let recovery_sequence = kind.is_recovery().then_some(self.next_sequence);
         let event = MediaTraceEvent {
             sequence: self.next_sequence,
+            process_id: std::process::id(),
+            process_instance_id: process_instance_id.to_owned(),
+            startup_wall_clock_unix_ms: self.startup_wall_clock_unix_ms,
             monotonic_us: u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
             origin_monotonic_us,
             pane_id,
             virtual_source,
             bridge_instance_id,
+            recovery_sequence,
             kind,
         };
         let bytes = serde_json::to_vec(&event).map_or(0, |encoded| encoded.len());
@@ -346,6 +365,7 @@ mod tests {
         let mut journal = MediaTraceJournal::with_limits(2, 64 * 1024);
         for id in 1..=3 {
             journal.push(
+                "test-instance",
                 Some(id),
                 Some(source(id)),
                 Some(9),
@@ -381,17 +401,19 @@ mod tests {
     fn pane_source_category_and_recovery_filters_are_exact() {
         let mut journal = MediaTraceJournal::default();
         journal.push(
+            "test-instance",
             Some(2),
             Some(source(1)),
             Some(4),
             None,
             MediaTraceKind::KeyframeRequest {
-                stage: MediaKeyframeStage::ProducerForwarded,
+                stage: MediaKeyframeStage::ProducerQueued,
                 minimum_epoch: Some(1),
                 reason: 1,
             },
         );
         journal.push(
+            "test-instance",
             Some(3),
             Some(source(2)),
             Some(4),

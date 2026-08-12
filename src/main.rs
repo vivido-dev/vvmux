@@ -26,7 +26,8 @@ mod server;
 mod session;
 mod theme;
 
-use std::io;
+use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -44,7 +45,7 @@ struct Cli {
     #[arg(long, global = true)]
     skill: bool,
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Option<Box<Command>>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -67,7 +68,30 @@ enum Command {
         replace: bool,
     },
     /// List live sessions owned by this user.
-    List,
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check registry identity, IPC responsiveness, attachment, queues, and revisions.
+    Doctor {
+        #[arg(short = 't', long = "target", default_value = "default")]
+        target: String,
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
+    /// Write an atomic, privacy-preserving diagnostic ZIP.
+    DebugBundle {
+        #[arg(short = 't', long = "target", default_value = "default")]
+        target: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        include_grid: bool,
+        #[arg(long)]
+        include_text: bool,
+        #[arg(long)]
+        include_logs: bool,
+    },
     /// Terminate a session and all of its panes.
     KillSession {
         #[arg(short = 't', long = "target")]
@@ -78,7 +102,7 @@ enum Command {
         #[arg(short = 't', long = "target")]
         target: Option<String>,
         #[command(subcommand)]
-        command: automation::MsgCommand,
+        command: Box<automation::MsgCommand>,
     },
     /// Install, inspect, and invoke user plugins.
     Plugin {
@@ -183,7 +207,30 @@ enum TokenCommand {
     },
 }
 
+#[cfg(not(windows))]
 fn main() {
+    main_entry();
+}
+
+// clap's generated parser visits the complete nested automation/plugin command tree. Windows gives
+// the process main thread a much smaller stack than the worker-thread default, so keep that parser
+// off the 1 MiB startup stack as the additive command surface grows.
+#[cfg(windows)]
+fn main() {
+    let worker = std::thread::Builder::new()
+        .name("vvmux-main".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(main_entry)
+        .unwrap_or_else(|error| {
+            eprintln!("vvmux: unable to start main worker: {error}");
+            std::process::exit(1);
+        });
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn main_entry() {
     if let Err(error) = run(Cli::parse()) {
         eprintln!("vvmux: {error}");
         std::process::exit(1);
@@ -195,7 +242,7 @@ fn run(cli: Cli) -> io::Result<()> {
         print!("{}", include_str!("../skills/vvmux/SKILL.md"));
         return Ok(());
     }
-    match cli.command {
+    match cli.command.map(|command| *command) {
         None => client::attach("default", false, true, cli.config.as_deref()),
         Some(Command::New {
             session,
@@ -215,23 +262,20 @@ fn run(cli: Cli) -> io::Result<()> {
             runtime::validate_session_name(&target)?;
             client::attach(&target, replace, false, cli.config.as_deref())
         }
-        Some(Command::List) => {
-            for session in runtime::list_registries()? {
-                match server::probe(&session.name) {
-                    Ok(()) => println!("{}\tpid {}", session.name, session.pid),
-                    Err(error) => eprintln!(
-                        "vvmux: ignoring unresponsive session {} (pid {}): {error}",
-                        session.name, session.pid
-                    ),
-                }
-            }
-            Ok(())
-        }
+        Some(Command::List { json }) => list_sessions(json),
+        Some(Command::Doctor { target, json }) => doctor(&target, json),
+        Some(Command::DebugBundle {
+            target,
+            output,
+            include_grid,
+            include_text,
+            include_logs,
+        }) => debug_bundle(&target, &output, include_grid, include_text, include_logs),
         Some(Command::KillSession { target }) => {
             runtime::validate_session_name(&target)?;
             client::kill(&target)
         }
-        Some(Command::Msg { target, command }) => automation::run(target.as_deref(), command),
+        Some(Command::Msg { target, command }) => automation::run(target.as_deref(), *command),
         Some(Command::Plugin { command }) => plugin::run(command),
         Some(Command::Integration { command }) => integration::run(command),
         #[cfg(feature = "server-capability")]
@@ -340,6 +384,260 @@ fn run(cli: Cli) -> io::Result<()> {
         #[cfg(windows)]
         Some(Command::ConsoleSelfTest) => platform::console_restoration_self_test(),
     }
+}
+
+fn list_sessions(json_output: bool) -> io::Result<()> {
+    let mut sessions = Vec::new();
+    for registry in runtime::list_registries()? {
+        match server::probe(&registry.name) {
+            Ok(()) => sessions.push(serde_json::json!({
+                "name": registry.name,
+                "pid": registry.pid,
+                "instance_nonce": registry.instance_nonce,
+                "vvmx_version": registry.vvmx_version,
+                "responsive": true,
+            })),
+            Err(error) if json_output => sessions.push(serde_json::json!({
+                "name": registry.name,
+                "pid": registry.pid,
+                "instance_nonce": registry.instance_nonce,
+                "vvmx_version": registry.vvmx_version,
+                "responsive": false,
+                "error": error.to_string(),
+            })),
+            Err(error) => eprintln!(
+                "vvmux: ignoring unresponsive session {} (pid {}): {error}",
+                registry.name, registry.pid
+            ),
+        }
+    }
+    if json_output {
+        serde_json::to_writer(
+            io::stdout().lock(),
+            &serde_json::json!({"schema_version": 1, "sessions": sessions}),
+        )
+        .map_err(io::Error::other)?;
+        println!();
+    } else {
+        for session in sessions {
+            println!(
+                "{}\tpid {}",
+                session["name"].as_str().unwrap_or("?"),
+                session["pid"]
+            );
+        }
+    }
+    Ok(())
+}
+
+fn doctor(target: &str, json_output: bool) -> io::Result<()> {
+    runtime::validate_session_name(target)?;
+    let registry = runtime::RuntimePaths::for_session(target)?.read_registry()?;
+    let inspect =
+        automation::request_json(target, ipc::AutomationMethod::SessionInspect, None, false)?;
+    let attached = !inspect["attachment"].is_null();
+    let pending_projections = inspect["pending"]["media_projections"]
+        .as_u64()
+        .unwrap_or(0);
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "status": if pending_projections == 0 { "ok" } else { "warning" },
+        "target": target,
+        "checks": {
+            "registry_identity": "ok",
+            "ipc_responsive": "ok",
+            "attached_client": attached,
+            "pending_media_projections": pending_projections,
+        },
+        "registry": {
+            "pid": registry.pid,
+            "instance_nonce": registry.instance_nonce,
+            "vvmx_version": registry.vvmx_version,
+        },
+        "session": inspect,
+    });
+    if json_output {
+        serde_json::to_writer(io::stdout().lock(), &report).map_err(io::Error::other)?;
+        println!();
+    }
+    Ok(())
+}
+
+fn debug_bundle(
+    target: &str,
+    output: &std::path::Path,
+    include_grid: bool,
+    include_text: bool,
+    include_logs: bool,
+) -> io::Result<()> {
+    let diagnose = automation::request_json(
+        target,
+        ipc::AutomationMethod::Diagnose {
+            pane_id: None,
+            all_panes: true,
+            trace_limit: if include_logs { 512 } else { 128 },
+        },
+        None,
+        false,
+    )?;
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "product": "vvmux",
+        "target": target,
+        "metadata_only_default": true,
+        "included": {"grid": include_grid, "text": include_text, "logs": include_logs},
+        "privacy": {
+            "process_arguments": false,
+            "environment": false,
+            "credentials": false,
+            "media_payloads": false,
+            "frame_hashes": false,
+        },
+    });
+    let mut entries = vec![
+        ("manifest.json".to_owned(), json_pretty(&manifest)?),
+        ("diagnose.json".to_owned(), json_pretty(&diagnose)?),
+    ];
+    if include_grid || include_text {
+        for pane in diagnose["panes"].as_array().into_iter().flatten() {
+            let Some(pane_id) = pane["pane"]["pane_id"].as_u64() else {
+                continue;
+            };
+            if include_grid {
+                let grid = automation::request_json(
+                    target,
+                    ipc::AutomationMethod::GetGrid {
+                        start_line: None,
+                        row_count: None,
+                        since_screen: None,
+                    },
+                    Some(pane_id),
+                    false,
+                )?;
+                entries.push((
+                    format!("content/pane-{pane_id}-grid.json"),
+                    json_pretty(&grid)?,
+                ));
+            }
+            if include_text {
+                let text = automation::request_json(
+                    target,
+                    ipc::AutomationMethod::GetText { rows: None },
+                    Some(pane_id),
+                    false,
+                )?;
+                entries.push((
+                    format!("content/pane-{pane_id}.txt"),
+                    text.as_str().unwrap_or_default().as_bytes().to_vec(),
+                ));
+            }
+        }
+    }
+    write_stored_zip(output, &entries)?;
+    println!("{}", output.display());
+    Ok(())
+}
+
+fn json_pretty(value: &serde_json::Value) -> io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(value).map_err(io::Error::other)
+}
+
+fn write_stored_zip(path: &std::path::Path, entries: &[(String, Vec<u8>)]) -> io::Result<()> {
+    #[cfg(unix)]
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("diagnostic bundle already exists: {}", path.display()),
+        ));
+    }
+    let temporary = path.with_extension(format!("zip.{}.tmp", std::process::id()));
+    #[cfg(unix)]
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    #[cfg(windows)]
+    let mut file = platform::create_secure_windows_registry_file(&temporary)?;
+    let result = (|| {
+        let mut central = Vec::new();
+        let mut offset = 0_u32;
+        for (name, bytes) in entries {
+            let name = name.as_bytes();
+            let name_length = u16::try_from(name.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ZIP name is too long"))?;
+            let size = u32::try_from(bytes.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "ZIP entry exceeds 4 GiB")
+            })?;
+            let crc = crc32(bytes);
+            let mut local = Vec::with_capacity(30 + name.len());
+            local.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+            local.extend_from_slice(&20_u16.to_le_bytes());
+            local.extend_from_slice(&[0; 8]);
+            local.extend_from_slice(&crc.to_le_bytes());
+            local.extend_from_slice(&size.to_le_bytes());
+            local.extend_from_slice(&size.to_le_bytes());
+            local.extend_from_slice(&name_length.to_le_bytes());
+            local.extend_from_slice(&0_u16.to_le_bytes());
+            local.extend_from_slice(name);
+            file.write_all(&local)?;
+            file.write_all(bytes)?;
+
+            central.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+            central.extend_from_slice(&20_u16.to_le_bytes());
+            central.extend_from_slice(&20_u16.to_le_bytes());
+            central.extend_from_slice(&[0; 8]);
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&name_length.to_le_bytes());
+            central.extend_from_slice(&[0; 12]);
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name);
+            offset = offset
+                .checked_add(u32::try_from(local.len() + bytes.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "ZIP archive exceeds 4 GiB")
+                })?)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "ZIP archive exceeds 4 GiB")
+                })?;
+        }
+        file.write_all(&central)?;
+        let central_size = u32::try_from(central.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ZIP index is too large"))?;
+        let count = u16::try_from(entries.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many ZIP entries"))?;
+        file.write_all(&0x0605_4b50_u32.to_le_bytes())?;
+        file.write_all(&[0; 4])?;
+        file.write_all(&count.to_le_bytes())?;
+        file.write_all(&count.to_le_bytes())?;
+        file.write_all(&central_size.to_le_bytes())?;
+        file.write_all(&offset.to_le_bytes())?;
+        file.write_all(&0_u16.to_le_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0_u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 #[cfg(test)]

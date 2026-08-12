@@ -99,6 +99,89 @@ done
     assert_success(&command(binary, &name, &["key", "Enter", "--pane-id", "2"]));
     wait_text(binary, &name, 2, "OUT pane=2:hello-top-right");
 
+    let write_report = json(command(
+        binary,
+        &name,
+        &["typing", "reported-input", "--pane-id", "2", "--report"],
+    ));
+    assert_eq!(write_report["pane_id"], 2);
+    assert_eq!(write_report["encoded_byte_count"], 14);
+    assert_eq!(write_report["pty_write_completed"], true);
+    assert_eq!(write_report["application_consumption_observed"], false);
+    assert_success(&command(binary, &name, &["key", "Enter", "--pane-id", "2"]));
+    wait_text(binary, &name, 2, "OUT pane=2:reported-input");
+
+    let session = json(command(binary, &name, &["session-inspect"]));
+    assert_eq!(session["session"], name);
+    assert_eq!(session["active_tab_id"], 1);
+    assert!(session["pending"]["actor_work"].is_u64());
+    assert!(session["queue_health"]["ipc"]["records_read"].is_u64());
+
+    let tabs = json(command(binary, &name, &["list-tabs"]));
+    assert_eq!(tabs["tabs"][0]["tab_id"], 1);
+    assert_eq!(tabs["tabs"][0]["active"], true);
+    let selected = json(command(binary, &name, &["select-tab", "--tab-id", "1"]));
+    assert_eq!(selected["tab_id"], 1);
+
+    let diagnosed = json(command(
+        binary,
+        &name,
+        &["diagnose", "--pane-id", "2", "--trace-limit", "16"],
+    ));
+    assert_eq!(diagnosed["schema_version"], 1);
+    assert_eq!(diagnosed["panes"][0]["pane"]["pane_id"], 2);
+    assert!(diagnosed["panes"][0]["trace"]["events"].is_array());
+
+    let doctor = Command::new(binary)
+        .args(["doctor", "--target", &name, "--json"])
+        .output()
+        .unwrap();
+    let doctor = json(doctor);
+    assert_eq!(doctor["checks"]["registry_identity"], "ok");
+    assert_eq!(doctor["checks"]["ipc_responsive"], "ok");
+
+    let listed = Command::new(binary)
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    let listed = json(listed);
+    assert!(
+        listed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["name"] == name && session["responsive"] == true)
+    );
+
+    let bundle = directory.path().join("diagnose.zip");
+    let bundled = Command::new(binary)
+        .args([
+            "debug-bundle",
+            "--target",
+            &name,
+            "--output",
+            bundle.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_success(&bundled);
+    let archive = fs::read(bundle).unwrap();
+    assert!(
+        archive
+            .windows(b"manifest.json".len())
+            .any(|part| part == b"manifest.json")
+    );
+    assert!(
+        archive
+            .windows(b"diagnose.json".len())
+            .any(|part| part == b"diagnose.json")
+    );
+    assert!(
+        !archive
+            .windows(b"content/".len())
+            .any(|part| part == b"content/")
+    );
+
     let top_right = text(command(binary, &name, &["get-text", "--pane-id", "2"]));
     assert!(top_right.contains("OUT pane=2:hello-top-right"));
     for pane in [1, 3, 4] {

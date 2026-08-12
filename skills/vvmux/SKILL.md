@@ -5,9 +5,25 @@ description: Discover and invoke the release-matched vvmux automation and plugin
 
 # vvmux automation
 
-Use `vvmux msg capabilities` before depending on a particular private VVMX method. Use
-`vvmux msg list-panes` to obtain exact pane identities, and pass `--pane-id` whenever the target
-matters. `VVMUX_PANE_ID` is accepted only when it belongs to the target session.
+Use this release-matched workflow:
+
+1. Discover with `vvmux list --json`, then check the selected session with `vvmux doctor --target
+   SESSION --json`.
+2. Capability-discover with `vvmux msg --target SESSION capabilities` and capture
+   `session-inspect`, `list-tabs`, and `list-panes`. Use exact stable tab and pane IDs.
+3. Capture the relevant screen, session, outer-projection, or trace sequence before acting.
+4. Use `focus` or `select-tab --tab-id ID` with `--wait outer` when media projection is the
+   assertion, or `--wait rendered` for the attached terminal frame. Use Vivido `wait frame`
+   separately when GPU presentation matters.
+5. Follow `trace-media --after SEQUENCE --follow` with complete owner filters during recovery.
+6. On failure, capture `diagnose --all-panes --trace-limit 512`; create a metadata-only
+   `vvmux debug-bundle` unless the user explicitly authorizes pane grid/text or log content.
+
+Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
+needed. It proves the bytes reached the PTY writer, not that the child application consumed them.
+Use `wait media-track` only with complete producer/context/surface/track identity. Never address a
+tab by its mutable display index. `VVMUX_PANE_ID` is accepted only when it belongs to the target
+session.
 
 Discover installed extension actions at runtime with:
 

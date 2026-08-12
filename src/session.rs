@@ -13,11 +13,12 @@ use vvmux_terminal::{Cell, Terminal, TerminalColor, TerminalEvent, TerminalModes
 use crate::agent::{AgentRuntime, AgentSnapshot, DetectorHandle, ProbeTarget, ProcessUpdate};
 use crate::config::Config;
 use crate::ipc::{
-    Action, AutomationError, AutomationMethod, AutomationRequest, AutomationResponse, Axis,
-    BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource, BridgeSourceDescriptor,
-    BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey, ClientMessage, Direction,
-    DisplayMetrics, FloatingEditCommand, FloatingEditKind, MouseEvent, MouseKind,
-    PluginEventEnvelope, ServerMessage, SharedWriter,
+    Action, AutomationCompletion, AutomationError, AutomationMethod, AutomationRequest,
+    AutomationResponse, Axis, BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource,
+    BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey,
+    ClientMessage, Direction, DisplayMetrics, FloatingEditCommand, FloatingEditKind,
+    MediaTrackIdentity, MediaTrackWaitCondition, MouseEvent, MouseKind, PluginEventEnvelope,
+    ServerMessage, SharedWriter,
 };
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
@@ -137,6 +138,9 @@ pub enum ActorEvent {
     AutomationInputComplete {
         reply: AutomationReplyTarget,
         result: Result<(), String>,
+        pane_id: PaneId,
+        byte_count: usize,
+        report: bool,
     },
     PluginComplete {
         reply: AutomationReplyTarget,
@@ -469,6 +473,16 @@ enum AutomationWaitKind {
         after_sequence: Option<u64>,
         limit: u16,
         filter: MediaTraceFilter,
+    },
+    Completion {
+        level: AutomationCompletion,
+        after_outer: u64,
+        after_session: u64,
+        result: serde_json::Value,
+    },
+    MediaTrack {
+        identity: MediaTrackIdentity,
+        condition: MediaTrackWaitCondition,
     },
 }
 
@@ -1595,10 +1609,27 @@ impl SessionActor {
                     self.close_pane(pane_id);
                 }
             }
-            ActorEvent::AutomationInputComplete { reply, result } => match result {
+            ActorEvent::AutomationInputComplete {
+                reply,
+                result,
+                pane_id,
+                byte_count,
+                report,
+            } => match result {
                 Ok(()) => {
                     self.complete_pending_actor_work(&reply);
-                    self.reply_automation(reply, serde_json::Value::Null);
+                    let result = if report {
+                        serde_json::json!({
+                            "pane_id": pane_id,
+                            "encoded_byte_count": byte_count,
+                            "input_sequence": reply.request_id,
+                            "pty_write_completed": true,
+                            "application_consumption_observed": false,
+                        })
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    self.reply_automation(reply, result);
                 }
                 Err(message) => {
                     self.complete_pending_actor_work(&reply);
@@ -1917,6 +1948,16 @@ impl SessionActor {
             ClientMessage::BridgeNeedKeyframes(requests) => {
                 if self.client_is(id) {
                     for request in requests {
+                        self.record_media_trace(
+                            Some(request.source),
+                            self.bridge_instance_id,
+                            None,
+                            MediaTraceKind::KeyframeRequest {
+                                stage: MediaKeyframeStage::ProducerQueued,
+                                minimum_epoch: request.minimum_epoch,
+                                reason: request.reason,
+                            },
+                        );
                         let outcome = self.vivid.request_keyframe(
                             request.source,
                             request.minimum_epoch,
@@ -1929,7 +1970,7 @@ impl SessionActor {
                             MediaTraceKind::KeyframeRequest {
                                 stage: match outcome {
                                     crate::media::KeyframeRequestOutcome::Forwarded => {
-                                        MediaKeyframeStage::ProducerForwarded
+                                        MediaKeyframeStage::ProducerWritten
                                     }
                                     crate::media::KeyframeRequestOutcome::Damped => {
                                         MediaKeyframeStage::ProducerDamped
@@ -2257,6 +2298,47 @@ impl SessionActor {
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
+            AutomationMethod::SessionInspect => {
+                self.reply_automation(target, self.automation_session_inspect());
+            }
+            AutomationMethod::ListTabs => {
+                self.reply_automation(target, self.automation_tabs());
+            }
+            AutomationMethod::SelectTab {
+                tab_id,
+                wait,
+                timeout_ms,
+            } => {
+                let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "tab_not_found",
+                            format!("tab {tab_id} does not exist"),
+                        ),
+                    );
+                    return;
+                };
+                let before_outer = self.outer_projection_revision;
+                self.active_tab = index;
+                self.force_full = true;
+                self.relayout();
+                let result = serde_json::json!({
+                    "tab_id": tab_id,
+                    "focused_pane_id": self.tabs[index].focused,
+                    "session_sequence": self.session_sequence,
+                    "layout_sequence": self.layout_revision,
+                });
+                self.finish_selection(target, wait, timeout_ms, before_outer, result);
+            }
+            AutomationMethod::Diagnose {
+                pane_id: requested_pane,
+                all_panes,
+                trace_limit,
+            } => match self.automation_diagnose(requested_pane, all_panes, trace_limit) {
+                Ok(result) => self.reply_automation(target, result),
+                Err(error) => self.reply_automation_error(target, error),
+            },
             AutomationMethod::ReportAgent {
                 agent,
                 state,
@@ -2400,18 +2482,35 @@ impl SessionActor {
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
+            AutomationMethod::FocusWait { wait, timeout_ms } => {
+                let pane_id = pane_id.unwrap();
+                let before_outer = self.outer_projection_revision;
+                match self.automation_focus(pane_id) {
+                    Ok(()) => {
+                        let result = serde_json::json!({
+                            "pane_id": pane_id,
+                            "tab_id": self.tabs[self.active_tab].id,
+                            "session_sequence": self.session_sequence,
+                            "layout_sequence": self.layout_revision,
+                        });
+                        self.finish_selection(target, Some(wait), timeout_ms, before_outer, result);
+                    }
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
             AutomationMethod::ClosePane => {
                 let pane_id = pane_id.unwrap();
                 self.close_pane(pane_id);
                 self.reply_automation(target, serde_json::Value::Null);
             }
-            AutomationMethod::Typing { text } => {
-                self.automation_input(target, pane_id.unwrap(), text.into_bytes());
+            AutomationMethod::Typing { text, report } => {
+                self.automation_input(target, pane_id.unwrap(), text.into_bytes(), report);
             }
             AutomationMethod::Key {
                 key,
                 modifiers,
                 repeat,
+                report,
             } => {
                 let pane_id = pane_id.unwrap();
                 let Some(pane) = self.panes.get(&pane_id) else {
@@ -2434,12 +2533,17 @@ impl SessionActor {
                             );
                             return;
                         }
-                        self.automation_input(target, pane_id, encoded.repeat(usize::from(repeat)));
+                        self.automation_input(
+                            target,
+                            pane_id,
+                            encoded.repeat(usize::from(repeat)),
+                            report,
+                        );
                     }
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
-            AutomationMethod::Paste { text } => {
+            AutomationMethod::Paste { text, report } => {
                 let pane_id = pane_id.unwrap();
                 let bracketed = self
                     .panes
@@ -2450,7 +2554,7 @@ impl SessionActor {
                     bytes.splice(0..0, b"\x1b[200~".iter().copied());
                     bytes.extend_from_slice(b"\x1b[201~");
                 }
-                self.automation_input(target, pane_id, bytes);
+                self.automation_input(target, pane_id, bytes, report);
             }
             AutomationMethod::GetText { rows } => {
                 match self.execute_session_command(
@@ -2837,6 +2941,21 @@ impl SessionActor {
                     kind: AutomationWaitKind::Media {
                         after_virtual_revision,
                         after_outer_revision,
+                    },
+                });
+            }
+            AutomationMethod::WaitMediaTrack {
+                identity,
+                condition,
+                timeout_ms,
+            } => {
+                self.add_automation_waiter(AutomationWaiter {
+                    reply: target,
+                    pane_id,
+                    deadline: deadline(timeout_ms),
+                    kind: AutomationWaitKind::MediaTrack {
+                        identity,
+                        condition,
                     },
                 });
             }
@@ -3268,6 +3387,159 @@ impl SessionActor {
         Ok(())
     }
 
+    fn finish_selection(
+        &mut self,
+        target: AutomationReplyTarget,
+        wait: Option<AutomationCompletion>,
+        timeout_ms: u64,
+        before_outer: u64,
+        result: serde_json::Value,
+    ) {
+        let Some(level) = wait else {
+            self.reply_automation(target, result);
+            return;
+        };
+        let supported = match level {
+            AutomationCompletion::Outer => {
+                self.attached.as_ref().is_some_and(|client| client.vivid)
+            }
+            AutomationCompletion::Rendered => self.attached.is_some(),
+        };
+        if !supported {
+            let message = match level {
+                AutomationCompletion::Outer => {
+                    "no attached Vivid-capable foreground client can acknowledge media projection"
+                }
+                AutomationCompletion::Rendered => {
+                    "no attached client can acknowledge the terminal frame"
+                }
+            };
+            self.reply_automation_error(
+                target,
+                AutomationError::new("missing_attachment", message),
+            );
+            return;
+        }
+        self.add_automation_waiter(AutomationWaiter {
+            reply: target,
+            pane_id: None,
+            deadline: deadline(timeout_ms),
+            kind: AutomationWaitKind::Completion {
+                level,
+                after_outer: before_outer,
+                after_session: self.session_sequence,
+                result,
+            },
+        });
+    }
+
+    fn automation_tabs(&self) -> serde_json::Value {
+        let tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let mut pane_ids = tab.tree.as_ref().map_or_else(Vec::new, TiledNode::pane_ids);
+                pane_ids.extend(tab.floating.pane_ids());
+                pane_ids.sort_unstable();
+                pane_ids.dedup();
+                serde_json::json!({
+                    "tab_id": tab.id,
+                    "display_index": index,
+                    "name": tab.name,
+                    "active": index == self.active_tab,
+                    "focused_pane_id": tab.focused,
+                    "pane_ids": pane_ids,
+                    "sync_input": tab.sync_input,
+                    "zoomed_pane_id": tab.zoomed,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "session": self.name,
+            "session_instance": self.session_instance,
+            "active_tab_id": self.active_tab().map(|tab| tab.id),
+            "tabs": tabs,
+        })
+    }
+
+    fn automation_session_inspect(&self) -> serde_json::Value {
+        let queue = self.relay_metrics();
+        serde_json::json!({
+            "schema_version": 1,
+            "session": self.name,
+            "session_instance": self.session_instance,
+            "attachment": self.attached.as_ref().map(|client| serde_json::json!({
+                "client_id": client.id,
+                "vivid_capable": client.vivid,
+                "acknowledged_frame": client.acknowledged_frame,
+                "rendered_session_sequence": client.rendered_session_sequence,
+                "pending_frame_acknowledgements": client.frame_sequences.len(),
+            })),
+            "active_tab_id": self.active_tab().map(|tab| tab.id),
+            "active_pane_id": self.active_tab().map(|tab| tab.focused),
+            "session_sequence": self.session_sequence,
+            "layout_revision": self.layout_revision,
+            "virtual_projection_revision": self.vivid.revision(),
+            "submitted_projection_revision": self.media_projection_revision,
+            "outer_projection_revision": self.outer_projection_revision,
+            "outer_apply_sequence": self.outer_apply_sequence,
+            "bridge_instance_id": self.bridge_instance_id,
+            "bridge_local_revision": self.bridge_local_revision,
+            "pending": {
+                "actor_work": self.pending_actor_work.len(),
+                "automation_waiters": self.automation_waiters.len(),
+                "media_projections": self.pending_media_projections.len(),
+                "render_scheduled": self.pending_render,
+            },
+            "queue_health": queue,
+            "tabs": self.automation_tabs()["tabs"],
+        })
+    }
+
+    fn automation_diagnose(
+        &self,
+        requested_pane: Option<PaneId>,
+        all_panes: bool,
+        trace_limit: u16,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let pane_ids = if all_panes {
+            self.panes.keys().copied().collect::<Vec<_>>()
+        } else {
+            vec![
+                requested_pane
+                    .or_else(|| self.active_tab().map(|tab| tab.focused))
+                    .ok_or_else(|| {
+                        AutomationError::new("no_focused_pane", "session has no pane")
+                    })?,
+            ]
+        };
+        let mut panes = Vec::with_capacity(pane_ids.len());
+        for pane_id in pane_ids {
+            let pane = self.pane_description(pane_id).ok_or_else(|| {
+                AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
+            })?;
+            let media = self.vivid.pane_status(
+                pane_id,
+                self.outer_media_projection(),
+                self.relay_metrics(),
+            );
+            let trace = self.media_trace.query(
+                None,
+                trace_limit,
+                Some(pane_id),
+                MediaTraceFilter::default(),
+            );
+            panes.push(serde_json::json!({"pane": pane, "media": media, "trace": trace}));
+        }
+        Ok(serde_json::json!({
+            "schema_version": 1,
+            "capture": {"atomic_actor_turn": true, "asynchronous_metric_age_ms": 0},
+            "session": self.automation_session_inspect(),
+            "panes": panes,
+        }))
+    }
+
     fn automation_action(
         &mut self,
         pane_id: PaneId,
@@ -3287,7 +3559,13 @@ impl SessionActor {
         }))
     }
 
-    fn automation_input(&mut self, target: AutomationReplyTarget, pane_id: PaneId, bytes: Vec<u8>) {
+    fn automation_input(
+        &mut self,
+        target: AutomationReplyTarget,
+        pane_id: PaneId,
+        bytes: Vec<u8>,
+        report: bool,
+    ) {
         if self.invalidate_mouse_selection_for_pane(pane_id) {
             self.schedule_render();
         }
@@ -3321,6 +3599,7 @@ impl SessionActor {
                 return;
             }
         };
+        let byte_count = bytes.len();
         let sender = self.sender.clone();
         let completion_target = target.clone();
         let spawn = std::thread::Builder::new()
@@ -3339,6 +3618,9 @@ impl SessionActor {
                 let _ = sender.send(ActorEvent::AutomationInputComplete {
                     reply: completion_target,
                     result,
+                    pane_id,
+                    byte_count,
+                    report,
                 });
             });
         if let Err(error) = spawn {
@@ -3755,6 +4037,94 @@ impl SessionActor {
                         .query(*after_sequence, *limit, waiter.pane_id, *filter);
                 (result.gap.is_some() || !result.events.is_empty()).then(|| {
                     serde_json::to_value(result).map_err(|error| {
+                        AutomationError::new("serialization_failed", error.to_string())
+                    })
+                })
+            }
+            AutomationWaitKind::Completion {
+                level,
+                after_outer,
+                after_session,
+                result,
+            } => {
+                let ready = match level {
+                    AutomationCompletion::Outer => {
+                        if self.attached.as_ref().is_none_or(|client| !client.vivid) {
+                            return Some(Err(AutomationError::new(
+                                "missing_attachment",
+                                "foreground Vivid bridge detached while waiting",
+                            )));
+                        }
+                        self.outer_projection_revision > *after_outer
+                    }
+                    AutomationCompletion::Rendered => {
+                        let Some(client) = self.attached.as_ref() else {
+                            return Some(Err(AutomationError::new(
+                                "missing_attachment",
+                                "terminal client detached while waiting for render",
+                            )));
+                        };
+                        client.rendered_session_sequence >= *after_session
+                    }
+                };
+                ready.then(|| {
+                    let mut result = result.clone();
+                    result["completion"] = serde_json::json!({
+                        "level": match level {
+                            AutomationCompletion::Outer => "outer",
+                            AutomationCompletion::Rendered => "rendered",
+                        },
+                        "outer_projection_revision": self.outer_projection_revision,
+                        "rendered_session_sequence": self.rendered_session_sequence(),
+                    });
+                    Ok(result)
+                })
+            }
+            AutomationWaitKind::MediaTrack {
+                identity,
+                condition,
+            } => {
+                let pane_id = waiter.pane_id?;
+                let status = self.vivid.pane_status(
+                    pane_id,
+                    self.outer_media_projection(),
+                    self.relay_metrics(),
+                );
+                let track = status.tracks.iter().find(|track| {
+                    track.producer_id == identity.producer_id
+                        && track.context_id == identity.context_id
+                        && track.surface_id == identity.surface_id
+                        && track.track_id == identity.track_id
+                });
+                let Some(track) = track else {
+                    return Some(Err(AutomationError::new(
+                        "track_not_found",
+                        "media track does not exist in the requested pane",
+                    )));
+                };
+                let clock_started = track.milestones & (1 << 6) != 0;
+                let eos = track.milestones & (1 << 7) != 0;
+                let random_access = track.milestones & (1 << 3) != 0;
+                let matched = match condition {
+                    MediaTrackWaitCondition::Visible => track.visible,
+                    MediaTrackWaitCondition::Hidden => !track.visible,
+                    MediaTrackWaitCondition::OuterAttached => {
+                        track.outer_mapping_fresh && track.outer_channel_generation.is_some()
+                    }
+                    MediaTrackWaitCondition::KeyframeNeeded => track.keyframe_needed,
+                    MediaTrackWaitCondition::KeyframeRecovered => {
+                        !track.keyframe_needed && random_access
+                    }
+                    MediaTrackWaitCondition::Playing => track.lifecycle == "playing",
+                    MediaTrackWaitCondition::Paused => track.lifecycle == "live" && clock_started,
+                    MediaTrackWaitCondition::Eos => eos || track.lifecycle == "ended",
+                    MediaTrackWaitCondition::Lost => track.lifecycle == "lost",
+                    MediaTrackWaitCondition::QueueDrained => {
+                        track.queued_packets == 0 && track.queued_bytes == 0
+                    }
+                };
+                matched.then(|| {
+                    serde_json::to_value(track).map_err(|error| {
                         AutomationError::new("serialization_failed", error.to_string())
                     })
                 })
@@ -6687,8 +7057,14 @@ impl SessionActor {
         kind: MediaTraceKind,
     ) {
         let pane = source.and_then(|source| self.vivid.pane_for_source(source));
-        self.media_trace
-            .push(pane, source, bridge_instance_id, origin_monotonic_us, kind);
+        self.media_trace.push(
+            &self.session_instance,
+            pane,
+            source,
+            bridge_instance_id,
+            origin_monotonic_us,
+            kind,
+        );
     }
 
     fn record_delivery_result(&mut self, delivery_id: u64, delivered: bool) {
@@ -7263,6 +7639,10 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
         method,
         AutomationMethod::Capabilities
             | AutomationMethod::ListPanes
+            | AutomationMethod::SessionInspect
+            | AutomationMethod::ListTabs
+            | AutomationMethod::SelectTab { .. }
+            | AutomationMethod::Diagnose { .. }
             | AutomationMethod::WaitRendered { .. }
             | AutomationMethod::ReloadConfig
             | AutomationMethod::Plugin(_)
@@ -7278,7 +7658,9 @@ fn event_sequence(envelope: &PluginEventEnvelope) -> Option<u64> {
 
 fn validate_automation_method(method: &AutomationMethod) -> Result<(), AutomationError> {
     let input = match method {
-        AutomationMethod::Typing { text } | AutomationMethod::Paste { text } => Some(text.len()),
+        AutomationMethod::Typing { text, .. } | AutomationMethod::Paste { text, .. } => {
+            Some(text.len())
+        }
         _ => None,
     };
     if input.is_some_and(|length| length > 1024 * 1024) {
@@ -7407,6 +7789,12 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 "media trace limit must be from 1 through 512",
             ))
         }
+        AutomationMethod::Diagnose { trace_limit, .. } if !(1..=512).contains(trace_limit) => {
+            Err(AutomationError::new(
+                "invalid_params",
+                "diagnostic trace limit must be from 1 through 512",
+            ))
+        }
         AutomationMethod::TraceMedia { filter, .. }
             if (filter.context_id.is_some()
                 || filter.surface_id.is_some()
@@ -7433,7 +7821,14 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 | AutomationMethod::WaitScreenStable { timeout_ms, .. }
                 | AutomationMethod::WaitRendered { timeout_ms, .. }
                 | AutomationMethod::WaitExit { timeout_ms }
-                | AutomationMethod::WaitMedia { timeout_ms, .. } => Some(*timeout_ms),
+                | AutomationMethod::WaitMedia { timeout_ms, .. }
+                | AutomationMethod::WaitMediaTrack { timeout_ms, .. }
+                | AutomationMethod::FocusWait { timeout_ms, .. } => Some(*timeout_ms),
+                AutomationMethod::SelectTab {
+                    wait: Some(_),
+                    timeout_ms,
+                    ..
+                } => Some(*timeout_ms),
                 AutomationMethod::TraceMedia { timeout_ms, .. } if *timeout_ms != 0 => {
                     Some(*timeout_ms)
                 }
@@ -7472,13 +7867,18 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
         "protocol": "VVMX",
         "protocol_version": crate::ipc::VERSION,
         "methods": [
-            "capabilities", "list_panes", "inspect", "inspect_media", "split", "focus", "close_pane",
+            "capabilities", "list_panes", "session_inspect", "list_tabs", "select_tab", "diagnose",
+            "inspect", "inspect_media", "split", "focus", "focus_wait", "close_pane",
             "typing", "key", "paste", "get_text", "get_grid", "search", "set_sync_input", "wait_text",
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
+            "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report"
         ],
         "limits": automation_limits(),
-        "render_acknowledgment": "attached_client_write",
+        "completion_waits": {
+            "outer": "foreground_bridge_projection_acknowledgement",
+            "rendered": "attached_client_terminal_frame_acknowledgement",
+        },
         "plugins": plugin,
     })
 }
@@ -9924,6 +10324,7 @@ mod tests {
                 key: "x".into(),
                 modifiers: Vec::new(),
                 repeat: 0,
+                report: false,
             })
             .is_err()
         );

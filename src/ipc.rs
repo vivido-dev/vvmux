@@ -16,13 +16,13 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Version 15 is the current hard cutover for plugin control and complete media-track identity.
+/// Version 16 is the hard cutover for deterministic automation waits and correlated diagnostics.
 /// Agent IDs remain strings on this wire, so replacing the closed Rust enum with validated plugin
 /// IDs does not change its encoding.
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 15;
+pub const VERSION: u16 = 16;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -78,6 +78,18 @@ pub struct AutomationRequest {
 pub enum AutomationMethod {
     Capabilities,
     ListPanes,
+    SessionInspect,
+    ListTabs,
+    SelectTab {
+        tab_id: u64,
+        wait: Option<AutomationCompletion>,
+        timeout_ms: u64,
+    },
+    Diagnose {
+        pane_id: Option<u64>,
+        all_panes: bool,
+        trace_limit: u16,
+    },
     ReportAgent {
         agent: crate::agent::AgentId,
         state: crate::agent::AgentState,
@@ -100,17 +112,24 @@ pub enum AutomationMethod {
         axis: Axis,
     },
     Focus,
+    FocusWait {
+        wait: AutomationCompletion,
+        timeout_ms: u64,
+    },
     ClosePane,
     Typing {
         text: String,
+        report: bool,
     },
     Key {
         key: String,
         modifiers: Vec<String>,
         repeat: u16,
+        report: bool,
     },
     Paste {
         text: String,
+        report: bool,
     },
     GetText {
         rows: Option<u16>,
@@ -173,6 +192,41 @@ pub enum AutomationMethod {
         after_outer_revision: Option<u64>,
         timeout_ms: u64,
     },
+    WaitMediaTrack {
+        identity: MediaTrackIdentity,
+        condition: MediaTrackWaitCondition,
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationCompletion {
+    Outer,
+    Rendered,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaTrackIdentity {
+    pub producer_id: u64,
+    pub context_id: u64,
+    pub surface_id: u64,
+    pub track_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaTrackWaitCondition {
+    Visible,
+    Hidden,
+    OuterAttached,
+    KeyframeNeeded,
+    KeyframeRecovered,
+    Playing,
+    Paused,
+    Eos,
+    Lost,
+    QueueDrained,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
