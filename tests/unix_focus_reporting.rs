@@ -8,11 +8,14 @@
 //! never asked for the mode echoed `^[[O`. Focus now reaches only a pane whose program enabled
 //! focus reporting, and only when that pane's own focus changed.
 
+#[allow(dead_code)]
+mod common;
+
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,13 +23,13 @@ use serde_json::Value;
 use vvmux_terminal::pty::PtyProcess;
 
 struct SessionGuard {
-    executable: PathBuf,
+    runtime: PathBuf,
     name: String,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let _ = Command::new(&self.executable)
+        let _ = common::vvmux_command(&self.runtime)
             .args(["kill-session", "-t", &self.name])
             .output();
     }
@@ -35,7 +38,15 @@ impl Drop for SessionGuard {
 #[test]
 fn focus_reports_reach_only_the_pane_that_asked_for_them() {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_vvmux"));
-    let directory = tempfile::tempdir().unwrap();
+    // Short `/tmp` root: the runtime directory holds the session socket, whose path must stay
+    // inside the platform's `sun_path` limit. Isolating `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR`
+    // keeps a developer's own `startup.toml` and live sessions out of this test's session.
+    let directory = tempfile::Builder::new()
+        .prefix("vvf-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = directory.path().to_path_buf();
     // Pane 1 asks for focus reporting; pane 2 never does. Both echo what they are sent, so a
     // report that reached the wrong pane is visible in that pane's own text.
     let shell = directory.path().join("fixture-shell");
@@ -75,19 +86,30 @@ done
             .as_nanos()
     );
     let guard = SessionGuard {
-        executable: executable.clone(),
+        runtime: runtime.clone(),
         name: session.clone(),
     };
 
     // The client only reads focus reports from its own terminal, so the session is hosted in a
-    // PTY the test can write raw bytes into.
+    // PTY the test can write raw bytes into. The hosted client owns the session, so it needs the
+    // same isolated runtime and config directories the `msg` commands use.
+    let isolation = [
+        (
+            "XDG_RUNTIME_DIR".to_owned(),
+            runtime.to_str().unwrap().to_owned(),
+        ),
+        (
+            "XDG_CONFIG_HOME".to_owned(),
+            runtime.to_str().unwrap().to_owned(),
+        ),
+    ];
     let parts = PtyProcess::spawn(
         std::ffi::OsStr::new("/bin/sh"),
         None,
         directory.path(),
         100,
         30,
-        &[],
+        &isolation,
     )
     .unwrap();
     let control = parts.control.clone();
@@ -118,50 +140,42 @@ done
         "the client never entered the alternate screen"
     );
 
-    wait_for_text(&executable, &session, 1, "READY pane=1");
-    wait_for_mode(&executable, &session, 1, "focus_reporting");
+    wait_for_text(&runtime, &session, 1, "READY pane=1");
+    wait_for_mode(&runtime, &session, 1, "focus_reporting");
     assert_success(&command(
-        &executable,
+        &runtime,
         &session,
         &["split", "vertical", "--pane-id", "1"],
     ));
-    wait_for_text(&executable, &session, 2, "READY pane=2");
+    wait_for_text(&runtime, &session, 2, "READY pane=2");
 
     // The split focused pane 2, so pane 1 has already been told it lost focus.
-    wait_for_text(&executable, &session, 1, "^[[O");
+    wait_for_text(&runtime, &session, 1, "^[[O");
 
-    assert_success(&command(
-        &executable,
-        &session,
-        &["focus", "--pane-id", "1"],
-    ));
-    wait_for_text(&executable, &session, 1, "^[[O^[[I");
+    assert_success(&command(&runtime, &session, &["focus", "--pane-id", "1"]));
+    wait_for_text(&runtime, &session, 1, "^[[O^[[I");
 
     // A blurred and refocused window is reported to the focused pane that asked for it.
     parts.input.send(b"\x1b[O").unwrap();
-    wait_for_text(&executable, &session, 1, "^[[O^[[I^[[O");
+    wait_for_text(&runtime, &session, 1, "^[[O^[[I^[[O");
     parts.input.send(b"\x1b[I").unwrap();
-    wait_for_text(&executable, &session, 1, "^[[O^[[I^[[O^[[I");
+    wait_for_text(&runtime, &session, 1, "^[[O^[[I^[[O^[[I");
 
     // Pane 2 holds focus for the rest of the run and never asked for focus reporting.
-    assert_success(&command(
-        &executable,
-        &session,
-        &["focus", "--pane-id", "2"],
-    ));
-    wait_for_text(&executable, &session, 1, "^[[O^[[I^[[O^[[I^[[O");
+    assert_success(&command(&runtime, &session, &["focus", "--pane-id", "2"]));
+    wait_for_text(&runtime, &session, 1, "^[[O^[[I^[[O^[[I^[[O");
     parts.input.send(b"\x1b[O").unwrap();
     parts.input.send(b"\x1b[I").unwrap();
     // Ordinary input still reaches the focused pane, and arrives after the discarded reports.
     parts.input.send(b"typed\r").unwrap();
-    wait_for_text(&executable, &session, 2, "OUT pane=2:typed");
+    wait_for_text(&runtime, &session, 2, "OUT pane=2:typed");
 
-    let pane_two = pane_text(&executable, &session, 2);
+    let pane_two = pane_text(&runtime, &session, 2);
     assert!(
         !pane_two.contains("^["),
         "a pane that never enabled focus reporting was sent one: {pane_two:?}"
     );
-    let pane_one = pane_text(&executable, &session, 1);
+    let pane_one = pane_text(&runtime, &session, 1);
     assert!(
         !pane_one.contains("^[[O^[[O") && !pane_one.contains("^[[I^[[I"),
         "focus was reported twice without an intervening change: {pane_one:?}"
@@ -196,9 +210,9 @@ fn wait_for(
     }
 }
 
-fn wait_for_text(executable: &Path, session: &str, pane: u64, text: &str) {
+fn wait_for_text(runtime: &Path, session: &str, pane: u64, text: &str) {
     let output = command(
-        executable,
+        runtime,
         session,
         &[
             "wait",
@@ -213,15 +227,15 @@ fn wait_for_text(executable: &Path, session: &str, pane: u64, text: &str) {
     assert!(
         output.status.success(),
         "pane {pane} never showed {text:?}: {}",
-        pane_text(executable, session, pane)
+        pane_text(runtime, session, pane)
     );
 }
 
-fn wait_for_mode(executable: &Path, session: &str, pane: u64, mode: &str) {
+fn wait_for_mode(runtime: &Path, session: &str, pane: u64, mode: &str) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let output = command(
-            executable,
+            runtime,
             session,
             &["inspect", "--pane-id", &pane.to_string()],
         );
@@ -242,9 +256,9 @@ fn wait_for_mode(executable: &Path, session: &str, pane: u64, mode: &str) {
     }
 }
 
-fn pane_text(executable: &Path, session: &str, pane: u64) -> String {
+fn pane_text(runtime: &Path, session: &str, pane: u64) -> String {
     let output = command(
-        executable,
+        runtime,
         session,
         &["get-text", "--pane-id", &pane.to_string()],
     );
@@ -252,8 +266,8 @@ fn pane_text(executable: &Path, session: &str, pane: u64) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn command(executable: &Path, session: &str, arguments: &[&str]) -> Output {
-    Command::new(executable)
+fn command(runtime: &Path, session: &str, arguments: &[&str]) -> Output {
+    common::vvmux_command(runtime)
         .args(["msg", "--target", session])
         .args(arguments)
         .output()

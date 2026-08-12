@@ -1,20 +1,23 @@
 #![cfg(unix)]
 
+#[allow(dead_code)]
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde_json::Value;
 
 struct SessionGuard {
-    binary: &'static str,
+    runtime: std::path::PathBuf,
     name: String,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let _ = Command::new(self.binary)
+        let _ = common::vvmux_command(&self.runtime)
             .args(["kill-session", "--target", &self.name])
             .output();
     }
@@ -22,8 +25,15 @@ impl Drop for SessionGuard {
 
 #[test]
 fn pane_automation_drives_and_observes_only_the_selected_pane() {
-    let binary = env!("CARGO_BIN_EXE_vvmux");
-    let directory = tempfile::tempdir().unwrap();
+    // Short `/tmp` root: the runtime directory holds the session socket, whose path must stay
+    // inside the platform's `sun_path` limit. Isolating `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR`
+    // keeps a developer's own `startup.toml` and live sessions out of this test's session.
+    let directory = tempfile::Builder::new()
+        .prefix("vva-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = directory.path().to_path_buf();
     let shell = directory.path().join("fixture-shell");
     fs::write(
         &shell,
@@ -50,7 +60,7 @@ done
     .unwrap();
 
     let name = format!("automation-test-{}", std::process::id());
-    let created = Command::new(binary)
+    let created = common::vvmux_command(&runtime)
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -63,44 +73,48 @@ done
         .unwrap();
     assert_success(&created);
     let _guard = SessionGuard {
-        binary,
+        runtime: runtime.clone(),
         name: name.clone(),
     };
 
-    wait_text(binary, &name, 1, "READY pane=1 tab=1");
+    wait_text(&runtime, &name, 1, "READY pane=1 tab=1");
     let right = json(command(
-        binary,
+        &runtime,
         &name,
         &["split", "vertical", "--pane-id", "1"],
     ));
     assert_eq!(right["new_pane_id"], 2);
     let bottom_left = json(command(
-        binary,
+        &runtime,
         &name,
         &["split", "horizontal", "--pane-id", "1"],
     ));
     assert_eq!(bottom_left["new_pane_id"], 3);
     let bottom_right = json(command(
-        binary,
+        &runtime,
         &name,
         &["split", "horizontal", "--pane-id", "2"],
     ));
     assert_eq!(bottom_right["new_pane_id"], 4);
 
     for pane in 1..=4 {
-        wait_text(binary, &name, pane, &format!("READY pane={pane} tab=1"));
+        wait_text(&runtime, &name, pane, &format!("READY pane={pane} tab=1"));
     }
 
     assert_success(&command(
-        binary,
+        &runtime,
         &name,
         &["typing", "hello-top-right", "--pane-id", "2"],
     ));
-    assert_success(&command(binary, &name, &["key", "Enter", "--pane-id", "2"]));
-    wait_text(binary, &name, 2, "OUT pane=2:hello-top-right");
+    assert_success(&command(
+        &runtime,
+        &name,
+        &["key", "Enter", "--pane-id", "2"],
+    ));
+    wait_text(&runtime, &name, 2, "OUT pane=2:hello-top-right");
 
     let write_report = json(command(
-        binary,
+        &runtime,
         &name,
         &["typing", "reported-input", "--pane-id", "2", "--report"],
     ));
@@ -108,23 +122,27 @@ done
     assert_eq!(write_report["encoded_byte_count"], 14);
     assert_eq!(write_report["pty_write_completed"], true);
     assert_eq!(write_report["application_consumption_observed"], false);
-    assert_success(&command(binary, &name, &["key", "Enter", "--pane-id", "2"]));
-    wait_text(binary, &name, 2, "OUT pane=2:reported-input");
+    assert_success(&command(
+        &runtime,
+        &name,
+        &["key", "Enter", "--pane-id", "2"],
+    ));
+    wait_text(&runtime, &name, 2, "OUT pane=2:reported-input");
 
-    let session = json(command(binary, &name, &["session-inspect"]));
+    let session = json(command(&runtime, &name, &["session-inspect"]));
     assert_eq!(session["session"], name);
     assert_eq!(session["active_tab_id"], 1);
     assert!(session["pending"]["actor_work"].is_u64());
     assert!(session["queue_health"]["ipc"]["records_read"].is_u64());
 
-    let tabs = json(command(binary, &name, &["list-tabs"]));
+    let tabs = json(command(&runtime, &name, &["list-tabs"]));
     assert_eq!(tabs["tabs"][0]["tab_id"], 1);
     assert_eq!(tabs["tabs"][0]["active"], true);
-    let selected = json(command(binary, &name, &["select-tab", "--tab-id", "1"]));
+    let selected = json(command(&runtime, &name, &["select-tab", "--tab-id", "1"]));
     assert_eq!(selected["tab_id"], 1);
 
     let diagnosed = json(command(
-        binary,
+        &runtime,
         &name,
         &["diagnose", "--pane-id", "2", "--trace-limit", "16"],
     ));
@@ -132,7 +150,7 @@ done
     assert_eq!(diagnosed["panes"][0]["pane"]["pane_id"], 2);
     assert!(diagnosed["panes"][0]["trace"]["events"].is_array());
 
-    let doctor = Command::new(binary)
+    let doctor = common::vvmux_command(&runtime)
         .args(["doctor", "--target", &name, "--json"])
         .output()
         .unwrap();
@@ -140,7 +158,7 @@ done
     assert_eq!(doctor["checks"]["registry_identity"], "ok");
     assert_eq!(doctor["checks"]["ipc_responsive"], "ok");
 
-    let listed = Command::new(binary)
+    let listed = common::vvmux_command(&runtime)
         .args(["list", "--json"])
         .output()
         .unwrap();
@@ -154,7 +172,7 @@ done
     );
 
     let bundle = directory.path().join("diagnose.zip");
-    let bundled = Command::new(binary)
+    let bundled = common::vvmux_command(&runtime)
         .args([
             "debug-bundle",
             "--target",
@@ -182,11 +200,11 @@ done
             .any(|part| part == b"content/")
     );
 
-    let top_right = text(command(binary, &name, &["get-text", "--pane-id", "2"]));
+    let top_right = text(command(&runtime, &name, &["get-text", "--pane-id", "2"]));
     assert!(top_right.contains("OUT pane=2:hello-top-right"));
     for pane in [1, 3, 4] {
         let output = text(command(
-            binary,
+            &runtime,
             &name,
             &["get-text", "--pane-id", &pane.to_string()],
         ));
@@ -195,7 +213,7 @@ done
             "output leaked into pane {pane}"
         );
     }
-    let listed = json(command(binary, &name, &["list-panes"]));
+    let listed = json(command(&runtime, &name, &["list-panes"]));
     assert_eq!(
         listed["panes"]
             .as_array()
@@ -208,7 +226,7 @@ done
     assert!(listed["panes"][0]["agent"].is_null());
 
     let reported = json(command(
-        binary,
+        &runtime,
         &name,
         &[
             "report-agent",
@@ -232,19 +250,19 @@ done
     assert_eq!(reported["agent"]["status"], "working");
     assert_eq!(reported["agent"]["source"], "report");
 
-    let after_report = json(command(binary, &name, &["list-panes"]));
+    let after_report = json(command(&runtime, &name, &["list-panes"]));
     let panes = after_report["panes"].as_array().unwrap();
     assert!(panes.iter().find(|pane| pane["pane_id"] == 1).unwrap()["agent"].is_null());
     assert_eq!(
         panes.iter().find(|pane| pane["pane_id"] == 2).unwrap()["agent"]["status"],
         "working"
     );
-    let inspected = json(command(binary, &name, &["inspect", "--pane-id", "2"]));
+    let inspected = json(command(&runtime, &name, &["inspect", "--pane-id", "2"]));
     assert_eq!(inspected["pane"]["agent"]["kind"], "codex");
     assert_eq!(inspected["pane"]["agent"]["source"], "report");
 
     let stale_report = command(
-        binary,
+        &runtime,
         &name,
         &[
             "report-agent",
@@ -264,7 +282,7 @@ done
     assert!(String::from_utf8_lossy(&stale_report.stderr).contains("invalid_agent_report"));
 
     let done = json(command(
-        binary,
+        &runtime,
         &name,
         &[
             "report-agent",
@@ -284,7 +302,7 @@ done
     assert_eq!(done["agent"]["status"], "done");
 
     assert_success(&command(
-        binary,
+        &runtime,
         &name,
         &[
             "clear-agent-report",
@@ -297,7 +315,7 @@ done
         ],
     ));
 
-    let missing_target = Command::new(binary)
+    let missing_target = common::vvmux_command(&runtime)
         .args([
             "msg",
             "--target",
@@ -319,9 +337,9 @@ done
     assert!(!missing_target.status.success());
     assert!(String::from_utf8_lossy(&missing_target.stderr).contains("requires --pane-id"));
 
-    let focused = text(command(binary, &name, &["get-text"]));
+    let focused = text(command(&runtime, &name, &["get-text"]));
     assert!(focused.contains("READY pane=4 tab=1"));
-    let inherited = Command::new(binary)
+    let inherited = common::vvmux_command(&runtime)
         .args(["msg", "get-text"])
         .env("VVMUX_SESSION", &name)
         .env("VVMUX_PANE_ID", "2")
@@ -329,7 +347,7 @@ done
         .unwrap();
     assert!(text(inherited).contains("READY pane=2 tab=1"));
 
-    let grid = json(command(binary, &name, &["get-grid", "--pane-id", "2"]));
+    let grid = json(command(&runtime, &name, &["get-grid", "--pane-id", "2"]));
     assert_eq!(grid["pane_id"], 2);
     assert!(grid["full"].as_bool().unwrap());
     assert!(grid["grid"]["columns"].as_u64().unwrap() >= 4);
@@ -345,7 +363,7 @@ done
 
     let sequence = grid["screen_sequence"].as_u64().unwrap();
     let unchanged = json(command(
-        binary,
+        &runtime,
         &name,
         &[
             "get-grid",
@@ -359,7 +377,7 @@ done
     assert!(unchanged["rows"].as_array().unwrap().is_empty());
 
     let stable = json(command(
-        binary,
+        &runtime,
         &name,
         &[
             "wait",
@@ -375,7 +393,7 @@ done
     assert_eq!(stable["pane_id"], 2);
 
     let trace = json(command(
-        binary,
+        &runtime,
         &name,
         &["trace-media", "--pane-id", "2", "--limit", "16"],
     ));
@@ -384,34 +402,38 @@ done
     assert!(trace["events"].as_array().is_some());
 
     assert_success(&command(
-        binary,
+        &runtime,
         &name,
         &["typing", "exit", "--pane-id", "4"],
     ));
-    assert_success(&command(binary, &name, &["key", "Enter", "--pane-id", "4"]));
+    assert_success(&command(
+        &runtime,
+        &name,
+        &["key", "Enter", "--pane-id", "4"],
+    ));
     let exited = json(command(
-        binary,
+        &runtime,
         &name,
         &["wait", "exit", "--pane-id", "4", "--timeout", "2s"],
     ));
     assert_eq!(exited["code"], 0);
     assert_eq!(exited["success"], true);
-    let stale = command(binary, &name, &["get-text", "--pane-id", "4"]);
+    let stale = command(&runtime, &name, &["get-text", "--pane-id", "4"]);
     assert!(!stale.status.success());
     assert!(String::from_utf8_lossy(&stale.stderr).contains("pane_not_found"));
 }
 
-fn command(binary: &str, session: &str, arguments: &[&str]) -> Output {
-    Command::new(binary)
+fn command(runtime: &Path, session: &str, arguments: &[&str]) -> Output {
+    common::vvmux_command(runtime)
         .args(["msg", "--target", session])
         .args(arguments)
         .output()
         .unwrap()
 }
 
-fn wait_text(binary: &str, session: &str, pane: u64, pattern: &str) {
+fn wait_text(runtime: &Path, session: &str, pane: u64, pattern: &str) {
     let output = command(
-        binary,
+        runtime,
         session,
         &[
             "wait",

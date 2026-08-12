@@ -2,28 +2,31 @@
 
 //! `vvmux msg run`, end to end against a real detached session.
 
+#[allow(dead_code)]
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Output};
+use std::path::PathBuf;
+use std::process::Output;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 struct SessionGuard {
-    binary: &'static str,
+    runtime: PathBuf,
     name: String,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let _ = Command::new(self.binary)
+        let _ = common::vvmux_command(&self.runtime)
             .args(["kill-session", "--target", &self.name])
             .output();
     }
 }
 
 struct Fixture {
-    binary: &'static str,
     name: String,
     directory: tempfile::TempDir,
     _guard: SessionGuard,
@@ -31,8 +34,15 @@ struct Fixture {
 
 impl Fixture {
     fn start(label: &str) -> Self {
-        let binary = env!("CARGO_BIN_EXE_vvmux");
-        let directory = tempfile::tempdir().unwrap();
+        // Short `/tmp` root: the runtime directory holds the session socket, whose path must stay
+        // inside the platform's `sun_path` limit. Isolating `XDG_CONFIG_HOME` and
+        // `XDG_RUNTIME_DIR` keeps a developer's own `startup.toml` and live sessions out of this
+        // test's session.
+        let directory = tempfile::Builder::new()
+            .prefix("vvr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         // A shell that idles forever, so the anchor pane never disappears mid-test.
         let shell = directory.path().join("fixture-shell");
         fs::write(
@@ -60,7 +70,7 @@ while IFS= read -r line; do :; done
         .unwrap();
 
         let name = format!("run-{label}-{}", std::process::id());
-        let created = Command::new(binary)
+        let created = common::vvmux_command(directory.path())
             .args([
                 "--config",
                 config.to_str().unwrap(),
@@ -74,10 +84,12 @@ while IFS= read -r line; do :; done
         assert_success(&created);
 
         let fixture = Fixture {
-            binary,
             name: name.clone(),
+            _guard: SessionGuard {
+                runtime: directory.path().to_path_buf(),
+                name,
+            },
             directory,
-            _guard: SessionGuard { binary, name },
         };
         assert_success(&fixture.msg(&[
             "wait",
@@ -92,7 +104,7 @@ while IFS= read -r line; do :; done
     }
 
     fn msg(&self, arguments: &[&str]) -> Output {
-        Command::new(self.binary)
+        common::vvmux_command(self.directory.path())
             .args(["msg", "--target", &self.name])
             .args(arguments)
             .output()

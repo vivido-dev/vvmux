@@ -6,11 +6,14 @@
 //! the PTY a zero dimension, and a refused resize closed the pane and killed its program. The
 //! panes disappeared for good: growing the window back could not restore what had been reaped.
 
+#[allow(dead_code)]
+mod common;
+
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,13 +21,13 @@ use serde_json::Value;
 use vvmux_terminal::pty::PtyProcess;
 
 struct SessionGuard {
-    executable: PathBuf,
+    runtime: PathBuf,
     name: String,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let _ = Command::new(&self.executable)
+        let _ = common::vvmux_command(&self.runtime)
             .args(["kill-session", "-t", &self.name])
             .output();
     }
@@ -33,7 +36,15 @@ impl Drop for SessionGuard {
 #[test]
 fn panes_squeezed_by_a_shrinking_window_survive_and_come_back() {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_vvmux"));
-    let directory = tempfile::tempdir().unwrap();
+    // Short `/tmp` root: the runtime directory holds the session socket, whose path must stay
+    // inside the platform's `sun_path` limit. Isolating `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR`
+    // keeps a developer's own `startup.toml` and live sessions out of this test's session.
+    let directory = tempfile::Builder::new()
+        .prefix("vvz-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = directory.path().to_path_buf();
     let shell = directory.path().join("fixture-shell");
     fs::write(
         &shell,
@@ -65,19 +76,31 @@ done
             .as_nanos()
     );
     let guard = SessionGuard {
-        executable: executable.clone(),
+        runtime: runtime.clone(),
         name: session.clone(),
     };
 
     // The client only learns a display size from its own terminal, so the session is hosted in a
     // PTY the test can resize.
+    // The hosted client owns the session, so it needs the same isolated runtime and config
+    // directories the `msg` commands use.
+    let isolation = [
+        (
+            "XDG_RUNTIME_DIR".to_owned(),
+            runtime.to_str().unwrap().to_owned(),
+        ),
+        (
+            "XDG_CONFIG_HOME".to_owned(),
+            runtime.to_str().unwrap().to_owned(),
+        ),
+    ];
     let parts = PtyProcess::spawn(
         std::ffi::OsStr::new("/bin/sh"),
         None,
         directory.path(),
         100,
         30,
-        &[],
+        &isolation,
     )
     .unwrap();
     let control = parts.control.clone();
@@ -110,17 +133,17 @@ done
 
     // One pane on the left, two stacked on the right.
     assert_success(&command(
-        &executable,
+        &runtime,
         &session,
         &["split", "vertical", "--pane-id", "1"],
     ));
     assert_success(&command(
-        &executable,
+        &runtime,
         &session,
         &["split", "horizontal", "--pane-id", "2"],
     ));
     assert_eq!(
-        wait_for_panes(&executable, &session, 3),
+        wait_for_panes(&runtime, &session, 3),
         vec![1, 2, 3],
         "the three panes were not established"
     );
@@ -129,16 +152,16 @@ done
     control.resize(16, 5).unwrap();
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(
-        wait_for_panes(&executable, &session, 3),
+        wait_for_panes(&runtime, &session, 3),
         vec![1, 2, 3],
         "a window too small to show the panes closed them"
     );
 
     control.resize(100, 30).unwrap();
-    let restored = wait_for_panes(&executable, &session, 3);
+    let restored = wait_for_panes(&runtime, &session, 3);
     assert_eq!(restored, vec![1, 2, 3], "the panes did not come back");
     for pane in restored {
-        let geometry = wait_for_content(&executable, &session, pane);
+        let geometry = wait_for_content(&runtime, &session, pane);
         assert!(
             geometry.0 > 1 && geometry.1 > 1,
             "pane {pane} stayed collapsed at {geometry:?} after the window grew back"
@@ -174,11 +197,11 @@ fn wait_for(
     }
 }
 
-fn wait_for_panes(executable: &Path, session: &str, expected: usize) -> Vec<u64> {
+fn wait_for_panes(runtime: &Path, session: &str, expected: usize) -> Vec<u64> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last = Vec::new();
     loop {
-        let output = command(executable, session, &["list-panes"]);
+        let output = command(runtime, session, &["list-panes"]);
         if output.status.success() {
             let value: Value = serde_json::from_slice(&output.stdout).unwrap();
             last = value["panes"]
@@ -198,10 +221,10 @@ fn wait_for_panes(executable: &Path, session: &str, expected: usize) -> Vec<u64>
     }
 }
 
-fn wait_for_content(executable: &Path, session: &str, pane: u64) -> (u64, u64) {
+fn wait_for_content(runtime: &Path, session: &str, pane: u64) -> (u64, u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let geometry = content_geometry(executable, session, pane);
+        let geometry = content_geometry(runtime, session, pane);
         if (geometry.0 > 1 && geometry.1 > 1) || Instant::now() >= deadline {
             return geometry;
         }
@@ -209,9 +232,9 @@ fn wait_for_content(executable: &Path, session: &str, pane: u64) -> (u64, u64) {
     }
 }
 
-fn content_geometry(executable: &Path, session: &str, pane: u64) -> (u64, u64) {
+fn content_geometry(runtime: &Path, session: &str, pane: u64) -> (u64, u64) {
     let output = command(
-        executable,
+        runtime,
         session,
         &["inspect", "--pane-id", &pane.to_string()],
     );
@@ -224,8 +247,8 @@ fn content_geometry(executable: &Path, session: &str, pane: u64) -> (u64, u64) {
     )
 }
 
-fn command(executable: &Path, session: &str, arguments: &[&str]) -> Output {
-    Command::new(executable)
+fn command(runtime: &Path, session: &str, arguments: &[&str]) -> Output {
+    common::vvmux_command(runtime)
         .args(["msg", "--target", session])
         .args(arguments)
         .output()

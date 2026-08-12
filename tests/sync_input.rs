@@ -2,22 +2,31 @@
 
 //! Tab-local sync-input state and owner isolation against real detached sessions.
 
+#[allow(dead_code)]
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde_json::Value;
 
 struct Fixture {
-    binary: &'static str,
     name: String,
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
 }
 
 impl Fixture {
     fn start(label: &str) -> Self {
-        let binary = env!("CARGO_BIN_EXE_vvmux");
-        let directory = tempfile::tempdir().unwrap();
+        // Short `/tmp` root: the runtime directory holds the session socket, whose path must stay
+        // inside the platform's `sun_path` limit. Isolating `XDG_CONFIG_HOME` and
+        // `XDG_RUNTIME_DIR` keeps a developer's own `startup.toml` and live sessions out of this
+        // test's session.
+        let directory = tempfile::Builder::new()
+            .prefix("vvs-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let shell = directory.path().join("sync-shell");
         fs::write(
             &shell,
@@ -40,7 +49,7 @@ done
         )
         .unwrap();
         let name = format!("sync-{label}-{}", std::process::id());
-        let created = Command::new(binary)
+        let created = common::vvmux_command(directory.path())
             .args([
                 "--config",
                 config.to_str().unwrap(),
@@ -52,17 +61,13 @@ done
             .output()
             .unwrap();
         assert_success(&created);
-        let fixture = Self {
-            binary,
-            name,
-            _directory: directory,
-        };
+        let fixture = Self { name, directory };
         fixture.wait_ready(1);
         fixture
     }
 
     fn msg(&self, arguments: &[&str]) -> Output {
-        Command::new(self.binary)
+        common::vvmux_command(self.directory.path())
             .args(["msg", "--target", &self.name])
             .args(arguments)
             .output()
@@ -95,7 +100,7 @@ done
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = Command::new(self.binary)
+        let _ = common::vvmux_command(self.directory.path())
             .args(["kill-session", "--target", &self.name])
             .output();
     }
