@@ -9,9 +9,17 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Output;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+// Every fixture launches a daemon from a subprocess whose stdout and stderr are captured by the
+// test. On macOS, launching those subprocesses concurrently can let one daemon inherit another
+// launcher's temporary capture pipe before close-on-exec is applied. That unrelated daemon then
+// keeps `Command::output` waiting indefinitely. Own the launch/daemon/teardown interval as one
+// critical section so no sibling fixture has a capture pipe open while a daemon is spawned.
+static SESSION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct SessionGuard {
     runtime: PathBuf,
@@ -30,10 +38,14 @@ struct Fixture {
     name: String,
     directory: tempfile::TempDir,
     _guard: SessionGuard,
+    _serial: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     fn start(label: &str) -> Self {
+        let serial = SESSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Short `/tmp` root: the runtime directory holds the session socket, whose path must stay
         // inside the platform's `sun_path` limit. Isolating `XDG_CONFIG_HOME` and
         // `XDG_RUNTIME_DIR` keeps a developer's own `startup.toml` and live sessions out of this
@@ -90,6 +102,7 @@ while IFS= read -r line; do :; done
                 name,
             },
             directory,
+            _serial: serial,
         };
         assert_success(&fixture.msg(&[
             "wait",
