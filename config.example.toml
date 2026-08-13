@@ -41,6 +41,9 @@ status_background = "blue"
 # search_match_background = "bright-yellow"
 # search_current_foreground = "bright-white"
 # search_current_background = "magenta"
+# Underline color for OSC 8 links. Only the underline is colored: the text color belongs to the
+# program that printed it, so a link inside already-colored output keeps its own color.
+# hyperlink = "bright-blue"
 # Status-row indicator color for synchronized input; frame titles use their normal title color.
 # Legacy compatibility key; the tabs-only status row has no separate sync segment.
 # sync_indicator = "bright-cyan"
@@ -59,6 +62,22 @@ ipc_queue_bytes = 33554432
 default_width_percent = 60
 default_height_percent = 60
 border_drag_margin = 1
+
+[hyperlinks]
+# OSC 8 links printed by programs in a pane. vvmux tracks the pointer itself, so hovering marks a
+# link and shows its target in the status row without needing a modifier.
+enabled = true
+# Underline every link, not only the hovered one, so links can be found without sweeping the mouse.
+persistent_style = true
+# Who opens a clicked link.
+#   "delegate" — vvmux opens nothing. The outer terminal activates the link (Shift+click in Vivido),
+#                so it opens on the machine you are sitting at. Correct when vvmux is the far end of
+#                an ssh session.
+#   "local"    — a plain click opens the link on the host running the vvmux *server*, which for a
+#                remote session is not the machine in front of you. Only http, https, mailto, and
+#                irc links are handed to the opener; anything else is refused, because an OSC 8 URI
+#                is written by whatever program holds the pane.
+open = "delegate"
 
 [plugins]
 # Live global kill switch. Disabling stops runtimes and the registry watcher for this session.

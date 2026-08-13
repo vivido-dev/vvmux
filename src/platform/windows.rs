@@ -14,6 +14,38 @@ use std::time::Duration;
 use super::{ConnectionCancel, Transport};
 use crate::ipc::DisplayMetrics;
 use sha2::{Digest, Sha256};
+
+/// Hand a URI to the host's registered handler, detached from vvmux entirely.
+///
+/// Deliberately not `cmd /c start`: `start` re-parses its argument through the command processor,
+/// where `&` in a query string ends the URL and runs the remainder as a command. `rundll32` takes
+/// the URI as a plain argument, so untrusted pane output stays inert. Stdio is null so a handler
+/// cannot write into the frame vvmux is painting.
+pub fn open_external(uri: &str) -> io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+    let mut child = Command::new("rundll32.exe")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(uri)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // No CREATE_NEW_PROCESS_GROUP, for the reason recorded at the daemon spawn below: it
+        // starts the child with Ctrl+C disabled, and that state is inherited.
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn()?;
+    // The handler is still a direct child, so reap it rather than leaving a zombie per click.
+    std::thread::Builder::new()
+        .name("vvmux-opener".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        })?;
+    Ok(())
+}
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE,
     ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED,

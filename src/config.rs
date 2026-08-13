@@ -16,6 +16,7 @@ pub struct Config {
     pub media: Media,
     pub keys: Keys,
     pub floating: Floating,
+    pub hyperlinks: Hyperlinks,
     pub plugins: Plugins,
     pub server: Server,
 }
@@ -63,6 +64,42 @@ pub struct Floating {
     pub default_width_percent: u16,
     pub default_height_percent: u16,
     pub border_drag_margin: u16,
+}
+
+/// OSC 8 hyperlink presentation and activation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Hyperlinks {
+    /// Track hover and style links at all. Disabling leaves the OSC 8 pass-through untouched, so
+    /// the outer terminal can still present links on its own.
+    pub enabled: bool,
+    /// Style links even when they are not hovered, so they can be found without sweeping the mouse.
+    pub persistent_style: bool,
+    /// Who opens a clicked link.
+    pub open: OpenMode,
+}
+
+/// Where a clicked link is opened.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenMode {
+    /// Hand activation to the outer terminal, which opens the link on the machine the user is
+    /// sitting at. The default because vvmux is frequently the remote end of an ssh session, where
+    /// spawning a browser locally would put it on the wrong host.
+    #[default]
+    Delegate,
+    /// Spawn an opener on whichever host vvmux itself runs on.
+    Local,
+}
+
+impl Default for Hyperlinks {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            persistent_style: true,
+            open: OpenMode::Delegate,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

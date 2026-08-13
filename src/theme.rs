@@ -127,6 +127,7 @@ pub struct Theme {
     pub search_current_foreground: Option<ThemeColor>,
     pub search_current_background: Option<ThemeColor>,
     pub sync_indicator: Option<ThemeColor>,
+    pub hyperlink: Option<ThemeColor>,
     /// Whether the status bar paints its background across the full width. Without it the bar is
     /// only as wide as its text, which looks broken against a colored background.
     pub status_fill: Option<bool>,
@@ -147,6 +148,12 @@ pub struct ResolvedTheme {
     pub search_current_foreground: TerminalColor,
     pub search_current_background: TerminalColor,
     pub sync_indicator: TerminalColor,
+    /// Underline color for OSC 8 links.
+    ///
+    /// Links are marked by underline rather than by recoloring their text: the text color belongs
+    /// to the application that printed it, and a link inside an already-colored run would lose that
+    /// color for no gain.
+    pub hyperlink: TerminalColor,
     pub status_fill: bool,
 }
 
@@ -204,6 +211,7 @@ fn base() -> ResolvedTheme {
         search_current_foreground: TerminalColor::Indexed(15),
         search_current_background: TerminalColor::Indexed(5),
         sync_indicator: TerminalColor::Indexed(14),
+        hyperlink: TerminalColor::Indexed(12),
         status_fill: true,
     }
 }
@@ -230,6 +238,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             search_current_foreground: TerminalColor::Indexed(15),
             search_current_background: TerminalColor::Indexed(8),
             sync_indicator: TerminalColor::Indexed(15),
+            hyperlink: TerminalColor::Indexed(7),
             status_fill: true,
         },
         "nord" => ResolvedTheme {
@@ -245,6 +254,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             search_current_foreground: rgb(0x2e, 0x34, 0x40),
             search_current_background: rgb(0xd0, 0x87, 0x70),
             sync_indicator: rgb(0xa3, 0xbe, 0x8c),
+            hyperlink: rgb(0x88, 0xc0, 0xd0),
             status_fill: true,
         },
         "solarized-dark" => ResolvedTheme {
@@ -260,6 +270,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             search_current_foreground: rgb(0x00, 0x2b, 0x36),
             search_current_background: rgb(0xcb, 0x4b, 0x16),
             sync_indicator: rgb(0x85, 0x99, 0x00),
+            hyperlink: rgb(0x26, 0x8b, 0xd2),
             status_fill: true,
         },
         "gruvbox-dark" => ResolvedTheme {
@@ -275,6 +286,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             search_current_foreground: rgb(0x28, 0x28, 0x28),
             search_current_background: rgb(0xfe, 0x80, 0x19),
             sync_indicator: rgb(0xb8, 0xbb, 0x26),
+            hyperlink: rgb(0x83, 0xa5, 0x98),
             status_fill: true,
         },
         _ => return None,
@@ -347,6 +359,7 @@ pub fn resolve(theme: &Theme, appearance: &Appearance) -> ResolvedTheme {
         resolved.search_current_background,
     );
     resolved.sync_indicator = pick(theme.sync_indicator, None, resolved.sync_indicator);
+    resolved.hyperlink = pick(theme.hyperlink, None, resolved.hyperlink);
     resolved.status_fill = theme.status_fill.unwrap_or(resolved.status_fill);
     resolved
 }

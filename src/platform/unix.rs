@@ -22,6 +22,46 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound on a startup diagnostic, so a failing server cannot flood its launcher.
 const READINESS_LIMIT: usize = 4096;
 
+/// Hand a URI to the host's registered handler, detached from vvmux entirely.
+///
+/// The URI is passed as one argv element and never reaches a shell: it comes from whatever wrote to
+/// a pane, so `;`, `&`, and backticks must stay inert. Stdio is null because a browser writing to
+/// the terminal vvmux is painting in raw mode would corrupt the frame, and `setsid` keeps the
+/// handler alive past the pane and out of reach of the terminal's job-control signals.
+pub fn open_external(uri: &str) -> io::Result<()> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut command = Command::new(program);
+    command
+        // No `--` separator: xdg-open matches it against its own `-*)` arm and fails with
+        // "unexpected option". It is unnecessary anyway — the caller's scheme allow-list means the
+        // URI always begins with a known scheme and can never be read as a flag.
+        .arg(uri)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    // `setsid` detaches the session, not the parent link: the opener is still a direct child, so
+    // something has to reap it or every clicked link leaves a zombie for the daemon's lifetime.
+    std::thread::Builder::new()
+        .name("vvmux-opener".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        })?;
+    Ok(())
+}
+
 /// Windows restores inherited console-interrupt state here; Unix needs nothing.
 pub fn prepare_server_process() {}
 

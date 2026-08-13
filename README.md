@@ -443,6 +443,27 @@ across pane boundaries. Use the unmodified gesture (or configure the outer termi
 Shift) when pane-bounded selection is required. Shift prevents pane-frame dragging when it is
 forwarded.
 
+### Hyperlinks
+
+Programs can mark text as a link with OSC 8 (`printf '\e]8;;https://example.com\e\\text\e]8;;\e\\'`).
+vvmux underlines every link so they are visible without hunting, and underlines the one under the
+pointer more strongly while showing its target in the status row. Matching is by link identity, not
+position, so a link that wraps across rows highlights as one link. Hover yields to the pane's own
+program: a full-screen application that requested motion reports keeps its mouse events.
+
+`[hyperlinks]` controls this. `enabled` turns the whole feature off, `persistent_style` drops the
+resting underline so only the hovered link is marked, and `open` decides who activates a click:
+
+- `"delegate"` (default) — vvmux opens nothing. The outer terminal activates the link, so it opens
+  on the machine you are sitting at. In Vivido that gesture is Shift+click. This is the default
+  because the vvmux server is frequently the far end of an ssh session.
+- `"local"` — a plain click opens the link on whichever host runs the vvmux *server*. Only `http`,
+  `https`, `mailto`, and `irc` links are handed to the system opener; anything else is refused,
+  because an OSC 8 target is written by whatever program holds the pane and nothing else vets it.
+
+The link's underline color is `[theme].hyperlink`. Only the underline is colored — the text color
+belongs to the program that printed it.
+
 Strict floating defaults live under `[floating]`: `default_width_percent` and
 `default_height_percent` accept 10–100, and `border_drag_margin` accepts 1–4. New floats are centered
 at 60% by 60% by default, with a minimum 4-by-2 content area plus frame.

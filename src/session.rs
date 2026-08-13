@@ -12,7 +12,7 @@ use vvmux_terminal::pty::{PtyControl, PtyExitStatus, PtyInput, PtyProcess};
 use vvmux_terminal::{Cell, Terminal, TerminalColor, TerminalEvent, TerminalModes, UnderlineStyle};
 
 use crate::agent::{AgentRuntime, AgentSnapshot, DetectorHandle, ProbeTarget, ProcessUpdate};
-use crate::config::Config;
+use crate::config::{Config, OpenMode};
 use crate::ipc::{
     Action, AutomationCompletion, AutomationError, AutomationMethod, AutomationRequest,
     AutomationResponse, Axis, BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource,
@@ -31,7 +31,7 @@ use crate::media::VirtualVivid;
 use crate::media_trace::{MediaKeyframeStage, MediaTraceFilter, MediaTraceJournal, MediaTraceKind};
 use crate::platform::VirtualPresenterEndpoint;
 use crate::region::{FixedRect, from_cells, intersect, subtract_all};
-use crate::screen::{ScreenBuffer, ansi_diff};
+use crate::screen::{LinkStyle, ScreenBuffer, ansi_diff};
 use crate::search::{
     PromptAction, SearchDirection, SearchMatch, SearchPattern, apply_prompt_key, find_all,
     find_next, find_on_line, row_text_with_columns,
@@ -545,6 +545,16 @@ struct MouseSelection {
     start: (isize, usize),
     end: (isize, usize),
     mode: MouseSelectionMode,
+}
+
+/// The OSC 8 link currently under the pointer.
+///
+/// Keyed by pane as well as link so hover stays owner-scoped: styling and clearing must never
+/// reach a pane the pointer is not in, even if another pane happens to show the same URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoveredLink {
+    pane: PaneId,
+    link: TerminalHyperlink,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1107,6 +1117,9 @@ struct SessionActor {
     pointer_drag: Option<PointerDrag>,
     mouse_selection_drag: Option<MouseSelectionDrag>,
     mouse_click_tracker: Option<MouseClickTracker>,
+    hovered_link: Option<HoveredLink>,
+    /// When a link was last handed to the host opener, so a double click opens one window.
+    last_link_open: Option<Instant>,
     float_modal: Option<FloatModal>,
     agent_navigator: Option<AgentNavigator>,
     tab_navigator: Option<TabNavigator>,
@@ -1305,6 +1318,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         last_projection_warning: None,
         pointer_drag: None,
         mouse_selection_drag: None,
+        hovered_link: None,
+        last_link_open: None,
         mouse_click_tracker: None,
         float_modal: None,
         agent_navigator: None,
@@ -1969,6 +1984,12 @@ impl SessionActor {
             ClientMessage::Focus(focused) => {
                 if self.client_is(id) {
                     self.client_focused = focused;
+                    if !focused {
+                        // There is no pointer-leave report, so blur is the only signal that the
+                        // pointer is gone. Without this a link stays marked as hovered while the
+                        // user works in another window.
+                        self.set_hovered_link(None);
+                    }
                 }
             }
             ClientMessage::Resize(display) => {
@@ -4545,6 +4566,14 @@ impl SessionActor {
     fn invalidate_mouse_selection_state(&mut self) -> bool {
         self.mouse_selection_drag = None;
         self.mouse_click_tracker = None;
+        // Everything the pointer was resolved against is now stale — the client detached, the
+        // display resized, or the pane scrolled under a stationary pointer. A wheel scroll is the
+        // case that matters most: no motion event follows it, so a hover kept here would stay
+        // painted on whichever link happened to scroll into that cell.
+        //
+        // Deliberately not in `invalidate_mouse_selection_for_pane`, which runs on every PTY output
+        // chunk: clearing there would make a link in any actively-printing pane unhoverable.
+        self.hovered_link = None;
         self.clear_retained_mouse_selections()
     }
 
@@ -4568,6 +4597,13 @@ impl SessionActor {
     }
 
     fn begin_mouse_selection(&mut self, pane_id: PaneId, content: Rect, mouse: MouseEvent) {
+        if !self.panes.contains_key(&pane_id) {
+            return;
+        }
+        // Motion during a drag is consumed before it reaches hover tracking, so a hover left
+        // standing here would stay painted for the whole drag. Activation does not depend on it:
+        // `finish_mouse_selection` re-reads the link from the grid cell the press landed on.
+        self.set_hovered_link(None);
         let Some(pane) = self.panes.get(&pane_id) else {
             return;
         };
@@ -4644,6 +4680,14 @@ impl SessionActor {
         if !selected {
             if let Some(pane) = self.panes.get_mut(&drag.pane) {
                 pane.mouse_selection = None;
+            }
+            // A press and release on one cell with no motion between them is a click, not a
+            // selection — the same test Vivido uses to decide a drag should not launch a link.
+            if self.config.hyperlinks.enabled
+                && self.config.hyperlinks.open == OpenMode::Local
+                && let Some(link) = self.link_at_cell(drag.pane, drag.start)
+            {
+                self.open_link_locally(&link.uri);
             }
             self.schedule_render();
             return;
@@ -4908,6 +4952,73 @@ impl SessionActor {
         }
     }
 
+    /// The OSC 8 link on a pane's grid cell, if any.
+    fn link_at_cell(&self, pane_id: PaneId, cell: (isize, usize)) -> Option<TerminalHyperlink> {
+        let pane = self.panes.get(&pane_id)?;
+        let line = pane.terminal.viewport_line(cell.0)?;
+        line.get(cell.1)?.hyperlink.clone()
+    }
+
+    /// The OSC 8 link at a pane-content coordinate, if any.
+    fn link_at(&self, pane_id: PaneId, content: Rect, x: u16, y: u16) -> Option<TerminalHyperlink> {
+        let pane = self.panes.get(&pane_id)?;
+        let display_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
+        let cell = mouse_selection_cell(content, x, y, display_offset)?;
+        self.link_at_cell(pane_id, cell)
+    }
+
+    /// Open a clicked link on the host vvmux itself runs on.
+    ///
+    /// Only reached in `open = "local"`. The default delegates instead, because vvmux is often the
+    /// remote end of an ssh session where the browser would come up on the wrong machine.
+    fn open_link_locally(&mut self, uri: &str) {
+        // A double click is two press/release pairs on one cell, so without a cooldown it would
+        // launch the handler twice.
+        let now = Instant::now();
+        if self
+            .last_link_open
+            .is_some_and(|last| now.duration_since(last) < LINK_OPEN_COOLDOWN)
+        {
+            return;
+        }
+        // The URI comes from whatever wrote to the pane, so it is untrusted input. Passing it as a
+        // single argv element keeps it out of any shell, and only a vetted scheme is handed over at
+        // all — an OSC 8 link is not constrained by the URL regex that guards text matches, so
+        // `file:` and friends would otherwise be one click from launching a local handler.
+        if !is_openable_uri(uri) {
+            self.notice(format!("refused to open unsupported link: {uri}"));
+            return;
+        }
+        self.last_link_open = Some(now);
+        match crate::platform::open_external(uri) {
+            Ok(()) => self.notice(format!("opening {uri}")),
+            Err(error) => self.notice(format!("could not open link: {error}")),
+        }
+    }
+
+    /// Record the link under the pointer, redrawing when it changes.
+    fn set_hovered_link(&mut self, hovered: Option<HoveredLink>) {
+        if self.hovered_link == hovered {
+            return;
+        }
+        self.hovered_link = hovered;
+        // No `force_full`: the hover mark is applied to cells during composition, so the ordinary
+        // cell diff already repaints exactly the run that changed. Forcing a full repaint here
+        // would rewrite the whole screen on every pointer motion.
+        self.schedule_render();
+    }
+
+    /// Drop hover state belonging to `pane_id`, leaving any other pane's hover alone.
+    fn clear_pane_hover(&mut self, pane_id: PaneId) {
+        if self
+            .hovered_link
+            .as_ref()
+            .is_some_and(|hovered| hovered.pane == pane_id)
+        {
+            self.set_hovered_link(None);
+        }
+    }
+
     /// Forward motion/release reports without changing pane focus. These used to return before
     /// application mouse handling, so even a pane in DEC 1003 mode could never hover, drag, or
     /// release a button.
@@ -4924,14 +5035,17 @@ impl SessionActor {
                 .rev()
                 .find(|projection| projection.outer.contains(mouse.x, mouse.y))
         }) else {
+            self.set_hovered_link(None);
             return;
         };
         let content = projection.outer.content();
         if !content.contains(mouse.x, mouse.y) {
+            self.set_hovered_link(None);
             return;
         }
         let pane_id = projection.pane_id;
         let Some(modes) = self.panes.get(&pane_id).map(|pane| pane.terminal.modes()) else {
+            self.set_hovered_link(None);
             return;
         };
         let application_mouse = !mouse.shift
@@ -4940,6 +5054,19 @@ impl SessionActor {
                 MouseKind::Release => modes.mouse_clicks,
                 _ => false,
             };
+        // Hover only where vvmux is the one reading the mouse. A pane running a full-screen
+        // application that asked for motion reports owns those events, exactly as vvmux owns them
+        // from the outer terminal; tracking hover anyway would mark links the pane cannot activate.
+        if mouse.kind == MouseKind::Move {
+            let hovered = (!application_mouse && self.config.hyperlinks.enabled)
+                .then(|| self.link_at(pane_id, content, mouse.x, mouse.y))
+                .flatten()
+                .map(|link| HoveredLink {
+                    pane: pane_id,
+                    link,
+                });
+            self.set_hovered_link(hovered);
+        }
         if !application_mouse {
             return;
         }
@@ -6908,6 +7035,7 @@ impl SessionActor {
 
     fn close_pane(&mut self, pane_id: PaneId) {
         self.invalidate_mouse_selection_for_pane(pane_id);
+        self.clear_pane_hover(pane_id);
         if let Some(drag) = &self.pointer_drag {
             self.cancel_pointer_drag(drag.pane() != Some(pane_id));
         }
@@ -7357,6 +7485,26 @@ impl SessionActor {
                         );
                     }
                 }
+                if self.config.hyperlinks.enabled {
+                    // Only the pane under the pointer gets a hovered link, so an identically
+                    // targeted link in another pane stays at its resting mark.
+                    let hovered = self
+                        .hovered_link
+                        .as_ref()
+                        .filter(|hovered| hovered.pane == projection.pane_id)
+                        .map(|hovered| &hovered.link);
+                    let resting = self
+                        .config
+                        .hyperlinks
+                        .persistent_style
+                        .then(|| LinkStyle::resting(theme.hyperlink));
+                    screen.style_links(
+                        content,
+                        hovered,
+                        resting,
+                        LinkStyle::hovered(theme.hyperlink),
+                    );
+                }
                 if active {
                     if let Some(copy) = &pane.copy {
                         cursor = Some((
@@ -7441,6 +7589,14 @@ impl SessionActor {
                 .or(save_prompt)
                 .or(search_prompt)
                 .or_else(|| self.active_status_notice().map(ToOwned::to_owned))
+                // Below notices on purpose: a notice reports something the user cannot recover
+                // once it scrolls past, while the hover preview returns the moment they point at
+                // the link again.
+                .or_else(|| {
+                    self.hovered_link
+                        .as_ref()
+                        .map(|hovered| hyperlink_status_text(&hovered.link.uri, screen.columns))
+                })
                 .unwrap_or_else(|| tab_status_text(&self.tabs, self.active_tab, screen.columns));
             let style = theme.status();
             let row = screen.rows - 1;
@@ -10209,6 +10365,51 @@ fn single_line(text: &str) -> String {
         .collect()
 }
 
+/// Schemes vvmux will hand to the system opener.
+///
+/// Deliberately short. An OSC 8 URI is written by whatever program has the pane — including remote
+/// output a user merely `cat`ed — and unlike a regex-matched text hint nothing has already vetted
+/// its shape. Schemes such as `file:` map to local handlers that can launch applications, so the
+/// list is an allow-list rather than a deny-list and grows only on request.
+const OPENABLE_SCHEMES: [&str; 5] = ["http://", "https://", "mailto:", "irc://", "ircs://"];
+
+/// Minimum gap between two local link activations.
+const LINK_OPEN_COOLDOWN: Duration = Duration::from_millis(500);
+
+/// Whether a link is safe to hand to the system opener.
+fn is_openable_uri(uri: &str) -> bool {
+    // Scheme comparison is ASCII case-insensitive per RFC 3986, and control characters must never
+    // reach an argv element.
+    if uri.chars().any(char::is_control) {
+        return false;
+    }
+    let lowered = uri.to_ascii_lowercase();
+    OPENABLE_SCHEMES
+        .iter()
+        .any(|scheme| lowered.starts_with(scheme) && lowered.len() > scheme.len())
+}
+
+/// The status-row text for a hovered link, trimmed to the row width.
+///
+/// The head of a URI is the part worth keeping — scheme and host say where a click would go — so an
+/// over-long target loses its tail rather than its beginning. Control characters are stripped
+/// because the URI is attacker-controlled: it arrives from whatever wrote to the pane, and the
+/// status row is composited into the same buffer as everything else.
+fn hyperlink_status_text(uri: &str, columns: u16) -> String {
+    const ELLIPSIS: char = '…';
+    let width = usize::from(columns);
+    let text = single_line(uri);
+    if width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text;
+    }
+    let mut truncated: String = text.chars().take(width.saturating_sub(1)).collect();
+    truncated.push(ELLIPSIS);
+    truncated
+}
+
 fn extract_selection_row(
     terminal: &Terminal,
     line_index: isize,
@@ -10333,6 +10534,49 @@ fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_vetted_schemes_reach_the_host_opener() {
+        assert!(is_openable_uri("https://example.test/a?b=1&c=2"));
+        assert!(is_openable_uri("http://example.test/"));
+        assert!(is_openable_uri("mailto:someone@example.test"));
+
+        // An OSC 8 URI is written by whatever holds the pane, so these are the shapes an attacker
+        // controls outright. None may reach a system handler.
+        assert!(!is_openable_uri("file:///etc/passwd"));
+        assert!(!is_openable_uri("javascript:alert(1)"));
+        assert!(!is_openable_uri("smb://host/share"));
+        assert!(!is_openable_uri("vscode://file/etc/passwd"));
+        // A scheme with nothing after it gives the handler no target to reason about.
+        assert!(!is_openable_uri("https://"));
+        // Control characters must never reach an argv element.
+        assert!(!is_openable_uri("https://example.test/\r\nX"));
+        assert!(!is_openable_uri("https://example.test/\u{1b}]0;pwned\u{7}"));
+        // Scheme matching is case-insensitive per RFC 3986.
+        assert!(is_openable_uri("HTTPS://example.test/"));
+        assert!(!is_openable_uri("FILE:///etc/passwd"));
+    }
+
+    #[test]
+    fn the_link_preview_keeps_the_head_of_an_over_long_uri() {
+        let uri = "https://example.test/a/very/long/path/that/will/not/fit";
+        let preview = hyperlink_status_text(uri, 20);
+        assert_eq!(preview.chars().count(), 20);
+        assert!(preview.starts_with("https://example.tes"));
+        assert!(preview.ends_with('…'));
+
+        // A URI that fits is shown whole.
+        assert_eq!(
+            hyperlink_status_text("https://a.test/", 40),
+            "https://a.test/"
+        );
+        // Control characters are neutralized before the preview is composited.
+        assert_eq!(
+            hyperlink_status_text("https://a.test/\u{1b}x", 40),
+            "https://a.test/ x"
+        );
+        assert_eq!(hyperlink_status_text("https://a.test/", 0), "");
+    }
 
     #[cfg(windows)]
     #[test]

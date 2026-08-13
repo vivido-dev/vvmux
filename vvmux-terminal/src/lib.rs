@@ -5,6 +5,7 @@
 use std::cmp;
 use std::collections::VecDeque;
 use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use unicode_width::UnicodeWidthChar;
 use vte::ansi::{
@@ -14,6 +15,35 @@ use vte::ansi::{
 
 const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = 4096;
 const AGENT_OSC_MAX_CHARS: usize = 256;
+
+/// Source of synthetic `id=` values for OSC 8 links that arrive without one.
+///
+/// The counter is process-global rather than per-`Terminal` because the outer terminal composites
+/// every pane into a single grid: two panes numbering their own links from zero would hand the
+/// presenter colliding identities for unrelated links. `Terminal::new` also takes no pane identity
+/// to seed a per-pane counter from.
+static HYPERLINK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Build the id for an OSC 8 link that the application left unlabeled.
+///
+/// Re-emitting a link without `id=` is not idempotent: a presenter that mints its own identity per
+/// OSC 8 open (as Vivido does) sees every reopen as a distinct link, and `ansi_diff` reopens a link
+/// on each style change and at the start of every partial repaint. Assigning the id once, at
+/// ingest, makes every later re-emission carry the same identity so the link stays one link.
+///
+/// One id per *open*, not per URI: two unlabeled links to the same target are separate links, which
+/// matches the presenter's own semantics.
+///
+/// The process id scopes the counter to this daemon. Without it a restarted daemon would start
+/// numbering at zero again while the outer terminal still held cells labeled by its predecessor,
+/// so two unrelated links could claim one identity.
+fn synthesize_hyperlink_id() -> String {
+    format!(
+        "vvmux-{:x}-{:x}",
+        std::process::id(),
+        HYPERLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 #[derive(Debug, Default)]
 struct AgentOscTracker {
@@ -923,7 +953,7 @@ impl Handler for Terminal {
 
     fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
         self.template.hyperlink = hyperlink.map(|link| TerminalHyperlink {
-            id: link.id,
+            id: Some(link.id.unwrap_or_else(synthesize_hyperlink_id)),
             uri: link.uri,
         });
     }
@@ -1597,6 +1627,81 @@ mod tests {
                 .as_ref()
                 .and_then(|link| link.id.as_deref()),
             Some("link-1")
+        );
+    }
+
+    /// Read the hyperlink id stamped onto a cell, if any.
+    fn link_id(terminal: &Terminal, row: usize, column: usize) -> Option<String> {
+        terminal.cells()[row][column]
+            .hyperlink
+            .as_ref()
+            .and_then(|link| link.id.clone())
+    }
+
+    #[test]
+    fn unlabeled_hyperlinks_receive_a_synthesized_id() {
+        let mut terminal = Terminal::new(2, 12, 10);
+        terminal.feed(b"\x1b]8;;https://example.test/\x1b\\x\x1b]8;;\x1b\\");
+
+        let id = link_id(&terminal, 0, 0).expect("unlabeled link should be assigned an id");
+        assert!(id.starts_with("vvmux-"), "unexpected synthesized id: {id}");
+        // `Style::from` drops links whose id carries control characters or `;`, so a synthesized id
+        // that cannot survive that filter would silently stop being re-emitted.
+        assert!(!id.contains(';'));
+        assert!(!id.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn separate_unlabeled_opens_are_distinct_links() {
+        let mut terminal = Terminal::new(2, 12, 10);
+        // Two opens of the same URI. They are separate links, so they must not merge.
+        terminal.feed(b"\x1b]8;;https://example.test/\x1b\\a\x1b]8;;\x1b\\");
+        terminal.feed(b"\x1b]8;;https://example.test/\x1b\\b\x1b]8;;\x1b\\");
+
+        let first = link_id(&terminal, 0, 0).expect("first link id");
+        let second = link_id(&terminal, 0, 1).expect("second link id");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn one_open_keeps_a_single_id_across_its_run() {
+        let mut terminal = Terminal::new(2, 12, 10);
+        // A style change mid-link must not start a new link.
+        terminal.feed(b"\x1b]8;;https://example.test/\x1b\\a\x1b[1mb\x1b]8;;\x1b\\");
+
+        let first = link_id(&terminal, 0, 0).expect("first cell id");
+        let second = link_id(&terminal, 0, 1).expect("second cell id");
+        assert_eq!(first, second);
+        assert!(terminal.cells()[0][1].bold);
+    }
+
+    #[test]
+    fn unlabeled_links_in_separate_panes_do_not_collide() {
+        // Two panes are two `Terminal`s whose grids number rows and columns identically. The outer
+        // presenter composites both into one grid, so identical URIs at identical coordinates must
+        // still be distinguishable links.
+        let mut left = Terminal::new(2, 12, 10);
+        let mut right = Terminal::new(2, 12, 10);
+        let sequence = b"\x1b]8;;https://example.test/\x1b\\x\x1b]8;;\x1b\\";
+        left.feed(sequence);
+        right.feed(sequence);
+
+        let left_id = link_id(&left, 0, 0).expect("left pane link id");
+        let right_id = link_id(&right, 0, 0).expect("right pane link id");
+        assert_ne!(
+            left_id, right_id,
+            "panes must not hand the presenter colliding link identities"
+        );
+        // The URI is genuinely the same; only identity separates them.
+        assert_eq!(
+            left.cells()[0][0]
+                .hyperlink
+                .as_ref()
+                .map(|l| l.uri.as_str()),
+            right.cells()[0][0]
+                .hyperlink
+                .as_ref()
+                .map(|l| l.uri.as_str())
         );
     }
 
