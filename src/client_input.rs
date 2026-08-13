@@ -143,7 +143,11 @@ pub(crate) struct PrefixParser {
     confirm_close: bool,
     mouse_coordinates: MouseCoordinates,
     keyboard_flags: u8,
-    suppressed_kitty_releases: HashSet<(u32, u8)>,
+    /// Kitty key codepoints whose press was consumed as a vvmux command, so their release and
+    /// repeat reports must not reach the pane. Keyed by codepoint alone: the modifier state at
+    /// release can differ from the press (releasing Ctrl before the prefix key reports the same
+    /// key with no modifiers), and a key is still the same key.
+    suppressed_kitty_releases: HashSet<u32>,
 }
 
 impl Default for PrefixParser {
@@ -253,15 +257,18 @@ impl PrefixParser {
                         if byte == b'u'
                             && let Some(key) = parse_kitty_key(&sequence)
                         {
-                            let identity = (key.codepoint, key.modifiers);
-                            if key.kind == KittyKeyKind::Release
-                                && self.suppressed_kitty_releases.remove(&identity)
-                            {
-                                // The prefix remains pending after its physical key is released.
-                            } else if key.kind == KittyKeyKind::Repeat
-                                && self.suppressed_kitty_releases.contains(&identity)
-                            {
-                                // Keep consuming a held prefix/command key.
+                            if key.kind != KittyKeyKind::Press {
+                                // A release or repeat report is never the command that follows the
+                                // prefix. Consume it when its press was consumed, otherwise hand it
+                                // to the pane, but never let it run a binding or cancel the prefix.
+                                let consumed = if key.kind == KittyKeyKind::Release {
+                                    self.suppressed_kitty_releases.remove(&key.codepoint)
+                                } else {
+                                    self.suppressed_kitty_releases.contains(&key.codepoint)
+                                };
+                                if !consumed {
+                                    output.push(ParsedInput::Input(sequence));
+                                }
                             } else if (57441..=57452).contains(&key.codepoint) {
                                 // Modifier reports surround a Kitty-encoded Ctrl+prefix chord but
                                 // are not themselves the following vvmux command. Forward them so
@@ -271,7 +278,7 @@ impl PrefixParser {
                                 let literal_prefix = command_byte == self.prefix_byte;
                                 self.handle_prefix_byte(command_byte, &sequence, &mut output);
                                 if !literal_prefix {
-                                    self.suppressed_kitty_releases.insert(identity);
+                                    self.suppressed_kitty_releases.insert(key.codepoint);
                                 }
                             } else {
                                 self.prefix = false;
@@ -326,13 +333,12 @@ impl PrefixParser {
                             && self.keyboard_flags != 0
                             && let Some(key) = parse_kitty_key(&sequence)
                         {
-                            let identity = (key.codepoint, key.modifiers);
                             if key.kind == KittyKeyKind::Release {
-                                if !self.suppressed_kitty_releases.remove(&identity) {
+                                if !self.suppressed_kitty_releases.remove(&key.codepoint) {
                                     ordinary.extend_from_slice(&sequence);
                                 }
                             } else if key.kind == KittyKeyKind::Repeat
-                                && self.suppressed_kitty_releases.contains(&identity)
+                                && self.suppressed_kitty_releases.contains(&key.codepoint)
                             {
                                 // A held vvmux command key remains consumed until its release.
                             } else if let Some(command_byte) = key.command_byte() {
@@ -349,7 +355,7 @@ impl PrefixParser {
                                         self.prefix && command_byte == self.prefix_byte;
                                     self.handle_prefix_byte(command_byte, &sequence, &mut output);
                                     if !literal_prefix {
-                                        self.suppressed_kitty_releases.insert(identity);
+                                        self.suppressed_kitty_releases.insert(key.codepoint);
                                     }
                                 } else {
                                     ordinary.extend_from_slice(&sequence);
@@ -815,6 +821,38 @@ mod tests {
             parser.feed(b"\x1b[99;1:3u").is_empty(),
             "the release for a consumed command must not leak into the pane"
         );
+    }
+
+    #[test]
+    fn kitty_prefix_survives_a_release_reported_without_its_modifier() {
+        // Neovim asks for Kitty flags 3, so the host terminal reports key releases. Lifting Ctrl
+        // before the prefix key reports that release with no modifiers, which must neither run a
+        // binding nor cancel the pending prefix: `prefix n` has to stay a tab switch.
+        let mut parser = PrefixParser::default();
+        parser.set_keyboard_flags(3);
+        assert!(parser.feed(b"\x1b[98;5u").is_empty());
+        assert!(
+            parser.feed(b"\x1b[98;1:3u").is_empty(),
+            "a release whose modifiers no longer match the press is not pane input either"
+        );
+        assert_eq!(
+            parser.feed(b"n"),
+            [ParsedInput::Action(Action::NextTab)],
+            "the prefix must still be pending after its own key is released"
+        );
+
+        // The same holds for the release order that keeps Ctrl down.
+        assert!(parser.feed(b"\x1b[98;5u").is_empty());
+        assert!(parser.feed(b"\x1b[98;5:3u").is_empty());
+        assert_eq!(parser.feed(b"c"), [ParsedInput::Action(Action::NewTab)]);
+
+        // A release for a key the prefix did not consume still reaches the pane, in order.
+        assert!(parser.feed(b"\x02").is_empty());
+        assert_eq!(
+            parser.feed(b"\x1b[106;1:3u"),
+            [ParsedInput::Input(b"\x1b[106;1:3u".to_vec())]
+        );
+        assert_eq!(parser.feed(b"z"), [ParsedInput::Action(Action::ToggleZoom)]);
     }
 
     #[test]
