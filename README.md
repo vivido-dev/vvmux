@@ -578,6 +578,23 @@ only their inner endpoint and root secret; outer credentials never enter the ses
 If the outer terminal has no Vivid capability, or its presenter rejects `node-clip-rect-v1`,
 terminal use continues without media and the client emits a single status/title warning.
 
+### Kitty graphics compatibility
+
+Vvmux has one deliberately narrow exception to its normal rule that media bytes do not cross a
+pane PTY. A pane may emit bounded Kitty graphics APC packets using direct transmission (`t=d`),
+quiet mode (`q=2`), and Unicode virtual placements (`U=1`). Vvmux validates and assembles the
+complete transfer, then writes it atomically before the full terminal repaint containing the
+`U+10EEEE` placeholder cells. File and shared-memory transports, cursor-positioned placements,
+animation commands, malformed packets, and more than 64 MiB of live transfer data are rejected.
+
+The native client advertises this exception only when the attaching terminal's exact `TERM` is
+`xterm-kitty` or `xterm-ghostty`; `TERM_PROGRAM` is never used as evidence. Hosted attachments,
+including Vivido, advertise no Kitty capability, and placeholder glyphs are suppressed there.
+Graphics bytes belong only to the current physical attachment and are discarded on detach rather
+than retained or replayed. Unix pane PTYs receive cell and pixel dimensions so applications can
+choose the correct image size. This behavior is private to vvmux and does not alter Vivid media or
+the public Vivid protocol.
+
 ## Current scope
 
 Implemented: native Unix sockets and owner-restricted Windows named pipes; Unix PTYs and
@@ -587,7 +604,8 @@ composition, mouse focus/move/resize/forwarding, status line, truecolor theming,
 live reload, command panes with hold-on-exit, bounded TOML startup layouts, VVMX IPC, exact
 fragment-aware pane media occlusion, static rehydration, timed-media headless semantics,
 full-duplex outer control, linked A/V projection, bounded scrollback search, tab-local synchronized
-input, and optional bulk-media endpoint discovery.
+input, optional bulk-media endpoint discovery, and validated Kitty/Ghostty graphics passthrough for
+Unicode virtual placements.
 
 Intentionally absent: a plugin marketplace, a bundled web UI, direct non-loopback/TLS serving,
 arbitrary action sockets, stacked panes, pane-class conversion, multi-pane selection, scrollback

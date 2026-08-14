@@ -3,10 +3,11 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use std::cmp;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use base64::Engine;
 use unicode_width::UnicodeWidthChar;
 use vte::ansi::{
     Attr, ClearMode, Color, Handler, Hyperlink, KeyboardModes, KeyboardModesApplyBehavior,
@@ -15,6 +16,9 @@ use vte::ansi::{
 
 const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = 4096;
 const AGENT_OSC_MAX_CHARS: usize = 256;
+const KITTY_PACKET_MAX_BYTES: usize = 8 * 1024;
+const KITTY_PAYLOAD_MAX_BYTES: usize = 4096;
+const KITTY_DECODED_TRANSFER_MAX_BYTES: u32 = 64 * 1024 * 1024;
 
 /// Source of synthetic `id=` values for OSC 8 links that arrive without one.
 ///
@@ -267,8 +271,22 @@ pub enum TerminalEvent {
         row: usize,
         column: usize,
     },
+    KittyGraphics(KittyGraphicsCommand),
     GridScroll(i32),
     Clear,
+}
+
+/// A validated Kitty graphics command consumed from pane output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KittyGraphicsCommand {
+    /// The standard direct-transmission support query. The session answers on the pane PTY.
+    Query { image_id: u32 },
+    /// A packet safe to forward to a directly attached Kitty-compatible host.
+    Packet {
+        bytes: Vec<u8>,
+        starts_transfer: bool,
+        more: bool,
+    },
 }
 
 pub struct Terminal {
@@ -296,6 +314,7 @@ pub struct Terminal {
     tab_stops: Vec<bool>,
     tab_stops_customized: bool,
     marker_scanner: VividMarkerScanner,
+    kitty_scanner: KittyGraphicsScanner,
     agent_osc: AgentOscTracker,
     keyboard_mode_stack: Vec<KeyboardModes>,
     inactive_keyboard_mode_stack: Vec<KeyboardModes>,
@@ -333,6 +352,7 @@ impl Terminal {
             tab_stops: default_tab_stops(cols, 8),
             tab_stops_customized: false,
             marker_scanner: VividMarkerScanner::default(),
+            kitty_scanner: KittyGraphicsScanner::default(),
             agent_osc: AgentOscTracker::default(),
             keyboard_mode_stack: Vec::new(),
             inactive_keyboard_mode_stack: Vec::new(),
@@ -341,8 +361,8 @@ impl Terminal {
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<TerminalEvent> {
         self.agent_osc.observe(bytes);
-        let chunks = self.marker_scanner.push(bytes);
-        self.process_chunks(chunks, !bytes.is_empty())
+        let chunks = self.kitty_scanner.push(bytes);
+        self.process_kitty_chunks(chunks, !bytes.is_empty(), false)
     }
 
     /// Latest bounded OSC 0/2 title retained for passive agent detection.
@@ -363,14 +383,38 @@ impl Terminal {
 
     /// Flush bytes held only because they could have been a fragmented marker.
     pub fn finish(&mut self) -> Vec<TerminalEvent> {
-        let chunks = self.marker_scanner.finish();
+        let chunks = self.kitty_scanner.finish();
         let has_bytes = chunks
             .iter()
-            .any(|chunk| matches!(chunk, VividChunk::Bytes(bytes) if !bytes.is_empty()));
-        self.process_chunks(chunks, has_bytes)
+            .any(|chunk| matches!(chunk, KittyChunk::Bytes(bytes) if !bytes.is_empty()));
+        self.process_kitty_chunks(chunks, has_bytes, true)
     }
 
-    fn process_chunks(&mut self, chunks: Vec<VividChunk>, damage: bool) -> Vec<TerminalEvent> {
+    fn process_kitty_chunks(
+        &mut self,
+        chunks: Vec<KittyChunk>,
+        damage: bool,
+        finishing: bool,
+    ) -> Vec<TerminalEvent> {
+        for chunk in chunks {
+            match chunk {
+                KittyChunk::Bytes(bytes) => {
+                    let vivid = self.marker_scanner.push(&bytes);
+                    self.process_vivid_chunks(vivid);
+                }
+                KittyChunk::Command(command) => {
+                    self.events.push(TerminalEvent::KittyGraphics(command));
+                }
+            }
+        }
+        if finishing {
+            let vivid = self.marker_scanner.finish();
+            self.process_vivid_chunks(vivid);
+        }
+        self.finish_events(damage)
+    }
+
+    fn process_vivid_chunks(&mut self, chunks: Vec<VividChunk>) {
         let mut processor = mem::take(&mut self.processor);
         for chunk in chunks {
             match chunk {
@@ -389,6 +433,9 @@ impl Terminal {
             }
         }
         self.processor = processor;
+    }
+
+    fn finish_events(&mut self, damage: bool) -> Vec<TerminalEvent> {
         if damage
             && !self
                 .events
@@ -1168,6 +1215,231 @@ const APC_ENVELOPE: MarkerEnvelope = MarkerEnvelope {
     payload_skip: 2,
 };
 
+enum KittyChunk {
+    Bytes(Vec<u8>),
+    Command(KittyGraphicsCommand),
+}
+
+#[derive(Default)]
+struct KittyGraphicsScanner {
+    pending: Vec<u8>,
+}
+
+impl KittyGraphicsScanner {
+    fn push(&mut self, bytes: &[u8]) -> Vec<KittyChunk> {
+        const PREFIX: &[u8] = b"\x1b_G";
+        const TERMINATOR: &[u8] = b"\x1b\\";
+
+        self.pending.extend_from_slice(bytes);
+        let mut chunks = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let Some(relative_start) = find_bytes(&self.pending[cursor..], PREFIX) else {
+                let keep = partial_prefix_len(&self.pending[cursor..], PREFIX);
+                let end = self.pending.len().saturating_sub(keep);
+                push_kitty_bytes(&mut chunks, &self.pending[cursor..end]);
+                cursor = end;
+                break;
+            };
+            let start = cursor + relative_start;
+            push_kitty_bytes(&mut chunks, &self.pending[cursor..start]);
+            let body_start = start + PREFIX.len();
+            let Some(relative_end) = find_bytes(&self.pending[body_start..], TERMINATOR) else {
+                if self.pending.len().saturating_sub(start) > KITTY_PACKET_MAX_BYTES {
+                    push_kitty_bytes(&mut chunks, &self.pending[start..body_start]);
+                    cursor = body_start;
+                    continue;
+                }
+                cursor = start;
+                break;
+            };
+            let terminator = body_start + relative_end;
+            let end = terminator + TERMINATOR.len();
+            if end.saturating_sub(start) > KITTY_PACKET_MAX_BYTES {
+                push_kitty_bytes(&mut chunks, &self.pending[start..body_start]);
+                cursor = body_start;
+                continue;
+            }
+            let raw = &self.pending[start..end];
+            match validate_kitty_command(&self.pending[body_start..terminator], raw) {
+                Some(command) => chunks.push(KittyChunk::Command(command)),
+                None => push_kitty_bytes(&mut chunks, raw),
+            }
+            cursor = end;
+        }
+        self.pending.drain(..cursor);
+        chunks
+    }
+
+    fn finish(&mut self) -> Vec<KittyChunk> {
+        let pending = mem::take(&mut self.pending);
+        if pending.is_empty() {
+            Vec::new()
+        } else {
+            vec![KittyChunk::Bytes(pending)]
+        }
+    }
+}
+
+fn validate_kitty_command(body: &[u8], raw: &[u8]) -> Option<KittyGraphicsCommand> {
+    let separator = body.iter().position(|byte| *byte == b';');
+    let (control, payload) = separator.map_or((body, &[][..]), |index| {
+        (&body[..index], &body[index + 1..])
+    });
+    let control = std::str::from_utf8(control).ok()?;
+    if !control.is_ascii() || payload.len() > KITTY_PAYLOAD_MAX_BYTES {
+        return None;
+    }
+
+    let mut fields = BTreeMap::new();
+    for field in control.split(',') {
+        let (key, value) = field.split_once('=')?;
+        if key.is_empty()
+            || value.is_empty()
+            || !key.bytes().all(|byte| byte.is_ascii_alphabetic())
+            || !value.is_ascii()
+            || fields.insert(key, value).is_some()
+        {
+            return None;
+        }
+    }
+    let number = |key: &str| fields.get(key).and_then(|value| value.parse::<u32>().ok());
+    let more = number("m").unwrap_or(0);
+    if more > 1 || number("q") != Some(2) {
+        return None;
+    }
+
+    match fields.get("a").copied() {
+        Some("q") => {
+            if !keys_are(&fields, &["a", "i", "s", "v", "t", "f", "q"])
+                || number("i") == Some(0)
+                || number("i").is_none()
+                || number("s") != Some(1)
+                || number("v") != Some(1)
+                || number("f") != Some(24)
+                || fields.get("t").copied() != Some("d")
+                || payload != b"AAAA"
+            {
+                return None;
+            }
+            Some(KittyGraphicsCommand::Query {
+                image_id: number("i")?,
+            })
+        }
+        Some("T") | Some("t") => {
+            let action = fields.get("a").copied()?;
+            let allowed = if action == "T" {
+                &["a", "i", "f", "s", "v", "c", "r", "U", "C", "q", "m", "t"][..]
+            } else {
+                &["a", "i", "f", "s", "v", "q", "m", "t"][..]
+            };
+            let format = number("f")?;
+            let width = number("s")?;
+            let height = number("v")?;
+            let bytes_per_pixel = match format {
+                24 => 3,
+                32 => 4,
+                _ => return None,
+            };
+            let decoded_bytes = width.checked_mul(height)?.checked_mul(bytes_per_pixel)?;
+            if !keys_are(&fields, allowed)
+                || fields.get("t").is_some_and(|transport| *transport != "d")
+                || width == 0
+                || height == 0
+                || decoded_bytes > KITTY_DECODED_TRANSFER_MAX_BYTES
+                || payload.is_empty()
+                || !valid_base64_payload(payload, more == 1)
+            {
+                return None;
+            }
+            if action == "T"
+                && (number("i").is_none_or(|value| value == 0)
+                    || number("U") != Some(1)
+                    || number("c").is_none_or(|value| value == 0)
+                    || number("r").is_none_or(|value| value == 0))
+            {
+                return None;
+            }
+            Some(KittyGraphicsCommand::Packet {
+                bytes: raw.to_vec(),
+                starts_transfer: true,
+                more: more == 1,
+            })
+        }
+        Some("p") => {
+            if !keys_are(&fields, &["a", "i", "c", "r", "U", "C", "q"])
+                || number("i").is_none_or(|value| value == 0)
+                || number("U") != Some(1)
+                || number("c").is_none_or(|value| value == 0)
+                || number("r").is_none_or(|value| value == 0)
+                || !payload.is_empty()
+            {
+                return None;
+            }
+            Some(KittyGraphicsCommand::Packet {
+                bytes: raw.to_vec(),
+                starts_transfer: true,
+                more: false,
+            })
+        }
+        Some("d") => {
+            if !keys_are(&fields, &["a", "d", "i", "q"])
+                || !matches!(fields.get("d").copied(), Some("i" | "I"))
+                || number("i").is_none_or(|value| value == 0)
+                || !payload.is_empty()
+            {
+                return None;
+            }
+            Some(KittyGraphicsCommand::Packet {
+                bytes: raw.to_vec(),
+                starts_transfer: true,
+                more: false,
+            })
+        }
+        None => {
+            if !keys_are(&fields, &["q", "m"])
+                || separator.is_none()
+                || payload.is_empty()
+                || !valid_base64_payload(payload, more == 1)
+            {
+                return None;
+            }
+            Some(KittyGraphicsCommand::Packet {
+                bytes: raw.to_vec(),
+                starts_transfer: false,
+                more: more == 1,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn keys_are(fields: &BTreeMap<&str, &str>, allowed: &[&str]) -> bool {
+    fields.keys().all(|key| allowed.contains(key))
+}
+
+fn valid_base64_payload(payload: &[u8], more: bool) -> bool {
+    payload.len() <= KITTY_PAYLOAD_MAX_BYTES
+        && (!more || payload.len().is_multiple_of(4))
+        && payload
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        && base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .is_ok()
+}
+
+fn push_kitty_bytes(chunks: &mut Vec<KittyChunk>, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    if let Some(KittyChunk::Bytes(previous)) = chunks.last_mut() {
+        previous.extend_from_slice(bytes);
+    } else {
+        chunks.push(KittyChunk::Bytes(bytes.to_vec()));
+    }
+}
+
 #[cfg(windows)]
 const CONPTY_ENVELOPE: MarkerEnvelope = MarkerEnvelope {
     prefix: b"VIVID;3;A;",
@@ -1370,6 +1642,98 @@ mod tests {
         terminal.feed(b"\x1b[>31u");
         let events = terminal.feed(b"\x1b[?u");
         assert!(events.contains(&TerminalEvent::PtyWrite(b"\x1b[?31u".to_vec())));
+    }
+
+    #[test]
+    fn kitty_packets_are_bounded_validated_and_fragment_safe() {
+        let packet = b"\x1b_Ga=T,i=16909060,f=32,s=1,v=1,c=1,r=1,U=1,q=2,m=0;AAAAAA==\x1b\\";
+        for split in 0..=packet.len() {
+            let mut terminal = Terminal::new(2, 4, 0);
+            let mut events = terminal.feed(&packet[..split]);
+            events.extend(terminal.feed(&packet[split..]));
+            assert!(events.contains(&TerminalEvent::KittyGraphics(
+                KittyGraphicsCommand::Packet {
+                    bytes: packet.to_vec(),
+                    starts_transfer: true,
+                    more: false,
+                }
+            )));
+            assert!(terminal.cells().iter().flatten().all(|cell| cell.ch == ' '));
+        }
+
+        let mut terminal = Terminal::new(2, 4, 0);
+        let rejected = terminal.feed(b"\x1b_Ga=T,t=f,i=1,f=32,s=1,v=1,c=1,r=1,U=1,q=2;AAAA\x1b\\");
+        assert!(
+            !rejected
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::KittyGraphics(_)))
+        );
+
+        let rejected = terminal.feed(b"\x1b_Ga=T,i=1,f=32,s=1,v=1,c=1,r=1,U=1,q=2;A===\x1b\\");
+        assert!(
+            !rejected
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::KittyGraphics(_)))
+        );
+
+        let rejected =
+            terminal.feed(b"\x1b_Ga=T,i=1,f=32,s=100000,v=100000,c=1,r=1,U=1,q=2;AAAA\x1b\\");
+        assert!(
+            !rejected
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::KittyGraphics(_)))
+        );
+
+        let oversized = vec![b'A'; KITTY_PAYLOAD_MAX_BYTES + 1];
+        let mut packet = b"\x1b_Ga=T,i=1,f=32,s=1,v=1,c=1,r=1,U=1,q=2;".to_vec();
+        packet.extend_from_slice(&oversized);
+        packet.extend_from_slice(b"\x1b\\");
+        let rejected = terminal.feed(&packet);
+        assert!(
+            !rejected
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::KittyGraphics(_)))
+        );
+    }
+
+    #[test]
+    fn kitty_chunks_queries_and_vivid_markers_coexist() {
+        let first = b"\x1b_Ga=T,i=1,f=32,s=1,v=1,c=1,r=1,U=1,q=2,m=1;AAAA\x1b\\";
+        let last = b"\x1b_Gq=2,m=0;AAAA\x1b\\";
+        let marker = b"\x1b_VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA\x1b\\";
+        let query = b"\x1b_Ga=q,t=d,f=24,s=1,v=1,i=31,q=2;AAAA\x1b\\";
+        let mut input = Vec::new();
+        input.extend_from_slice(first);
+        input.extend_from_slice(marker);
+        input.extend_from_slice(last);
+        input.extend_from_slice(query);
+
+        let mut terminal = Terminal::new(2, 4, 0);
+        let events = terminal.feed(&input);
+        assert!(events.contains(&TerminalEvent::KittyGraphics(
+            KittyGraphicsCommand::Packet {
+                bytes: first.to_vec(),
+                starts_transfer: true,
+                more: true,
+            }
+        )));
+        assert!(events.contains(&TerminalEvent::KittyGraphics(
+            KittyGraphicsCommand::Packet {
+                bytes: last.to_vec(),
+                starts_transfer: false,
+                more: false,
+            }
+        )));
+        assert!(
+            events.contains(&TerminalEvent::KittyGraphics(KittyGraphicsCommand::Query {
+                image_id: 31
+            }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::VividMarker { .. }))
+        );
     }
 
     #[test]

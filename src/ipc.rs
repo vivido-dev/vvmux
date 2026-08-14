@@ -27,7 +27,7 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 19;
+pub const VERSION: u16 = 20;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -449,6 +449,8 @@ pub enum ClientMessage {
         replace: bool,
         display: DisplayMetrics,
         vivid: bool,
+        /// The directly hosting terminal speaks the Kitty graphics protocol.
+        kitty_graphics: bool,
     },
     Input(Vec<u8>),
     Mouse(MouseEvent),

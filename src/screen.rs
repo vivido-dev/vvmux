@@ -294,6 +294,17 @@ impl ScreenBuffer {
             }
         }
     }
+
+    /// Hide multiplexer-only Kitty placement cells from hosts that cannot render them.
+    pub fn suppress_kitty_placeholders(&mut self) {
+        for cell in &mut self.cells {
+            if cell.ch == '\u{10EEEE}' {
+                cell.ch = ' ';
+                cell.combining.clear();
+                cell.foreground = TerminalColor::Default;
+            }
+        }
+    }
 }
 
 pub fn ansi_diff(
@@ -501,6 +512,30 @@ fn write_color(output: &mut Vec<u8>, color: TerminalColor, foreground: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kitty_placeholders_are_hidden_without_changing_other_cells() {
+        let mut screen = ScreenBuffer::new(2, 1);
+        let placeholder = Cell {
+            ch: '\u{10EEEE}',
+            combining: "\u{0305}\u{030D}\u{030E}".into(),
+            foreground: TerminalColor::Rgb(1, 2, 3),
+            ..Cell::default()
+        };
+        screen.set(0, 0, placeholder);
+        let text = Cell {
+            ch: 'x',
+            ..Cell::default()
+        };
+        screen.set(1, 0, text.clone());
+
+        screen.suppress_kitty_placeholders();
+
+        assert_eq!(screen.cells[0].ch, ' ');
+        assert!(screen.cells[0].combining.is_empty());
+        assert_eq!(screen.cells[0].foreground, TerminalColor::Default);
+        assert_eq!(screen.cells[1], text);
+    }
     use vvmux_terminal::TerminalHyperlink;
 
     #[test]

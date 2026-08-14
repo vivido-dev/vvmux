@@ -95,8 +95,8 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 19 is a hard cutover. In addition to complete track identity and binary media,
-it adds deterministic outer/rendered completion waits, stable tab-ID selection, correlated
+Private VVMX version 20 is a hard cutover. In addition to complete track identity and binary media,
+it retains deterministic outer/rendered completion waits, stable tab-ID selection, correlated
 diagnostics, PTY-write reports, and process-anchored recovery traces. Its binary media header carries complete track identity
 and bounded binary render/media records,
 pane-scoped sanitized media status and waits, bridge-instance correlation, and metadata-only media
@@ -110,6 +110,19 @@ the preceding snapshot still described an older attachment as resident. The inne
 terminates raster delta chains into a retained latest framebuffer; restoration re-encodes those
 composed pixels as a hop-local full frame, so an interactive canvas does not fall back to its old
 pre-drawing full frame. Mixed VVMX versions are rejected with restart guidance.
+
+Version 20 also carries an attachment-scoped Kitty graphics capability. Only a native attachment
+whose exact host `TERM` is `xterm-kitty` or `xterm-ghostty` sets it; gateway and Vivido attachments
+leave it false. The terminal parser recognizes bounded fragmented APC packets beside the Vivid
+marker scanner, accepts only direct quiet uploads, Unicode virtual placements, targeted deletion,
+and support queries, and accounts in-progress plus ready transfers against a 64 MiB session bound.
+Completed packets are prepended to a forced-full screen render, and the foreground client
+reassembles all VVMX render chunks before one queue admission, making upload-before-placeholder
+ordering atomic. Placeholder cells remain ordinary grid cells through composition and scrollback,
+but are blanked for incapable attachments. Transfer state is cleared whenever the physical client
+detaches and is never part of retained session state. On Unix, PTY resize propagation includes
+checked pixel dimensions; Windows accepts the same internal call and continues using ConPTY cells.
+This is the sole scoped PTY media exception in vvmux and does not change the Vivid wire stack.
 
 ```text
 Vivi → inner vvmux presenter → VVMX 18 → outer vvmux producer → Vivido

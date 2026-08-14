@@ -54,6 +54,7 @@ impl SessionAdapter {
                     replace: takeover,
                     display,
                     vivid,
+                    kitty_graphics: false,
                 })?;
             match reader.recv_server()? {
                 ServerMessage::Attached { session, text_only } => {

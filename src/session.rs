@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 use vvmux_terminal::TerminalHyperlink;
 use vvmux_terminal::pty::{PtyControl, PtyExitStatus, PtyInput, PtyProcess};
-use vvmux_terminal::{Cell, Terminal, TerminalColor, TerminalEvent, TerminalModes, UnderlineStyle};
+use vvmux_terminal::{
+    Cell, KittyGraphicsCommand, Terminal, TerminalColor, TerminalEvent, TerminalModes,
+    UnderlineStyle,
+};
 
 use crate::agent::{AgentRuntime, AgentSnapshot, DetectorHandle, ProbeTarget, ProcessUpdate};
 use crate::config::{Config, OpenMode};
@@ -65,6 +68,7 @@ const MAX_PENDING_MEDIA_PROJECTIONS: usize = 64;
 /// how far the server may run ahead of what the user can actually see. Media snapshots and media
 /// records are never gated by it: a slow terminal must not stall the projected scene.
 const MAX_UNACKNOWLEDGED_FRAMES: u64 = 8;
+const KITTY_GRAPHICS_SESSION_BYTES: usize = 64 * 1024 * 1024;
 const AUTOMATION_RESPONSE_QUEUE: usize = 8;
 const SCREEN_CHANGE_HISTORY: usize = 1024;
 const EXIT_TOMBSTONES: usize = 128;
@@ -353,8 +357,96 @@ struct AttachedClient {
     display: DisplayMetrics,
     acknowledged_frame: u64,
     vivid: bool,
+    kitty_graphics: bool,
     rendered_session_sequence: u64,
     frame_sequences: VecDeque<(u64, u64)>,
+}
+
+#[derive(Default)]
+struct KittyTransferBuffer {
+    transfers: HashMap<PaneId, Vec<u8>>,
+    pending: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl KittyTransferBuffer {
+    fn clear(&mut self) {
+        self.transfers.clear();
+        self.pending.clear();
+        self.bytes = 0;
+    }
+
+    fn push(&mut self, pane_id: PaneId, packet: Vec<u8>, starts: bool, more: bool) -> bool {
+        self.push_bounded(pane_id, packet, starts, more, KITTY_GRAPHICS_SESSION_BYTES)
+    }
+
+    fn push_bounded(
+        &mut self,
+        pane_id: PaneId,
+        packet: Vec<u8>,
+        starts: bool,
+        more: bool,
+        maximum_bytes: usize,
+    ) -> bool {
+        if starts {
+            if let Some(old) = self.transfers.remove(&pane_id) {
+                self.bytes = self.bytes.saturating_sub(old.len());
+            }
+            if !self.reserve(packet.len(), maximum_bytes) {
+                return false;
+            }
+            if more {
+                self.transfers.insert(pane_id, packet);
+            } else {
+                self.pending.push_back(packet);
+            }
+            return true;
+        }
+
+        let Some(mut transfer) = self.transfers.remove(&pane_id) else {
+            return false;
+        };
+        if !self.reserve(packet.len(), maximum_bytes) {
+            self.bytes = self.bytes.saturating_sub(transfer.len());
+            return false;
+        }
+        transfer.extend_from_slice(&packet);
+        if more {
+            self.transfers.insert(pane_id, transfer);
+        } else {
+            self.pending.push_back(transfer);
+        }
+        true
+    }
+
+    fn reserve(&mut self, bytes: usize, maximum_bytes: usize) -> bool {
+        let Some(total) = self.bytes.checked_add(bytes) else {
+            return false;
+        };
+        if total > maximum_bytes {
+            return false;
+        }
+        self.bytes = total;
+        true
+    }
+
+    fn drain_pending(&mut self) -> Vec<u8> {
+        let capacity = self.pending.iter().map(Vec::len).sum();
+        let mut prefix = Vec::with_capacity(capacity);
+        while let Some(packet) = self.pending.pop_front() {
+            self.bytes = self.bytes.saturating_sub(packet.len());
+            prefix.extend_from_slice(&packet);
+        }
+        prefix
+    }
+}
+
+fn kitty_query_response(capable: bool, image_id: u32) -> Vec<u8> {
+    if capable {
+        format!("\x1b_Gi={image_id};OK\x1b\\").into_bytes()
+    } else {
+        format!("\x1b_Gi={image_id};ENOTSUP\x1b\\").into_bytes()
+    }
 }
 
 /// How one pane's process should be started.
@@ -1103,6 +1195,8 @@ struct SessionActor {
     outer_bracketed_paste: Option<bool>,
     force_full: bool,
     pending_render: bool,
+    /// Validated Kitty transfers live only for the current physical attachment.
+    kitty_transfers: KittyTransferBuffer,
     layout_revision: u64,
     last_media_projection: Option<MediaProjectionKey>,
     media_projection_revision: u64,
@@ -1309,6 +1403,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         outer_bracketed_paste: None,
         force_full: true,
         pending_render: false,
+        kitty_transfers: KittyTransferBuffer::default(),
         layout_revision: 0,
         last_media_projection: None,
         media_projection_revision: 0,
@@ -1550,6 +1645,7 @@ impl SessionActor {
                     self.cancel_pointer_drag(true);
                     self.invalidate_mouse_selection_state();
                     self.attached = None;
+                    self.clear_kitty_graphics();
                     self.reported_input_mode = None;
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
@@ -1577,6 +1673,7 @@ impl SessionActor {
                 let mut input_warning = false;
                 let mut input_closed = false;
                 let mut changed_screen_sequence = None;
+                let mut kitty_commands = Vec::new();
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
                     let old_cells = pane.terminal.cells().to_vec();
                     let old_cursor = pane.terminal.cursor();
@@ -1610,6 +1707,7 @@ impl SessionActor {
                                 self.vivid
                                     .observe_marker(pane_id, &marker, row as i32, column);
                             }
+                            TerminalEvent::KittyGraphics(command) => kitty_commands.push(command),
                             TerminalEvent::GridScroll(lines) => {
                                 self.vivid.scroll_anchors(pane_id, lines);
                             }
@@ -1648,6 +1746,9 @@ impl SessionActor {
                         }
                     }
                     self.schedule_render();
+                }
+                for command in kitty_commands {
+                    self.handle_kitty_graphics(pane_id, command);
                 }
                 if let Some(screen_sequence) = changed_screen_sequence {
                     let pending_cause = self.pending_pane_plugin_causes.remove(&pane_id);
@@ -1878,6 +1979,36 @@ impl SessionActor {
         Ok(())
     }
 
+    fn clear_kitty_graphics(&mut self) {
+        self.kitty_transfers.clear();
+    }
+
+    fn handle_kitty_graphics(&mut self, pane_id: PaneId, command: KittyGraphicsCommand) {
+        let capable = self
+            .attached
+            .as_ref()
+            .is_some_and(|client| client.kitty_graphics);
+        match command {
+            KittyGraphicsCommand::Query { image_id } => {
+                let response = kitty_query_response(capable, image_id);
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    let _ = queue_pane_input(pane, &response);
+                }
+            }
+            KittyGraphicsCommand::Packet {
+                bytes,
+                starts_transfer,
+                more,
+            } => {
+                if !capable {
+                    return;
+                }
+                self.kitty_transfers
+                    .push(pane_id, bytes, starts_transfer, more);
+            }
+        }
+    }
+
     fn handle_client(
         &mut self,
         id: u64,
@@ -1890,6 +2021,7 @@ impl SessionActor {
                 replace,
                 display,
                 vivid,
+                kitty_graphics,
             } => {
                 if let Some(old) = &self.attached {
                     if !replace {
@@ -1914,6 +2046,7 @@ impl SessionActor {
                 // authoritative projection.
                 self.vivid.deactivate_bridge();
                 self.pending_media_projections.clear();
+                self.clear_kitty_graphics();
                 let display = normalized_display(display, self.config.general.status_visible);
                 self.last_display = display;
                 self.client_ipc = Some(
@@ -1941,6 +2074,7 @@ impl SessionActor {
                     // becomes its first outstanding frame instead of being suppressed as stale.
                     acknowledged_frame: self.frame_id,
                     vivid,
+                    kitty_graphics,
                     rendered_session_sequence: 0,
                     frame_sequences: VecDeque::new(),
                 });
@@ -2318,6 +2452,7 @@ impl SessionActor {
                         },
                     )?;
                     self.attached = None;
+                    self.clear_kitty_graphics();
                     self.reported_input_mode = None;
                     self.bridge_instance_id = None;
                     self.bridge_local_revision = 0;
@@ -7382,9 +7517,16 @@ impl SessionActor {
                     // and its program intact.
                     let columns = content.width.max(1);
                     let rows = content.height.max(1);
-                    if pane.terminal.rows() != rows as usize
-                        || pane.terminal.cols() != columns as usize
-                    {
+                    let metrics = (
+                        content.width,
+                        content.height,
+                        display.cell_width,
+                        display.cell_height,
+                    );
+                    let dimensions_changed = pane.terminal.rows() != rows as usize
+                        || pane.terminal.cols() != columns as usize;
+                    let metrics_changed = pane.vivid_metrics != Some(metrics);
+                    if dimensions_changed {
                         pane.terminal.resize(rows as usize, columns as usize);
                         pane.screen_sequence = pane.screen_sequence.wrapping_add(1);
                         pane.last_screen_change = Instant::now();
@@ -7396,17 +7538,25 @@ impl SessionActor {
                             pane.screen_changes.pop_front();
                         }
                         resized_panes = resized_panes.wrapping_add(1);
-                        if pane.control.resize(columns, rows).is_err() {
+                    }
+                    if dimensions_changed || metrics_changed {
+                        let pixel_width = u32::from(columns)
+                            .checked_mul(u32::from(display.cell_width))
+                            .and_then(|value| u16::try_from(value).ok())
+                            .unwrap_or(0);
+                        let pixel_height = u32::from(rows)
+                            .checked_mul(u32::from(display.cell_height))
+                            .and_then(|value| u16::try_from(value).ok())
+                            .unwrap_or(0);
+                        if pane
+                            .control
+                            .resize_with_pixels(columns, rows, pixel_width, pixel_height)
+                            .is_err()
+                        {
                             resize_failures.push(projection.pane_id);
                         }
                     }
-                    let metrics = (
-                        content.width,
-                        content.height,
-                        display.cell_width,
-                        display.cell_height,
-                    );
-                    if pane.vivid_metrics != Some(metrics) {
+                    if metrics_changed {
                         self.vivid.update_metrics(
                             projection.pane_id,
                             content.width,
@@ -7447,6 +7597,7 @@ impl SessionActor {
         let theme = self.config.resolved_theme();
         let display = client.display;
         let writer = client.writer.clone();
+        let kitty_graphics = client.kitty_graphics;
         #[cfg(windows)]
         let focused_bracketed_paste = self
             .active_tab()
@@ -7668,10 +7819,23 @@ impl SessionActor {
                 ));
             }
         }
+        if !kitty_graphics {
+            screen.suppress_kitty_placeholders();
+        }
+        let mut kitty_prefix = if kitty_graphics {
+            self.kitty_transfers.drain_pending()
+        } else {
+            Vec::new()
+        };
+        let frame_full = self.force_full || !kitty_prefix.is_empty();
         self.frame_id = self.frame_id.wrapping_add(1);
         // Mutated only by the Windows bracketed-paste prepend below.
         #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut bytes = ansi_diff(self.last_screen.as_ref(), &screen, self.force_full);
+        let mut bytes = ansi_diff(self.last_screen.as_ref(), &screen, frame_full);
+        if !kitty_prefix.is_empty() {
+            kitty_prefix.extend_from_slice(&bytes);
+            bytes = kitty_prefix;
+        }
         #[cfg(windows)]
         let bracketed_paste_transition =
             bracketed_paste_transition(self.outer_bracketed_paste, focused_bracketed_paste);
@@ -7687,7 +7851,7 @@ impl SessionActor {
             &writer,
             self.frame_id,
             self.session_sequence,
-            self.force_full,
+            frame_full,
             &bytes,
         )
         .is_ok();
@@ -7702,6 +7866,7 @@ impl SessionActor {
                 },
             );
             self.attached = None;
+            self.clear_kitty_graphics();
             self.reported_input_mode = None;
             self.last_screen = None;
             #[cfg(windows)]
@@ -10589,6 +10754,39 @@ fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kitty_transfers_are_pane_isolated_bounded_and_drained_in_order() {
+        let mut transfers = KittyTransferBuffer::default();
+        assert!(transfers.push_bounded(1, b"a1".to_vec(), true, true, 12));
+        assert!(transfers.push_bounded(2, b"b1".to_vec(), true, true, 12));
+        assert!(transfers.push_bounded(1, b"a2".to_vec(), false, false, 12));
+        assert!(transfers.push_bounded(2, b"b2".to_vec(), false, false, 12));
+        assert_eq!(transfers.drain_pending(), b"a1a2b1b2");
+        assert_eq!(transfers.bytes, 0);
+
+        assert!(transfers.push_bounded(1, b"123456".to_vec(), true, true, 8));
+        assert!(!transfers.push_bounded(1, b"789".to_vec(), false, false, 8));
+        assert_eq!(transfers.bytes, 0);
+        assert!(transfers.pending.is_empty());
+        assert!(transfers.transfers.is_empty());
+    }
+
+    #[test]
+    fn clearing_kitty_transfers_drops_attachment_pixels() {
+        let mut transfers = KittyTransferBuffer::default();
+        assert!(transfers.push(1, b"upload".to_vec(), true, false));
+        transfers.clear();
+        assert_eq!(transfers.bytes, 0);
+        assert!(transfers.pending.is_empty());
+        assert!(transfers.transfers.is_empty());
+    }
+
+    #[test]
+    fn kitty_support_query_reports_attachment_capability() {
+        assert_eq!(kitty_query_response(true, 31), b"\x1b_Gi=31;OK\x1b\\");
+        assert_eq!(kitty_query_response(false, 31), b"\x1b_Gi=31;ENOTSUP\x1b\\");
+    }
 
     #[test]
     fn only_vetted_schemes_reach_the_host_opener() {

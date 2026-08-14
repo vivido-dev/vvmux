@@ -98,6 +98,16 @@ impl PtyControl {
     }
 
     pub fn resize(&self, columns: u16, rows: u16) -> io::Result<()> {
+        self.resize_with_pixels(columns, rows, 0, 0)
+    }
+
+    pub fn resize_with_pixels(
+        &self,
+        columns: u16,
+        rows: u16,
+        _pixel_width: u16,
+        _pixel_height: u16,
+    ) -> io::Result<()> {
         if columns == 0 || rows == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

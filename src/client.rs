@@ -36,6 +36,79 @@ const DISPLAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DETACH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Idle wait for host terminal input when nothing time-sensitive is buffered.
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// One 64 MiB graphics transfer plus the largest bounded composed text repaint and framing.
+const MAX_ATOMIC_RENDER_BYTES: usize = 128 * 1024 * 1024;
+
+struct PendingRender {
+    frame_id: u64,
+    session_sequence: u64,
+    full: bool,
+    bytes: Vec<u8>,
+}
+
+enum RenderAssembly {
+    Pending,
+    Complete(PendingRender),
+    Rejected,
+}
+
+struct RenderAssembler {
+    pending: Option<PendingRender>,
+    discarding: Option<u64>,
+    maximum_bytes: usize,
+}
+
+impl RenderAssembler {
+    fn new(maximum_bytes: usize) -> Self {
+        Self {
+            pending: None,
+            discarding: None,
+            maximum_bytes,
+        }
+    }
+
+    fn push(
+        &mut self,
+        frame_id: u64,
+        session_sequence: u64,
+        full: bool,
+        last: bool,
+        bytes: Vec<u8>,
+    ) -> RenderAssembly {
+        if self.discarding == Some(frame_id) {
+            if last {
+                self.discarding = None;
+            }
+            return RenderAssembly::Pending;
+        }
+        let first_chunk = self.pending.is_none();
+        let pending = self.pending.get_or_insert_with(|| PendingRender {
+            frame_id,
+            session_sequence,
+            full,
+            bytes: Vec::new(),
+        });
+        let coherent = pending.frame_id == frame_id
+            && pending.session_sequence == session_sequence
+            && (first_chunk || !full);
+        let fits = pending
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .is_some_and(|size| size <= self.maximum_bytes);
+        if !coherent || !fits {
+            self.pending = None;
+            self.discarding = (!last).then_some(frame_id);
+            return RenderAssembly::Rejected;
+        }
+        pending.bytes.extend_from_slice(&bytes);
+        if last {
+            RenderAssembly::Complete(self.pending.take().expect("render is being assembled"))
+        } else {
+            RenderAssembly::Pending
+        }
+    }
+}
 
 pub fn attach(
     name: &str,
@@ -61,12 +134,21 @@ pub fn attach(
     let outer_bulk_endpoint = std::env::var("VIVID_ENDPOINT_BULK").ok();
     let outer_root_secret = std::env::var("VIVID_ROOT_SECRET").ok().map(Zeroizing::new);
     let vivid = outer_endpoint.is_some() && outer_root_secret.is_some();
+    let host_term = std::env::var_os("TERM");
+    let kitty_graphics = host_supports_kitty_graphics(host_term.as_deref());
     // Negotiate the attachment before entering raw/alternate-screen mode. A rejected attach must
     // remain an ordinary command error: changing terminal state here would visibly clear the
     // caller's Vivido window, and the later terminal teardown would hide the server's diagnostic.
     let display = crate::platform::current_display_metrics()?;
     let presenter_cell_size = Arc::new(AtomicU32::new(pack_cell_size(display)));
-    let text_only = request_attachment(&mut reader, &writer, replace, display, vivid)?;
+    let text_only = request_attachment(
+        &mut reader,
+        &writer,
+        replace,
+        display,
+        vivid,
+        kitty_graphics,
+    )?;
     let terminal = ClientTerminal::enter()?;
 
     let stopped = Arc::new(AtomicBool::new(false));
@@ -133,19 +215,39 @@ pub fn attach(
                 }
                 _ => None,
             };
+            let mut render_assembler = RenderAssembler::new(MAX_ATOMIC_RENDER_BYTES);
             while let Ok(message) = reader.recv_server() {
                 match message {
                     ServerMessage::Attached { .. } => break,
                     ServerMessage::Render {
                         frame_id,
+                        session_sequence,
                         full,
                         last,
                         bytes,
-                        ..
                     } => {
-                        // Queue and return. The acknowledgement is sent by the output thread once
-                        // the bytes reach the terminal, so it stays a true completion signal.
-                        if !output_thread.enqueue_frame(frame_id, full, last, bytes) {
+                        let completed = match render_assembler.push(
+                            frame_id,
+                            session_sequence,
+                            full,
+                            last,
+                            bytes,
+                        ) {
+                            RenderAssembly::Pending => continue,
+                            RenderAssembly::Rejected => {
+                                let _ = send_client(&read_writer, &ClientMessage::RenderResync);
+                                continue;
+                            }
+                            RenderAssembly::Complete(completed) => completed,
+                        };
+                        // Queue the complete upload-and-repaint unit. The acknowledgement is sent
+                        // only after all bytes reach the terminal.
+                        if !output_thread.enqueue_frame(
+                            completed.frame_id,
+                            completed.full,
+                            true,
+                            completed.bytes,
+                        ) {
                             // The backlog was discarded, so the screen no longer matches what the
                             // server believes it drew. Only a full redraw can restore agreement.
                             let _ = send_client(&read_writer, &ClientMessage::RenderResync);
@@ -451,12 +553,20 @@ pub fn attach(
     result
 }
 
+fn host_supports_kitty_graphics(term: Option<&std::ffi::OsStr>) -> bool {
+    matches!(
+        term.and_then(std::ffi::OsStr::to_str),
+        Some("xterm-kitty" | "xterm-ghostty")
+    )
+}
+
 fn request_attachment(
     reader: &mut crate::ipc::RecordReader,
     writer: &SharedWriter,
     replace: bool,
     display: crate::ipc::DisplayMetrics,
     vivid: bool,
+    kitty_graphics: bool,
 ) -> io::Result<bool> {
     send_client(
         writer,
@@ -464,6 +574,7 @@ fn request_attachment(
             replace,
             display,
             vivid,
+            kitty_graphics,
         },
     )?;
     match reader.recv_server()? {
@@ -1845,7 +1956,7 @@ struct TerminalOutput {
 /// Frame diffs are incremental, so a queued frame can never be dropped in isolation without
 /// corrupting the screen. When the bound is reached the queue is cleared and the server is asked
 /// for a full redraw, which is the one supersede that is safe.
-const OUTPUT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+const OUTPUT_QUEUE_BYTES: usize = MAX_ATOMIC_RENDER_BYTES;
 
 impl TerminalOutput {
     fn spawn(output: Arc<Mutex<Box<dyn Write + Send>>>, writer: SharedWriter) -> io::Result<Self> {
@@ -1969,6 +2080,61 @@ mod tests {
     use image::ImageEncoder;
     use vivid_protocol::media::{self, AudioPacket, VideoPacket};
 
+    #[test]
+    fn render_chunks_are_admitted_as_one_atomic_job() {
+        let mut assembler = RenderAssembler::new(32);
+        assert!(matches!(
+            assembler.push(7, 9, true, false, b"upload".to_vec()),
+            RenderAssembly::Pending
+        ));
+        let RenderAssembly::Complete(frame) =
+            assembler.push(7, 9, false, true, b"placeholder".to_vec())
+        else {
+            panic!("render did not complete");
+        };
+        assert!(frame.full);
+        assert_eq!(frame.bytes, b"uploadplaceholder");
+    }
+
+    #[test]
+    fn render_assembly_rejects_overflow_and_interleaving() {
+        let mut assembler = RenderAssembler::new(4);
+        assert!(matches!(
+            assembler.push(1, 1, true, false, b"abc".to_vec()),
+            RenderAssembly::Pending
+        ));
+        assert!(matches!(
+            assembler.push(1, 1, false, true, b"de".to_vec()),
+            RenderAssembly::Rejected
+        ));
+
+        assert!(matches!(
+            assembler.push(2, 2, false, false, b"a".to_vec()),
+            RenderAssembly::Pending
+        ));
+        assert!(matches!(
+            assembler.push(3, 2, false, true, b"b".to_vec()),
+            RenderAssembly::Rejected
+        ));
+    }
+
+    #[test]
+    fn kitty_host_capability_uses_only_exact_term_values() {
+        use std::ffi::OsStr;
+
+        assert!(host_supports_kitty_graphics(Some(OsStr::new(
+            "xterm-kitty"
+        ))));
+        assert!(host_supports_kitty_graphics(Some(OsStr::new(
+            "xterm-ghostty"
+        ))));
+        assert!(!host_supports_kitty_graphics(Some(OsStr::new("vvmux"))));
+        assert!(!host_supports_kitty_graphics(Some(OsStr::new(
+            "xterm-kitty-256color"
+        ))));
+        assert!(!host_supports_kitty_graphics(None));
+    }
+
     fn test_surface(key: BridgeSourceKey) -> BridgeSurface {
         BridgeSurface {
             key: crate::ipc::BridgeSurfaceKey {
@@ -2045,6 +2211,7 @@ mod tests {
                 cell_height: 20,
             },
             true,
+            false,
         )
         .unwrap_err();
 

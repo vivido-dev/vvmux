@@ -40,6 +40,16 @@ impl PtyControl {
     }
 
     pub fn resize(&self, columns: u16, rows: u16) -> io::Result<()> {
+        self.resize_with_pixels(columns, rows, 0, 0)
+    }
+
+    pub fn resize_with_pixels(
+        &self,
+        columns: u16,
+        rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> io::Result<()> {
         if columns == 0 || rows == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -49,8 +59,8 @@ impl PtyControl {
         let size = libc::winsize {
             ws_row: rows,
             ws_col: columns,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: pixel_width,
+            ws_ypixel: pixel_height,
         };
         if unsafe { libc::ioctl(self.inner.resize.as_raw_fd(), libc::TIOCSWINSZ as _, &size) } == -1
         {
@@ -233,4 +243,41 @@ fn spawn_command(
         },
         waiter: PtyWaiter { child },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_propagates_pixel_dimensions() {
+        let parts = spawn(
+            OsStr::new("/bin/sh"),
+            Some(OsStr::new("sleep 5")),
+            Path::new("/tmp"),
+            80,
+            24,
+            &[],
+        )
+        .unwrap();
+        parts
+            .control
+            .resize_with_pixels(100, 30, 1200, 600)
+            .unwrap();
+        let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+        assert_ne!(
+            unsafe {
+                libc::ioctl(
+                    parts.control.inner.resize.as_raw_fd(),
+                    libc::TIOCGWINSZ as _,
+                    size.as_mut_ptr(),
+                )
+            },
+            -1
+        );
+        let size = unsafe { size.assume_init() };
+        assert_eq!((size.ws_col, size.ws_row), (100, 30));
+        assert_eq!((size.ws_xpixel, size.ws_ypixel), (1200, 600));
+        parts.control.terminate_blocking();
+    }
 }
