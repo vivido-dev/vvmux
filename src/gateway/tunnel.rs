@@ -1570,8 +1570,10 @@ mod tests {
 
     #[tokio::test]
     async fn real_rustls_session_derives_the_same_exporter_on_both_ends() {
-        let rcgen::CertifiedKey { cert, key_pair } =
-            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+        let rcgen::CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
         let certificate = cert.der().clone();
         let private_key = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
         let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(

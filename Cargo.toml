@@ -3,7 +3,7 @@ name = "vvmux"
 version = "0.4.2"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.94"
 license = "Apache-2.0"
 repository = "https://github.com/vivido-dev/vvmux"
 description = "A detachable Vivid-aware terminal multiplexer"
@@ -39,10 +39,10 @@ serde_json = "1"
 sha2 = "0.11"
 semver = { version = "1", features = ["serde"] }
 subtle = { version = "2.6", optional = true }
-ed25519-dalek = { version = "2", features = [
+ed25519-dalek = { version = "3", features = [
+  "fast",
   "signature",
   "digest",
-  "std",
   "zeroize",
 ], optional = true }
 httpdate = { version = "1", optional = true }
@@ -70,13 +70,13 @@ zeroize = { version = "1.9", features = ["serde"] }
 vvmux-plugin-api = { version = "0.4", path = "vvmux-plugin-api" }
 # 38.0.4 was the original design pin but now has applicable RustSec sandbox/WASI advisories.
 # 36.0.13 is the fully patched maintenance line that still supports this workspace's Rust 1.88.
-wasmtime = { version = "=36.0.13", default-features = false, features = [
+wasmtime = { version = "47", default-features = false, features = [
   "component-model",
   "cranelift",
   "runtime",
   "std",
 ] }
-wasmtime-wasi = { version = "=36.0.13", default-features = false }
+wasmtime-wasi = { version = "47", default-features = false }
 
 [features]
 default = ["server-capability"]
@@ -125,7 +125,7 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
 tempfile = "3"
 wat = "1"
 tokio-rustls = "0.26"
