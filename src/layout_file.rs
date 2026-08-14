@@ -53,6 +53,10 @@ pub struct LayoutNode {
     cwd: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
     hold: bool,
+    /// Named for the non-default state so a transparent pane — what every pane is unless the user
+    /// says otherwise — keeps serializing exactly as it did before this key existed.
+    #[serde(skip_serializing_if = "is_false")]
+    opaque: bool,
     // Arrays of tables must follow every scalar and inline value in the same table, so `children`
     // stays last: TOML serialization order is part of this struct's contract.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -99,6 +103,9 @@ pub struct LayoutFloat {
     height_percent: u16,
     #[serde(skip_serializing_if = "is_false")]
     pinned: bool,
+    /// Named for the non-default state, exactly as on `LayoutNode`.
+    #[serde(skip_serializing_if = "is_false")]
+    opaque: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -115,6 +122,7 @@ impl Default for LayoutFloat {
             width_percent: 60,
             height_percent: 60,
             pinned: false,
+            opaque: false,
         }
     }
 }
@@ -228,6 +236,7 @@ impl LayoutFile {
                     float.command,
                     float.cwd,
                     float.hold,
+                    float.opaque,
                     home,
                     tab_number,
                     &label,
@@ -269,10 +278,11 @@ impl LayoutFile {
 }
 
 impl LayoutNode {
-    pub fn leaf(pane: String, cwd: Option<String>) -> Self {
+    pub fn leaf(pane: String, cwd: Option<String>, opaque: bool) -> Self {
         Self {
             pane: Some(pane),
             cwd,
+            opaque,
             ..Self::default()
         }
     }
@@ -294,6 +304,7 @@ impl LayoutFloat {
         width_percent: u16,
         height_percent: u16,
         pinned: bool,
+        opaque: bool,
     ) -> Self {
         Self {
             pane: Some(pane),
@@ -303,6 +314,7 @@ impl LayoutFloat {
             width_percent,
             height_percent,
             pinned,
+            opaque,
         }
     }
 }
@@ -422,12 +434,20 @@ fn lower_node(
         }
         validate_command(node.command.as_deref(), tab, &label)?;
         let slot = spawns.len();
-        spawns.push(spawn(node.command, node.cwd, node.hold, home, tab, &label)?);
+        spawns.push(spawn(
+            node.command,
+            node.cwd,
+            node.hold,
+            node.opaque,
+            home,
+            tab,
+            &label,
+        )?);
         return Ok(PlannedNode::Leaf(slot));
     }
-    if node.command.is_some() || node.cwd.is_some() || node.hold {
+    if node.command.is_some() || node.cwd.is_some() || node.hold || node.opaque {
         return Err(invalid(format!(
-            "tab {tab} split node cannot have command, cwd, or hold"
+            "tab {tab} split node cannot have command, cwd, hold, or opaque"
         )));
     }
     let Some(split) = node.split else {
@@ -484,6 +504,7 @@ fn spawn(
     command: Option<String>,
     cwd: Option<String>,
     hold: bool,
+    opaque: bool,
     home: Option<&Path>,
     tab: usize,
     label: &str,
@@ -494,6 +515,9 @@ fn spawn(
         cwd: cwd
             .map(|cwd| expand_home(&cwd, home, tab, label))
             .transpose()?,
+        // A saved layout is authoritative about the pane it recorded, so it pins the state rather
+        // than falling through to the config default.
+        transparent: Some(!opaque),
         hold_on_exit: hold,
         extra_env: Vec::new(),
         role: crate::session::PaneRole::Core,
@@ -692,8 +716,8 @@ hold = true
                     Axis::Vertical,
                     vec![30, 70],
                     vec![
-                        LayoutNode::leaf("p1".to_owned(), Some("~/src/vvmux".to_owned())),
-                        LayoutNode::leaf("p2".to_owned(), None),
+                        LayoutNode::leaf("p1".to_owned(), Some("~/src/vvmux".to_owned()), true),
+                        LayoutNode::leaf("p2".to_owned(), None, false),
                     ],
                 )),
                 Vec::new(),
@@ -705,11 +729,11 @@ hold = true
                     Axis::Horizontal,
                     vec![1, 3],
                     vec![
-                        LayoutNode::leaf("p1".to_owned(), None),
-                        LayoutNode::leaf("p2".to_owned(), None),
+                        LayoutNode::leaf("p1".to_owned(), None, false),
+                        LayoutNode::leaf("p2".to_owned(), None, false),
                     ],
                 )),
-                vec![LayoutFloat::new("p3".to_owned(), None, 40, 50, true)],
+                vec![LayoutFloat::new("p3".to_owned(), None, 40, 50, true, true)],
             ),
         ]);
         let rendered = file.render().unwrap();
@@ -726,6 +750,10 @@ hold = true
             first.spawns[0].cwd.as_deref(),
             Some(Path::new("/home/test/src/vvmux"))
         );
+        // A saved layout pins what it recorded rather than deferring to `[panes].transparent`, so
+        // reopening it reproduces the pane the user actually saved.
+        assert_eq!(first.spawns[0].transparent, Some(false));
+        assert_eq!(first.spawns[1].transparent, Some(true));
         let geometry = first
             .tiled
             .as_ref()
@@ -746,6 +774,7 @@ hold = true
         assert_eq!(second.floating[0].width_percent, 40);
         assert_eq!(second.floating[0].height_percent, 50);
         assert!(second.floating[0].pinned);
+        assert_eq!(second.spawns[2].transparent, Some(false));
         let geometry = second
             .tiled
             .as_ref()
@@ -759,6 +788,45 @@ hold = true
             });
         assert_eq!(geometry[&1].height, 10);
         assert_eq!(geometry[&2].height, 30);
+    }
+
+    /// `opaque` arrived after layouts were already in use, so a file written before it existed
+    /// must still load, and must load as the transparent pane it described.
+    #[test]
+    fn a_layout_without_opaque_loads_as_transparent() {
+        let plan = parse(
+            r#"
+[[tabs]]
+[tabs.layout]
+pane = "p1"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(plan.tabs[0].spawns[0].transparent, Some(true));
+    }
+
+    /// `opaque` describes a pane, so it has no meaning on a split — the same rule the other
+    /// leaf-only keys already follow.
+    #[test]
+    fn a_split_cannot_be_opaque() {
+        let error = parse(
+            r#"
+[[tabs]]
+[tabs.layout]
+split = "vertical"
+opaque = true
+
+[[tabs.layout.children]]
+pane = "p1"
+
+[[tabs.layout.children]]
+pane = "p2"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("opaque"), "{error}");
     }
 
     /// The save prompt accepts a file name or a path; only a bare name means "in the config
@@ -797,8 +865,8 @@ hold = true
                 Axis::Vertical,
                 vec![1, 1],
                 vec![
-                    LayoutNode::leaf("p1".to_owned(), Some("/tmp".to_owned())),
-                    LayoutNode::leaf("p2".to_owned(), None),
+                    LayoutNode::leaf("p1".to_owned(), Some("/tmp".to_owned()), false),
+                    LayoutNode::leaf("p2".to_owned(), None, false),
                 ],
             )),
             Vec::new(),

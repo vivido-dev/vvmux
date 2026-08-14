@@ -120,6 +120,9 @@ pub struct Theme {
     pub active_title: Option<ThemeColor>,
     pub inactive_title: Option<ThemeColor>,
     pub frame_background: Option<ThemeColor>,
+    /// The background an opaque pane paints behind its own cells. Ignored by transparent panes,
+    /// which leave the background to the outer terminal; see `[panes].transparent`.
+    pub pane_background: Option<ThemeColor>,
     pub status_foreground: Option<ThemeColor>,
     pub status_background: Option<ThemeColor>,
     pub search_match_foreground: Option<ThemeColor>,
@@ -141,6 +144,9 @@ pub struct ResolvedTheme {
     pub active_title: TerminalColor,
     pub inactive_title: TerminalColor,
     pub frame_background: TerminalColor,
+    /// What an opaque pane paints where its cells would otherwise inherit the outer terminal's
+    /// background. A transparent pane never consults this.
+    pub pane_background: TerminalColor,
     pub status_foreground: TerminalColor,
     pub status_background: TerminalColor,
     pub search_match_foreground: TerminalColor,
@@ -204,6 +210,9 @@ fn base() -> ResolvedTheme {
         active_title: TerminalColor::Indexed(12),
         inactive_title: TerminalColor::Indexed(8),
         frame_background: TerminalColor::Default,
+        // Palette black rather than a fixed RGB: an opaque pane should sit on whatever the user
+        // already tuned their terminal's background to, light or dark.
+        pane_background: TerminalColor::Indexed(0),
         status_foreground: TerminalColor::Indexed(15),
         status_background: TerminalColor::Indexed(4),
         search_match_foreground: TerminalColor::Indexed(0),
@@ -231,6 +240,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             active_title: TerminalColor::Indexed(15),
             inactive_title: TerminalColor::Indexed(8),
             frame_background: TerminalColor::Default,
+            pane_background: TerminalColor::Indexed(0),
             status_foreground: TerminalColor::Indexed(0),
             status_background: TerminalColor::Indexed(7),
             search_match_foreground: TerminalColor::Indexed(0),
@@ -247,6 +257,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             active_title: rgb(0xec, 0xef, 0xf4),
             inactive_title: rgb(0x61, 0x6e, 0x88),
             frame_background: TerminalColor::Default,
+            pane_background: rgb(0x2e, 0x34, 0x40),
             status_foreground: rgb(0xec, 0xef, 0xf4),
             status_background: rgb(0x3b, 0x42, 0x52),
             search_match_foreground: rgb(0x2e, 0x34, 0x40),
@@ -263,6 +274,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             active_title: rgb(0x93, 0xa1, 0xa1),
             inactive_title: rgb(0x58, 0x6e, 0x75),
             frame_background: TerminalColor::Default,
+            pane_background: rgb(0x00, 0x2b, 0x36),
             status_foreground: rgb(0x93, 0xa1, 0xa1),
             status_background: rgb(0x07, 0x36, 0x42),
             search_match_foreground: rgb(0x00, 0x2b, 0x36),
@@ -279,6 +291,7 @@ pub fn preset(name: &str) -> Option<ResolvedTheme> {
             active_title: rgb(0xeb, 0xdb, 0xb2),
             inactive_title: rgb(0x92, 0x83, 0x74),
             frame_background: TerminalColor::Default,
+            pane_background: rgb(0x28, 0x28, 0x28),
             status_foreground: rgb(0xeb, 0xdb, 0xb2),
             status_background: rgb(0x3c, 0x38, 0x36),
             search_match_foreground: rgb(0x28, 0x28, 0x28),
@@ -328,6 +341,7 @@ pub fn resolve(theme: &Theme, appearance: &Appearance) -> ResolvedTheme {
         resolved.inactive_title,
     );
     resolved.frame_background = pick(theme.frame_background, None, resolved.frame_background);
+    resolved.pane_background = pick(theme.pane_background, None, resolved.pane_background);
     resolved.status_foreground = pick(
         theme.status_foreground,
         legacy(appearance.status_foreground),
@@ -425,6 +439,11 @@ mod tests {
         );
         assert_eq!(resolved.frame_background, TerminalColor::Default);
         assert_eq!(
+            resolved.pane_background,
+            TerminalColor::Indexed(0),
+            "an opaque pane defaults to the palette background the user already tuned"
+        );
+        assert_eq!(
             resolved.active_title, resolved.active_frame,
             "a title with no theme keeps being drawn in the border color"
         );
@@ -503,6 +522,29 @@ mod tests {
             );
         }
         assert!(preset("no-such-preset").is_none());
+    }
+
+    /// `pane_background` follows the same precedence as every other color, and it is the one key
+    /// a user reaches for when their opaque panes do not match their terminal's own background.
+    #[test]
+    fn a_pane_background_overrides_the_preset_it_sits_on() {
+        let theme = Theme {
+            preset: Some("nord".to_owned()),
+            ..Theme::default()
+        };
+        assert_eq!(
+            resolve(&theme, &Appearance::default()).pane_background,
+            TerminalColor::Rgb(0x2e, 0x34, 0x40)
+        );
+
+        let theme = Theme {
+            pane_background: color("#101010").map(ThemeColor),
+            ..theme
+        };
+        assert_eq!(
+            resolve(&theme, &Appearance::default()).pane_background,
+            TerminalColor::Rgb(0x10, 0x10, 0x10)
+        );
     }
 
     #[test]

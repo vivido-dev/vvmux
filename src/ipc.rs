@@ -16,6 +16,9 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
+/// Version 19 added the per-pane transparency action. `Action` rides `ClientMessage`, and an
+/// unknown variant name is a decode failure rather than a negotiation, so a new client against a
+/// surviving old server tore the connection down mid-session instead of saying why.
 /// Version 18 reports recreated retained outer sources so their bodies can be rehydrated.
 /// Version 17 added actor-owned tab-navigation, rename, and close-confirmation actions.
 /// Version 16 was the hard cutover for deterministic automation waits and correlated diagnostics.
@@ -24,7 +27,7 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 18;
+pub const VERSION: u16 = 19;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -395,6 +398,8 @@ pub enum Action {
     NewFloatingPane,
     ToggleFloatingPanes,
     TogglePanePinned,
+    /// Flip whether this pane paints its own background or leaves it to the outer terminal.
+    TogglePaneTransparency,
     EnterFloatingMoveMode,
     EnterFloatingResizeMode,
     /// Invoke a configured plugin action. The host resolves and validates this reference.

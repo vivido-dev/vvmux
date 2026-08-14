@@ -446,6 +446,7 @@ impl PrefixParser {
             b'f' => output.push(ParsedInput::Action(Action::NewFloatingPane)),
             b'F' => output.push(ParsedInput::Action(Action::ToggleFloatingPanes)),
             b'P' => output.push(ParsedInput::Action(Action::TogglePanePinned)),
+            b't' => output.push(ParsedInput::Action(Action::TogglePaneTransparency)),
             b'm' => output.push(ParsedInput::Action(Action::EnterFloatingMoveMode)),
             b'r' => output.push(ParsedInput::Action(Action::EnterFloatingResizeMode)),
             b'a' => output.push(ParsedInput::Action(Action::ToggleAgentNavigator)),
@@ -498,6 +499,7 @@ pub(crate) fn parse_configured_action(action: &str) -> Option<Action> {
         "new-floating-pane" => Some(Action::NewFloatingPane),
         "toggle-floating-panes" => Some(Action::ToggleFloatingPanes),
         "toggle-pane-pinned" => Some(Action::TogglePanePinned),
+        "toggle-pane-transparency" => Some(Action::TogglePaneTransparency),
         "enter-floating-move-mode" => Some(Action::EnterFloatingMoveMode),
         "enter-floating-resize-mode" => Some(Action::EnterFloatingResizeMode),
         "agent-navigator" => Some(Action::ToggleAgentNavigator),
@@ -703,6 +705,15 @@ mod tests {
             [
                 ParsedInput::Action(Action::BeginSaveLayout),
                 ParsedInput::Action(Action::ToggleSyncInput),
+            ]
+        );
+        // `t` rather than `b`: the prefix key's own letter is confusing to press twice, and `b`
+        // reads as "back" to the vi-style navigation the other bindings follow.
+        assert_eq!(
+            parser.feed(b"\x02t\x02P"),
+            [
+                ParsedInput::Action(Action::TogglePaneTransparency),
+                ParsedInput::Action(Action::TogglePanePinned),
             ]
         );
     }

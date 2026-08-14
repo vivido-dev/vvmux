@@ -34,6 +34,9 @@ inactive_frame = "bright-black"
 # active_title = "bright-white"
 # inactive_title = "bright-black"
 # frame_background = "default"
+# What an opaque pane paints where its cells would otherwise inherit the outer terminal's
+# background. Only panes made opaque consult this; see [panes].
+# pane_background = "black"
 status_foreground = "bright-white"
 status_background = "blue"
 # Search matches are recolored in place; text, wide glyphs, and links are preserved.
@@ -50,6 +53,13 @@ status_background = "blue"
 # The status bar paints its background across the full width. Set false for the
 # older look, where the background stopped where the text did.
 # status_fill = true
+
+[panes]
+# Whether a new pane leaves its background to the outer terminal. Transparent panes emit SGR 49,
+# so a translucent host window shows the desktop through them; an opaque pane paints
+# [theme].pane_background instead and reads as a solid panel. Toggle a single pane at runtime with
+# the `toggle-pane-transparency` action.
+# transparent = true
 
 [media]
 aggregate_retained_bytes = 268435456
@@ -107,6 +117,7 @@ S = "toggle-sync-input"
 f = "new-floating-pane"
 F = "toggle-floating-panes"
 P = "toggle-pane-pinned"
+t = "toggle-pane-transparency"
 m = "enter-floating-move-mode"
 r = "enter-floating-resize-mode"
 

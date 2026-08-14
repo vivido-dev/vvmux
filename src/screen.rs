@@ -153,6 +153,31 @@ impl ScreenBuffer {
         }
     }
 
+    /// Give the cells inside `rect` that inherit the host terminal's background an explicit one.
+    ///
+    /// This is what makes a pane opaque. A cell left at [`TerminalColor::Default`] is written as
+    /// SGR 49, which the outer terminal renders with no background of its own — under a
+    /// translucent window that means the desktop shows through. Substituting a concrete color
+    /// makes just this pane a solid panel while its neighbours stay see-through.
+    ///
+    /// Only the default background is replaced. A cell the application colored itself already
+    /// paints over the window, and overwriting it would discard the application's choice.
+    /// Everything else about each cell — text, wide-cell structure, combining marks, foreground,
+    /// hyperlinks — is left alone, exactly as in [`Self::restyle`].
+    pub fn fill_default_background(&mut self, rect: Rect, color: TerminalColor) {
+        let right = rect.x.saturating_add(rect.width).min(self.columns);
+        let bottom = rect.y.saturating_add(rect.height).min(self.rows);
+        for y in rect.y..bottom {
+            for x in rect.x..right {
+                let index = usize::from(y) * usize::from(self.columns) + usize::from(x);
+                let cell = &mut self.cells[index];
+                if cell.background == TerminalColor::Default {
+                    cell.background = color;
+                }
+            }
+        }
+    }
+
     /// Toggle reverse video across an existing run without replacing any terminal cell data.
     ///
     /// A toggle, rather than forcing inverse on, keeps selection visible over applications that
@@ -648,6 +673,141 @@ mod tests {
 
         assert_eq!(screen.cells[3].background, TerminalColor::Indexed(2));
         assert_eq!(screen.cells[0].background, TerminalColor::Indexed(0));
+    }
+
+    #[test]
+    fn an_opaque_pane_fills_only_the_cells_that_inherit_the_terminal_background() {
+        let mut screen = ScreenBuffer::new(4, 1);
+        screen.draw_text(0, 0, "ab", TextStyle::indexed(7, 0));
+        screen.cells[2] = Cell {
+            ch: 'c',
+            foreground: TerminalColor::Indexed(7),
+            background: TerminalColor::Default,
+            ..Cell::default()
+        };
+
+        screen.fill_default_background(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+            TerminalColor::Rgb(30, 30, 46),
+        );
+
+        assert_eq!(
+            screen.cells[0].background,
+            TerminalColor::Indexed(0),
+            "a background the application chose must survive"
+        );
+        assert_eq!(screen.cells[2].background, TerminalColor::Rgb(30, 30, 46));
+        assert_eq!(screen.cells[2].ch, 'c', "text must survive the fill");
+        assert_eq!(
+            screen.cells[2].foreground,
+            TerminalColor::Indexed(7),
+            "only the background is decided by the pane's opacity"
+        );
+        assert_eq!(
+            screen.cells[3].background,
+            TerminalColor::Rgb(30, 30, 46),
+            "blank cells are what make the pane read as a solid panel"
+        );
+    }
+
+    #[test]
+    fn filling_a_pane_background_clamps_to_the_buffer_and_leaves_neighbours_alone() {
+        let mut screen = ScreenBuffer::new(4, 2);
+
+        screen.fill_default_background(
+            Rect {
+                x: 2,
+                y: 0,
+                width: 99,
+                height: 99,
+            },
+            TerminalColor::Indexed(4),
+        );
+
+        assert_eq!(screen.cells[2].background, TerminalColor::Indexed(4));
+        assert_eq!(screen.cells[3].background, TerminalColor::Indexed(4));
+        assert_eq!(
+            screen.cells[0].background,
+            TerminalColor::Default,
+            "a transparent pane to the left keeps showing the desktop"
+        );
+        assert_eq!(
+            screen.cells[usize::from(screen.columns) + 2].background,
+            TerminalColor::Indexed(4),
+            "the fill covers every row of the rect"
+        );
+    }
+
+    /// Composition fills each pane as it is drawn rather than sweeping the finished buffer, which
+    /// is what keeps the projection order authoritative: a transparent pane stacked over an opaque
+    /// one stays see-through where the two overlap.
+    #[test]
+    fn a_later_transparent_pane_is_not_made_opaque_by_the_pane_beneath_it() {
+        let mut screen = ScreenBuffer::new(4, 1);
+
+        let beneath = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+        };
+        screen.fill_default_background(beneath, TerminalColor::Indexed(4));
+
+        for x in 2..4 {
+            screen.set(x, 0, Cell::default());
+        }
+
+        assert_eq!(screen.cells[0].background, TerminalColor::Indexed(4));
+        assert_eq!(screen.cells[1].background, TerminalColor::Indexed(4));
+        assert_eq!(
+            screen.cells[2].background,
+            TerminalColor::Default,
+            "the pane drawn later owns the cell, opacity and all"
+        );
+        assert_eq!(screen.cells[3].background, TerminalColor::Default);
+    }
+
+    #[test]
+    fn filling_a_pane_background_preserves_wide_glyph_structure() {
+        let mut screen = ScreenBuffer::new(2, 1);
+        screen.set(
+            0,
+            0,
+            Cell {
+                ch: '漢',
+                ..Cell::default()
+            },
+        );
+        screen.set(
+            1,
+            0,
+            Cell {
+                wide_continuation: true,
+                ..Cell::default()
+            },
+        );
+
+        screen.fill_default_background(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            TerminalColor::Indexed(4),
+        );
+
+        assert_eq!(screen.cells[0].ch, '漢');
+        assert!(
+            screen.cells[1].wide_continuation,
+            "an in-place fill must not go through the wide-cell repair in `set`"
+        );
+        assert_eq!(screen.cells[1].background, TerminalColor::Indexed(4));
     }
 
     #[test]

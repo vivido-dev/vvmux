@@ -13,6 +13,7 @@ pub struct Config {
     /// see `crate::theme::resolve`.
     pub appearance: Appearance,
     pub theme: Theme,
+    pub panes: Panes,
     pub media: Media,
     pub keys: Keys,
     pub floating: Floating,
@@ -144,6 +145,27 @@ impl Default for Floating {
             default_height_percent: 60,
             border_drag_margin: 1,
         }
+    }
+}
+
+/// Pane defaults. Appearance that is a color belongs in `[theme]`; what belongs here is the
+/// behavior a newly spawned pane starts with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Panes {
+    /// Whether a new pane leaves its background to the outer terminal.
+    ///
+    /// Transparent is the default because it is what vvmux has always done: a cell that inherits
+    /// the terminal background is written as SGR 49, so a translucent host window shows the
+    /// desktop through the pane. An opaque pane paints `[theme].pane_background` instead, which is
+    /// what makes it stand out as a solid panel against transparent neighbours. Individual panes
+    /// override this at runtime with the `toggle-pane-transparency` action.
+    pub transparent: bool,
+}
+
+impl Default for Panes {
+    fn default() -> Self {
+        Self { transparent: true }
     }
 }
 
@@ -472,6 +494,20 @@ mod tests {
         assert_eq!(config.server.listen, "127.0.0.1:7880");
     }
 
+    /// Panes have always left their background to the outer terminal, so a config that says
+    /// nothing must keep doing exactly that.
+    #[test]
+    fn panes_are_transparent_until_a_config_says_otherwise() {
+        assert!(Config::default().panes.transparent);
+        assert!(toml::from_str::<Config>("").unwrap().panes.transparent);
+
+        let config: Config = toml::from_str("[panes]\ntransparent = false").unwrap();
+        assert!(!config.panes.transparent);
+        config.validate().unwrap();
+
+        assert!(toml::from_str::<Config>("[panes]\nopaque = true").is_err());
+    }
+
     #[test]
     fn plugin_kill_switch_is_strict_and_can_be_disabled() {
         let config: Config = toml::from_str("[plugins]\nenabled = false").unwrap();
@@ -548,6 +584,7 @@ mod tests {
             "new-floating-pane",
             "toggle-floating-panes",
             "toggle-pane-pinned",
+            "toggle-pane-transparency",
             "enter-floating-move-mode",
             "enter-floating-resize-mode",
             "agent-navigator",

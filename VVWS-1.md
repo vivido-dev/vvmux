@@ -88,7 +88,7 @@ remote deployments use an SSH tunnel or a trusted TLS reverse proxy.
 
 ### Private IPC compatibility
 
-VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 18,
+VVWS/1 remains protocol version 1. Its server-side session adapter uses private VVMX version 19,
 which is a hard cutover from every earlier VVMX version. VVMX 7 moved render and media byte
 payloads out of JSON into bounded binary records. VVMX 8 added transport-loss recovery without
 inventing a new producer epoch. VVMX 9 added bridge-instance correlation and bounded,

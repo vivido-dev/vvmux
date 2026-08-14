@@ -370,6 +370,9 @@ pub struct PaneSpawn {
     /// Exact program and arguments. This path never invokes a shell.
     pub argv: Option<Vec<OsString>>,
     pub cwd: Option<PathBuf>,
+    /// Whether the pane starts transparent, or `None` to take `[panes].transparent` from config.
+    /// A saved layout carries the pane's own state here; an ordinary split does not.
+    pub transparent: Option<bool>,
     pub hold_on_exit: bool,
     /// Extra environment applied before the fixed pane identity, so it can never shadow it.
     pub extra_env: Vec<(String, String)>,
@@ -386,6 +389,7 @@ impl Default for PaneSpawn {
             command: None,
             argv: None,
             cwd: None,
+            transparent: None,
             hold_on_exit: false,
             extra_env: Vec::new(),
             role: PaneRole::Core,
@@ -425,6 +429,12 @@ struct Pane {
     copy: Option<CopyState>,
     mouse_selection: Option<MouseSelection>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
+    /// Whether the pane leaves its background to the outer terminal rather than painting one.
+    ///
+    /// A transparent pane's default-background cells stay SGR 49, so a translucent host window
+    /// shows the desktop through them. An opaque pane substitutes `theme.pane_background` during
+    /// composition and reads as a solid panel against transparent neighbours.
+    transparent: bool,
     /// Whether the pane stays open after its process exits, keeping the output readable.
     #[allow(dead_code)]
     hold_on_exit: bool,
@@ -3447,6 +3457,7 @@ impl SessionActor {
             command: Some(OsString::from(command)),
             argv: None,
             cwd: cwd.map(PathBuf::from),
+            transparent: None,
             hold_on_exit: hold,
             extra_env: Vec::new(),
             role: PaneRole::Core,
@@ -3887,6 +3898,7 @@ impl SessionActor {
             "layer": layer,
             "zoomed": tab.zoomed == Some(pane_id),
             "sync_input": tab.sync_input,
+            "transparent": pane.transparent,
             "title": title,
             "plugin": plugin,
             "agent": pane.agent.snapshot().map(agent_json),
@@ -5355,6 +5367,7 @@ impl SessionActor {
             Action::NewFloatingPane => self.new_float(),
             Action::ToggleFloatingPanes => self.toggle_floats(),
             Action::TogglePanePinned => self.toggle_pin(),
+            Action::TogglePaneTransparency => self.toggle_transparency(),
             Action::EnterFloatingMoveMode => self.enter_float_mode(FloatingEditKind::Move),
             Action::EnterFloatingResizeMode => self.enter_float_mode(FloatingEditKind::Resize),
             Action::Plugin(reference) => self.start_plugin_action(reference),
@@ -5516,6 +5529,7 @@ impl SessionActor {
                     command: None,
                     argv: Some(launch.pane.command.iter().map(OsString::from).collect()),
                     cwd: Some(launch.package_root),
+                    transparent: None,
                     hold_on_exit: launch.pane.hold_on_exit,
                     extra_env,
                     role: PaneRole::Plugin(identity),
@@ -6661,6 +6675,29 @@ impl SessionActor {
         self.projection_changed();
     }
 
+    /// Flip whether the focused pane paints its own background.
+    ///
+    /// No full repaint is forced: the substitution changes the composited cells themselves, so the
+    /// ordinary per-cell diff already carries it. The status message is worth the line because the
+    /// effect is invisible unless the outer terminal is running translucent — without it, a user
+    /// whose window is opaque cannot tell the action fired at all.
+    fn toggle_transparency(&mut self) {
+        let Some(pane_id) = self.active_tab().map(|tab| tab.focused) else {
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
+        pane.transparent = !pane.transparent;
+        let transparent = pane.transparent;
+        self.schedule_render();
+        self.status(if transparent {
+            "pane background: transparent"
+        } else {
+            "pane background: opaque"
+        });
+    }
+
     fn new_tab(&mut self) -> io::Result<()> {
         let pane_id = self.next_pane_id;
         let tab_id = self.next_tab_id;
@@ -6801,6 +6838,7 @@ impl SessionActor {
                     saved_percent(float.rect.width, area.width),
                     saved_percent(float.rect.height, area.height),
                     float.pinned,
+                    !pane.transparent,
                 ));
             }
             if tiled.is_none() && floating.is_empty() {
@@ -6847,7 +6885,11 @@ impl SessionActor {
                 let pane = self.core_pane(*pane_id)?;
                 let label = format!("p{}", labels.len() + 1);
                 labels.push((*pane_id, label.clone()));
-                Some(LayoutNode::leaf(label, saved_cwd(&pane.spawn_cwd, home)))
+                Some(LayoutNode::leaf(
+                    label,
+                    saved_cwd(&pane.spawn_cwd, home),
+                    !pane.transparent,
+                ))
             }
             TiledNode::Split {
                 axis,
@@ -7013,6 +7055,7 @@ impl SessionActor {
                 copy: None,
                 mouse_selection: None,
                 vivid_metrics: None,
+                transparent: spec.transparent.unwrap_or(self.config.panes.transparent),
                 hold_on_exit: spec.hold_on_exit,
                 exit_status: None,
                 focus_reported: false,
@@ -7241,6 +7284,11 @@ impl SessionActor {
         if next.general.default_layout != self.config.general.default_layout {
             report.deferred.push("general.default_layout".to_owned());
         }
+        // Only the seed for a newly spawned pane. Panes already open keep whatever they were last
+        // toggled to, which a reload has no business overriding.
+        if next.panes.transparent != self.config.panes.transparent {
+            report.deferred.push("panes.transparent".to_owned());
+        }
         let server_changed = serde_json::to_value(&next.server).ok()
             != serde_json::to_value(&self.config.server).ok();
         if server_changed {
@@ -7446,6 +7494,13 @@ impl SessionActor {
                 let content = projection.content;
                 let offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
                 screen.draw_terminal(content, &pane.terminal, offset);
+                if !pane.transparent {
+                    // Filling here rather than in a pass over the finished buffer is what keeps
+                    // the projection order authoritative: a pane drawn later still overwrites an
+                    // opaque pane beneath it. The frame is included so the border does not stay
+                    // see-through around solid content.
+                    screen.fill_default_background(projection.outer, theme.pane_background);
+                }
                 if let Some(copy) = &pane.copy {
                     for found in &copy.matches {
                         let row = found.line + copy.offset as isize;
