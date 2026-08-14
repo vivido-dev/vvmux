@@ -200,7 +200,7 @@ impl VividBroker {
 
 impl ConnectionFactory for VividBroker {
     fn open(&self, kind: ConnectionKind, _lane: Option<LaneClass>) -> io::Result<Connection> {
-        if kind == ConnectionKind::Lane {
+        if matches!(kind, ConnectionKind::Lane | ConnectionKind::FileTransfer) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "the vvmux Vivid broker carries Control and Track connections only",
