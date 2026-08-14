@@ -133,6 +133,18 @@ fn float_edit_sequence_prefix(sequence: &[u8]) -> bool {
         .any(|candidate| candidate.starts_with(sequence))
 }
 
+/// Kitty keyboard flag for reporting key release and repeat events, not only presses.
+const KITTY_REPORT_EVENT_TYPES: u8 = 2;
+
+/// The Kitty codepoint a plain command byte reports when it is released.
+///
+/// A release report carries the unshifted key, so `prefix S` presses as `S` and releases as `s`.
+/// Layout-specific shifted symbols such as `%` have no base key that can be recovered from the
+/// byte alone, and their release reaches the pane as an ordinary report.
+fn release_codepoint(byte: u8) -> u32 {
+    u32::from(byte.to_ascii_lowercase())
+}
+
 pub(crate) struct PrefixParser {
     prefix_byte: u8,
     bindings: HashMap<u8, Action>,
@@ -179,6 +191,11 @@ impl PrefixParser {
             keyboard_flags: 0,
             suppressed_kitty_releases: HashSet::new(),
         }
+    }
+
+    /// Whether the host terminal reports key releases and repeats, not only presses.
+    fn reports_key_events(&self) -> bool {
+        self.keyboard_flags & KITTY_REPORT_EVENT_TYPES != 0
     }
 
     pub(crate) fn set_mouse_coordinates(&mut self, coordinates: MouseCoordinates) {
@@ -387,7 +404,16 @@ impl PrefixParser {
                 }
                 continue;
             }
+            // A command taken from a plain byte still has a Kitty release report on its way when
+            // the host reports key events: an unambiguous key such as `w` presses as text and only
+            // its release is escaped. The pane never saw the press, so it must not see the release
+            // either.
+            let consumed = byte != self.prefix_byte && self.reports_key_events();
             self.handle_prefix_byte(byte, &[self.prefix_byte], &mut output);
+            if consumed {
+                self.suppressed_kitty_releases
+                    .insert(release_codepoint(byte));
+            }
         }
         if !ordinary.is_empty() {
             output.push(ParsedInput::Input(ordinary));
@@ -864,6 +890,46 @@ mod tests {
             [ParsedInput::Input(b"\x1b[106;1:3u".to_vec())]
         );
         assert_eq!(parser.feed(b"z"), [ParsedInput::Action(Action::ToggleZoom)]);
+    }
+
+    #[test]
+    fn a_command_key_pressed_as_text_has_its_release_report_consumed() {
+        // With Kitty flags 3 the host escapes only what is ambiguous, so `prefix w` arrives as a
+        // plain `w` press followed by an escaped release. The pane never saw that press, and the
+        // tab navigator the press opened reads a leading ESC as a cancel, so the release must not
+        // be forwarded.
+        let mut parser = PrefixParser::default();
+        parser.set_keyboard_flags(3);
+        assert!(parser.feed(b"\x1b[98;5u").is_empty());
+        assert!(parser.feed(b"\x1b[98;1:3u").is_empty());
+        assert_eq!(
+            parser.feed(b"w"),
+            [ParsedInput::Action(Action::ToggleTabNavigator)]
+        );
+        assert_eq!(parser.feed(b"\x1b[119;1:3u"), []);
+
+        // A shifted command key releases as its unshifted codepoint.
+        assert!(parser.feed(b"\x1b[98;5u").is_empty());
+        assert_eq!(
+            parser.feed(b"S"),
+            [ParsedInput::Action(Action::ToggleSyncInput)]
+        );
+        assert_eq!(parser.feed(b"\x1b[115;2:3u"), []);
+
+        // A release for a key vvmux never consumed still reaches the pane.
+        assert_eq!(
+            parser.feed(b"\x1b[106;1:3u"),
+            [ParsedInput::Input(b"\x1b[106;1:3u".to_vec())]
+        );
+
+        // Without event reporting there is no release to wait for, so nothing is recorded.
+        parser.set_keyboard_flags(1);
+        assert!(parser.feed(b"\x02").is_empty());
+        assert_eq!(parser.feed(b"z"), [ParsedInput::Action(Action::ToggleZoom)]);
+        assert_eq!(
+            parser.feed(b"\x1b[122;1:3u"),
+            [ParsedInput::Input(b"\x1b[122;1:3u".to_vec())]
+        );
     }
 
     #[test]

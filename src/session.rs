@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
@@ -4649,23 +4650,23 @@ impl SessionActor {
 
     fn input(&mut self, bytes: Vec<u8>) {
         if self.agent_navigator.is_some() {
-            self.agent_navigator_input(&bytes);
+            self.agent_navigator_input(&key_presses(&bytes));
             return;
         }
         if self.tab_navigator.is_some() {
-            self.tab_navigator_input(&bytes);
+            self.tab_navigator_input(&key_presses(&bytes));
             return;
         }
         if self.tab_rename.is_some() {
-            self.tab_rename_input(&bytes);
+            self.tab_rename_input(&key_presses(&bytes));
             return;
         }
         if self.close_pane_confirmation.is_some() {
-            self.close_pane_confirmation_input(&bytes);
+            self.close_pane_confirmation_input(&key_presses(&bytes));
             return;
         }
         if self.save_layout_prompt.is_some() {
-            self.save_layout_prompt_input(&bytes);
+            self.save_layout_prompt_input(&key_presses(&bytes));
             return;
         }
         if self.invalidate_mouse_selection_state() {
@@ -4679,7 +4680,7 @@ impl SessionActor {
             .get(&pane_id)
             .is_some_and(|pane| pane.copy.is_some())
         {
-            self.copy_input(pane_id, &bytes);
+            self.copy_input(pane_id, &key_presses(&bytes));
         } else if self.active_tab().is_some_and(|tab| tab.sync_input) {
             self.broadcast_input(&bytes);
         } else if let Some(pane) = self.panes.get_mut(&pane_id) {
@@ -10540,6 +10541,58 @@ fn agent_navigator_rect(area: Rect, row_count: usize) -> Option<Rect> {
     })
 }
 
+/// Longest key report `key_presses` will look ahead for a final byte.
+const MAX_KEY_REPORT_BYTES: usize = 64;
+
+/// Drop key release and repeat reports from input bound for one of vvmux's own prompts.
+///
+/// A pane can ask the host terminal to report key events and not only presses, and vvmux mirrors
+/// that request so the pane receives the stream it asked for. Its prompts read a much smaller key
+/// language in which a leading ESC cancels, and every one of those reports begins `ESC [`: without
+/// this filter `prefix w` closed its own popup as soon as the key came back up, and every
+/// selection key closed it again. Pane input is never filtered.
+fn key_presses(bytes: &[u8]) -> Cow<'_, [u8]> {
+    if !bytes.contains(&0x1b) {
+        return Cow::Borrowed(bytes);
+    }
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match non_press_key_report(&bytes[offset..]) {
+            Some(length) => offset += length,
+            None => {
+                kept.push(bytes[offset]);
+                offset += 1;
+            }
+        }
+    }
+    if kept.len() == bytes.len() {
+        Cow::Borrowed(bytes)
+    } else {
+        Cow::Owned(kept)
+    }
+}
+
+/// The length of a leading key release or repeat report, if the input begins with one.
+///
+/// Both carry the event type as a sub-parameter of the modifier parameter — `ESC[119;1:3u` for a
+/// released `w`, `ESC[1;1:2B` for a repeating Down — which is what separates them from the press
+/// reports and legacy sequences a prompt understands. An incomplete report is left alone: the
+/// client's parser only forwards whole sequences, so a truncated one is not a key report.
+fn non_press_key_report(bytes: &[u8]) -> Option<usize> {
+    let parameters = bytes.strip_prefix(b"\x1b[")?;
+    let end = parameters
+        .iter()
+        .take(MAX_KEY_REPORT_BYTES)
+        .position(|byte| (0x40..=0x7e).contains(byte))?;
+    let event = parameters[..end]
+        .split(|&byte| byte == b';')
+        .nth(1)?
+        .split(|&byte| byte == b':')
+        .nth(1)?;
+    matches!(event, b"2" | b"3").then_some(b"\x1b[".len() + end + 1)
+}
+
 fn decode_agent_navigator_key(input: &[u8]) -> (usize, Option<AgentNavigatorKey>) {
     const SEQUENCES: &[(&[u8], AgentNavigatorKey)] = &[
         (b"\x1b[A", AgentNavigatorKey::Up),
@@ -11042,6 +11095,33 @@ mod tests {
         assert_eq!(
             decode_agent_navigator_key(b"\x1b[8~"),
             (4, Some(AgentNavigatorKey::End))
+        );
+    }
+
+    #[test]
+    fn prompt_input_keeps_presses_and_drops_release_and_repeat_reports() {
+        // A pane running under Kitty flags 3 makes the host report key events, so the navigator
+        // sees the release of the very key that opened it and the release of every key used to
+        // move the selection. Each begins with ESC, which the prompt language reads as a cancel.
+        assert_eq!(key_presses(b"\x1b[119;1:3u").as_ref(), b"");
+        assert_eq!(key_presses(b"\x1b[1;1:2B").as_ref(), b"");
+        assert_eq!(
+            key_presses(b"j\x1b[106;1:3uk\x1b[107;1:3u\r").as_ref(),
+            b"jk\r"
+        );
+
+        // Presses, legacy sequences, and a real Escape are the prompt's own language.
+        assert_eq!(key_presses(b"\x1b[B").as_ref(), b"\x1b[B");
+        assert_eq!(key_presses(b"\x1b[119u").as_ref(), b"\x1b[119u");
+        assert_eq!(key_presses(b"\x1b").as_ref(), b"\x1b");
+        assert!(matches!(key_presses(b"jk"), Cow::Borrowed(_)));
+
+        let (consumed, key) = decode_agent_navigator_key(&key_presses(b"\x1b[119;1:3u"));
+        assert_eq!((consumed, key), (0, None));
+        assert_eq!(
+            decode_agent_navigator_key(b"\x1b[119;1:3u"),
+            (1, Some(AgentNavigatorKey::Close)),
+            "the unfiltered report is what closed the popup"
         );
     }
 
