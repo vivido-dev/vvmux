@@ -533,7 +533,7 @@ fn a_saved_layout_reproduces_the_live_tabs_and_panes() {
 
     // Saving reports the session; it must not touch it. The panes, their tabs, and focus are
     // unchanged, and the next ordinary mutation still lands.
-    assert_eq!(source.panes(), before);
+    assert_eq!(pane_identity(&source.panes()), pane_identity(&before));
     assert_eq!(
         json(source.msg(&["split", "vertical", "--pane-id", "1"]))["new_pane_id"],
         4
@@ -573,11 +573,32 @@ fn a_failed_save_reports_the_error_and_leaves_the_session_intact() {
     );
     assert!(!target.exists());
 
-    assert_eq!(fixture.panes(), before);
+    assert_eq!(pane_identity(&fixture.panes()), pane_identity(&before));
     assert_eq!(
         json(fixture.msg(&["split", "vertical", "--pane-id", "1"]))["new_pane_id"],
         2
     );
+}
+
+/// Pane JSON carries volatile fields (`cursor` advances as shell output lands, and
+/// `screen_sequence`/`session_sequence` bump on every command), so comparing two snapshots
+/// byte-for-byte races. Reduce each pane to the structural fields a save must not disturb.
+fn pane_identity(panes: &[Value]) -> Vec<Value> {
+    panes
+        .iter()
+        .map(|pane| {
+            serde_json::json!({
+                "pane_id": pane["pane_id"],
+                "tab_id": pane["tab_id"],
+                "geometry": pane["geometry"],
+                "content_geometry": pane["content_geometry"],
+                "layer": pane["layer"],
+                "focused": pane["focused"],
+                "columns": pane["columns"],
+                "rows": pane["rows"],
+            })
+        })
+        .collect()
 }
 
 fn json(output: Output) -> Value {
