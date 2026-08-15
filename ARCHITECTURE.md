@@ -19,10 +19,26 @@ delivery acknowledgement. The level-triggered recovery bit is edge-coalesced bef
 so media-only projection revisions cannot queue duplicate requests that arrive after the good
 keyframe and force the producer to skip to the next GOP.
 
+Linked audio is parked only while a replacement video keyframe has not been *accepted* yet.
+Accepting one arms the catch-up floor that discards retired-epoch samples, which is what keeps them
+out of the new physical audio clock, so the park is released there rather than on the outer
+acknowledgement. It has to be: the outer relay publishes the replacement PLAY only once every
+linked member has submitted pre-roll, so audio held for that acknowledgement holds the activation
+the acknowledgement is waiting for. For the same reason the first record of a replacement
+generation on an already-presented audio track — a seek's handoff — passes the gate outright.
+
 Each media track starts with one record of flow allowance so recovery control can overtake at most
 one stale packet. Its first completed outer delivery expands only that track to the bounded rolling
 window declared by its immutable inflight-byte limit. In particular, linked audio can prebuffer and
-absorb acknowledgement jitter without borrowing capacity from video or another producer.
+absorb acknowledgement jitter without borrowing capacity from video or another producer. A seek's
+replacement generation is re-granted that window on its handoff record instead, because the outer
+delivery that would earn it cannot complete until the PLAY the prebuffer gates.
+
+A paused timed outer track forwards one bounded pre-roll record at a time before PLAY, so the
+writer queue never holds more than one. Slot activation needs decoded output, and a decoder
+routinely wants several access units before it emits its first picture, so a blocked activation
+attempt is itself the evidence that admits one more record, up to the ceiling the track declared.
+Otherwise the allowance and the readiness it feeds wait on each other.
 
 Ordinary timed audio/video packets update delivery and query status without advancing the virtual
 scene projection. PLAY, PAUSE, EOS, recovery edges, track lifecycle, and retained image/raster
