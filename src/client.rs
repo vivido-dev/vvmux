@@ -260,9 +260,7 @@ pub fn attach(
                         output_thread.enqueue_control(b"\x07".to_vec());
                     }
                     ServerMessage::Clipboard(text) => {
-                        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-                        output_thread
-                            .enqueue_control(format!("\x1b]52;c;{encoded}\x1b\\").into_bytes());
+                        output_thread.enqueue_control(clipboard_control_sequence(&text));
                     }
                     ServerMessage::Status(status) => {
                         write_title(&output_thread, &format!("vvmux: {status}"));
@@ -1931,6 +1929,11 @@ fn write_title(output: &TerminalOutput, title: &str) {
     output.enqueue_control(format!("\x1b]2;{sanitized}\x1b\\").into_bytes());
 }
 
+fn clipboard_control_sequence(text: &str) -> Vec<u8> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;c;{encoded}\x1b\\").into_bytes()
+}
+
 /// One unit of work for the terminal writer thread.
 enum OutputJob {
     /// A chunk of one server frame. `last` carries the frame's acknowledgement.
@@ -2322,6 +2325,14 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(error.to_string(), "session already has an attached client");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn clipboard_message_is_mirrored_as_exact_utf8_osc52_control_bytes() {
+        assert_eq!(
+            clipboard_control_sequence("héllo 🦀"),
+            b"\x1b]52;c;aMOpbGxvIPCfpoA=\x1b\\"
+        );
     }
 
     #[cfg(unix)]

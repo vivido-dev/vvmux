@@ -617,6 +617,20 @@ fn is_supported_clipboard_selection(selection: u8) -> bool {
     matches!(selection, b'c' | b'p' | b's')
 }
 
+fn clipboard_store_allowed(
+    policy: crate::config::Osc52,
+    focused: bool,
+    attached: bool,
+    selection: u8,
+) -> bool {
+    policy.allows_store() && focused && attached && is_supported_clipboard_selection(selection)
+}
+
+fn osc52_reply(selection: u8, bytes: &[u8], terminator: &str) -> Vec<u8> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("\x1b]52;{};{encoded}{terminator}", selection as char).into_bytes()
+}
+
 fn queue_pane_input(pane: &mut Pane, bytes: &[u8]) -> Option<InputFailure> {
     let error = pane.input.send(bytes).err()?;
     let now = Instant::now();
@@ -5036,11 +5050,12 @@ impl SessionActor {
     /// nobody can see — is not something the user asked for. Between a focused pane and a mouse
     /// selection the later write wins, and an in-progress selection is left untouched.
     fn handle_clipboard_store(&mut self, focused: bool, selection: u8, text: Vec<u8>) {
-        if !self.config.clipboard.osc52.allows_store()
-            || !focused
-            || self.attached.is_none()
-            || !is_supported_clipboard_selection(selection)
-        {
+        if !clipboard_store_allowed(
+            self.config.clipboard.osc52,
+            focused,
+            self.attached.is_some(),
+            selection,
+        ) {
             return;
         }
         self.set_copy_buffer(text);
@@ -5061,8 +5076,7 @@ impl SessionActor {
         {
             return;
         }
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&self.copy_buffer);
-        let reply = format!("\x1b]52;{};{encoded}{terminator}", selection as char).into_bytes();
+        let reply = osc52_reply(selection, &self.copy_buffer, terminator);
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             let _ = queue_pane_input(pane, &reply);
         }
@@ -11506,6 +11520,41 @@ mod tests {
         for selection in [b'q', b'0', b'?'] {
             assert!(!is_supported_clipboard_selection(selection));
         }
+    }
+
+    #[test]
+    fn osc52_store_requires_policy_focus_attachment_and_a_known_selection() {
+        use crate::config::Osc52;
+
+        let cases = [
+            (Osc52::OnlyCopy, true, true, b'c', true),
+            (Osc52::CopyPaste, true, true, b'p', true),
+            (Osc52::CopyPaste, true, true, b's', true),
+            (Osc52::OnlyCopy, false, true, b'c', false),
+            (Osc52::OnlyCopy, true, false, b'c', false),
+            (Osc52::Disabled, true, true, b'c', false),
+            (Osc52::OnlyPaste, true, true, b'c', false),
+            (Osc52::OnlyCopy, true, true, b'q', false),
+        ];
+        for (policy, focused, attached, selection, expected) in cases {
+            assert_eq!(
+                clipboard_store_allowed(policy, focused, attached, selection),
+                expected,
+                "policy={policy:?} focused={focused} attached={attached} selection={selection:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc52_load_reply_uses_request_selection_terminator_and_copy_buffer() {
+        assert_eq!(
+            osc52_reply(b'c', "héllo".as_bytes(), "\x1b\\"),
+            b"\x1b]52;c;aMOpbGxv\x1b\\"
+        );
+        assert_eq!(
+            osc52_reply(b'p', b"hello", "\x07"),
+            b"\x1b]52;p;aGVsbG8=\x07"
+        );
     }
 
     #[test]
