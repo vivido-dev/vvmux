@@ -1909,13 +1909,22 @@ fn send_client(writer: &SharedWriter, message: &ClientMessage) -> io::Result<()>
         .send(message)
 }
 
-fn write_output(output: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8]) -> io::Result<()> {
+/// Write `parts` to the terminal as one uninterrupted unit: a single lock, a single flush, and no
+/// copy to join them.
+fn write_output(output: &Arc<Mutex<Box<dyn Write + Send>>>, parts: &[&[u8]]) -> io::Result<()> {
     let mut output = output
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    output.write_all(bytes)?;
+    for part in parts {
+        output.write_all(part)?;
+    }
     output.flush()
 }
+
+/// Begin and end a synchronized update (DECSET 2026). A repaint bracketed this way is applied by
+/// the outer terminal in one step rather than being shown as it is painted.
+const SYNC_UPDATE_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_UPDATE_END: &[u8] = b"\x1b[?2026l";
 
 fn write_title(output: &TerminalOutput, title: &str) {
     let sanitized = title.replace(['\x07', '\x1b'], "");
@@ -1932,6 +1941,11 @@ enum OutputJob {
     },
     /// Title, bell, or clipboard bytes, which are not part of the frame diff stream.
     Control(Vec<u8>),
+}
+
+fn output_job_len(job: &OutputJob) -> usize {
+    let (OutputJob::Frame { bytes, .. } | OutputJob::Control(bytes)) = job;
+    bytes.len()
 }
 
 #[derive(Default)]
@@ -1983,7 +1997,10 @@ impl TerminalOutput {
             queue
                 .jobs
                 .retain(|job| matches!(job, OutputJob::Control(_)));
-            queue.bytes = 0;
+            // Recompute rather than zero: the retained Control jobs still have their lengths
+            // subtracted when they are written, so zeroing here leaves the accounting short and
+            // quietly raises the effective queue bound.
+            queue.bytes = queue.jobs.iter().map(output_job_len).sum();
         }
         if queue.bytes.saturating_add(bytes.len()) > OUTPUT_QUEUE_BYTES {
             queue.jobs.clear();
@@ -2048,7 +2065,13 @@ fn run_terminal_output(
                 last,
                 bytes,
             } => {
-                if write_output(output, &bytes).is_err() {
+                // Bracket the repaint in a synchronized update so the outer terminal applies the
+                // whole diff at once instead of showing it being painted cell by cell. A frame
+                // reaches this queue whole — `RenderAssembler` rejoins the server's chunks before
+                // it is enqueued — so the closing bracket can never be separated from the opening
+                // one by a discarded job. A frame larger than the outer terminal's update buffer
+                // degrades to one mid-frame flush, which is what happens today without brackets.
+                if write_output(output, &[SYNC_UPDATE_BEGIN, &bytes, SYNC_UPDATE_END]).is_err() {
                     return;
                 }
                 // Acknowledge only after the bytes reached the terminal. The server uses this as
@@ -2059,7 +2082,7 @@ fn run_terminal_output(
                 }
             }
             OutputJob::Control(bytes) => {
-                if write_output(output, &bytes).is_err() {
+                if write_output(output, &[&bytes]).is_err() {
                     return;
                 }
             }
@@ -2079,6 +2102,87 @@ mod tests {
     use crate::media::VirtualVivid;
     use image::ImageEncoder;
     use vivid_protocol::media::{self, AudioPacket, VideoPacket};
+
+    #[cfg(unix)]
+    #[test]
+    fn frames_reach_the_terminal_inside_a_closed_synchronized_update() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let client_establish =
+            thread::spawn(move || establish(test_transport(client), ChannelKind::Control));
+        let _server_side = establish(test_transport(server), ChannelKind::Control).unwrap();
+        let (_reader, writer) = client_establish.join().unwrap().unwrap();
+
+        let capture = Capture::default();
+        let written = capture.0.clone();
+        let output: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(capture)));
+
+        let queue = Arc::new((Mutex::new(OutputQueue::default()), Condvar::new()));
+        {
+            let mut state = queue.0.lock().unwrap();
+            state
+                .jobs
+                .push_back(OutputJob::Control(b"\x1b]2;title\x1b\\".to_vec()));
+            state.jobs.push_back(OutputJob::Frame {
+                frame_id: 1,
+                last: true,
+                bytes: b"repaint".to_vec(),
+            });
+            state.stopped = true;
+        }
+        run_terminal_output(&output, &writer, &queue);
+
+        let bytes = written.lock().unwrap().clone();
+        assert_eq!(
+            bytes,
+            b"\x1b]2;title\x1b\\\x1b[?2026hrepaint\x1b[?2026l".to_vec(),
+            "a repaint is bracketed; unrelated control bytes are not"
+        );
+        // Any opening bracket the outer terminal sees must be matched, or it stays buffering until
+        // its own timeout fires.
+        let opens = bytes
+            .windows(SYNC_UPDATE_BEGIN.len())
+            .filter(|window| *window == SYNC_UPDATE_BEGIN)
+            .count();
+        let closes = bytes
+            .windows(SYNC_UPDATE_END.len())
+            .filter(|window| *window == SYNC_UPDATE_END)
+            .count();
+        assert_eq!(opens, closes);
+    }
+
+    #[test]
+    fn discarding_superseded_frames_keeps_the_queue_accounting_honest() {
+        let output = TerminalOutput {
+            queue: Arc::new((Mutex::new(OutputQueue::default()), Condvar::new())),
+        };
+        output.enqueue_control(b"ctl".to_vec());
+        assert!(output.enqueue_frame(1, false, true, b"superseded".to_vec()));
+        // A full redraw discards the queued diff, which is now irrelevant, but keeps control bytes.
+        assert!(output.enqueue_frame(2, true, true, b"full".to_vec()));
+
+        let state = output.queue.0.lock().unwrap();
+        assert_eq!(state.jobs.len(), 2, "the control job survives the discard");
+        // The writer subtracts each job's length as it drains, so the running count has to match
+        // exactly what is still queued or the effective queue bound drifts upward.
+        let queued: usize = state.jobs.iter().map(output_job_len).sum();
+        assert_eq!(state.bytes, queued);
+        assert_eq!(state.bytes, b"ctl".len() + b"full".len());
+    }
 
     #[test]
     fn render_chunks_are_admitted_as_one_atomic_job() {
