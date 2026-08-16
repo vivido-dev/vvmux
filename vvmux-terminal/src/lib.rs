@@ -6,6 +6,7 @@ use std::cmp;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use base64::Engine;
 use unicode_width::UnicodeWidthChar;
@@ -19,6 +20,15 @@ const AGENT_OSC_MAX_CHARS: usize = 256;
 const KITTY_PACKET_MAX_BYTES: usize = 8 * 1024;
 const KITTY_PAYLOAD_MAX_BYTES: usize = 4096;
 const KITTY_DECODED_TRANSFER_MAX_BYTES: u32 = 64 * 1024 * 1024;
+/// Largest OSC 52 payload accepted from a pane, matching the session's copy-buffer ceiling.
+const CLIPBOARD_DECODED_MAX_BYTES: usize = 1024 * 1024;
+
+/// OSC 52 producers in the wild routinely omit base64 padding, so a store is decoded with either
+/// form accepted rather than rejected outright.
+const CLIPBOARD_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::general_purpose::PAD_INDIFFERENT,
+);
 
 /// Source of synthetic `id=` values for OSC 8 links that arrive without one.
 ///
@@ -274,6 +284,17 @@ pub enum TerminalEvent {
     KittyGraphics(KittyGraphicsCommand),
     GridScroll(i32),
     Clear,
+    /// A pane asked to write the user's clipboard (OSC 52 store). Already decoded and bounded.
+    ClipboardStore {
+        selection: u8,
+        text: Vec<u8>,
+    },
+    /// A pane asked to read the user's clipboard (OSC 52 query). The pane's own terminator is
+    /// carried back so the reply is framed the way the pane framed its request.
+    ClipboardLoad {
+        selection: u8,
+        terminator: String,
+    },
 }
 
 /// A validated Kitty graphics command consumed from pane output.
@@ -289,6 +310,15 @@ pub enum KittyGraphicsCommand {
     },
 }
 
+/// DECSC/DECRC state. Origin mode belongs to the saved cursor, so an application that saves while
+/// addressing is margin-relative restores into the same coordinate space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SavedCursor {
+    row: usize,
+    col: usize,
+    origin_mode: bool,
+}
+
 pub struct Terminal {
     rows: usize,
     cols: usize,
@@ -301,10 +331,14 @@ pub struct Terminal {
     history_limit: usize,
     cursor_row: usize,
     cursor_col: usize,
-    saved_cursor: (usize, usize),
-    primary_cursor_before_alternate: Option<(usize, usize)>,
+    saved_cursor: SavedCursor,
+    /// The DECSC slot belonging to whichever screen is not currently active. xterm keeps one save
+    /// slot per screen, which is what stops a full-screen application's own DECSC from clobbering
+    /// the primary-screen cursor that DECSET 1049 captured.
+    inactive_saved_cursor: SavedCursor,
     scroll_top: usize,
     scroll_bottom: usize,
+    origin_mode: bool,
     template: Cell,
     processor: Processor,
     events: Vec<TerminalEvent>,
@@ -336,10 +370,11 @@ impl Terminal {
             history_limit,
             cursor_row: 0,
             cursor_col: 0,
-            saved_cursor: (0, 0),
-            primary_cursor_before_alternate: None,
+            saved_cursor: SavedCursor::default(),
+            inactive_saved_cursor: SavedCursor::default(),
             scroll_top: 0,
             scroll_bottom: rows,
+            origin_mode: false,
             template: Cell::default(),
             processor: Processor::new(),
             events: Vec::new(),
@@ -388,6 +423,29 @@ impl Terminal {
             .iter()
             .any(|chunk| matches!(chunk, KittyChunk::Bytes(bytes) if !bytes.is_empty()));
         self.process_kitty_chunks(chunks, has_bytes, true)
+    }
+
+    /// When a buffered synchronized update (DECSET 2026) has to be applied even though the ESU
+    /// that would close it never arrived.
+    ///
+    /// vte arms this deadline on BSU but never tests it: `StdSyncHandler::pending_timeout` only
+    /// reports that a deadline exists. Unless the owner drives it, a pane that opens a synchronized
+    /// update and then stalls keeps buffering until it hits vte's 2 MiB ceiling, so the pane
+    /// appears frozen.
+    pub fn sync_flush_deadline(&self) -> Option<Instant> {
+        self.processor.sync_timeout().sync_timeout()
+    }
+
+    /// Apply a synchronized update that outlived its deadline.
+    ///
+    /// Never call this from inside a `Handler` callback: `self.processor` is a default placeholder
+    /// for the duration of `advance`, so a re-entrant call would silently no-op and strand the
+    /// buffered bytes.
+    pub fn flush_synchronized_update(&mut self) -> Vec<TerminalEvent> {
+        let mut processor = mem::take(&mut self.processor);
+        processor.stop_sync(self);
+        self.processor = processor;
+        self.finish_events(true)
     }
 
     fn process_kitty_chunks(
@@ -450,6 +508,8 @@ impl Terminal {
     pub fn resize(&mut self, rows: usize, cols: usize) {
         let rows = rows.max(1);
         let cols = cols.max(1);
+        // Capture the region shape against the old height, before `self.rows` moves.
+        let region_was_full_screen = self.scroll_top == 0 && self.scroll_bottom == self.rows;
         resize_grid(&mut self.grid, rows, cols);
         resize_grid(&mut self.alternate_grid, rows, cols);
         self.grid_wrapped.resize(rows, false);
@@ -463,12 +523,17 @@ impl Terminal {
         self.cols = cols;
         self.cursor_row = self.cursor_row.min(rows - 1);
         self.cursor_col = self.cursor_col.min(cols - 1);
-        if let Some((row, column)) = &mut self.primary_cursor_before_alternate {
-            *row = (*row).min(rows - 1);
-            *column = (*column).min(cols - 1);
+        // A region an application deliberately set outlives the resize, clamped to the new height.
+        // A region that already spanned the screen was not that kind of choice, so it regrows
+        // instead of being pinned to the old height. Saved cursors need no clamp here: DECRC
+        // clamps on restore and nothing else reads the slots.
+        if region_was_full_screen {
+            self.scroll_top = 0;
+            self.scroll_bottom = rows;
+        } else {
+            self.scroll_top = self.scroll_top.min(rows - 1);
+            self.scroll_bottom = self.scroll_bottom.clamp(self.scroll_top + 1, rows);
         }
-        self.scroll_top = 0;
-        self.scroll_bottom = rows;
         self.events.push(TerminalEvent::Damage);
     }
 
@@ -576,6 +641,43 @@ impl Terminal {
             tab_width: None,
             ..self.template.clone()
         }
+    }
+
+    /// Exchange the active and inactive screens. Grids, wrap flags, keyboard-mode stacks and DECSC
+    /// slots all belong to a screen, so they move together.
+    fn swap_screens(&mut self) {
+        mem::swap(&mut self.grid, &mut self.alternate_grid);
+        mem::swap(&mut self.grid_wrapped, &mut self.alternate_grid_wrapped);
+        mem::swap(
+            &mut self.keyboard_mode_stack,
+            &mut self.inactive_keyboard_mode_stack,
+        );
+        mem::swap(&mut self.saved_cursor, &mut self.inactive_saved_cursor);
+        self.modes.keyboard_flags = self
+            .keyboard_mode_stack
+            .last()
+            .copied()
+            .unwrap_or(KeyboardModes::NO_MODE)
+            .bits();
+        self.alternate_screen = !self.alternate_screen;
+        self.damage();
+    }
+
+    /// Blank the active screen without announcing `TerminalEvent::Clear`. Media anchors belong to
+    /// the pane rather than to one screen, so reporting a clear while switching screens would drop
+    /// anchors the primary screen still owns.
+    fn clear_active_grid(&mut self) {
+        self.grid = blank_grid(self.rows, self.cols);
+        self.grid_wrapped.fill(false);
+        self.damage();
+    }
+
+    /// IL and DL are defined only when the cursor sits inside the scroll region. Outside it they
+    /// must not touch the grid: `insert_blank_lines`/`delete_lines` widen the region to reach the
+    /// cursor, so a cursor above the region would restore the full-screen shape that
+    /// `scroll_region_up` treats as permission to feed scrollback.
+    fn cursor_inside_scroll_region(&self) -> bool {
+        self.cursor_row >= self.scroll_top && self.cursor_row < self.scroll_bottom
     }
 
     fn scroll_region_up(&mut self, count: usize) {
@@ -698,8 +800,14 @@ impl Handler for Terminal {
     }
 
     fn goto(&mut self, line: i32, col: usize) {
-        self.cursor_row = line.max(0) as usize;
-        self.cursor_row = self.cursor_row.min(self.rows - 1);
+        // Under DECOM row addressing is relative to the scroll region and confined to it. With
+        // origin mode off, absolute addressing may legally leave a region that is set.
+        let (origin, last_row) = if self.origin_mode {
+            (self.scroll_top, self.scroll_bottom.saturating_sub(1))
+        } else {
+            (0, self.rows - 1)
+        };
+        self.cursor_row = (line.max(0) as usize).saturating_add(origin).min(last_row);
         self.cursor_col = col.min(self.cols - 1);
     }
 
@@ -884,6 +992,9 @@ impl Handler for Terminal {
     }
 
     fn insert_blank_lines(&mut self, rows: usize) {
+        if !self.cursor_inside_scroll_region() {
+            return;
+        }
         let old_top = self.scroll_top;
         self.scroll_top = self.cursor_row;
         self.scroll_region_down(rows);
@@ -891,6 +1002,9 @@ impl Handler for Terminal {
     }
 
     fn delete_lines(&mut self, rows: usize) {
+        if !self.cursor_inside_scroll_region() {
+            return;
+        }
         let old_top = self.scroll_top;
         self.scroll_top = self.cursor_row;
         self.scroll_region_up(rows);
@@ -906,12 +1020,19 @@ impl Handler for Terminal {
     }
 
     fn save_cursor_position(&mut self) {
-        self.saved_cursor = (self.cursor_row, self.cursor_col);
+        self.saved_cursor = SavedCursor {
+            row: self.cursor_row,
+            col: self.cursor_col,
+            origin_mode: self.origin_mode,
+        };
     }
 
     fn restore_cursor_position(&mut self) {
-        self.cursor_row = self.saved_cursor.0.min(self.rows - 1);
-        self.cursor_col = self.saved_cursor.1.min(self.cols - 1);
+        // The saved position is absolute, so it is restored without the origin offset. Origin mode
+        // itself is part of the saved state and comes back with it.
+        self.origin_mode = self.saved_cursor.origin_mode;
+        self.cursor_row = self.saved_cursor.row.min(self.rows - 1);
+        self.cursor_col = self.saved_cursor.col.min(self.cols - 1);
     }
 
     fn reverse_index(&mut self) {
@@ -931,9 +1052,14 @@ impl Handler for Terminal {
         self.history_wrapped.clear();
         self.cursor_row = 0;
         self.cursor_col = 0;
-        self.primary_cursor_before_alternate = None;
+        self.saved_cursor = SavedCursor::default();
+        self.inactive_saved_cursor = SavedCursor::default();
+        // RIS returns to the primary screen. Leaving the flag set would outlive the reset and
+        // permanently suppress scrollback capture, which `scroll_region_up` gates on it.
+        self.alternate_screen = false;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows;
+        self.origin_mode = false;
         self.template = Cell::default();
         self.tab_stops = default_tab_stops(self.cols, 8);
         self.tab_stops_customized = false;
@@ -1019,9 +1145,69 @@ impl Handler for Terminal {
         self.events.push(TerminalEvent::Bell);
     }
 
-    fn identify_terminal(&mut self, _: Option<char>) {
-        self.events
-            .push(TerminalEvent::PtyWrite(b"\x1b[?62;4c".to_vec()));
+    fn identify_terminal(&mut self, intermediate: Option<char>) {
+        let reply = match intermediate {
+            // Primary DA: VT220 with ANSI color. Sixel (4) is deliberately absent — DCS is
+            // discarded before it reaches the parser, so advertising it only persuades
+            // applications to emit bytes that vanish.
+            None => b"\x1b[?62;22c".to_vec(),
+            Some('>') => {
+                format!("\x1b[>0;{};1c", version_number(env!("CARGO_PKG_VERSION"))).into_bytes()
+            }
+            Some('=') => b"\x1bP!|00000000\x1b\\".to_vec(),
+            _ => return,
+        };
+        self.events.push(TerminalEvent::PtyWrite(reply));
+    }
+
+    fn clipboard_store(&mut self, clipboard: u8, base64: &[u8]) {
+        // Whether the store is permitted, and from which pane, is the session's decision: only it
+        // knows which pane holds focus and what the configured OSC 52 policy is.
+        let Some(text) = decode_clipboard_payload(base64) else {
+            return;
+        };
+        self.events.push(TerminalEvent::ClipboardStore {
+            selection: clipboard,
+            text,
+        });
+    }
+
+    fn clipboard_load(&mut self, clipboard: u8, terminator: &str) {
+        self.events.push(TerminalEvent::ClipboardLoad {
+            selection: clipboard,
+            terminator: terminator.to_owned(),
+        });
+    }
+
+    fn report_private_mode(&mut self, mode: PrivateMode) {
+        // DECRPM states: 1 set, 2 reset, 0 not recognized. Reporting 0 for a mode we do implement
+        // would keep applications from using it at all — synchronized output is detected this way,
+        // not through device attributes — so the answer set is enumerated rather than guessed.
+        let enabled = match mode.raw() {
+            1 => self.modes.application_cursor,
+            6 => self.origin_mode,
+            25 => self.modes.cursor_visible,
+            47 | 1047 | 1049 => self.alternate_screen,
+            1000 => self.modes.mouse_clicks,
+            1002 | 1003 => self.modes.mouse_motion,
+            1004 => self.modes.focus_reporting,
+            1006 => self.modes.sgr_mouse,
+            1016 => self.modes.sgr_pixels,
+            2004 => self.modes.bracketed_paste,
+            // vte buffers synchronized updates itself and the session applies the deadline, so
+            // support is real, but an update is never still open once a query is answered.
+            2026 => false,
+            _ => {
+                self.events.push(TerminalEvent::PtyWrite(
+                    format!("\x1b[?{};0$y", mode.raw()).into_bytes(),
+                ));
+                return;
+            }
+        };
+        let state = if enabled { 1 } else { 2 };
+        self.events.push(TerminalEvent::PtyWrite(
+            format!("\x1b[?{};{state}$y", mode.raw()).into_bytes(),
+        ));
     }
 
     fn device_status(&mut self, status: usize) {
@@ -1073,6 +1259,12 @@ impl Terminal {
     fn update_private_mode(&mut self, mode: PrivateMode, enabled: bool) {
         match mode.raw() {
             1 => self.modes.application_cursor = enabled,
+            6 => {
+                // Both DECSET and DECRST of DECOM home the cursor, and home is itself
+                // origin-relative, so the flag has to be live before the move.
+                self.origin_mode = enabled;
+                self.goto(0, 0);
+            }
             2004 => self.modes.bracketed_paste = enabled,
             1000 => self.modes.mouse_clicks = enabled,
             1002 | 1003 => {
@@ -1086,31 +1278,35 @@ impl Terminal {
             1016 => self.modes.sgr_pixels = enabled,
             1004 => self.modes.focus_reporting = enabled,
             25 => self.modes.cursor_visible = enabled,
-            1049 if enabled != self.alternate_screen => {
-                let next_cursor = if enabled {
-                    self.primary_cursor_before_alternate = Some((self.cursor_row, self.cursor_col));
-                    (0, 0)
+            47 | 1047 if enabled != self.alternate_screen => {
+                // Legacy smcup/rmcup. Neither variant saves or restores the cursor. 1047 clears
+                // the alternate screen on the way out of it; 47 leaves it intact.
+                if !enabled && mode.raw() == 1047 {
+                    self.clear_active_grid();
+                }
+                self.swap_screens();
+            }
+            1048 => {
+                // Cursor save and restore with no screen switch.
+                if enabled {
+                    self.save_cursor_position();
                 } else {
-                    self.primary_cursor_before_alternate
-                        .take()
-                        .unwrap_or((0, 0))
-                };
-                mem::swap(&mut self.grid, &mut self.alternate_grid);
-                mem::swap(&mut self.grid_wrapped, &mut self.alternate_grid_wrapped);
-                mem::swap(
-                    &mut self.keyboard_mode_stack,
-                    &mut self.inactive_keyboard_mode_stack,
-                );
-                self.modes.keyboard_flags = self
-                    .keyboard_mode_stack
-                    .last()
-                    .copied()
-                    .unwrap_or(KeyboardModes::NO_MODE)
-                    .bits();
-                self.alternate_screen = enabled;
-                self.cursor_row = next_cursor.0;
-                self.cursor_col = next_cursor.1;
-                self.damage();
+                    self.restore_cursor_position();
+                }
+            }
+            1049 if enabled != self.alternate_screen => {
+                // Save before the swap, restore after it. Each screen owns its DECSC slot, so the
+                // primary cursor has to be written while the primary screen is still active and
+                // read back only once it is active again — otherwise an application's own DECSC
+                // inside the alternate screen overwrites the position the shell needs back.
+                if enabled {
+                    self.save_cursor_position();
+                    self.swap_screens();
+                    self.clear_active_grid();
+                } else {
+                    self.swap_screens();
+                    self.restore_cursor_position();
+                }
             }
             _ => {}
         }
@@ -1148,6 +1344,30 @@ fn resize_grid(grid: &mut Vec<Vec<Cell>>, rows: usize, cols: usize) {
     for row in grid {
         row.resize(cols, Cell::default());
     }
+}
+
+/// Decode an OSC 52 store payload, rejecting anything that would decode past the copy-buffer
+/// ceiling before allocating for it.
+fn decode_clipboard_payload(base64: &[u8]) -> Option<Vec<u8>> {
+    // Every four base64 characters carry at most three bytes, so the decoded size is bounded
+    // without decoding. The extra group covers an unpadded trailing partial group.
+    let decoded_bound = (base64.len() / 4).checked_add(1)?.checked_mul(3)?;
+    if decoded_bound > CLIPBOARD_DECODED_MAX_BYTES {
+        return None;
+    }
+    CLIPBOARD_BASE64.decode(base64).ok()
+}
+
+/// Encode a semantic version as the single integer a secondary device-attributes reply carries.
+fn version_number(mut version: &str) -> usize {
+    if let Some(separator) = version.rfind('-') {
+        version = &version[..separator];
+    }
+    let mut number = 0;
+    for (index, part) in version.split('.').rev().enumerate() {
+        number += usize::pow(100, index as u32) * part.parse::<usize>().unwrap_or(0);
+    }
+    number
 }
 
 fn default_tab_stops(cols: usize, interval: usize) -> Vec<bool> {
@@ -1899,6 +2119,315 @@ mod tests {
         populated.feed(b"one\r\ntwo\r\nthree\r\nfour");
         let events = populated.feed(b"\x1b[3J");
         assert!(!events.contains(&TerminalEvent::Clear));
+    }
+
+    #[test]
+    fn origin_mode_makes_cursor_addressing_margin_relative_and_survives_save_restore() {
+        let mut terminal = Terminal::new(10, 8, 0);
+        // Region is 1-based rows 4..8, so origin-relative row 1 is absolute row 3.
+        terminal.feed(b"\x1b[4;8r\x1b[?6h");
+        // DECOM homes to the top margin on set, not to the screen origin.
+        assert_eq!(terminal.cursor(), (3, 0));
+
+        terminal.feed(b"\x1b[2;3H");
+        assert_eq!(terminal.cursor(), (4, 2));
+
+        // Addressing past the bottom margin is confined to the region.
+        terminal.feed(b"\x1b[9;1H");
+        assert_eq!(terminal.cursor(), (7, 0));
+
+        // DECSC captures origin mode with the position; the app then leaves origin mode and
+        // addresses absolutely, and DECRC must bring both back.
+        terminal.feed(b"\x1b[3;2H\x1b7");
+        assert_eq!(terminal.cursor(), (5, 1));
+        terminal.feed(b"\x1b[?6l\x1b[1;1H");
+        assert_eq!(terminal.cursor(), (0, 0));
+        terminal.feed(b"\x1b8");
+        assert_eq!(terminal.cursor(), (5, 1));
+        terminal.feed(b"\x1b[1;1H");
+        assert_eq!(
+            terminal.cursor(),
+            (3, 0),
+            "restore must bring origin mode back"
+        );
+
+        // RIS clears origin mode along with the region.
+        terminal.feed(b"\x1bc\x1b[1;1H");
+        assert_eq!(terminal.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn scrolling_region_change_homes_to_the_origin_in_both_modes() {
+        let mut absolute = Terminal::new(10, 8, 0);
+        absolute.feed(b"\x1b[5;5H\x1b[3;9r");
+        assert_eq!(absolute.cursor(), (0, 0));
+
+        let mut relative = Terminal::new(10, 8, 0);
+        relative.feed(b"\x1b[?6h\x1b[5;5H\x1b[3;9r");
+        assert_eq!(relative.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn line_insert_and_delete_outside_the_scroll_region_do_not_scroll_or_reach_scrollback() {
+        let mut terminal = Terminal::new(10, 4, 10);
+        for row in 0..10 {
+            terminal.feed(format!("\x1b[{};1Hr{row}", row + 1).as_bytes());
+        }
+        // A region that reaches the last row is the dangerous case: above it, the cursor-relative
+        // shim in DL restores `scroll_top == 0 && scroll_bottom == rows`, which is exactly the shape
+        // scroll_region_up reads as permission to push rows into history. Those rows never scrolled
+        // off, so accepting them silently corrupts scrollback.
+        terminal.feed(b"\x1b[6;10r");
+        let untouched = terminal.cells().to_vec();
+
+        terminal.feed(b"\x1b[1;1H\x1b[2M");
+        assert_eq!(terminal.cells(), untouched.as_slice());
+        assert_eq!(terminal.history_len(), 0);
+
+        terminal.feed(b"\x1b[1;1H\x1b[3L");
+        assert_eq!(terminal.cells(), untouched.as_slice());
+        assert_eq!(terminal.history_len(), 0);
+
+        // Below the region IL and DL must be inert too.
+        terminal.feed(b"\x1b[1;5r\x1b[9;1H\x1b[2M\x1b[3L");
+        assert_eq!(terminal.cells(), untouched.as_slice());
+        assert_eq!(terminal.history_len(), 0);
+    }
+
+    #[test]
+    fn osc52_store_and_query_are_reported_with_the_selection_and_terminator() {
+        let mut terminal = Terminal::new(2, 8, 0);
+        let events = terminal.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(events.contains(&TerminalEvent::ClipboardStore {
+            selection: b'c',
+            text: b"hello".to_vec(),
+        }));
+
+        // Producers routinely omit padding, and the pane's own terminator is echoed so the reply
+        // is framed the way the request was.
+        let unpadded = terminal.feed(b"\x1b]52;p;aGVsbG8\x1b\\");
+        assert!(unpadded.contains(&TerminalEvent::ClipboardStore {
+            selection: b'p',
+            text: b"hello".to_vec(),
+        }));
+
+        let queried = terminal.feed(b"\x1b]52;c;?\x1b\\");
+        assert!(queried.contains(&TerminalEvent::ClipboardLoad {
+            selection: b'c',
+            terminator: "\x1b\\".to_owned(),
+        }));
+    }
+
+    #[test]
+    fn oversized_osc52_payload_is_rejected_before_decoding() {
+        let oversized = vec![b'A'; (CLIPBOARD_DECODED_MAX_BYTES / 3 + 8) * 4];
+        assert!(decode_clipboard_payload(&oversized).is_none());
+        assert!(decode_clipboard_payload(b"not valid base64!!").is_none());
+        assert_eq!(
+            decode_clipboard_payload(b"aGVsbG8=").as_deref(),
+            Some(b"hello".as_slice())
+        );
+    }
+
+    #[test]
+    fn device_attribute_queries_answer_primary_secondary_and_tertiary_distinctly() {
+        let mut terminal = Terminal::new(2, 8, 0);
+        let replies = |events: Vec<TerminalEvent>| {
+            events
+                .into_iter()
+                .filter_map(|event| match event {
+                    TerminalEvent::PtyWrite(bytes) => Some(bytes),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            replies(terminal.feed(b"\x1b[c")),
+            vec![b"\x1b[?62;22c".to_vec()],
+            "primary DA must not claim sixel, which vvmux discards"
+        );
+        assert_eq!(
+            replies(terminal.feed(b"\x1b[>c")),
+            vec![format!("\x1b[>0;{};1c", version_number(env!("CARGO_PKG_VERSION"))).into_bytes()]
+        );
+        assert_eq!(
+            replies(terminal.feed(b"\x1b[=c")),
+            vec![b"\x1bP!|00000000\x1b\\".to_vec()]
+        );
+        assert_eq!(version_number("0.4.2"), 402);
+        assert_eq!(version_number("1.2.3-rc1"), 10203);
+    }
+
+    #[test]
+    fn decrqm_reports_tracked_modes_and_zero_for_unknown_modes() {
+        let mut terminal = Terminal::new(2, 8, 0);
+        let reply = |events: Vec<TerminalEvent>| {
+            events
+                .into_iter()
+                .find_map(|event| match event {
+                    TerminalEvent::PtyWrite(bytes) => Some(bytes),
+                    _ => None,
+                })
+                .expect("DECRQM must be answered")
+        };
+
+        assert_eq!(reply(terminal.feed(b"\x1b[?2004$p")), b"\x1b[?2004;2$y");
+        assert_eq!(
+            reply(terminal.feed(b"\x1b[?2004h\x1b[?2004$p")),
+            b"\x1b[?2004;1$y"
+        );
+        // Synchronized output must not answer "not recognized": applications detect it here, and a
+        // zero would keep them from ever opening an update.
+        assert_eq!(reply(terminal.feed(b"\x1b[?2026$p")), b"\x1b[?2026;2$y");
+        assert_eq!(reply(terminal.feed(b"\x1b[?6h\x1b[?6$p")), b"\x1b[?6;1$y");
+        assert_eq!(
+            reply(terminal.feed(b"\x1b[?1049h\x1b[?1049$p")),
+            b"\x1b[?1049;1$y"
+        );
+        assert_eq!(reply(terminal.feed(b"\x1b[?12345$p")), b"\x1b[?12345;0$y");
+    }
+
+    #[test]
+    fn stalled_synchronized_update_is_flushed_after_the_vte_timeout() {
+        let mut terminal = Terminal::new(2, 8, 0);
+        terminal.feed(b"\x1b[?2026hburied");
+
+        // vte buffers everything after BSU, so nothing has reached the grid yet.
+        assert_eq!(terminal.extract_rows(0, 1), "");
+        assert!(
+            terminal.sync_flush_deadline().is_some(),
+            "BSU has to arm a deadline the session can drive"
+        );
+
+        // The pane never sends ESU. Without an owner applying the deadline it would stay frozen
+        // until vte's 2 MiB buffer ceiling forced the issue.
+        terminal.flush_synchronized_update();
+        assert_eq!(terminal.extract_rows(0, 1), "buried");
+        assert!(terminal.sync_flush_deadline().is_none());
+
+        // A well-behaved application closing its own update needs no flush and arms no deadline.
+        let mut closed = Terminal::new(2, 8, 0);
+        closed.feed(b"\x1b[?2026hshown\x1b[?2026l");
+        assert_eq!(closed.extract_rows(0, 1), "shown");
+        assert!(closed.sync_flush_deadline().is_none());
+    }
+
+    #[test]
+    fn queries_buffered_in_a_synchronized_update_reply_only_once_it_is_flushed() {
+        let mut terminal = Terminal::new(2, 8, 0);
+        let buffered = terminal.feed(b"\x1b[?2026h\x1b[c");
+        assert!(
+            !buffered
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::PtyWrite(_))),
+            "a query inside the update is buffered with everything else"
+        );
+
+        let flushed = terminal.flush_synchronized_update();
+        assert!(
+            flushed
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::PtyWrite(_))),
+            "the flush has to deliver replies the pane is blocked waiting for"
+        );
+    }
+
+    #[test]
+    fn legacy_alternate_screen_modes_swap_without_saving_the_cursor() {
+        // 47 leaves the alternate screen intact on the way out; 1047 clears it.
+        for (mode, alt_survives) in [(47, true), (1047, false)] {
+            let mut terminal = Terminal::new(2, 4, 10);
+            terminal.feed(b"main");
+            terminal.feed(format!("\x1b[?{mode}h").as_bytes());
+            assert!(terminal.alternate_screen());
+            terminal.feed(b"\x1b[1;1Halt");
+            terminal.feed(format!("\x1b[?{mode}l").as_bytes());
+
+            assert!(!terminal.alternate_screen());
+            assert_eq!(terminal.extract_rows(0, 1), "main");
+            // Neither variant restores a cursor, so the position carries across unchanged.
+            assert_eq!(terminal.cursor(), (0, 3));
+
+            terminal.feed(format!("\x1b[?{mode}h").as_bytes());
+            assert_eq!(
+                terminal.extract_rows(0, 1),
+                if alt_survives { "alt" } else { "" }
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_save_mode_1048_does_not_switch_screens() {
+        let mut terminal = Terminal::new(4, 8, 10);
+        terminal.feed(b"\x1b[3;5H\x1b[?1048h\x1b[1;1H");
+        assert_eq!(terminal.cursor(), (0, 0));
+        assert!(!terminal.alternate_screen());
+
+        terminal.feed(b"\x1b[?1048l");
+        assert_eq!(terminal.cursor(), (2, 4));
+        assert!(!terminal.alternate_screen());
+    }
+
+    #[test]
+    fn alternate_screen_keeps_a_separate_saved_cursor_per_screen() {
+        let mut terminal = Terminal::new(4, 12, 10);
+        terminal.feed(b"\x1b[2;3H\x1b7");
+
+        // The application's own DECSC inside the alternate screen writes the alternate screen's
+        // slot, so the primary screen's slot survives untouched on both sides of the switch.
+        terminal.feed(b"\x1b[?1049h\x1b[4;10H\x1b7\x1b[1;1H\x1b8");
+        assert_eq!(terminal.cursor(), (3, 9));
+        terminal.feed(b"\x1b[?1049l\x1b[1;1H\x1b8");
+        assert_eq!(terminal.cursor(), (1, 2));
+    }
+
+    #[test]
+    fn alternate_screen_entry_clears_the_alternate_grid_without_clearing_media_anchors() {
+        let mut terminal = Terminal::new(2, 4, 10);
+        terminal.feed(b"\x1b[?1049hold\x1b[?1049l");
+
+        // A second smcup must not inherit the previous alternate-screen contents.
+        let events = terminal.feed(b"\x1b[?1049h");
+        assert_eq!(terminal.extract_rows(0, 1), "");
+        assert!(
+            !events.contains(&TerminalEvent::Clear),
+            "anchors belong to the pane, so a screen switch must not report a clear"
+        );
+    }
+
+    #[test]
+    fn reset_while_on_the_alternate_screen_returns_to_primary_and_restores_scrollback() {
+        let mut terminal = Terminal::new(2, 4, 10);
+        terminal.feed(b"\x1b[?1049h");
+        terminal.feed(b"\x1bc");
+        assert!(!terminal.alternate_screen());
+
+        // A stuck alternate-screen flag silently suppresses scrollback capture for good.
+        terminal.feed(b"a\r\nb\r\nc\r\nd");
+        assert!(terminal.history_len() > 0);
+    }
+
+    #[test]
+    fn resize_keeps_a_partial_scroll_region_and_regrows_a_full_screen_one() {
+        let mut partial = Terminal::new(10, 8, 0);
+        partial.feed(b"\x1b[3;7r\x1b[?6h");
+        partial.resize(6, 8);
+        // Origin-relative addressing reports the region that survived the resize.
+        partial.feed(b"\x1b[1;1H");
+        assert_eq!(partial.cursor(), (2, 0));
+        partial.feed(b"\x1b[99;1H");
+        assert_eq!(partial.cursor(), (5, 0));
+
+        let mut full = Terminal::new(10, 8, 0);
+        full.feed(b"\x1b[?6h");
+        full.resize(20, 8);
+        full.feed(b"\x1b[99;1H");
+        assert_eq!(
+            full.cursor(),
+            (19, 0),
+            "a full-screen region regrows with the screen"
+        );
     }
 
     #[test]

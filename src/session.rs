@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use vvmux_terminal::TerminalHyperlink;
 use vvmux_terminal::pty::{PtyControl, PtyExitStatus, PtyInput, PtyProcess};
 use vvmux_terminal::{
@@ -609,6 +610,11 @@ enum AutomationTextPattern {
 struct InputFailure {
     warn: bool,
     close: bool,
+}
+
+/// OSC 52 selection names vvmux maps onto its single copy buffer.
+fn is_supported_clipboard_selection(selection: u8) -> bool {
+    matches!(selection, b'c' | b'p' | b's')
 }
 
 fn queue_pane_input(pane: &mut Pane, bytes: &[u8]) -> Option<InputFailure> {
@@ -1492,6 +1498,7 @@ impl SessionActor {
             timeout = timeout.min(self.next_automation_deadline());
             timeout = timeout.min(self.next_agent_evaluation_delay());
             timeout = timeout.min(self.next_notice_deadline());
+            timeout = timeout.min(self.next_sync_flush_delay());
             // Give ready media low-latency service, but force a general-queue turn after a bounded
             // batch. A bounded channel is not a bounded drain when its producer can refill it.
             if self.drain_media(&media_receiver) {
@@ -1503,6 +1510,7 @@ impl SessionActor {
                     if self.handle_event(event).is_err() {
                         self.force_full = true;
                     }
+                    self.flush_expired_sync_updates();
                     self.drain_media(&media_receiver);
                     self.sync_pending_media_projection();
                     self.expire_status_notice();
@@ -1518,6 +1526,7 @@ impl SessionActor {
                     self.evaluate_agent_states();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.flush_expired_sync_updates();
                     self.drain_media(&media_receiver);
                     self.sync_pending_media_projection();
                     self.expire_status_notice();
@@ -1667,111 +1676,7 @@ impl SessionActor {
                 }
             }
             ActorEvent::PtyOutput(pane_id, bytes) => {
-                self.invalidate_mouse_selection_for_pane(pane_id);
-                let focused = self.active_tab().is_some_and(|tab| tab.focused == pane_id);
-                let mut title = None;
-                let mut bell = false;
-                let mut input_warning = false;
-                let mut input_closed = false;
-                let mut changed_screen_sequence = None;
-                let mut kitty_commands = Vec::new();
-                if let Some(pane) = self.panes.get_mut(&pane_id) {
-                    let old_cells = pane.terminal.cells().to_vec();
-                    let old_cursor = pane.terminal.cursor();
-                    let old_modes = pane.terminal.modes();
-                    let old_screen = pane.terminal.alternate_screen();
-                    let events = pane.terminal.feed(&bytes);
-                    for event in events {
-                        match event {
-                            TerminalEvent::PtyWrite(bytes) => {
-                                if let Some(failure) = queue_pane_input(pane, &bytes) {
-                                    input_warning |= failure.warn;
-                                    input_closed |= failure.close;
-                                }
-                            }
-                            TerminalEvent::Title(next_title) if focused => {
-                                title = next_title;
-                            }
-                            TerminalEvent::Bell => {
-                                bell = true;
-                            }
-                            TerminalEvent::VividMarker {
-                                marker,
-                                row,
-                                column,
-                            } => {
-                                // The authenticated marker is consumed here. Media ownership is
-                                // connected by the virtual-presenter module, never forwarded into
-                                // the outer terminal byte stream. The position was captured when
-                                // the marker was consumed: the live cursor has already moved on
-                                // when ConPTY batches repositioning output behind the marker.
-                                self.vivid
-                                    .observe_marker(pane_id, &marker, row as i32, column);
-                            }
-                            TerminalEvent::KittyGraphics(command) => kitty_commands.push(command),
-                            TerminalEvent::GridScroll(lines) => {
-                                self.vivid.scroll_anchors(pane_id, lines);
-                            }
-                            TerminalEvent::Clear => self.vivid.clear_anchors(pane_id),
-                            _ => {}
-                        }
-                    }
-                    let semantic_changed = old_cells != pane.terminal.cells()
-                        || old_cursor != pane.terminal.cursor()
-                        || old_modes != pane.terminal.modes()
-                        || old_screen != pane.terminal.alternate_screen();
-                    if semantic_changed {
-                        let rows = changed_rows(&old_cells, pane.terminal.cells());
-                        let rows = (old_screen == pane.terminal.alternate_screen()).then_some(rows);
-                        pane.screen_sequence = pane.screen_sequence.wrapping_add(1);
-                        pane.last_screen_change = Instant::now();
-                        pane.screen_changes.push_back(ScreenChange {
-                            sequence: pane.screen_sequence,
-                            rows,
-                        });
-                        while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
-                            pane.screen_changes.pop_front();
-                        }
-                        changed_screen_sequence = Some(pane.screen_sequence);
-                        self.session_sequence = self.session_sequence.wrapping_add(1);
-                    }
-                    if let Some(client) = &self.attached {
-                        if let Some(title) = title {
-                            let _ = crate::ipc::send(
-                                &client.writer,
-                                &ServerMessage::Title(format!("{title} — vvmux")),
-                            );
-                        }
-                        if bell {
-                            let _ = crate::ipc::send(&client.writer, &ServerMessage::Bell);
-                        }
-                    }
-                    self.schedule_render();
-                }
-                for command in kitty_commands {
-                    self.handle_kitty_graphics(pane_id, command);
-                }
-                if let Some(screen_sequence) = changed_screen_sequence {
-                    let pending_cause = self.pending_pane_plugin_causes.remove(&pane_id);
-                    let previous_cause =
-                        std::mem::replace(&mut self.active_plugin_cause, pending_cause);
-                    self.queue_plugin_state_event(
-                        "pane.screen_changed",
-                        pane_id.to_string(),
-                        serde_json::json!({
-                            "pane_id": pane_id,
-                            "screen_sequence": screen_sequence,
-                        }),
-                        Some(pane_id),
-                    );
-                    self.active_plugin_cause = previous_cause;
-                }
-                if input_warning {
-                    self.status(&format!("pane {pane_id} input queue is unavailable"));
-                }
-                if input_closed {
-                    self.close_pane(pane_id);
-                }
+                self.drive_pane_terminal(pane_id, |terminal| terminal.feed(&bytes));
             }
             ActorEvent::PtyExit(pane_id, status) => {
                 self.publish_plugin_event(
@@ -1982,6 +1887,174 @@ impl SessionActor {
 
     fn clear_kitty_graphics(&mut self) {
         self.kitty_transfers.clear();
+    }
+
+    /// Run terminal events produced for one pane through the full observation path: PTY replies,
+    /// title and bell, media anchors, the semantic-change sequence automation and plugins observe,
+    /// and render scheduling.
+    ///
+    /// Live PTY output and a flushed synchronized update both come through here, so a flush is
+    /// observed exactly like ordinary output rather than mutating the grid behind everyone's back.
+    fn drive_pane_terminal<F>(&mut self, pane_id: PaneId, produce: F)
+    where
+        F: FnOnce(&mut Terminal) -> Vec<TerminalEvent>,
+    {
+        self.invalidate_mouse_selection_for_pane(pane_id);
+        let focused = self.active_tab().is_some_and(|tab| tab.focused == pane_id);
+        let mut title = None;
+        let mut bell = false;
+        let mut input_warning = false;
+        let mut input_closed = false;
+        let mut changed_screen_sequence = None;
+        let mut kitty_commands = Vec::new();
+        let mut clipboard_store = None;
+        let mut clipboard_load = None;
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            let old_cells = pane.terminal.cells().to_vec();
+            let old_cursor = pane.terminal.cursor();
+            let old_modes = pane.terminal.modes();
+            let old_screen = pane.terminal.alternate_screen();
+            let events = produce(&mut pane.terminal);
+            for event in events {
+                match event {
+                    TerminalEvent::PtyWrite(bytes) => {
+                        if let Some(failure) = queue_pane_input(pane, &bytes) {
+                            input_warning |= failure.warn;
+                            input_closed |= failure.close;
+                        }
+                    }
+                    TerminalEvent::Title(next_title) if focused => {
+                        title = next_title;
+                    }
+                    TerminalEvent::Bell => {
+                        bell = true;
+                    }
+                    TerminalEvent::VividMarker {
+                        marker,
+                        row,
+                        column,
+                    } => {
+                        // The authenticated marker is consumed here. Media ownership is
+                        // connected by the virtual-presenter module, never forwarded into
+                        // the outer terminal byte stream. The position was captured when
+                        // the marker was consumed: the live cursor has already moved on
+                        // when ConPTY batches repositioning output behind the marker.
+                        self.vivid
+                            .observe_marker(pane_id, &marker, row as i32, column);
+                    }
+                    TerminalEvent::KittyGraphics(command) => kitty_commands.push(command),
+                    TerminalEvent::GridScroll(lines) => {
+                        self.vivid.scroll_anchors(pane_id, lines);
+                    }
+                    TerminalEvent::Clear => self.vivid.clear_anchors(pane_id),
+                    // Deferred: honoring these needs the session's policy and focus state, which
+                    // cannot be read while a pane is mutably borrowed.
+                    TerminalEvent::ClipboardStore { selection, text } => {
+                        clipboard_store = Some((selection, text));
+                    }
+                    TerminalEvent::ClipboardLoad {
+                        selection,
+                        terminator,
+                    } => {
+                        clipboard_load = Some((selection, terminator));
+                    }
+                    _ => {}
+                }
+            }
+            let semantic_changed = old_cells != pane.terminal.cells()
+                || old_cursor != pane.terminal.cursor()
+                || old_modes != pane.terminal.modes()
+                || old_screen != pane.terminal.alternate_screen();
+            if semantic_changed {
+                let rows = changed_rows(&old_cells, pane.terminal.cells());
+                let rows = (old_screen == pane.terminal.alternate_screen()).then_some(rows);
+                pane.screen_sequence = pane.screen_sequence.wrapping_add(1);
+                pane.last_screen_change = Instant::now();
+                pane.screen_changes.push_back(ScreenChange {
+                    sequence: pane.screen_sequence,
+                    rows,
+                });
+                while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
+                    pane.screen_changes.pop_front();
+                }
+                changed_screen_sequence = Some(pane.screen_sequence);
+                self.session_sequence = self.session_sequence.wrapping_add(1);
+            }
+            if let Some(client) = &self.attached {
+                if let Some(title) = title {
+                    let _ = crate::ipc::send(
+                        &client.writer,
+                        &ServerMessage::Title(format!("{title} — vvmux")),
+                    );
+                }
+                if bell {
+                    let _ = crate::ipc::send(&client.writer, &ServerMessage::Bell);
+                }
+            }
+            self.schedule_render();
+        }
+        for command in kitty_commands {
+            self.handle_kitty_graphics(pane_id, command);
+        }
+        if let Some((selection, text)) = clipboard_store {
+            self.handle_clipboard_store(focused, selection, text);
+        }
+        if let Some((selection, terminator)) = clipboard_load {
+            self.handle_clipboard_load(pane_id, focused, selection, &terminator);
+        }
+        if let Some(screen_sequence) = changed_screen_sequence {
+            let pending_cause = self.pending_pane_plugin_causes.remove(&pane_id);
+            let previous_cause = std::mem::replace(&mut self.active_plugin_cause, pending_cause);
+            self.queue_plugin_state_event(
+                "pane.screen_changed",
+                pane_id.to_string(),
+                serde_json::json!({
+                    "pane_id": pane_id,
+                    "screen_sequence": screen_sequence,
+                }),
+                Some(pane_id),
+            );
+            self.active_plugin_cause = previous_cause;
+        }
+        if input_warning {
+            self.status(&format!("pane {pane_id} input queue is unavailable"));
+        }
+        if input_closed {
+            self.close_pane(pane_id);
+        }
+    }
+
+    /// How long until the earliest pane's buffered synchronized update must be applied.
+    fn next_sync_flush_delay(&self) -> Duration {
+        let now = Instant::now();
+        self.panes
+            .values()
+            .filter_map(|pane| pane.terminal.sync_flush_deadline())
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min()
+            .unwrap_or(Duration::MAX)
+    }
+
+    /// Apply synchronized updates whose deadline has passed.
+    ///
+    /// vte buffers everything between BSU and ESU but never enforces the deadline it arms, so a
+    /// pane that opens DECSET 2026 and then stalls would look frozen until it produced two more
+    /// megabytes of output.
+    fn flush_expired_sync_updates(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<PaneId> = self
+            .panes
+            .iter()
+            .filter(|(_, pane)| {
+                pane.terminal
+                    .sync_flush_deadline()
+                    .is_some_and(|deadline| deadline <= now)
+            })
+            .map(|(pane_id, _)| *pane_id)
+            .collect();
+        for pane_id in expired {
+            self.drive_pane_terminal(pane_id, |terminal| terminal.flush_synchronized_update());
+        }
     }
 
     fn handle_kitty_graphics(&mut self, pane_id: PaneId, command: KittyGraphicsCommand) {
@@ -4849,13 +4922,57 @@ impl SessionActor {
         if let Some(pane) = self.panes.get_mut(&drag.pane) {
             pane.mouse_selection = Some(selection);
         }
+        self.set_copy_buffer(bytes);
+        self.schedule_render();
+    }
+
+    /// Adopt `bytes` as the copy buffer and mirror it to the attached client's clipboard.
+    fn set_copy_buffer(&mut self, bytes: Vec<u8>) {
         self.copy_buffer = bytes;
         self.copy_buffer.truncate(COPY_BUFFER_LIMIT);
         let clipboard = String::from_utf8_lossy(&self.copy_buffer).into_owned();
         if let Some(client) = &self.attached {
             let _ = crate::ipc::send(&client.writer, &ServerMessage::Clipboard(clipboard));
         }
-        self.schedule_render();
+    }
+
+    /// Honor an OSC 52 store from a pane.
+    ///
+    /// Restricted to the focused pane of an attached session. The copy buffer belongs to the user,
+    /// so a background pane silently overwriting it — or a detached session accepting a write
+    /// nobody can see — is not something the user asked for. Between a focused pane and a mouse
+    /// selection the later write wins, and an in-progress selection is left untouched.
+    fn handle_clipboard_store(&mut self, focused: bool, selection: u8, text: Vec<u8>) {
+        if !self.config.clipboard.osc52.allows_store()
+            || !focused
+            || self.attached.is_none()
+            || !is_supported_clipboard_selection(selection)
+        {
+            return;
+        }
+        self.set_copy_buffer(text);
+    }
+
+    /// Answer an OSC 52 query on the requesting pane's own PTY.
+    fn handle_clipboard_load(
+        &mut self,
+        pane_id: PaneId,
+        focused: bool,
+        selection: u8,
+        terminator: &str,
+    ) {
+        if !self.config.clipboard.osc52.allows_load()
+            || !focused
+            || self.attached.is_none()
+            || !is_supported_clipboard_selection(selection)
+        {
+            return;
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&self.copy_buffer);
+        let reply = format!("\x1b]52;{};{encoded}{terminator}", selection as char).into_bytes();
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            let _ = queue_pane_input(pane, &reply);
+        }
     }
 
     fn mouse(&mut self, mut mouse: MouseEvent, pixel_coordinates: bool) {
@@ -11225,6 +11342,16 @@ mod tests {
                 tab_id: Some(1),
                 deadline_unix_ms: 0,
             },
+        }
+    }
+
+    #[test]
+    fn osc52_selections_map_onto_the_single_copy_buffer() {
+        for selection in [b'c', b'p', b's'] {
+            assert!(is_supported_clipboard_selection(selection));
+        }
+        for selection in [b'q', b'0', b'?'] {
+            assert!(!is_supported_clipboard_selection(selection));
         }
     }
 

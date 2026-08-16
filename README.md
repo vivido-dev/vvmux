@@ -464,6 +464,23 @@ resting underline so only the hovered link is marked, and `open` decides who act
 The link's underline color is `[theme].hyperlink`. Only the underline is colored — the text color
 belongs to the program that printed it.
 
+### Clipboard access from panes
+
+Programs can read and write the clipboard with OSC 52 (`printf '\e]52;c;<base64>\e\\'` to store,
+`printf '\e]52;c;?\e\\'` to query). A store lands in the same copy buffer as a mouse selection and is
+mirrored to the outer terminal; a query is answered on the requesting pane's own PTY. Both directions
+are honored only for the focused pane of an attached session, so a background pane cannot overwrite
+or read the buffer behind your back, and the later of a pane store and a mouse selection wins.
+
+`[clipboard].osc52` decides which directions are honored:
+
+- `"only_copy"` (default) — a pane may write the clipboard but not read it. This is the default
+  because the vvmux server is frequently the far end of an ssh session, where answering a read would
+  let any pane copy your clipboard off the machine you are sitting at.
+- `"disabled"` — OSC 52 is ignored in both directions.
+- `"only_paste"` — a pane may read the clipboard but not write it.
+- `"copy_paste"` — both directions. Enable only where every pane is as trusted as you are.
+
 Strict floating defaults live under `[floating]`: `default_width_percent` and
 `default_height_percent` accept 10–100, and `border_drag_margin` accepts 1–4. New floats are centered
 at 60% by 60% by default, with a minimum 4-by-2 content area plus frame.

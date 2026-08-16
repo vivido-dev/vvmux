@@ -89,6 +89,19 @@ persistent_style = true
 #                is written by whatever program holds the pane.
 open = "delegate"
 
+[clipboard]
+# What a program running in a pane may do with your clipboard through OSC 52. A store lands in the
+# same copy buffer as a mouse selection and is mirrored to the outer terminal; a query is answered
+# on the requesting pane's own PTY. Either direction is honored only for the focused pane of an
+# attached session, so a background pane cannot overwrite or read the buffer behind your back.
+#   "disabled"   — OSC 52 is ignored in both directions.
+#   "only_copy"  — a pane may write the clipboard but not read it. The default, because vvmux is
+#                  frequently the far end of an ssh session: answering a read would let any pane,
+#                  including a remote shell, copy your clipboard off the machine you are at.
+#   "only_paste" — a pane may read the clipboard but not write it.
+#   "copy_paste" — both directions. Enable only where every pane is as trusted as you are.
+osc52 = "only_copy"
+
 [plugins]
 # Live global kill switch. Disabling stops runtimes and the registry watcher for this session.
 # It also disables bundled and installed agent detection. Toggle individual bundled providers with

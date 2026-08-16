@@ -18,6 +18,7 @@ pub struct Config {
     pub keys: Keys,
     pub floating: Floating,
     pub hyperlinks: Hyperlinks,
+    pub clipboard: Clipboard,
     pub plugins: Plugins,
     pub server: Server,
 }
@@ -100,6 +101,40 @@ impl Default for Hyperlinks {
             persistent_style: true,
             open: OpenMode::Delegate,
         }
+    }
+}
+
+/// What a program running in a pane may do with the user's clipboard through OSC 52.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Clipboard {
+    pub osc52: Osc52,
+}
+
+/// Which OSC 52 directions are honored.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Osc52 {
+    /// Ignore OSC 52 entirely.
+    Disabled,
+    /// A pane may write the clipboard but not read it. The default: vvmux is frequently the far
+    /// end of an ssh session, so answering a read turns any pane into a channel for copying the
+    /// user's clipboard off the machine they are sitting at.
+    #[default]
+    OnlyCopy,
+    /// A pane may read the clipboard but not write it.
+    OnlyPaste,
+    /// Both directions are honored.
+    CopyPaste,
+}
+
+impl Osc52 {
+    pub fn allows_store(self) -> bool {
+        matches!(self, Self::OnlyCopy | Self::CopyPaste)
+    }
+
+    pub fn allows_load(self) -> bool {
+        matches!(self, Self::OnlyPaste | Self::CopyPaste)
     }
 }
 
@@ -506,6 +541,36 @@ mod tests {
         config.validate().unwrap();
 
         assert!(toml::from_str::<Config>("[panes]\nopaque = true").is_err());
+    }
+
+    #[test]
+    fn panes_may_write_the_clipboard_by_default_but_never_read_it() {
+        // vvmux is frequently the far end of an ssh session, so a pane answering an OSC 52 query
+        // out of the box would copy the user's clipboard off the machine they are sitting at.
+        let default = Config::default().clipboard.osc52;
+        assert_eq!(default, Osc52::OnlyCopy);
+        assert!(default.allows_store());
+        assert!(!default.allows_load());
+        assert_eq!(
+            toml::from_str::<Config>("").unwrap().clipboard.osc52,
+            default
+        );
+
+        for (source, store, load) in [
+            ("disabled", false, false),
+            ("only_copy", true, false),
+            ("only_paste", false, true),
+            ("copy_paste", true, true),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[clipboard]\nosc52 = \"{source}\"")).unwrap();
+            assert_eq!(config.clipboard.osc52.allows_store(), store, "{source}");
+            assert_eq!(config.clipboard.osc52.allows_load(), load, "{source}");
+            config.validate().unwrap();
+        }
+
+        assert!(toml::from_str::<Config>("[clipboard]\nosc52 = \"always\"").is_err());
+        assert!(toml::from_str::<Config>("[clipboard]\nunknown = true").is_err());
     }
 
     #[test]
