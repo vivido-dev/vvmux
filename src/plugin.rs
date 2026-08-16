@@ -3305,7 +3305,17 @@ fn run_one_shot(
         terminate_process_tree(&mut child, process_id, &process_tree);
         return Err(invalid("schema_invalid: action input exceeds 1 MiB"));
     }
-    stdin.write_all(&body)?;
+    // An action that ignores its input closes stdin and may exit before the write lands, which
+    // fails the write with `BrokenPipe`. That is the child's normal behaviour, not an error: let it
+    // run to completion so its exit status, stderr, and stdout decide the outcome.
+    match stdin.write_all(&body) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+        Err(error) => {
+            terminate_process_tree(&mut child, process_id, &process_tree);
+            return Err(error);
+        }
+    }
     drop(stdin);
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -4044,6 +4054,50 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
         )
         .unwrap();
         assert_eq!(output, serde_json::json!({"token": false}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_actions_that_never_read_their_input_report_their_own_outcome() {
+        // Larger than a pipe buffer, so the write is still in flight when a child that never reads
+        // exits. Without that the outcome depends on scheduling and only fails under load.
+        let input = serde_json::json!({"payload": "x".repeat(256 * 1024)});
+        let output = run_one_shot(
+            Path::new("/"),
+            &["sh".into(), "-c".into(), "printf '{\"read\":false}'".into()],
+            &input,
+            Duration::from_secs(5),
+            OneShotContext {
+                session: Some("test"),
+                plugin_id: "dev.example",
+                cancel: None,
+                session_instance: Some("session-instance"),
+            },
+        )
+        .unwrap();
+        assert_eq!(output, serde_json::json!({"read": false}));
+
+        // A child that fails without reading still reports why, rather than a broken pipe.
+        let error = run_one_shot(
+            Path::new("/"),
+            &[
+                "sh".into(),
+                "-c".into(),
+                "printf 'refused' >&2; exit 3".into(),
+            ],
+            &input,
+            Duration::from_secs(5),
+            OneShotContext {
+                session: Some("test"),
+                plugin_id: "dev.example",
+                cancel: None,
+                session_instance: Some("session-instance"),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("runtime_crashed"), "{error}");
+        assert!(error.contains("refused"), "{error}");
     }
 
     #[cfg(unix)]
