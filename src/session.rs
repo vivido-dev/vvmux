@@ -1943,7 +1943,7 @@ impl SessionActor {
                             .observe_marker(pane_id, &marker, row as i32, column);
                     }
                     TerminalEvent::KittyGraphics(command) => kitty_commands.push(command),
-                    TerminalEvent::GridScroll(lines) => {
+                    TerminalEvent::GridScroll { lines, .. } => {
                         self.vivid.scroll_anchors(pane_id, lines);
                     }
                     TerminalEvent::Clear => self.vivid.clear_anchors(pane_id),

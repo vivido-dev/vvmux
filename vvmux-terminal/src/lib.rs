@@ -282,7 +282,16 @@ pub enum TerminalEvent {
         column: usize,
     },
     KittyGraphics(KittyGraphicsCommand),
-    GridScroll(i32),
+    /// The grid scrolled. `lines` is signed (up positive, down negative); `top`/`bottom` bound the
+    /// scrolled region. `pushed_to_history` is set only when a full-screen primary-screen scroll
+    /// carried lines into scrollback — the only scroll that keeps a viewport-anchored cell on the
+    /// same text, which is what selection rotation needs to know.
+    GridScroll {
+        lines: i32,
+        top: usize,
+        bottom: usize,
+        pushed_to_history: bool,
+    },
     Clear,
     /// A pane asked to write the user's clipboard (OSC 52 store). Already decoded and bounded.
     ClipboardStore {
@@ -682,10 +691,13 @@ impl Terminal {
 
     fn scroll_region_up(&mut self, count: usize) {
         let count = count.min(self.scroll_bottom.saturating_sub(self.scroll_top));
+        // Only a full-screen primary-screen scroll carries lines into scrollback.
+        let pushed_to_history =
+            self.scroll_top == 0 && self.scroll_bottom == self.rows && !self.alternate_screen;
         for _ in 0..count {
             let removed = self.grid.remove(self.scroll_top);
             let removed_wrapped = self.grid_wrapped.remove(self.scroll_top);
-            if self.scroll_top == 0 && self.scroll_bottom == self.rows && !self.alternate_screen {
+            if pushed_to_history {
                 self.history.push_back(removed);
                 self.history_wrapped.push_back(removed_wrapped);
                 while self.history.len() > self.history_limit {
@@ -698,7 +710,12 @@ impl Terminal {
             self.grid_wrapped.insert(self.scroll_bottom - 1, false);
         }
         if count > 0 {
-            self.events.push(TerminalEvent::GridScroll(count as i32));
+            self.events.push(TerminalEvent::GridScroll {
+                lines: count as i32,
+                top: self.scroll_top,
+                bottom: self.scroll_bottom,
+                pushed_to_history,
+            });
             self.damage();
         }
     }
@@ -713,7 +730,12 @@ impl Terminal {
             self.grid_wrapped.insert(self.scroll_top, false);
         }
         if count > 0 {
-            self.events.push(TerminalEvent::GridScroll(-(count as i32)));
+            self.events.push(TerminalEvent::GridScroll {
+                lines: -(count as i32),
+                top: self.scroll_top,
+                bottom: self.scroll_bottom,
+                pushed_to_history: false,
+            });
             self.damage();
         }
     }
@@ -2119,6 +2141,55 @@ mod tests {
         populated.feed(b"one\r\ntwo\r\nthree\r\nfour");
         let events = populated.feed(b"\x1b[3J");
         assert!(!events.contains(&TerminalEvent::Clear));
+    }
+
+    #[test]
+    fn grid_scroll_reports_region_and_history_push() {
+        // A full-screen primary-screen scroll carries lines into scrollback.
+        let mut terminal = Terminal::new(3, 10, 10);
+        terminal.feed(b"one\r\ntwo\r\nthree");
+        let events = terminal.feed(b"\r\nx");
+        assert!(events.contains(&TerminalEvent::GridScroll {
+            lines: 1,
+            top: 0,
+            bottom: 3,
+            pushed_to_history: true,
+        }));
+        assert_eq!(terminal.history_len(), 1);
+
+        // A partial scroll region never pushes to history.
+        let mut region = Terminal::new(3, 10, 10);
+        region.feed(b"\x1b[2;3r\x1b[3;1H");
+        let events = region.feed(b"\r\nx");
+        assert!(events.contains(&TerminalEvent::GridScroll {
+            lines: 1,
+            top: 1,
+            bottom: 3,
+            pushed_to_history: false,
+        }));
+        assert_eq!(region.history_len(), 0);
+
+        // Alternate-screen scrolls are dropped, not retained.
+        let mut alt = Terminal::new(3, 10, 10);
+        alt.feed(b"\x1b[?1049h\x1b[3;1H");
+        let events = alt.feed(b"\r\n");
+        assert!(events.contains(&TerminalEvent::GridScroll {
+            lines: 1,
+            top: 0,
+            bottom: 3,
+            pushed_to_history: false,
+        }));
+        assert_eq!(alt.history_len(), 0);
+
+        // A downward scroll reports negative lines.
+        let mut down = Terminal::new(3, 10, 10);
+        let events = down.feed(b"\x1bM");
+        assert!(events.contains(&TerminalEvent::GridScroll {
+            lines: -1,
+            top: 0,
+            bottom: 3,
+            pushed_to_history: false,
+        }));
     }
 
     #[test]
