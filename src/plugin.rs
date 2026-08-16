@@ -447,7 +447,7 @@ fn registry_candidate(registry: &Registry) -> io::Result<RegistryCandidate> {
             if loaded.manifest.plugin.id != entry.id {
                 return Err(invalid("manifest ID differs from registry ID"));
             }
-            let actual_digest = digest_tree(&entry.root)?;
+            let actual_digest = digest_tree(&entry.root, entry.linked)?;
             if !entry.linked && actual_digest != entry.digest {
                 return Err(invalid("installed package digest differs from registry"));
             }
@@ -1609,7 +1609,7 @@ fn commit_package_graph(
         let (root, digest) = if package.linked {
             (
                 package.source_dir.clone(),
-                digest_tree(&package.source_dir)?,
+                digest_tree(&package.source_dir, true)?,
             )
         } else {
             let staging = paths.packages.join(format!(
@@ -1634,10 +1634,10 @@ fn commit_package_graph(
                 cleanup_temporary(paths, &installed_new);
                 return Err(invalid("manifest changed while the package was staged"));
             }
-            let digest = digest_tree(&staging)?;
+            let digest = digest_tree(&staging, false)?;
             let destination = paths.package_version(&package.id, &digest);
             if destination.exists() {
-                if digest_tree(&destination)? != digest {
+                if digest_tree(&destination, false)? != digest {
                     remove_known_tree(&paths.packages, &staging)?;
                     cleanup_temporary(paths, &installed_new);
                     return Err(invalid("installed version path has an unexpected digest"));
@@ -1961,7 +1961,7 @@ fn doctor(paths: &PluginPaths, json: bool) -> io::Result<()> {
         let result = load_package(&entry.root).and_then(|loaded| {
             if loaded.manifest.plugin.id != entry.id {
                 Err(invalid("manifest ID differs from registry ID"))
-            } else if !entry.linked && digest_tree(&entry.root)? != entry.digest {
+            } else if !entry.linked && digest_tree(&entry.root, false)? != entry.digest {
                 Err(invalid("installed package digest differs from registry"))
             } else {
                 Ok(loaded.warnings)
@@ -3058,7 +3058,7 @@ fn encode_lock(registry: &Registry) -> io::Result<String> {
             source: entry.source.clone(),
             commit: entry.commit.clone(),
             manifest_digest: digest_file(&entry.root.join("vvmux-plugin.toml"))?,
-            artifact_digest: digest_tree(&entry.root)?,
+            artifact_digest: digest_tree(&entry.root, entry.linked)?,
         });
     }
     let lock = LockFile {
@@ -3579,12 +3579,26 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn digest_tree(root: &Path) -> io::Result<String> {
-    fn visit(root: &Path, current: &Path, hasher: &mut Sha256) -> io::Result<()> {
+/// Directories a linked development tree regenerates from its own sources. An installed package is
+/// a store copy this process made and later verifies byte for byte, so it digests everything it
+/// copied; a linked package is the contributor's working directory, where the digest is an advisory
+/// fingerprint (`linked` entries skip every digest comparison) and build output would otherwise
+/// churn the lock and rehash hundreds of megabytes on each registry commit.
+const BUILD_OUTPUT_DIRECTORIES: [&str; 3] = ["target", "node_modules", "__pycache__"];
+
+fn digest_tree(root: &Path, linked: bool) -> io::Result<String> {
+    fn visit(root: &Path, current: &Path, linked: bool, hasher: &mut Sha256) -> io::Result<()> {
         let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             if entry.file_name() == ".git" {
+                continue;
+            }
+            if linked
+                && BUILD_OUTPUT_DIRECTORIES
+                    .iter()
+                    .any(|name| entry.file_name() == *name)
+            {
                 continue;
             }
             let ty = entry.file_type()?;
@@ -3601,7 +3615,7 @@ fn digest_tree(root: &Path) -> io::Result<String> {
             hasher.update(relative.as_bytes());
             if ty.is_dir() {
                 hasher.update(b"d");
-                visit(root, &entry.path(), hasher)?;
+                visit(root, &entry.path(), linked, hasher)?;
             } else if ty.is_file() {
                 hasher.update(b"f");
                 let bytes = fs::read(entry.path())?;
@@ -3612,7 +3626,7 @@ fn digest_tree(root: &Path) -> io::Result<String> {
         Ok(())
     }
     let mut hasher = Sha256::new();
-    visit(root, root, &mut hasher)?;
+    visit(root, root, linked, &mut hasher)?;
     Ok(hex(&hasher.finalize()))
 }
 
@@ -3833,7 +3847,7 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
             root: root.into(),
             source: format!("https://example.invalid/{id}"),
             commit: Some("a".repeat(40)),
-            digest: digest_tree(root).unwrap(),
+            digest: digest_tree(root, false).unwrap(),
             manifest_digest: digest_file(&root.join("vvmux-plugin.toml")).unwrap(),
             enabled: true,
             linked: false,
@@ -3893,7 +3907,7 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
                 root: package.clone(),
                 source: package.display().to_string(),
                 commit: None,
-                digest: digest_tree(&package).unwrap(),
+                digest: digest_tree(&package, true).unwrap(),
                 manifest_digest: digest_file(&package.join("vvmux-plugin.toml")).unwrap(),
                 enabled: true,
                 linked: true,
@@ -4091,9 +4105,56 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
         let entry = &registry.plugins["dev.example"];
         assert!(entry.enabled);
         assert_eq!(entry.runtime_tier, "trusted_native");
-        assert_eq!(digest_tree(&entry.root).unwrap(), entry.digest);
+        assert_eq!(digest_tree(&entry.root, false).unwrap(), entry.digest);
         resolve(&paths, false).unwrap();
         assert!(paths.lock.is_file());
+    }
+
+    #[test]
+    fn linked_digests_ignore_build_output_but_installed_digests_cover_every_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        write_test_package(&source);
+        let root = directory.path().join("config/plugins");
+        let paths = PluginPaths {
+            registry: root.join("registry.json"),
+            packages: root.join("packages"),
+            lock: root.join("vvmux-plugin.lock"),
+            root,
+        };
+        install_local(&paths, &source, true, true, None, None).unwrap();
+        let registry = load_registry(&paths).unwrap();
+        let entry = registry.plugins["dev.example"].clone();
+        assert!(entry.linked);
+        let locked = encode_lock(&registry).unwrap();
+
+        // Rebuilding a linked development tree must not move its fingerprint or churn the lock.
+        fs::create_dir_all(source.join("target/wasm32-wasip2/release")).unwrap();
+        fs::write(
+            source.join("target/wasm32-wasip2/release/plugin.wasm"),
+            [0; 64],
+        )
+        .unwrap();
+        fs::create_dir_all(source.join("node_modules/dependency")).unwrap();
+        fs::write(source.join("node_modules/dependency/index.js"), "export{}").unwrap();
+        fs::create_dir_all(source.join("__pycache__")).unwrap();
+        fs::write(source.join("__pycache__/plugin.pyc"), [1; 32]).unwrap();
+        assert_eq!(digest_tree(&source, true).unwrap(), entry.digest);
+        assert_eq!(encode_lock(&registry).unwrap(), locked);
+        assert!(registry_candidate(&registry).unwrap().failed.is_empty());
+
+        // Editing the package itself still does.
+        fs::write(source.join("schemas/output.json"), r#"{"type":"object"} "#).unwrap();
+        assert_ne!(digest_tree(&source, true).unwrap(), entry.digest);
+
+        // An installed package is a store copy this process verifies byte for byte, so no path in
+        // it is exempt: a file planted under a build-output name must break the digest.
+        let installed = directory.path().join("installed");
+        write_test_package(&installed);
+        let digest = digest_tree(&installed, false).unwrap();
+        fs::create_dir_all(installed.join("target")).unwrap();
+        fs::write(installed.join("target/planted"), "planted").unwrap();
+        assert_ne!(digest_tree(&installed, false).unwrap(), digest);
     }
 
     #[test]
@@ -4151,7 +4212,7 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
                 root: package.clone(),
                 source: "test".into(),
                 commit: None,
-                digest: digest_tree(&package).unwrap(),
+                digest: digest_tree(&package, false).unwrap(),
                 manifest_digest: digest_file(&package.join("vvmux-plugin.toml")).unwrap(),
                 enabled: true,
                 linked: false,
