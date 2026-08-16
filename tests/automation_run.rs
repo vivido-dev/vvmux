@@ -36,8 +36,10 @@ impl Drop for SessionGuard {
 
 struct Fixture {
     name: String,
-    directory: tempfile::TempDir,
     _guard: SessionGuard,
+    // Fields drop in declaration order. Keep the runtime directory alive until the guard has
+    // connected to and killed the detached session, or the server and pane become orphans.
+    directory: tempfile::TempDir,
     _serial: MutexGuard<'static, ()>,
 }
 

@@ -114,6 +114,13 @@ fn run_inner(
             }
         }
     }
+    // `shutdown` requests the actor to stop; it does not mean pane process groups have already
+    // been reaped. Waiting for the actor's completion prevents the server process from exiting
+    // underneath `terminate_children`, which otherwise orphans panes and eventually exhausts the
+    // finite PTY pool on macOS.
+    while !actor.terminated.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(10));
+    }
     paths.remove_instance(&registry);
     Ok(())
 }

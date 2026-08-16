@@ -324,6 +324,15 @@ type PendingPluginStateEvent = (
 pub struct ActorHandle {
     pub sender: mpsc::SyncSender<ActorEvent>,
     pub shutdown: Arc<AtomicBool>,
+    pub terminated: Arc<AtomicBool>,
+}
+
+struct ActorTermination(Arc<AtomicBool>);
+
+impl Drop for ActorTermination {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// What a reload actually did, so the caller learns which sections could not take effect now
@@ -1316,6 +1325,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
     let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE);
     let (media_sender, media_receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE);
     let shutdown = Arc::new(AtomicBool::new(false));
+    let terminated = Arc::new(AtomicBool::new(false));
     let vivid =
         VirtualVivid::start_with_events(vivid_endpoint, config.media.clone(), Some(media_sender))?;
     let media_projection_pending = Arc::new(AtomicBool::new(false));
@@ -1487,10 +1497,18 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         Some(layout) => actor.apply_layout_plan(layout)?,
         None => actor.new_tab()?,
     }
+    let actor_terminated = terminated.clone();
     std::thread::Builder::new()
         .name("vvmux-session".into())
-        .spawn(move || actor.run(receiver, media_receiver))?;
-    Ok(ActorHandle { sender, shutdown })
+        .spawn(move || {
+            let _termination = ActorTermination(actor_terminated);
+            actor.run(receiver, media_receiver);
+        })?;
+    Ok(ActorHandle {
+        sender,
+        shutdown,
+        terminated,
+    })
 }
 
 impl SessionActor {

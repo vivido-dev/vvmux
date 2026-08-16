@@ -22,6 +22,19 @@ struct ControlInner {
     terminating: AtomicBool,
 }
 
+impl Drop for ControlInner {
+    fn drop(&mut self) {
+        // Startup errors and actor panics can drop a pane before the ordinary close path runs.
+        // Do not leave its process group holding a PTY indefinitely; the normal termination paths
+        // set this flag first and retain their SIGHUP-to-SIGKILL grace period.
+        if !self.terminating.swap(true, Ordering::AcqRel) {
+            unsafe {
+                libc::kill(-self.process_group, libc::SIGHUP);
+            }
+        }
+    }
+}
+
 pub struct PtyWaiter {
     child: Child,
 }
