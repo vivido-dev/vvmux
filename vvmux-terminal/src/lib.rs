@@ -22,6 +22,7 @@ const KITTY_PAYLOAD_MAX_BYTES: usize = 4096;
 const KITTY_DECODED_TRANSFER_MAX_BYTES: u32 = 64 * 1024 * 1024;
 /// Largest OSC 52 payload accepted from a pane, matching the session's copy-buffer ceiling.
 const CLIPBOARD_DECODED_MAX_BYTES: usize = 1024 * 1024;
+const DCS_MAX_BYTES: usize = 4096;
 
 /// OSC 52 producers in the wild routinely omit base64 padding, so a store is decoded with either
 /// form accepted rather than rejected outright.
@@ -65,6 +66,132 @@ struct AgentOscTracker {
     body: Vec<u8>,
     title: Option<String>,
     progress: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct DcsScanner {
+    state: DcsState,
+    body: Vec<u8>,
+    raw: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum DcsState {
+    #[default]
+    Ground,
+    Escape,
+    Body,
+    BodyEscape,
+    Discarding,
+    DiscardingEscape,
+}
+
+#[derive(Debug)]
+enum DcsChunk {
+    Bytes(Vec<u8>),
+    Request(DcsRequest),
+}
+
+#[derive(Debug)]
+enum DcsRequest {
+    Decrqss(Vec<u8>),
+    Xtgettcap(Vec<u8>),
+    Xtsettcap(Vec<u8>),
+}
+
+impl DcsScanner {
+    fn push(&mut self, bytes: &[u8]) -> Vec<DcsChunk> {
+        let mut chunks = Vec::new();
+        for &byte in bytes {
+            match self.state {
+                DcsState::Ground if byte == 0x1b => self.state = DcsState::Escape,
+                DcsState::Ground => push_dcs_bytes(&mut chunks, &[byte]),
+                DcsState::Escape if byte == b'P' => {
+                    self.body.clear();
+                    self.raw.clear();
+                    self.raw.extend_from_slice(b"\x1bP");
+                    self.state = DcsState::Body;
+                }
+                DcsState::Escape if byte == 0x1b => {
+                    push_dcs_bytes(&mut chunks, b"\x1b");
+                }
+                DcsState::Escape => {
+                    push_dcs_bytes(&mut chunks, &[0x1b, byte]);
+                    self.state = DcsState::Ground;
+                }
+                DcsState::Body if byte == 0x1b => {
+                    self.state = DcsState::BodyEscape;
+                }
+                DcsState::Body => self.push_body(byte),
+                DcsState::BodyEscape if byte == b'\\' => {
+                    self.raw.extend_from_slice(b"\x1b\\");
+                    self.finish(&mut chunks);
+                }
+                DcsState::BodyEscape => {
+                    self.push_body(0x1b);
+                    if matches!(self.state, DcsState::Body) {
+                        self.push_body(byte);
+                    }
+                }
+                DcsState::Discarding if byte == 0x1b => {
+                    self.state = DcsState::DiscardingEscape;
+                }
+                DcsState::Discarding => {}
+                DcsState::DiscardingEscape if byte == b'\\' => {
+                    self.body.clear();
+                    self.raw.clear();
+                    self.state = DcsState::Ground;
+                }
+                DcsState::DiscardingEscape if byte == 0x1b => {}
+                DcsState::DiscardingEscape => self.state = DcsState::Discarding,
+            }
+        }
+        chunks
+    }
+
+    fn push_body(&mut self, byte: u8) {
+        self.body.push(byte);
+        self.raw.push(byte);
+        self.state = if self.body.len() > DCS_MAX_BYTES {
+            self.body.clear();
+            self.raw.clear();
+            DcsState::Discarding
+        } else {
+            DcsState::Body
+        };
+    }
+
+    fn finish(&mut self, chunks: &mut Vec<DcsChunk>) {
+        let request = self
+            .body
+            .strip_prefix(b"$q")
+            .map(|body| DcsRequest::Decrqss(body.to_vec()))
+            .or_else(|| {
+                self.body
+                    .strip_prefix(b"+q")
+                    .map(|body| DcsRequest::Xtgettcap(body.to_vec()))
+            })
+            .or_else(|| {
+                self.body
+                    .strip_prefix(b"+p")
+                    .map(|body| DcsRequest::Xtsettcap(body.to_vec()))
+            });
+        chunks.push(match request {
+            Some(request) => DcsChunk::Request(request),
+            None => DcsChunk::Bytes(mem::take(&mut self.raw)),
+        });
+        self.body.clear();
+        self.raw.clear();
+        self.state = DcsState::Ground;
+    }
+}
+
+fn push_dcs_bytes(chunks: &mut Vec<DcsChunk>, bytes: &[u8]) {
+    if let Some(DcsChunk::Bytes(previous)) = chunks.last_mut() {
+        previous.extend_from_slice(bytes);
+    } else {
+        chunks.push(DcsChunk::Bytes(bytes.to_vec()));
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -358,6 +485,7 @@ pub struct Terminal {
     tab_stops_customized: bool,
     marker_scanner: VividMarkerScanner,
     kitty_scanner: KittyGraphicsScanner,
+    dcs_scanner: DcsScanner,
     agent_osc: AgentOscTracker,
     keyboard_mode_stack: Vec<KeyboardModes>,
     inactive_keyboard_mode_stack: Vec<KeyboardModes>,
@@ -397,6 +525,7 @@ impl Terminal {
             tab_stops_customized: false,
             marker_scanner: VividMarkerScanner::default(),
             kitty_scanner: KittyGraphicsScanner::default(),
+            dcs_scanner: DcsScanner::default(),
             agent_osc: AgentOscTracker::default(),
             keyboard_mode_stack: Vec::new(),
             inactive_keyboard_mode_stack: Vec::new(),
@@ -466,8 +595,8 @@ impl Terminal {
         for chunk in chunks {
             match chunk {
                 KittyChunk::Bytes(bytes) => {
-                    let vivid = self.marker_scanner.push(&bytes);
-                    self.process_vivid_chunks(vivid);
+                    let dcs = self.dcs_scanner.push(&bytes);
+                    self.process_dcs_chunks(dcs);
                 }
                 KittyChunk::Command(command) => {
                     self.events.push(TerminalEvent::KittyGraphics(command));
@@ -479,6 +608,88 @@ impl Terminal {
             self.process_vivid_chunks(vivid);
         }
         self.finish_events(damage)
+    }
+
+    fn process_dcs_chunks(&mut self, chunks: Vec<DcsChunk>) {
+        for chunk in chunks {
+            match chunk {
+                DcsChunk::Bytes(bytes) => {
+                    let vivid = self.marker_scanner.push(&bytes);
+                    self.process_vivid_chunks(vivid);
+                }
+                DcsChunk::Request(request) => self.handle_dcs_request(request),
+            }
+        }
+    }
+
+    fn handle_dcs_request(&mut self, request: DcsRequest) {
+        match request {
+            DcsRequest::Decrqss(request) => self.report_status_string(&request),
+            DcsRequest::Xtgettcap(request) => self.report_termcap(&request, "vvmux"),
+            DcsRequest::Xtsettcap(request) => {
+                // Validate the bounded hex input, then deliberately ignore it. Terminal identity
+                // and capabilities are emulator-owned state and cannot be changed by a pane.
+                let _ = request
+                    .split(|byte| *byte == b';')
+                    .all(|name| !name.is_empty() && hex::decode(name).is_ok());
+            }
+        }
+    }
+
+    fn report_status_string(&mut self, request: &[u8]) {
+        let status = match request {
+            b"m" => sgr_status(&self.template),
+            b"r" => format!("{};{}r", self.scroll_top + 1, self.scroll_bottom),
+            b"\"p" => "62;1\"p".to_owned(),
+            // Select Character Protection Attribute is not otherwise tracked, so characters are
+            // always reported as erasable (the DEC default).
+            b"\"q" => "0\"q".to_owned(),
+            _ => {
+                self.events
+                    .push(TerminalEvent::PtyWrite(b"\x1bP0$r\x1b\\".to_vec()));
+                return;
+            }
+        };
+        self.events.push(TerminalEvent::PtyWrite(
+            format!("\x1bP1$r{status}\x1b\\").into_bytes(),
+        ));
+    }
+
+    fn report_termcap(&mut self, request: &[u8], terminal_name: &str) {
+        let mut values = Vec::new();
+        for encoded_name in request.split(|byte| *byte == b';') {
+            let Ok(name) = hex::decode(encoded_name) else {
+                continue;
+            };
+            let value = match name.as_slice() {
+                b"TN" => Some(Some(terminal_name.as_bytes())),
+                b"Co" => Some(Some(b"256".as_slice())),
+                b"RGB" => Some(Some(b"8".as_slice())),
+                b"Tc" => Some(None),
+                _ => None,
+            };
+            let Some(value) = value else { continue };
+            let mut entry = encoded_name.to_vec();
+            if let Some(value) = value {
+                entry.push(b'=');
+                entry.extend_from_slice(hex::encode(value).as_bytes());
+            }
+            values.push(entry);
+        }
+        let reply = if values.is_empty() {
+            b"\x1bP0+r\x1b\\".to_vec()
+        } else {
+            let mut reply = b"\x1bP1+r".to_vec();
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    reply.push(b';');
+                }
+                reply.extend_from_slice(value);
+            }
+            reply.extend_from_slice(b"\x1b\\");
+            reply
+        };
+        self.events.push(TerminalEvent::PtyWrite(reply));
     }
 
     fn process_vivid_chunks(&mut self, chunks: Vec<VividChunk>) {
@@ -1425,6 +1636,63 @@ fn append_row_text(output: &mut String, cells: &[Cell]) {
     }
 }
 
+fn sgr_status(cell: &Cell) -> String {
+    let mut params = Vec::new();
+    if cell.bold {
+        params.push("1".to_owned());
+    }
+    if cell.dim {
+        params.push("2".to_owned());
+    }
+    if cell.italic {
+        params.push("3".to_owned());
+    }
+    match cell.underline_style {
+        UnderlineStyle::None => {}
+        UnderlineStyle::Single => params.push("4".to_owned()),
+        UnderlineStyle::Double => params.push("4:2".to_owned()),
+        UnderlineStyle::Curl => params.push("4:3".to_owned()),
+        UnderlineStyle::Dotted => params.push("4:4".to_owned()),
+        UnderlineStyle::Dashed => params.push("4:5".to_owned()),
+    }
+    if cell.blink {
+        params.push("5".to_owned());
+    }
+    if cell.inverse {
+        params.push("7".to_owned());
+    }
+    if cell.hidden {
+        params.push("8".to_owned());
+    }
+    if cell.strikeout {
+        params.push("9".to_owned());
+    }
+    push_sgr_color(&mut params, cell.foreground, true);
+    push_sgr_color(&mut params, cell.background, false);
+    if params.is_empty() {
+        params.push("0".to_owned());
+    }
+    format!("{}m", params.join(";"))
+}
+
+fn push_sgr_color(params: &mut Vec<String>, color: TerminalColor, foreground: bool) {
+    let base = if foreground { 30 } else { 40 };
+    match color {
+        TerminalColor::Default => {}
+        TerminalColor::Indexed(index @ 0..=7) => params.push((base + index).to_string()),
+        TerminalColor::Indexed(index @ 8..=15) => {
+            params.push((base + 60 + index - 8).to_string());
+        }
+        TerminalColor::Indexed(index) => {
+            params.push(format!("{};5;{index}", if foreground { 38 } else { 48 }));
+        }
+        TerminalColor::Rgb(red, green, blue) => params.push(format!(
+            "{};2;{red};{green};{blue}",
+            if foreground { 38 } else { 48 }
+        )),
+    }
+}
+
 fn convert_color(color: Color, foreground: bool) -> TerminalColor {
     match color {
         Color::Indexed(index) => TerminalColor::Indexed(index),
@@ -2357,6 +2625,72 @@ mod tests {
             b"\x1b[?1049;1$y"
         );
         assert_eq!(reply(terminal.feed(b"\x1b[?12345$p")), b"\x1b[?12345;0$y");
+    }
+
+    #[test]
+    fn decrqss_reports_sgr_scroll_region_and_refuses_unknown_requests() {
+        let mut terminal = Terminal::new(10, 20, 0);
+        terminal.feed(b"\x1b[1;31m\x1b[3;7r");
+        let replies = |events: Vec<TerminalEvent>| {
+            events
+                .into_iter()
+                .filter_map(|event| match event {
+                    TerminalEvent::PtyWrite(bytes) => Some(bytes),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            replies(terminal.feed(b"\x1bP$qm\x1b\\")),
+            vec![b"\x1bP1$r1;31m\x1b\\".to_vec()]
+        );
+        assert_eq!(
+            replies(terminal.feed(b"\x1bP$qr\x1b\\")),
+            vec![b"\x1bP1$r3;7r\x1b\\".to_vec()]
+        );
+        assert_eq!(
+            replies(terminal.feed(b"\x1bP$qz\x1b\\")),
+            vec![b"\x1bP0$r\x1b\\".to_vec()]
+        );
+    }
+
+    #[test]
+    fn xtgettcap_is_fragment_safe_bounded_and_reports_honest_capabilities() {
+        let mut terminal = Terminal::new(2, 8, 0);
+        assert!(
+            terminal
+                .feed(b"\x1bP+q544e;524")
+                .iter()
+                .all(|event| !matches!(event, TerminalEvent::PtyWrite(_)))
+        );
+        let events = terminal.feed(b"742;5463;756e6b6e6f776e\x1b\\");
+        assert!(events.contains(&TerminalEvent::PtyWrite(
+            b"\x1bP1+r544e=76766d7578;524742=38;5463\x1b\\".to_vec()
+        )));
+
+        assert!(
+            terminal
+                .feed(b"\x1bP+q756e6b6e6f776e\x1b\\")
+                .contains(&TerminalEvent::PtyWrite(b"\x1bP0+r\x1b\\".to_vec()))
+        );
+        assert!(
+            terminal
+                .feed(b"\x1bP+p544e=6576696c\x1b\\")
+                .iter()
+                .all(|event| !matches!(event, TerminalEvent::PtyWrite(_)))
+        );
+
+        let oversized = vec![b'a'; DCS_MAX_BYTES + 1];
+        let mut packet = b"\x1bP+q".to_vec();
+        packet.extend_from_slice(&oversized);
+        packet.extend_from_slice(b"\x1b\\");
+        assert!(
+            terminal
+                .feed(&packet)
+                .iter()
+                .all(|event| !matches!(event, TerminalEvent::PtyWrite(_)))
+        );
     }
 
     #[test]
