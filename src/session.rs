@@ -1890,8 +1890,8 @@ impl SessionActor {
     }
 
     /// Run terminal events produced for one pane through the full observation path: PTY replies,
-    /// title and bell, media anchors, the semantic-change sequence automation and plugins observe,
-    /// and render scheduling.
+    /// title and bell, media anchors, mouse-selection adjustment, the semantic-change sequence
+    /// automation and plugins observe, and render scheduling.
     ///
     /// Live PTY output and a flushed synchronized update both come through here, so a flush is
     /// observed exactly like ordinary output rather than mutating the grid behind everyone's back.
@@ -1899,7 +1899,6 @@ impl SessionActor {
     where
         F: FnOnce(&mut Terminal) -> Vec<TerminalEvent>,
     {
-        self.invalidate_mouse_selection_for_pane(pane_id);
         let focused = self.active_tab().is_some_and(|tab| tab.focused == pane_id);
         let mut title = None;
         let mut bell = false;
@@ -1909,12 +1908,27 @@ impl SessionActor {
         let mut kitty_commands = Vec::new();
         let mut clipboard_store = None;
         let mut clipboard_load = None;
+        // Selection-relevant output, folded into the pane's mouse selection once the pane borrow
+        // below has ended.
+        let mut selection_events = Vec::new();
+        let mut screen_switched = false;
+        let mut history_len = 0;
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             let old_cells = pane.terminal.cells().to_vec();
             let old_cursor = pane.terminal.cursor();
             let old_modes = pane.terminal.modes();
             let old_screen = pane.terminal.alternate_screen();
             let events = produce(&mut pane.terminal);
+            selection_events = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        TerminalEvent::GridScroll { .. } | TerminalEvent::Clear
+                    )
+                })
+                .cloned()
+                .collect();
             for event in events {
                 match event {
                     TerminalEvent::PtyWrite(bytes) => {
@@ -1961,13 +1975,15 @@ impl SessionActor {
                     _ => {}
                 }
             }
+            screen_switched = old_screen != pane.terminal.alternate_screen();
+            history_len = pane.terminal.history_len();
             let semantic_changed = old_cells != pane.terminal.cells()
                 || old_cursor != pane.terminal.cursor()
                 || old_modes != pane.terminal.modes()
-                || old_screen != pane.terminal.alternate_screen();
+                || screen_switched;
             if semantic_changed {
                 let rows = changed_rows(&old_cells, pane.terminal.cells());
-                let rows = (old_screen == pane.terminal.alternate_screen()).then_some(rows);
+                let rows = (!screen_switched).then_some(rows);
                 pane.screen_sequence = pane.screen_sequence.wrapping_add(1);
                 pane.last_screen_change = Instant::now();
                 pane.screen_changes.push_back(ScreenChange {
@@ -1993,6 +2009,12 @@ impl SessionActor {
             }
             self.schedule_render();
         }
+        self.adjust_mouse_selection_after_pane_output(
+            pane_id,
+            &selection_events,
+            screen_switched,
+            history_len,
+        );
         for command in kitty_commands {
             self.handle_kitty_graphics(pane_id, command);
         }
@@ -4792,10 +4814,81 @@ impl SessionActor {
         // case that matters most: no motion event follows it, so a hover kept here would stay
         // painted on whichever link happened to scroll into that cell.
         //
-        // Deliberately not in `invalidate_mouse_selection_for_pane`, which runs on every PTY output
-        // chunk: clearing there would make a link in any actively-printing pane unhoverable.
+        // Deliberately not tied to pane output, which no longer invalidates selections wholesale:
+        // clearing on every PTY chunk would make a link in any actively-printing pane unhoverable
+        // (and erased selections during any continuous redraw — see
+        // `adjust_mouse_selection_after_pane_output` for the replacement).
         self.hovered_link = None;
         self.clear_retained_mouse_selections()
+    }
+
+    /// Fold one batch of pane output into the pane's mouse-selection state.
+    ///
+    /// The selection used to be invalidated on every PTY output chunk, which erased it during any
+    /// continuous redraw. It now survives redraws and rotates with content that scrolls into
+    /// scrollback; the same transform keeps a drag anchor and a multi-click cell on their text, so
+    /// a selection in progress in a busy pane finishes on what was selected. Rendering is left to
+    /// the caller — pane output already schedules one.
+    fn adjust_mouse_selection_after_pane_output(
+        &mut self,
+        pane_id: PaneId,
+        events: &[TerminalEvent],
+        screen_switched: bool,
+        history_len: usize,
+    ) {
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            let adjusted = pane_mouse_selection_after_output(
+                pane.mouse_selection,
+                events,
+                screen_switched,
+                history_len,
+            );
+            pane.mouse_selection = adjusted;
+        }
+        if let Some(drag) = self
+            .mouse_selection_drag
+            .take()
+            .filter(|drag| drag.pane == pane_id)
+        {
+            let anchor = MouseSelection {
+                start: drag.start,
+                end: drag.start,
+                mode: drag.mode,
+            };
+            match pane_mouse_selection_after_output(
+                Some(anchor),
+                events,
+                screen_switched,
+                history_len,
+            ) {
+                Some(anchor) => {
+                    self.mouse_selection_drag = Some(MouseSelectionDrag {
+                        start: anchor.start,
+                        ..drag
+                    })
+                }
+                None => self.mouse_click_tracker = None,
+            }
+        }
+        if let Some(click) = self
+            .mouse_click_tracker
+            .take()
+            .filter(|click| click.pane == pane_id)
+        {
+            let cell = MouseSelection {
+                start: click.cell,
+                end: click.cell,
+                mode: MouseSelectionMode::Character,
+            };
+            if let Some(cell) =
+                pane_mouse_selection_after_output(Some(cell), events, screen_switched, history_len)
+            {
+                self.mouse_click_tracker = Some(MouseClickTracker {
+                    cell: cell.start,
+                    ..click
+                });
+            }
+        }
     }
 
     fn invalidate_mouse_selection_for_pane(&mut self, pane_id: PaneId) -> bool {
@@ -10371,6 +10464,66 @@ fn terminfo_installed() -> bool {
         .any(|root| root.join("v/vvmux").exists())
 }
 
+/// Shift one viewport-anchored selection cell by a full-screen scroll that entered scrollback.
+fn shift_mouse_selection_cell(cell: (isize, usize), lines: i32) -> (isize, usize) {
+    (cell.0 - lines as isize, cell.1)
+}
+
+/// Whether a selection's row span intersects the half-open row range `[top, bottom)`.
+fn mouse_selection_intersects_rows(selection: MouseSelection, top: usize, bottom: usize) -> bool {
+    let first = selection.start.0.min(selection.end.0);
+    let last = selection.start.0.max(selection.end.0);
+    last >= isize::try_from(top).unwrap_or(isize::MIN)
+        && first < isize::try_from(bottom).unwrap_or(isize::MIN)
+}
+
+/// Decide what happens to a pane's mouse selection across one batch of pane output.
+///
+/// Mouse selections are viewport-relative: coordinates only stay on the same text when the whole
+/// primary screen scrolls into scrollback (`pushed_to_history`), in which case both endpoints
+/// shift up by the scroll count — vivido rotates its selections the same way. A scroll inside a
+/// sub-region or on the alternate screen moves rows by an amount that depends on each row's
+/// position in the region, so a selection intersecting it is dropped rather than rotated onto
+/// different text; vivido clamps such selections instead, which needs grid-absolute anchors.
+/// Screen clears, alternate-screen switches, and scrolling fully past the retained scrollback
+/// also drop the selection.
+fn pane_mouse_selection_after_output(
+    selection: Option<MouseSelection>,
+    events: &[TerminalEvent],
+    screen_switched: bool,
+    history_len: usize,
+) -> Option<MouseSelection> {
+    let mut selection = selection?;
+    for event in events {
+        match *event {
+            TerminalEvent::GridScroll {
+                lines,
+                top,
+                bottom,
+                pushed_to_history,
+            } => {
+                if pushed_to_history {
+                    selection.start = shift_mouse_selection_cell(selection.start, lines);
+                    selection.end = shift_mouse_selection_cell(selection.end, lines);
+                    let oldest_retained = -isize::try_from(history_len).unwrap_or(isize::MIN);
+                    if selection.start.0.max(selection.end.0) < oldest_retained {
+                        // Every selected line has scrolled past the retained scrollback.
+                        return None;
+                    }
+                } else if mouse_selection_intersects_rows(selection, top, bottom) {
+                    return None;
+                }
+            }
+            TerminalEvent::Clear => return None,
+            _ => {}
+        }
+    }
+    if screen_switched {
+        return None;
+    }
+    Some(selection)
+}
+
 fn mouse_selection_cell(
     content: Rect,
     x: u16,
@@ -11498,6 +11651,169 @@ mod tests {
         assert_eq!(
             extract_mouse_selection(&terminal, selection),
             "e\u{301}\tb".as_bytes()
+        );
+    }
+
+    #[test]
+    fn mouse_selection_survives_output_that_does_not_scroll() {
+        let mut terminal = Terminal::new(4, 20, 10);
+        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour");
+        let selection = MouseSelection {
+            start: (1, 0),
+            end: (1, 2),
+            mode: MouseSelectionMode::Character,
+        };
+        // A plain redraw that rewrites cells without scrolling.
+        let events = terminal.feed(b"\x1b[2;1HTWO");
+        assert_eq!(
+            pane_mouse_selection_after_output(
+                Some(selection),
+                &events,
+                false,
+                terminal.history_len()
+            ),
+            Some(selection)
+        );
+    }
+
+    #[test]
+    fn mouse_selection_rotates_with_scrollback_scroll() {
+        let mut terminal = Terminal::new(4, 20, 10);
+        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour");
+        let selection = MouseSelection {
+            start: (1, 0),
+            end: (2, 3),
+            mode: MouseSelectionMode::Character,
+        };
+        let text = extract_mouse_selection(&terminal, selection);
+
+        // One full-screen line scrolls into history; both endpoints shift up with their text.
+        let events = terminal.feed(b"\r\nx");
+        let rotated = pane_mouse_selection_after_output(
+            Some(selection),
+            &events,
+            false,
+            terminal.history_len(),
+        )
+        .unwrap();
+        assert_eq!(
+            rotated,
+            MouseSelection {
+                start: (0, 0),
+                end: (1, 3),
+                mode: MouseSelectionMode::Character,
+            }
+        );
+        assert_eq!(extract_mouse_selection(&terminal, rotated), text);
+    }
+
+    #[test]
+    fn mouse_selection_partially_scrolled_into_history_is_kept() {
+        let mut terminal = Terminal::new(4, 20, 10);
+        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour");
+        let selection = MouseSelection {
+            start: (0, 0),
+            end: (1, 3),
+            mode: MouseSelectionMode::Character,
+        };
+
+        // After the scroll, row -1 lives in history and row 0 on screen; both resolve.
+        let events = terminal.feed(b"\r\nx");
+        assert_eq!(
+            pane_mouse_selection_after_output(
+                Some(selection),
+                &events,
+                false,
+                terminal.history_len()
+            ),
+            Some(MouseSelection {
+                start: (-1, 0),
+                end: (0, 3),
+                mode: MouseSelectionMode::Character,
+            })
+        );
+    }
+
+    #[test]
+    fn mouse_selection_drops_when_scrolled_past_retained_history() {
+        let mut terminal = Terminal::new(2, 20, 2);
+        terminal.feed(b"one\r\ntwo");
+        let selection = MouseSelection {
+            start: (0, 0),
+            end: (0, 2),
+            mode: MouseSelectionMode::Character,
+        };
+
+        let mut events = Vec::new();
+        for _ in 0..6 {
+            events.extend(terminal.feed(b"\r\nx"));
+        }
+        // The selected line was evicted from the two-line scrollback long ago.
+        assert_eq!(
+            pane_mouse_selection_after_output(
+                Some(selection),
+                &events,
+                false,
+                terminal.history_len()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mouse_selection_drops_only_when_region_scroll_intersects_it() {
+        // Scroll region rows 2..4 (0-based 1..3) on a 4-row terminal.
+        let mut terminal = Terminal::new(4, 20, 10);
+        terminal.feed(b"\x1b[2;4r\x1b[4;1H");
+        let events = terminal.feed(b"\r\n");
+
+        let inside = MouseSelection {
+            start: (2, 0),
+            end: (2, 3),
+            mode: MouseSelectionMode::Character,
+        };
+        assert_eq!(
+            pane_mouse_selection_after_output(Some(inside), &events, false, terminal.history_len()),
+            None,
+            "a selection inside the scrolled region now points at different text"
+        );
+
+        let above = MouseSelection {
+            start: (0, 0),
+            end: (0, 3),
+            mode: MouseSelectionMode::Character,
+        };
+        assert_eq!(
+            pane_mouse_selection_after_output(Some(above), &events, false, terminal.history_len()),
+            Some(above),
+            "rows outside the scrolled region keep their coordinates"
+        );
+    }
+
+    #[test]
+    fn mouse_selection_drops_on_screen_clear_and_alt_screen_switch() {
+        let selection = MouseSelection {
+            start: (0, 0),
+            end: (1, 3),
+            mode: MouseSelectionMode::Character,
+        };
+
+        assert_eq!(
+            pane_mouse_selection_after_output(Some(selection), &[TerminalEvent::Clear], false, 10),
+            None
+        );
+
+        let mut terminal = Terminal::new(4, 20, 10);
+        terminal.feed(b"one\r\ntwo");
+        let events = terminal.feed(b"\x1b[?1049h");
+        assert_eq!(
+            pane_mouse_selection_after_output(
+                Some(selection),
+                &events,
+                true,
+                terminal.history_len()
+            ),
+            None
         );
     }
 
