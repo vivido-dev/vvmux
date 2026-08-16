@@ -43,14 +43,10 @@ fn reference_plugins_cover_install_discovery_invoke_pane_media_and_disable() {
         "typescript-agent",
         "vivid-chart",
     ] {
+        let staged = stage_package(&examples.join(package), &directory.path().join("packages"));
         assert_success(
             &command(binary, &runtime, &config_home)
-                .args([
-                    "plugin",
-                    "link",
-                    examples.join(package).to_str().unwrap(),
-                    "--yes",
-                ])
+                .args(["plugin", "link", staged.to_str().unwrap(), "--yes"])
                 .output()
                 .unwrap(),
         );
@@ -189,6 +185,34 @@ fn invoke(
             .output()
             .unwrap(),
     )
+}
+
+/// Copy a reference package into `staging` without local build output. `vvmux plugin link` digests
+/// the whole linked tree, so linking the example directory in place would also hash whatever
+/// `build.sh` or `npm install` left behind — hundreds of megabytes on a developer machine that has
+/// built the Rust component, and nothing on one that has not.
+fn stage_package(source: &Path, staging: &Path) -> PathBuf {
+    fn copy_tree(source: &Path, destination: &Path) {
+        private_directory(destination);
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if matches!(name.to_str(), Some("target" | "node_modules" | ".git")) {
+                continue;
+            }
+            let path = entry.path();
+            let target = destination.join(&name);
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&path, &target);
+            } else {
+                fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+
+    let destination = staging.join(source.file_name().unwrap());
+    copy_tree(source, &destination);
+    destination
 }
 
 fn write_config(root: &Path) -> PathBuf {
