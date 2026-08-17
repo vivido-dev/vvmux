@@ -16,7 +16,9 @@ use vvmux_terminal::{
     UnderlineStyle,
 };
 
-use crate::agent::{AgentRuntime, AgentSnapshot, DetectorHandle, ProbeTarget, ProcessUpdate};
+use crate::agent::{
+    AgentRuntime, AgentSnapshot, AgentStatus, DetectorHandle, ProbeTarget, ProcessUpdate,
+};
 use crate::config::{Config, OpenMode};
 use crate::ipc::{
     Action, AutomationCompletion, AutomationError, AutomationMethod, AutomationRequest,
@@ -826,6 +828,12 @@ struct AgentNavigatorRow {
     tab_index: usize,
     tab_label: String,
     title: String,
+    /// The reported display name, falling back to the provider's agent label.
+    label: String,
+    /// The reported name for this status, falling back to the built-in one.
+    status_label: String,
+    /// Block reason and metadata tokens, already joined for display.
+    detail: String,
     agent: AgentSnapshot,
 }
 
@@ -2824,6 +2832,52 @@ impl SessionActor {
                     ),
                 }
             }
+            AutomationMethod::ReportMetadata {
+                source,
+                sequence,
+                tokens,
+                ttl_ms,
+                display_agent,
+                state_labels,
+                title,
+            } => {
+                let pane_id = pane_id.unwrap();
+                let patch = crate::agent::AgentMetadataPatch {
+                    tokens,
+                    ttl: ttl_ms.map(Duration::from_millis),
+                    display_agent,
+                    state_labels,
+                    title,
+                };
+                let result = self
+                    .panes
+                    .get_mut(&pane_id)
+                    .ok_or("pane no longer exists")
+                    .and_then(|pane| {
+                        pane.agent
+                            .report_metadata(&source, sequence, patch, Instant::now())
+                    });
+                match result {
+                    Ok(changed) => {
+                        if changed {
+                            self.note_agent_display_change();
+                        }
+                        let metadata = self.panes[&pane_id].agent.metadata();
+                        self.reply_automation(
+                            target,
+                            serde_json::json!({
+                                "pane_id": pane_id,
+                                "changed": changed,
+                                "metadata": agent_metadata_json(metadata),
+                            }),
+                        );
+                    }
+                    Err(message) => self.reply_automation_error(
+                        target,
+                        AutomationError::new("invalid_agent_report", message),
+                    ),
+                }
+            }
             AutomationMethod::ClearAgentReport { source, sequence } => {
                 let pane_id = pane_id.unwrap();
                 let result = self
@@ -4193,6 +4247,11 @@ impl SessionActor {
             "plugin": plugin,
             "agent": pane.agent.snapshot().map(|snapshot| {
                 let mut agent = agent_json(snapshot);
+                // Omitted rather than emitted empty: most panes never carry metadata, and a bulk
+                // listing should not pay four empty containers per pane to say so.
+                if !pane.agent.metadata().is_empty() {
+                    agent["metadata"] = agent_metadata_json(pane.agent.metadata());
+                }
                 if disclosure == AgentDisclosure::Full
                     && let Some(session) = pane.agent.session()
                 {
@@ -4785,13 +4844,18 @@ impl SessionActor {
             HashSet::new()
         };
         let now = Instant::now();
+        let mut expired = false;
         for pane in self.panes.values_mut() {
+            expired |= pane.agent.expire_metadata(now);
             pane.agent.evaluate_terminal(
                 &self.agent_catalog,
                 &pane.terminal,
                 visible.contains(&pane.id),
                 now,
             );
+        }
+        if expired {
+            self.note_agent_display_change();
         }
         self.sync_agent_status();
     }
@@ -4819,6 +4883,16 @@ impl SessionActor {
         if !changed {
             return;
         }
+        self.note_agent_display_change();
+    }
+
+    /// Record an observable agent-related change: advance the session sequence and repaint.
+    ///
+    /// Display-only metadata calls this directly rather than travelling through
+    /// [`Self::sync_agent_status`]. Metadata can churn on every tool call, and a progress counter
+    /// must not become a stream of lifecycle transitions for waiters, events, and notifications to
+    /// react to.
+    fn note_agent_display_change(&mut self) {
         self.session_sequence = self.session_sequence.wrapping_add(1);
         // Agent state is drawn only by the navigator popup; the status row does not carry it.
         if self.agent_navigator.is_some() {
@@ -4830,7 +4904,19 @@ impl SessionActor {
         let now = Instant::now();
         self.panes
             .values()
-            .filter_map(|pane| pane.agent.next_evaluation_delay(now))
+            .flat_map(|pane| {
+                [
+                    pane.agent.next_evaluation_delay(now),
+                    // A token TTL has to wake the actor on its own: a pane whose agent needs no
+                    // further classification would otherwise leave an expired token on screen
+                    // until unrelated traffic happened to arrive.
+                    pane.agent
+                        .metadata()
+                        .next_expiry()
+                        .map(|expiry| expiry.saturating_duration_since(now)),
+                ]
+            })
+            .flatten()
             .min()
             .unwrap_or(Duration::from_secs(1))
     }
@@ -6165,14 +6251,27 @@ impl SessionActor {
                 let Some(agent) = pane.agent.snapshot() else {
                     continue;
                 };
+                let metadata = pane.agent.metadata();
                 rows.push(AgentNavigatorRow {
                     pane_id,
                     tab_index,
                     tab_label: tab_label.clone(),
-                    title: pane
-                        .terminal
-                        .title()
-                        .map_or_else(|| format!("pane {pane_id}"), ToOwned::to_owned),
+                    // A reported title names what the agent is doing, which is more useful here
+                    // than whatever the program last set as the terminal title.
+                    title: metadata.title().map(ToOwned::to_owned).unwrap_or_else(|| {
+                        pane.terminal
+                            .title()
+                            .map_or_else(|| format!("pane {pane_id}"), ToOwned::to_owned)
+                    }),
+                    label: metadata
+                        .display_agent()
+                        .unwrap_or(agent.label.as_str())
+                        .to_owned(),
+                    status_label: metadata
+                        .state_label(agent.status)
+                        .unwrap_or(agent.status.label())
+                        .to_owned(),
+                    detail: agent_row_detail(agent.message.as_deref(), metadata),
                     agent,
                 });
             }
@@ -6382,14 +6481,18 @@ impl SessionActor {
         } else {
             let scroll = self.agent_navigator.map_or(0, |navigator| navigator.scroll);
             for (offset, row) in rows.iter().skip(scroll).take(page).enumerate() {
-                let text = format!(
+                let mut text = format!(
                     "[{:<7}] {:<8} {} · pane {} · {}",
-                    row.agent.status.label().to_ascii_uppercase(),
-                    row.agent.label,
+                    single_line(&row.status_label).to_ascii_uppercase(),
+                    single_line(&row.label),
                     single_line(&row.tab_label),
                     row.pane_id,
                     single_line(&row.title),
                 );
+                if !row.detail.is_empty() {
+                    text.push_str(" · ");
+                    text.push_str(&single_line(&row.detail));
+                }
                 let y = rect.y + 1 + offset as u16;
                 screen.draw_text(rect.x + 1, y, &text, style);
                 if self
@@ -9438,7 +9541,7 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
             "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report",
-            "save_layout"
+            "report_metadata", "save_layout"
         ],
         "limits": automation_limits(),
         "completion_waits": {
@@ -9644,6 +9747,14 @@ fn automation_limits() -> serde_json::Value {
         "search_scan_lines": crate::search::MAX_SEARCH_SCAN_LINES,
         "command_bytes": MAX_RUN_COMMAND_BYTES,
         "agent_report_source_bytes": crate::agent::MAX_REPORT_SOURCE_BYTES,
+        "agent_report_sources": crate::agent::MAX_REPORT_SOURCES,
+        "agent_report_message_bytes": crate::agent::MAX_REPORT_MESSAGE_BYTES,
+        "agent_session_bytes": crate::agent::MAX_AGENT_SESSION_BYTES,
+        "agent_metadata_tokens": crate::agent::MAX_METADATA_TOKENS,
+        "agent_metadata_key_bytes": crate::agent::MAX_METADATA_KEY_BYTES,
+        "agent_metadata_value_bytes": crate::agent::MAX_METADATA_VALUE_BYTES,
+        "agent_metadata_state_labels": crate::agent::MAX_METADATA_STATE_LABELS,
+        "agent_metadata_ttl_ms": { "minimum": 1, "maximum": crate::agent::MAX_METADATA_TTL_MS },
         "media_trace_events": crate::media_trace::MAX_MEDIA_TRACE_EVENTS,
         "media_trace_bytes": crate::media_trace::MAX_MEDIA_TRACE_BYTES,
         "media_trace_query_events": crate::media_trace::MAX_MEDIA_TRACE_QUERY_EVENTS,
@@ -9675,6 +9786,52 @@ fn agent_json(agent: AgentSnapshot) -> serde_json::Value {
         "source": agent.source,
         "message": agent.message,
         "session_present": agent.session_present,
+    })
+}
+
+/// Join a block reason and metadata tokens into one navigator suffix.
+///
+/// The reason comes first because it is the thing the user has to act on; tokens follow in the
+/// stable key order the map already keeps, so a row does not reshuffle as values update.
+fn agent_row_detail(message: Option<&str>, metadata: &crate::agent::AgentMetadata) -> String {
+    message
+        .map(ToOwned::to_owned)
+        .into_iter()
+        .chain(
+            metadata
+                .tokens()
+                .map(|(key, value)| format!("${key} {value}")),
+        )
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn agent_metadata_json(metadata: &crate::agent::AgentMetadata) -> serde_json::Value {
+    let tokens = metadata
+        .tokens()
+        .map(|(key, value)| (key.to_owned(), serde_json::Value::String(value.to_owned())))
+        .collect::<serde_json::Map<_, _>>();
+    let state_labels = [
+        AgentStatus::Idle,
+        AgentStatus::Working,
+        AgentStatus::Blocked,
+        AgentStatus::Done,
+    ]
+    .into_iter()
+    .filter_map(|status| {
+        metadata.state_label(status).map(|label| {
+            (
+                status.label().to_owned(),
+                serde_json::Value::String(label.to_owned()),
+            )
+        })
+    })
+    .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "tokens": tokens,
+        "display_agent": metadata.display_agent(),
+        "title": metadata.title(),
+        "state_labels": state_labels,
     })
 }
 

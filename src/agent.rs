@@ -28,6 +28,16 @@ pub const MAX_REPORT_SOURCES: usize = 32;
 pub const MAX_REPORT_MESSAGE_BYTES: usize = 256;
 /// Native agent session identifier or path retained for a later resume.
 pub const MAX_AGENT_SESSION_BYTES: usize = 256;
+/// Display-only tokens one pane retains.
+pub const MAX_METADATA_TOKENS: usize = 16;
+pub const MAX_METADATA_KEY_BYTES: usize = 32;
+pub const MAX_METADATA_VALUE_BYTES: usize = 128;
+/// Custom status names, one per [`AgentStatus`].
+pub const MAX_METADATA_STATE_LABELS: usize = 4;
+pub const MAX_DISPLAY_AGENT_BYTES: usize = 64;
+pub const MAX_AGENT_TITLE_BYTES: usize = 128;
+/// Matches the automation timeout ceiling, so a TTL cannot outlive what a caller can wait for.
+pub const MAX_METADATA_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const IDLE_CONFIRMATIONS: u8 = 3;
 const IDLE_CONFIRMATION_LIMIT: Duration = Duration::from_millis(700);
 const IDLE_CONFIRMATION_RECHECK: Duration = Duration::from_millis(100);
@@ -102,13 +112,40 @@ pub enum AgentState {
     Blocked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+    Hash,
+)]
 #[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
 pub enum AgentStatus {
     Idle,
     Working,
     Blocked,
     Done,
+}
+
+impl FromStr for AgentStatus {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "idle" => Ok(Self::Idle),
+            "working" => Ok(Self::Working),
+            "blocked" => Ok(Self::Blocked),
+            "done" => Ok(Self::Done),
+            _ => Err("agent status must be idle, working, blocked, or done"),
+        }
+    }
 }
 
 impl AgentStatus {
@@ -213,6 +250,170 @@ impl fmt::Debug for AgentSessionRef {
     }
 }
 
+/// Display-only annotations an integration attaches to a pane.
+///
+/// Adapted from HerdR's `src/metadata_tokens.rs` (Apache-2.0); see `agent/PROVENANCE.md`.
+///
+/// Deliberately outside [`AgentSnapshot`]: these are presentation details that can change on every
+/// tool call ("indexing 42 files"), while a snapshot is the lifecycle fact that waiters and
+/// notifications react to. Folding one into the other would turn a progress counter into a stream
+/// of status transitions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentMetadata {
+    tokens: BTreeMap<String, MetadataToken>,
+    display_agent: Option<String>,
+    state_labels: BTreeMap<AgentStatus, String>,
+    title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataToken {
+    value: String,
+    expires_at: Option<Instant>,
+}
+
+/// One display-only metadata update. A `None` value clears that field; a field absent from the
+/// patch is left alone, so an integration can update one token without restating the rest.
+#[derive(Debug, Clone, Default)]
+pub struct AgentMetadataPatch {
+    pub tokens: Vec<(String, Option<String>)>,
+    pub ttl: Option<Duration>,
+    pub display_agent: Option<Option<String>>,
+    pub state_labels: Vec<(AgentStatus, Option<String>)>,
+    pub title: Option<Option<String>>,
+}
+
+impl AgentMetadata {
+    pub fn tokens(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.tokens
+            .iter()
+            .map(|(key, token)| (key.as_str(), token.value.as_str()))
+    }
+
+    pub fn display_agent(&self) -> Option<&str> {
+        self.display_agent.as_deref()
+    }
+
+    pub fn state_label(&self, status: AgentStatus) -> Option<&str> {
+        self.state_labels.get(&status).map(String::as_str)
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+            && self.display_agent.is_none()
+            && self.state_labels.is_empty()
+            && self.title.is_none()
+    }
+
+    /// The earliest token expiry, so the actor can schedule a wake instead of polling.
+    pub fn next_expiry(&self) -> Option<Instant> {
+        self.tokens
+            .values()
+            .filter_map(|token| token.expires_at)
+            .min()
+    }
+
+    /// Drop every token whose TTL has elapsed. Returns whether anything was removed.
+    pub fn expire_at(&mut self, now: Instant) -> bool {
+        let before = self.tokens.len();
+        self.tokens
+            .retain(|_, token| token.expires_at.is_none_or(|deadline| deadline > now));
+        self.tokens.len() != before
+    }
+
+    /// Validate a patch against every bound before any of it is applied, so a rejected update
+    /// leaves the previous display intact rather than half-replacing it.
+    fn validate(&self, patch: &AgentMetadataPatch) -> Result<(), &'static str> {
+        let mut keys = self.tokens.keys().cloned().collect::<BTreeSet<_>>();
+        for (key, value) in &patch.tokens {
+            if key.is_empty()
+                || key.len() > MAX_METADATA_KEY_BYTES
+                || key.chars().any(char::is_control)
+            {
+                return Err("metadata token name must contain 1..=32 printable bytes");
+            }
+            match value {
+                Some(value) => {
+                    if value.len() > MAX_METADATA_VALUE_BYTES || value.chars().any(char::is_control)
+                    {
+                        return Err(
+                            "metadata token value must contain at most 128 printable bytes",
+                        );
+                    }
+                    keys.insert(key.clone());
+                }
+                None => {
+                    keys.remove(key);
+                }
+            }
+        }
+        if keys.len() > MAX_METADATA_TOKENS {
+            return Err("metadata token limit reached");
+        }
+        let bounded = |value: &Option<Option<String>>, limit: usize| {
+            value
+                .as_ref()
+                .and_then(Option::as_ref)
+                .is_none_or(|value| value.len() <= limit && !value.chars().any(char::is_control))
+        };
+        if !bounded(&patch.display_agent, MAX_DISPLAY_AGENT_BYTES) {
+            return Err("metadata display agent must contain at most 64 printable bytes");
+        }
+        if !bounded(&patch.title, MAX_AGENT_TITLE_BYTES) {
+            return Err("metadata title must contain at most 128 printable bytes");
+        }
+        if patch.state_labels.iter().any(|(_, label)| {
+            label.as_ref().is_some_and(|label| {
+                label.is_empty()
+                    || label.len() > MAX_METADATA_VALUE_BYTES
+                    || label.chars().any(char::is_control)
+            })
+        }) {
+            return Err("metadata state label must contain 1..=128 printable bytes");
+        }
+        if patch.state_labels.len() > MAX_METADATA_STATE_LABELS {
+            return Err("metadata state label limit reached");
+        }
+        Ok(())
+    }
+
+    /// Apply a validated patch. Returns whether the rendered display actually changed.
+    fn apply(&mut self, patch: AgentMetadataPatch, now: Instant) -> bool {
+        let expires_at = patch.ttl.and_then(|ttl| now.checked_add(ttl));
+        let mut changed = false;
+        for (key, value) in patch.tokens {
+            match value {
+                Some(value) => {
+                    let token = MetadataToken { value, expires_at };
+                    changed |= self.tokens.insert(key, token.clone()).as_ref() != Some(&token);
+                }
+                None => changed |= self.tokens.remove(&key).is_some(),
+            }
+        }
+        if let Some(display_agent) = patch.display_agent {
+            changed |= self.display_agent != display_agent;
+            self.display_agent = display_agent;
+        }
+        if let Some(title) = patch.title {
+            changed |= self.title != title;
+            self.title = title;
+        }
+        for (status, label) in patch.state_labels {
+            match label {
+                Some(label) => {
+                    changed |= self.state_labels.insert(status, label.clone()) != Some(label)
+                }
+                None => changed |= self.state_labels.remove(&status).is_some(),
+            }
+        }
+        changed
+    }
+}
+
 /// One authoritative lifecycle report from a named source.
 #[derive(Debug, Clone)]
 pub struct AgentReport {
@@ -246,6 +447,7 @@ pub struct AgentRuntime {
     report: Option<ReportedState>,
     report_sequences: HashMap<String, u64>,
     session: Option<AgentSessionRef>,
+    metadata: AgentMetadata,
 }
 
 impl AgentRuntime {
@@ -261,6 +463,7 @@ impl AgentRuntime {
             report: None,
             report_sequences: HashMap::new(),
             session: None,
+            metadata: AgentMetadata::default(),
         }
     }
 
@@ -292,6 +495,39 @@ impl AgentRuntime {
     /// Callers must treat the result as capability-adjacent: see [`AgentSessionRef`].
     pub fn session(&self) -> Option<&AgentSessionRef> {
         self.session.as_ref()
+    }
+
+    pub fn metadata(&self) -> &AgentMetadata {
+        &self.metadata
+    }
+
+    /// Attach display-only metadata from a named source.
+    ///
+    /// Shares the report sequence table, so metadata and state from one integration cannot be
+    /// applied out of order relative to each other. Accepted even before the agent is detected:
+    /// an integration that starts reporting during startup grace keeps its annotations, which
+    /// surface once the process is identified.
+    pub fn report_metadata(
+        &mut self,
+        source: &str,
+        sequence: u64,
+        patch: AgentMetadataPatch,
+        now: Instant,
+    ) -> Result<bool, &'static str> {
+        self.check_sequence(source, sequence)?;
+        if let Some(ttl) = patch.ttl
+            && (ttl.is_zero() || ttl > Duration::from_millis(MAX_METADATA_TTL_MS))
+        {
+            return Err("metadata TTL must be from 1ms through 24h");
+        }
+        self.metadata.validate(&patch)?;
+        self.report_sequences.insert(source.to_owned(), sequence);
+        Ok(self.metadata.apply(patch, now))
+    }
+
+    /// Drop expired tokens. Returns whether the rendered display changed.
+    pub fn expire_metadata(&mut self, now: Instant) -> bool {
+        self.metadata.expire_at(now)
     }
 
     pub fn next_evaluation_delay(&self, now: Instant) -> Option<Duration> {
@@ -326,6 +562,7 @@ impl AgentRuntime {
             self.report = None;
             self.report_sequences.clear();
             self.session = None;
+            self.metadata = AgentMetadata::default();
             self.pending_idle = None;
             self.done = false;
             self.identity = identity;
@@ -338,6 +575,7 @@ impl AgentRuntime {
             if self.identity.as_ref() != Some(&identity) {
                 self.report = None;
                 self.session = None;
+                self.metadata = AgentMetadata::default();
                 self.pending_idle = None;
                 self.done = false;
                 self.state = AgentState::Idle;
@@ -349,6 +587,7 @@ impl AgentRuntime {
             self.report = None;
             self.report_sequences.clear();
             self.session = None;
+            self.metadata = AgentMetadata::default();
             self.pending_idle = None;
             self.identity = None;
             self.done = false;
@@ -506,6 +745,7 @@ impl AgentRuntime {
             self.report = None;
             self.report_sequences.clear();
             self.session = None;
+            self.metadata = AgentMetadata::default();
             self.pending_idle = None;
             self.identity = None;
             self.done = false;
@@ -1881,6 +2121,229 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                 false,
             )
             .unwrap();
+    }
+
+    fn token_patch(tokens: &[(&str, Option<&str>)], ttl: Option<Duration>) -> AgentMetadataPatch {
+        AgentMetadataPatch {
+            tokens: tokens
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.map(ToOwned::to_owned)))
+                .collect(),
+            ttl,
+            ..AgentMetadataPatch::default()
+        }
+    }
+
+    #[test]
+    fn metadata_patches_only_the_keys_it_names() {
+        let now = Instant::now();
+        let mut runtime = AgentRuntime::new();
+        runtime
+            .report_metadata(
+                "hook",
+                1,
+                token_patch(&[("summary", Some("one")), ("model", Some("opus"))], None),
+                now,
+            )
+            .unwrap();
+        // A second patch updates one token, clears another, and leaves the rest alone.
+        assert!(
+            runtime
+                .report_metadata(
+                    "hook",
+                    2,
+                    token_patch(&[("summary", Some("two")), ("model", None)], None),
+                    now,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            runtime.metadata().tokens().collect::<Vec<_>>(),
+            [("summary", "two")]
+        );
+        // Re-applying the same value is not a display change, so it must not repaint.
+        assert!(
+            !runtime
+                .report_metadata(
+                    "hook",
+                    3,
+                    token_patch(&[("summary", Some("two"))], None),
+                    now
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_tokens_expire_only_when_due() {
+        let now = Instant::now();
+        let mut runtime = AgentRuntime::new();
+        runtime
+            .report_metadata(
+                "hook",
+                1,
+                token_patch(&[("short", Some("one"))], Some(Duration::from_secs(1))),
+                now,
+            )
+            .unwrap();
+        runtime
+            .report_metadata("hook", 2, token_patch(&[("kept", Some("two"))], None), now)
+            .unwrap();
+
+        assert_eq!(
+            runtime.metadata().next_expiry(),
+            Some(now + Duration::from_secs(1))
+        );
+        assert!(!runtime.expire_metadata(now));
+        assert!(runtime.expire_metadata(now + Duration::from_secs(2)));
+        assert_eq!(
+            runtime.metadata().tokens().collect::<Vec<_>>(),
+            [("kept", "two")]
+        );
+        // Nothing timed remains, so the actor has no metadata wake to schedule.
+        assert!(runtime.metadata().next_expiry().is_none());
+    }
+
+    #[test]
+    fn a_rejected_metadata_patch_leaves_the_previous_display_intact() {
+        let now = Instant::now();
+        let mut runtime = AgentRuntime::new();
+        runtime
+            .report_metadata("hook", 1, token_patch(&[("kept", Some("one"))], None), now)
+            .unwrap();
+
+        // Over the token ceiling: the whole patch is refused rather than partly applied.
+        let mut overflowing = Vec::new();
+        for index in 0..MAX_METADATA_TOKENS {
+            overflowing.push((format!("token-{index}"), Some("value".to_owned())));
+        }
+        assert_eq!(
+            runtime.report_metadata(
+                "hook",
+                2,
+                AgentMetadataPatch {
+                    tokens: overflowing,
+                    ..AgentMetadataPatch::default()
+                },
+                now,
+            ),
+            Err("metadata token limit reached")
+        );
+        assert_eq!(
+            runtime.report_metadata(
+                "hook",
+                2,
+                token_patch(&[("wide", Some(&"v".repeat(129)))], None),
+                now
+            ),
+            Err("metadata token value must contain at most 128 printable bytes")
+        );
+        // Control characters would corrupt the navigator row they are drawn into.
+        assert_eq!(
+            runtime.report_metadata(
+                "hook",
+                2,
+                token_patch(&[("bad", Some("a\u{1b}[2Jb"))], None),
+                now
+            ),
+            Err("metadata token value must contain at most 128 printable bytes")
+        );
+        assert_eq!(
+            runtime.report_metadata(
+                "hook",
+                2,
+                token_patch(
+                    &[("late", Some("x"))],
+                    Some(Duration::from_secs(25 * 60 * 60))
+                ),
+                now
+            ),
+            Err("metadata TTL must be from 1ms through 24h")
+        );
+
+        assert_eq!(
+            runtime.metadata().tokens().collect::<Vec<_>>(),
+            [("kept", "one")]
+        );
+        // No rejected patch consumed the sequence slot it was offered.
+        runtime
+            .report_metadata("hook", 2, token_patch(&[("kept", Some("two"))], None), now)
+            .unwrap();
+    }
+
+    #[test]
+    fn metadata_overrides_display_without_touching_lifecycle_state() {
+        let catalog = catalog();
+        let now = Instant::now();
+        let mut runtime = AgentRuntime::new();
+        runtime
+            .report(
+                state_report(
+                    identity(&catalog, "codex"),
+                    AgentState::Working,
+                    "codex-hook",
+                    1,
+                ),
+                false,
+            )
+            .unwrap();
+        let before = runtime.snapshot().unwrap();
+
+        runtime
+            .report_metadata(
+                "codex-hook",
+                2,
+                AgentMetadataPatch {
+                    tokens: vec![("files".into(), Some("42".into()))],
+                    display_agent: Some(Some("Codex (review)".into())),
+                    state_labels: vec![(AgentStatus::Working, Some("indexing".into()))],
+                    title: Some(Some("reviewing src/agent.rs".into())),
+                    ..AgentMetadataPatch::default()
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(runtime.metadata().display_agent(), Some("Codex (review)"));
+        assert_eq!(
+            runtime.metadata().state_label(AgentStatus::Working),
+            Some("indexing")
+        );
+        assert_eq!(runtime.metadata().title(), Some("reviewing src/agent.rs"));
+        // The snapshot is what waiters, events, and notifications react to: display-only metadata
+        // must leave it untouched, or a progress counter becomes a stream of transitions.
+        assert_eq!(runtime.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn metadata_shares_the_report_sequence_table_and_agent_lifetime() {
+        let catalog = catalog();
+        let now = Instant::now();
+        let mut runtime = AgentRuntime::new();
+        runtime
+            .report_metadata("hook", 5, token_patch(&[("a", Some("1"))], None), now)
+            .unwrap();
+        // Ordering is shared with state, so metadata cannot be applied out of order against it.
+        assert_eq!(
+            runtime.report(
+                state_report(identity(&catalog, "codex"), AgentState::Working, "hook", 4),
+                false
+            ),
+            Err("agent report sequence is stale")
+        );
+        runtime
+            .report(
+                state_report(identity(&catalog, "codex"), AgentState::Working, "hook", 6),
+                false,
+            )
+            .unwrap();
+        assert_eq!(runtime.metadata().tokens().count(), 1);
+
+        // Annotations describe one agent, so they leave with it.
+        assert!(!runtime.observe_process(Some(70), Some(identity(&catalog, "codex"))));
+        assert_eq!(runtime.metadata().tokens().count(), 1);
+        assert!(runtime.observe_process(Some(71), Some(identity(&catalog, "codex"))));
+        assert!(runtime.metadata().is_empty());
     }
 
     #[test]

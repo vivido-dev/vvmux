@@ -249,6 +249,34 @@ pub enum MsgCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Attach display-only metadata to one pane, without claiming lifecycle authority.
+    ///
+    /// Use this for progress and custom status text an integration wants shown; use
+    /// `report-agent` only for real lifecycle state. Every option distinguishes "not given, leave
+    /// alone" from "given empty, clear".
+    ReportMetadata {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        sequence: u64,
+        /// `NAME=VALUE` shown beside the agent; `NAME=` clears that token. Repeatable.
+        #[arg(long = "token", value_parser = parse_metadata_token)]
+        tokens: Vec<(String, Option<String>)>,
+        /// Expire the tokens in this call after a delay. Untimed tokens persist.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=crate::agent::MAX_METADATA_TTL_MS))]
+        ttl_ms: Option<u64>,
+        /// Replace the displayed agent name; empty clears.
+        #[arg(long)]
+        display_agent: Option<String>,
+        /// `STATUS=TEXT` renaming one status in the display; `STATUS=` clears. Repeatable.
+        #[arg(long = "state-label", value_parser = parse_metadata_state_label)]
+        state_labels: Vec<(crate::agent::AgentStatus, Option<String>)>,
+        /// Replace the displayed pane title; empty clears.
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Clear one source's authoritative AI-agent report.
     ClearAgentReport {
         #[arg(long)]
@@ -520,6 +548,7 @@ pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()>
         AutomationMethod::ClosePane
             | AutomationMethod::ReportAgent { .. }
             | AutomationMethod::ClearAgentReport { .. }
+            | AutomationMethod::ReportMetadata { .. }
     ) && pane_id.is_none()
     {
         return Err(io::Error::new(
@@ -720,6 +749,32 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 message,
                 session_id,
                 session_path,
+            },
+            pane_id,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::ReportMetadata {
+            source,
+            sequence,
+            tokens,
+            ttl_ms,
+            display_agent,
+            state_labels,
+            title,
+            pane_id,
+        } => (
+            AutomationMethod::ReportMetadata {
+                source,
+                sequence,
+                tokens,
+                ttl_ms,
+                // clap gives `None` when the option was not passed and `Some("")` when it was
+                // passed empty, which is exactly the leave-alone/clear distinction the server
+                // expects.
+                display_agent: display_agent.map(|value| (!value.is_empty()).then_some(value)),
+                state_labels,
+                title: title.map(|value| (!value.is_empty()).then_some(value)),
             },
             pane_id,
             false,
@@ -1138,6 +1193,30 @@ fn inherited_pane_from_environment() -> Option<u64> {
 
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// `NAME=VALUE`, where an empty value clears the token.
+fn parse_metadata_token(value: &str) -> Result<(String, Option<String>), String> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| "expected NAME=VALUE".to_string())?;
+    Ok((
+        name.to_owned(),
+        (!value.is_empty()).then(|| value.to_owned()),
+    ))
+}
+
+/// `STATUS=TEXT`, where an empty text clears the override.
+fn parse_metadata_state_label(
+    value: &str,
+) -> Result<(crate::agent::AgentStatus, Option<String>), String> {
+    let (status, label) = value
+        .split_once('=')
+        .ok_or_else(|| "expected STATUS=TEXT".to_string())?;
+    let status = status
+        .parse::<crate::agent::AgentStatus>()
+        .map_err(str::to_owned)?;
+    Ok((status, (!label.is_empty()).then(|| label.to_owned())))
 }
 
 fn parse_timeout(value: &str) -> Result<Duration, String> {

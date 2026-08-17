@@ -497,6 +497,135 @@ done
         ],
     ));
 
+    assert_success(&command(
+        &runtime,
+        &name,
+        &[
+            "report-agent",
+            "--agent",
+            "codex",
+            "--state",
+            "working",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "20",
+            "--pane-id",
+            "2",
+        ],
+    ));
+
+    // Display-only metadata annotates a pane without claiming lifecycle authority.
+    let metadata = json(command(
+        &runtime,
+        &name,
+        &[
+            "report-metadata",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "21",
+            "--token",
+            "files=42",
+            "--display-agent",
+            "Codex (review)",
+            "--state-label",
+            "idle=ready",
+            "--title",
+            "reviewing src/agent.rs",
+            "--pane-id",
+            "2",
+        ],
+    ));
+    assert_eq!(metadata["changed"], true);
+    assert_eq!(metadata["metadata"]["tokens"]["files"], "42");
+    assert_eq!(metadata["metadata"]["display_agent"], "Codex (review)");
+    assert_eq!(metadata["metadata"]["state_labels"]["idle"], "ready");
+    assert_eq!(metadata["metadata"]["title"], "reviewing src/agent.rs");
+
+    // Metadata is display-only: it must not disturb the lifecycle state waiters react to.
+    let after_metadata = json(command(&runtime, &name, &["inspect", "--pane-id", "2"]));
+    assert_eq!(after_metadata["pane"]["agent"]["state"], "working");
+    assert_eq!(
+        after_metadata["pane"]["agent"]["metadata"]["tokens"]["files"],
+        "42"
+    );
+
+    // A token with a TTL is swept once it is due, and the sweep takes only what expired. Polling
+    // with `inspect` wakes the actor itself, so this covers the sweep, not the wake scheduling;
+    // `next_expiry` feeding `next_agent_evaluation_delay` is unit-tested separately.
+    assert_success(&command(
+        &runtime,
+        &name,
+        &[
+            "report-metadata",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "22",
+            "--token",
+            "transient=soon",
+            "--ttl-ms",
+            "200",
+            "--pane-id",
+            "2",
+        ],
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let inspected = json(command(&runtime, &name, &["inspect", "--pane-id", "2"]));
+        if inspected["pane"]["agent"]["metadata"]["tokens"]["transient"].is_null() {
+            // The untimed token from the previous call is untouched by the sweep.
+            assert_eq!(
+                inspected["pane"]["agent"]["metadata"]["tokens"]["files"],
+                "42"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "metadata token outlived its TTL"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let bad_token = command(
+        &runtime,
+        &name,
+        &[
+            "report-metadata",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "23",
+            "--token",
+            &format!("wide={}", "v".repeat(129)),
+            "--pane-id",
+            "2",
+        ],
+    );
+    assert!(!bad_token.status.success());
+
+    let missing_metadata_pane = common::vvmux_command(&runtime)
+        .args([
+            "msg",
+            "--target",
+            &name,
+            "report-metadata",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "24",
+            "--token",
+            "files=1",
+        ])
+        .env_remove("VVMUX_SESSION")
+        .env_remove("VVMUX_PANE_ID")
+        .output()
+        .unwrap();
+    assert!(!missing_metadata_pane.status.success());
+    assert!(String::from_utf8_lossy(&missing_metadata_pane.stderr).contains("requires --pane-id"));
+
     let missing_target = common::vvmux_command(&runtime)
         .args([
             "msg",

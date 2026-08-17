@@ -110,6 +110,18 @@ pub enum AutomationMethod {
         source: String,
         sequence: u64,
     },
+    /// Attach display-only metadata to one pane, without claiming lifecycle authority.
+    ///
+    /// Every field distinguishes "absent, leave alone" from "present but empty, clear".
+    ReportMetadata {
+        source: String,
+        sequence: u64,
+        tokens: Vec<(String, Option<String>)>,
+        ttl_ms: Option<u64>,
+        display_agent: Option<Option<String>>,
+        state_labels: Vec<(crate::agent::AgentStatus, Option<String>)>,
+        title: Option<Option<String>>,
+    },
     Inspect,
     InspectMedia,
     TraceMedia {

@@ -17,3 +17,13 @@ UI or server architecture.
 
 The adapted first-party rules are now shipped as the four data-only plugin manifests under
 `builtin-plugins/`; user agent providers use the same public manifest schema.
+
+## Per-feature adaptations
+
+Later features adapted from the same HerdR commit, recorded as they land:
+
+- **Display-only metadata tokens** (`AgentMetadata` in `agent.rs`) — the patch/TTL/expiry model
+  is adapted from `src/metadata_tokens.rs`. vvmux binds tokens to the agent runtime rather than to
+  a separate pane record, keeps them out of `AgentSnapshot` so lifecycle waiters and events do not
+  observe display churn, and shares the existing per-source report sequence table instead of
+  HerdR's separate one.

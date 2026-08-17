@@ -91,6 +91,7 @@ list-tabs
 select-tab --tab-id ID [--wait outer|rendered] [--timeout DURATION]
 diagnose [--pane-id ID|--all-panes] [--trace-limit N]
 report-agent --agent claude|codex|opencode|hermes --state idle|working|blocked --source ID --sequence N [--message TEXT] [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
+report-metadata --source ID --sequence N [--token NAME=VALUE]... [--ttl-ms MS] [--display-agent TEXT] [--state-label STATUS=TEXT]... [--title TEXT] [--pane-id ID]
 clear-agent-report --source ID --sequence N [--pane-id ID]
 inspect [--pane-id ID]
 inspect-media [--pane-id ID]
@@ -157,6 +158,25 @@ stored reference. That reference names a resumable conversation on your agent ac
 returned only by `inspect` for a single pane. `list-panes`, the plugin host's `session.inspect`,
 `diagnose`, and the debug bundles built from them report `session_present` alone, and it is never
 written to a log.
+
+`report-metadata` attaches display-only annotations without claiming lifecycle authority: use it
+for progress and custom status text, and `report-agent` only for real state. Tokens render beside
+the agent in the navigator as `$name value`, `--display-agent` and `--state-label` rename the agent
+and one status, and `--title` replaces the pane title shown there. Each option distinguishes "not
+given, leave alone" from "given empty, clear", so one call can update a single token without
+restating the rest. `--ttl-ms` expires only the tokens in that call; untimed tokens persist.
+
+```sh
+vvmux msg report-metadata --pane-id 2 --source my-tool --sequence 7 \
+  --token 'files=42 indexed' --state-label 'working=indexing' --ttl-ms 5000
+```
+
+Metadata shares the report sequence table with `report-agent`, so one integration's state and
+annotations cannot be applied out of order against each other, and it is dropped whenever report
+authority is dropped. A pane holds at most 16 tokens (names 32 bytes, values 128) and 4 state
+labels; an over-limit patch is refused whole rather than applied in part. Because these are
+display-only, they deliberately do not appear in the agent state that `wait` and event subscribers
+observe — a progress counter must not read as a stream of lifecycle transitions.
 
 Agent detection is plugin-provided. vvmux bundles four immutable data-only providers: Claude Code
 and Codex are enabled by default, while OpenCode and Hermes are disabled by default. They use the
