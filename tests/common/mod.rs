@@ -589,9 +589,23 @@ async fn leg_upgrade(
 }
 
 /// Run a `vvmux` binary command with an isolated runtime directory.
+///
+/// `HOME` is isolated along with the XDG directories, and it is not optional. Pane shells are login
+/// shells (`vvmux-terminal/src/pty/unix.rs:146`), so each one sources the invoking user's
+/// `~/.profile` — and the conventional profile prepends `$HOME/bin` and `$HOME/.local/bin` to `PATH`
+/// when those directories exist. A test that puts a fixture executable first on the `PATH` it passes
+/// here would therefore have its ordering silently rewritten by the developer's own profile, and a
+/// real binary of the same name would win instead. That failure is invisible on a machine that
+/// happens not to have one installed, which is exactly how it survived unnoticed.
+///
+/// `XDG_STATE_HOME` is pinned for a second reason: without it, persisted session state falls back to
+/// `$HOME/.local/state`, and an integration test would write snapshots into the developer's real
+/// state directory.
 pub fn vvmux_command(runtime: &std::path::Path) -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vvmux"));
     command.env("XDG_RUNTIME_DIR", runtime);
     command.env("XDG_CONFIG_HOME", runtime);
+    command.env("XDG_STATE_HOME", runtime);
+    command.env("HOME", runtime);
     command
 }
