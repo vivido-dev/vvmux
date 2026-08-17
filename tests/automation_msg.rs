@@ -1041,6 +1041,63 @@ done
     assert!(!timed_out.status.success());
     assert!(String::from_utf8_lossy(&timed_out.stderr).contains("timeout"));
 
+    // `subscribe` streams session events as NDJSON. It works with plugins disabled, because these
+    // events describe the session rather than the plugin system.
+    let stream_runtime = runtime.clone();
+    let stream_name = name.clone();
+    let mut streaming = common::vvmux_command(&stream_runtime)
+        .args([
+            "msg",
+            "--target",
+            &stream_name,
+            "subscribe",
+            "--name",
+            "agent.status_changed",
+            "--pane-id",
+            "2",
+        ])
+        .stdout(std::process::Stdio::piped())
+        // Killing the subscriber at the end closes its socket mid-read; that diagnostic is
+        // expected and would otherwise be mistaken for a test failure.
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = {
+        use std::io::BufRead as _;
+        std::io::BufReader::new(streaming.stdout.take().unwrap()).lines()
+    };
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // A transition on the filtered-out pane must not appear in this stream.
+    report_pane("1", "working", "10");
+    report_pane("2", "idle", "27");
+
+    let event: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert_eq!(event["type"], "event");
+    assert_eq!(event["name"], "agent.status_changed");
+    assert_eq!(event["payload"]["pane_id"], 2);
+    // Reported idle, published as done: the pane is not visible, so vvmux derives "finished while
+    // you were not looking" rather than taking the reporter's idle at face value.
+    assert_eq!(event["payload"]["status"], "done");
+    assert_eq!(event["payload"]["state"], "idle");
+    assert_eq!(event["payload"]["previous_status"], "blocked");
+    assert_eq!(event["payload"]["kind"], "codex");
+    assert_eq!(event["context"]["pane_id"], 2);
+    // Display-only metadata must never ride a lifecycle event.
+    assert!(event["payload"].get("metadata").is_none());
+
+    // The next event on this stream is pane 2's, never pane 1's.
+    report_pane("2", "working", "28");
+    let next: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert_eq!(next["payload"]["pane_id"], 2);
+    assert_eq!(next["payload"]["status"], "working");
+    assert!(
+        next["sequence"].as_u64().unwrap() > event["sequence"].as_u64().unwrap(),
+        "event sequence did not advance"
+    );
+    let _ = streaming.kill();
+    let _ = streaming.wait();
+
     // A pane with no agent names that, instead of blocking until the timeout.
     let no_agent = command(
         &runtime,

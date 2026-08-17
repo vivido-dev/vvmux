@@ -232,6 +232,7 @@ struct PluginEventSubscription {
     client_id: u64,
     sender: mpsc::SyncSender<PluginStreamMessage>,
     cancel: crate::platform::ConnectionCancel,
+    filter: crate::ipc::EventFilter,
 }
 
 enum PluginStreamMessage {
@@ -3321,7 +3322,18 @@ impl SessionActor {
             AutomationMethod::Plugin(crate::ipc::PluginMethod::EventSubscribe {
                 after_sequence,
             }) => {
-                self.subscribe_plugin_events(target, after_sequence);
+                self.subscribe_plugin_events(
+                    target,
+                    after_sequence,
+                    crate::ipc::EventFilter::default(),
+                    true,
+                );
+            }
+            AutomationMethod::Subscribe {
+                after_sequence,
+                filter,
+            } => {
+                self.subscribe_plugin_events(target, after_sequence, filter, false);
             }
             AutomationMethod::Plugin(crate::ipc::PluginMethod::EventUnsubscribe {
                 subscription_id,
@@ -3622,8 +3634,13 @@ impl SessionActor {
         &mut self,
         target: AutomationReplyTarget,
         after_sequence: Option<u64>,
+        filter: crate::ipc::EventFilter,
+        require_plugins: bool,
     ) {
-        if self.plugin_supervisor.is_none() {
+        // `msg subscribe` deliberately does not require plugins: pane, layout, and agent events
+        // describe the session, not the plugin system. The plugin-facing subscription keeps its
+        // gate, since a plugin stream with no plugin runtime is a caller mistake worth naming.
+        if require_plugins && self.plugin_supervisor.is_none() {
             self.reply_automation_error(target, plugin_disabled_error());
             return;
         }
@@ -3687,11 +3704,17 @@ impl SessionActor {
             return;
         }
         if let Some(after) = after_sequence {
+            // Replay is computed against the global sequence and filtered afterwards, so retention
+            // gaps stay truthful. A filtered stream will show jumps in event sequence numbers;
+            // that is the filter working, and it is distinguishable from a gap record.
             for envelope in self.plugin_event_journal.replay(
                 after,
                 self.plugin_event_sequence,
                 PLUGIN_EVENT_STREAM_QUEUE.saturating_sub(1),
             ) {
+                if !filter.accepts(&envelope) {
+                    continue;
+                }
                 if sender
                     .try_send(PluginStreamMessage::Event(envelope))
                     .is_err()
@@ -3707,6 +3730,7 @@ impl SessionActor {
                 client_id: target.client_id,
                 sender,
                 cancel: target.cancel,
+                filter,
             },
         );
     }
@@ -3772,6 +3796,9 @@ impl SessionActor {
         };
         self.plugin_event_journal.push(envelope.clone());
         self.plugin_event_subscriptions.retain(|_, subscription| {
+            if !subscription.filter.accepts(&envelope) {
+                return true;
+            }
             let sent = subscription
                 .sender
                 .try_send(PluginStreamMessage::Event(envelope.clone()))
@@ -4995,19 +5022,27 @@ impl SessionActor {
     /// Consumers that react to a transition — lifecycle events, state waiters, notifications —
     /// belong in the loop below rather than at the six call sites.
     fn sync_agent_status(&mut self) {
-        let mut changed = false;
+        let mut transitions = Vec::new();
         for pane in self.panes.values_mut() {
             let current = pane.agent.snapshot();
             if pane.agent_published == current {
                 continue;
             }
-            pane.agent_published = current;
-            changed = true;
+            let previous = std::mem::replace(&mut pane.agent_published, current.clone());
+            transitions.push((pane.id, previous, current));
         }
-        if !changed {
+        if transitions.is_empty() {
             return;
         }
         self.note_agent_display_change();
+        for (pane_id, previous, current) in transitions {
+            self.publish_plugin_event(
+                "agent.status_changed",
+                agent_status_changed_payload(pane_id, previous.as_ref(), current.as_ref()),
+                Some(pane_id),
+                None,
+            );
+        }
         // Resolve state waits here rather than leaving them to the next actor tick. A report
         // arrives as an event and the run loop checks waiters after handling one, but screen
         // classification runs in `evaluate_agent_states`, which the loop calls *after* that check
@@ -9438,6 +9473,9 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
             | AutomationMethod::ReloadConfig
             | AutomationMethod::SaveLayout { .. }
             | AutomationMethod::Plugin(_)
+            // Session-wide. Its filter may name a pane, but that narrows the stream rather than
+            // targeting the request.
+            | AutomationMethod::Subscribe { .. }
     )
 }
 
@@ -9720,7 +9758,7 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "wait_agent_state", "wait_media",
             "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report",
-            "report_metadata", "agent_explain", "save_layout"
+            "report_metadata", "agent_explain", "subscribe", "save_layout"
         ],
         "limits": automation_limits(),
         "completion_waits": {
@@ -9983,6 +10021,30 @@ fn agent_row_detail(message: Option<&str>, metadata: &crate::agent::AgentMetadat
         )
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+/// The `agent.status_changed` payload.
+///
+/// Carries the lifecycle fact only. Display-only metadata is deliberately absent: it can change on
+/// every tool call, and a subscriber reacting to lifecycle must not be woken by a progress
+/// counter. A `null` status means the agent left the pane.
+fn agent_status_changed_payload(
+    pane_id: PaneId,
+    previous: Option<&AgentSnapshot>,
+    current: Option<&AgentSnapshot>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pane_id": pane_id,
+        "status": current.map(|agent| agent.status),
+        "previous_status": previous.map(|agent| agent.status),
+        "state": current.map(|agent| agent.state),
+        "kind": current.map(|agent| &agent.kind),
+        "label": current.map(|agent| &agent.label),
+        "provider": current.map(|agent| &agent.provider),
+        "source": current.map(|agent| agent.source),
+        "message": current.and_then(|agent| agent.message.as_deref()),
+        "session_present": current.is_some_and(|agent| agent.session_present),
+    })
 }
 
 fn agent_metadata_json(metadata: &crate::agent::AgentMetadata) -> serde_json::Value {

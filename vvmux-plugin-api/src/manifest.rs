@@ -473,6 +473,7 @@ impl LoadedManifest {
             "pane.exited",
             "pane.closed",
             "pane.screen_changed",
+            "agent.status_changed",
             "layout.changed",
             "focus.changed",
             "config.changed",

@@ -470,6 +470,22 @@ pub enum MsgCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Stream session events as NDJSON until interrupted.
+    ///
+    /// Event-driven alternative to polling: react to `agent.status_changed` or pane lifecycle
+    /// instead of re-reading `get-text`. A `gap` record reports events that were dropped and is
+    /// never filtered out, so a filtered stream still tells you when it missed something.
+    Subscribe {
+        /// Replay retained events after this sequence before streaming live ones.
+        #[arg(long)]
+        after: Option<u64>,
+        /// Only stream these event names. Repeatable; unset streams every event.
+        #[arg(long = "name")]
+        names: Vec<String>,
+        /// Only stream events belonging to this pane.
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Wait for pane or render state.
     Wait {
         #[command(subcommand)]
@@ -606,6 +622,11 @@ pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()>
     if matches!(output, Output::TraceFollow) {
         return run_trace_follow(&mut reader, &writer, request);
     }
+    if matches!(output, Output::EventStream) {
+        let id = request.id;
+        send_automation_request(&writer, request)?;
+        return stream_events(&mut reader, id);
+    }
     send_automation_request(&writer, request.clone())?;
     let result = response_result(receive_response(&mut reader, request.id)?)?;
     match output {
@@ -624,7 +645,32 @@ pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()>
             println!();
             Ok(())
         }
-        Output::TraceFollow => unreachable!(),
+        Output::TraceFollow | Output::EventStream => unreachable!(),
+    }
+}
+
+/// Print an event subscription's records as NDJSON until the connection ends.
+///
+/// Shared by `msg subscribe` and `plugin events` so the two cannot drift in how they frame
+/// records or report a failed subscribe.
+pub(crate) fn stream_events(reader: &mut crate::ipc::RecordReader, id: u64) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    let mut subscribed = false;
+    loop {
+        match reader.recv_server()? {
+            ServerMessage::Automation(response) if response.id == id => {
+                response_result(response)?;
+                subscribed = true;
+            }
+            ServerMessage::PluginEvent { envelope, .. } if subscribed => {
+                serde_json::to_writer(&mut stdout, &envelope).map_err(io::Error::other)?;
+                writeln!(stdout)?;
+                // A subscriber is usually a pipe, where stdout is block-buffered; without this an
+                // event-driven consumer would wait for a full buffer rather than for an event.
+                stdout.flush()?;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -722,6 +768,7 @@ enum Output {
     Text,
     Json,
     TraceFollow,
+    EventStream,
 }
 
 fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u64>, bool, Output)> {
@@ -1094,6 +1141,33 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             true,
             Output::Json,
         ),
+        MsgCommand::Subscribe {
+            after,
+            names,
+            pane_id,
+        } => {
+            if names.len() > crate::ipc::EventFilter::MAX_NAMES
+                || names.iter().any(|name| {
+                    name.is_empty() || name.len() > crate::ipc::EventFilter::MAX_NAME_BYTES
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "at most 16 event names, each 1..=64 bytes",
+                ));
+            }
+            (
+                AutomationMethod::Subscribe {
+                    after_sequence: after,
+                    filter: crate::ipc::EventFilter { names, pane_id },
+                },
+                // The pane filter narrows the stream; it is not the request's pane target, and a
+                // subscription is session-wide.
+                None,
+                false,
+                Output::EventStream,
+            )
+        }
         MsgCommand::Wait { command } => match command {
             WaitCommand::Text {
                 text,

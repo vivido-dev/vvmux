@@ -24,6 +24,9 @@ Use this release-matched workflow:
 8. To drive an agent pane, use `submit TEXT` for one atomic line, then
    `wait agent-state --until blocked,done` rather than polling `get-text`. Waits are pane-scoped
    and fail fast with `agent_not_detected` on a pane that has no agent.
+9. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
+   polling each one. Treat a `gap` record as missed events, not as an error; it is never filtered
+   out even when the stream is narrowed.
 
 Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
 needed. It proves the bytes reached the PTY writer, not that the child application consumed them.

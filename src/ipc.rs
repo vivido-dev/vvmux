@@ -221,6 +221,12 @@ pub enum AutomationMethod {
     WaitExit {
         timeout_ms: u64,
     },
+    /// Stream session lifecycle events. Unlike the plugin event subscription this does not
+    /// require plugins to be enabled: the events describe the session, not the plugin system.
+    Subscribe {
+        after_sequence: Option<u64>,
+        filter: EventFilter,
+    },
     /// Wait until a pane's agent reaches one of the given lifecycle states.
     WaitAgentState {
         until: Vec<crate::agent::AgentStatus>,
@@ -236,6 +242,32 @@ pub enum AutomationMethod {
         condition: MediaTrackWaitCondition,
         timeout_ms: u64,
     },
+}
+
+/// Narrows an event stream. An empty filter accepts everything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventFilter {
+    pub names: Vec<String>,
+    pub pane_id: Option<u64>,
+}
+
+impl EventFilter {
+    pub const MAX_NAMES: usize = 16;
+    pub const MAX_NAME_BYTES: usize = 64;
+
+    pub fn accepts(&self, envelope: &PluginEventEnvelope) -> bool {
+        match envelope {
+            // A gap always passes. It reports events this subscriber will never see, and hiding
+            // that because the lost events might not have matched would be a lie about coverage.
+            PluginEventEnvelope::Gap { .. } => true,
+            PluginEventEnvelope::Event { name, context, .. } => {
+                (self.names.is_empty() || self.names.iter().any(|allowed| allowed == name))
+                    && self
+                        .pane_id
+                        .is_none_or(|pane_id| context.pane_id == Some(pane_id))
+            }
+        }
+    }
 }
 
 /// Which terminal text a pane read returns.

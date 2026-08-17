@@ -112,6 +112,7 @@ wait text TEXT [--regex] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID
 wait screen-change [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait screen-stable [--quiet DURATION] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait rendered --after-session SEQ [--timeout DURATION]
+subscribe [--after SEQ] [--name EVENT]... [--pane-id ID]
 wait agent-state --until idle|working|blocked|done[,...] [--timeout DURATION] [--pane-id ID]
 wait exit [--timeout DURATION] [--pane-id ID]
 wait media [--after-virtual REV] [--after-outer REV] [--timeout DURATION] [--pane-id ID]
@@ -258,6 +259,26 @@ priority = 500
 region = "whole_recent"
 contains = ["esc to interrupt"]
 ```
+
+`subscribe` streams session events as NDJSON, so automation can react instead of poll. It does not
+require plugins to be enabled — these events describe the session, not the plugin system.
+
+```sh
+vvmux msg subscribe --name agent.status_changed | while read -r event; do
+  echo "$event" | jq -r '.payload | "\(.pane_id) \(.previous_status) -> \(.status)"'
+done
+```
+
+`--name` (repeatable, up to 16) and `--pane-id` narrow the stream; `--after SEQ` replays retained
+events first. Each record is an `event` with a monotonic `sequence`, or a `gap` naming a range that
+was dropped. **A gap is never filtered out**, so a narrowed stream still tells you when it missed
+something; filtered streams also show jumps in `sequence`, which is the filter working rather than
+loss. A subscriber that stops reading is disconnected rather than allowed to stall the session.
+
+`agent.status_changed` carries `pane_id`, `status`, `previous_status`, `state`, and the agent's
+`kind`/`label`/`provider`/`source`, plus a blocked `message`. A `null` status means the agent left
+the pane. Display-only metadata is deliberately absent: it can change on every tool call, and a
+subscriber reacting to lifecycle should not be woken by a progress counter.
 
 `wait agent-state` blocks until a pane's agent reaches one of the states you name, so a script can
 submit work and then wait for the agent to need it or finish, instead of polling:

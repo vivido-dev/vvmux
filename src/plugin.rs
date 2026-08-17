@@ -2143,9 +2143,7 @@ fn pane(command: PluginPaneCommand) -> io::Result<()> {
 }
 
 fn events(target: &str, after_sequence: Option<u64>) -> io::Result<()> {
-    use crate::ipc::{
-        AutomationMethod, AutomationRequest, ClientMessage, PluginMethod, ServerMessage,
-    };
+    use crate::ipc::{AutomationMethod, AutomationRequest, ClientMessage, PluginMethod};
 
     crate::runtime::validate_session_name(target)?;
     let (mut reader, writer) = crate::server::connect(target)?;
@@ -2158,22 +2156,7 @@ fn events(target: &str, after_sequence: Option<u64>) -> io::Result<()> {
             allow_focused: false,
             method: AutomationMethod::Plugin(PluginMethod::EventSubscribe { after_sequence }),
         }))?;
-    let mut subscribed = false;
-    loop {
-        match reader.recv_server()? {
-            ServerMessage::Automation(response) if response.id == 1 => {
-                crate::automation::response_result(response)?;
-                subscribed = true;
-            }
-            ServerMessage::PluginEvent { envelope, .. } if subscribed => {
-                println!(
-                    "{}",
-                    serde_json::to_string(&envelope).map_err(io::Error::other)?
-                );
-            }
-            _ => {}
-        }
-    }
+    crate::automation::stream_events(&mut reader, 1)
 }
 
 fn job_target(job_id: &str) -> io::Result<&str> {
