@@ -6,7 +6,7 @@ use clap::{Subcommand, ValueEnum};
 
 const OPENCODE_PLUGIN: &str = include_str!("integration/opencode.js");
 const MARKER: &str = "VVMUX_INTEGRATION_ID=opencode";
-const VERSION_MARKER: &str = "VVMUX_INTEGRATION_VERSION=1";
+const VERSION_MARKER: &str = "VVMUX_INTEGRATION_VERSION=2";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[clap(rename_all = "snake_case")]
@@ -133,7 +133,7 @@ fn status_at(path: &Path) -> io::Result<&'static str> {
     if !header.contains(MARKER) {
         Ok("foreign file")
     } else if header.contains(VERSION_MARKER) {
-        Ok("current (v1)")
+        Ok("current (v2)")
     } else {
         Ok("outdated")
     }
@@ -176,12 +176,12 @@ mod tests {
         );
         fs::write(
             &path,
-            format!("// {MARKER}\n// VVMUX_INTEGRATION_VERSION=0\n"),
+            format!("// {MARKER}\n// VVMUX_INTEGRATION_VERSION=1\n"),
         )
         .unwrap();
         assert_eq!(status_at(&path).unwrap(), "outdated");
         install_at(&path).unwrap();
-        assert_eq!(status_at(&path).unwrap(), "current (v1)");
+        assert_eq!(status_at(&path).unwrap(), "current (v2)");
         assert!(uninstall_at(&path).unwrap());
         assert!(!path.exists());
     }

@@ -2778,6 +2778,9 @@ impl SessionActor {
                 state,
                 source,
                 sequence,
+                message,
+                session_id,
+                session_path,
             } => {
                 let pane_id = pane_id.unwrap();
                 let visible = self.pane_is_visibly_present(pane_id);
@@ -2790,8 +2793,20 @@ impl SessionActor {
                             .get_mut(&pane_id)
                             .ok_or("pane no longer exists")
                             .and_then(|pane| {
-                                pane.agent
-                                    .report(identity, state, source, sequence, visible)
+                                pane.agent.report(
+                                    crate::agent::AgentReport {
+                                        identity,
+                                        state,
+                                        source,
+                                        sequence,
+                                        message,
+                                        session: crate::agent::AgentSessionRef::new(
+                                            session_id,
+                                            session_path,
+                                        ),
+                                    },
+                                    visible,
+                                )
                             })
                     });
                 match result {
@@ -2833,7 +2848,9 @@ impl SessionActor {
             }
             AutomationMethod::Inspect => {
                 let pane_id = pane_id.unwrap();
-                let Some(pane) = self.pane_description(pane_id) else {
+                // The one surface that names a single pane on the owner-only socket, so the only
+                // one that discloses a reported native agent session reference.
+                let Some(pane) = self.pane_description(pane_id, AgentDisclosure::Full) else {
                     self.reply_automation_error(
                         target,
                         AutomationError::new("pane_not_found", "pane no longer exists"),
@@ -3975,9 +3992,12 @@ impl SessionActor {
         };
         let mut panes = Vec::with_capacity(pane_ids.len());
         for pane_id in pane_ids {
-            let pane = self.pane_description(pane_id).ok_or_else(|| {
-                AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
-            })?;
+            // Diagnostics are collected into debug bundles and pasted into issues.
+            let pane = self
+                .pane_description(pane_id, AgentDisclosure::Presence)
+                .ok_or_else(|| {
+                    AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
+                })?;
             let media = self.vivid.pane_status(
                 pane_id,
                 self.outer_media_projection(),
@@ -4109,7 +4129,11 @@ impl SessionActor {
             .remove(&(target.client_id, target.request_id));
     }
 
-    fn pane_description(&self, pane_id: PaneId) -> Option<serde_json::Value> {
+    fn pane_description(
+        &self,
+        pane_id: PaneId,
+        disclosure: AgentDisclosure,
+    ) -> Option<serde_json::Value> {
         let pane = self.panes.get(&pane_id)?;
         let tab_index = self.tabs.iter().position(|tab| tab.contains(pane_id))?;
         let tab = &self.tabs[tab_index];
@@ -4167,7 +4191,18 @@ impl SessionActor {
             "transparent": pane.transparent,
             "title": title,
             "plugin": plugin,
-            "agent": pane.agent.snapshot().map(agent_json),
+            "agent": pane.agent.snapshot().map(|snapshot| {
+                let mut agent = agent_json(snapshot);
+                if disclosure == AgentDisclosure::Full
+                    && let Some(session) = pane.agent.session()
+                {
+                    agent["agent_session"] = serde_json::json!({
+                        "id": session.id(),
+                        "path": session.path(),
+                    });
+                }
+                agent
+            }),
             "geometry": rect_json(outer),
             "content_geometry": rect_json(outer.content()),
             "columns": pane.terminal.cols(),
@@ -5809,7 +5844,9 @@ impl SessionActor {
                     .panes
                     .keys()
                     .copied()
-                    .filter_map(|pane| self.pane_description(pane))
+                    // Serves both `msg list-panes` and the plugin host's `session.inspect`, so a
+                    // bulk listing never carries a native agent session reference.
+                    .filter_map(|pane| self.pane_description(pane, AgentDisclosure::Presence))
                     .collect::<Vec<_>>();
                 Ok(serde_json::json!({
                     "session": self.name,
@@ -9182,6 +9219,31 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 "agent report source must contain 1..=128 bytes",
             ))
         }
+        AutomationMethod::ReportAgent {
+            message: Some(message),
+            ..
+        } if message.is_empty() || message.len() > crate::agent::MAX_REPORT_MESSAGE_BYTES => {
+            Err(AutomationError::new(
+                "invalid_params",
+                "agent report message must contain 1..=256 bytes",
+            ))
+        }
+        AutomationMethod::ReportAgent {
+            session_id,
+            session_path,
+            ..
+        } if [session_id, session_path]
+            .into_iter()
+            .flatten()
+            .any(|value| {
+                value.is_empty() || value.len() > crate::agent::MAX_AGENT_SESSION_BYTES
+            }) =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "agent session identity must contain 1..=256 bytes",
+            ))
+        }
         AutomationMethod::Run { command, .. } if command.trim().is_empty() => Err(
             AutomationError::new("invalid_params", "run requires a non-empty command"),
         ),
@@ -9611,7 +9673,21 @@ fn agent_json(agent: AgentSnapshot) -> serde_json::Value {
         "state": agent.state,
         "status": agent.status,
         "source": agent.source,
+        "message": agent.message,
+        "session_present": agent.session_present,
     })
+}
+
+/// How much of a pane's reported agent identity a serialization may disclose.
+///
+/// A native session reference names a resumable conversation on the user's agent account, so it
+/// is returned only where a caller asked about exactly one pane. Bulk listings, plugin-visible
+/// session inspection, and diagnostics — including the debug bundle built from them — see
+/// presence alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentDisclosure {
+    Presence,
+    Full,
 }
 
 fn terminal_mode_names(modes: TerminalModes) -> Vec<&'static str> {

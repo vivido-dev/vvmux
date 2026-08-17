@@ -315,6 +315,129 @@ done
         ],
     ));
 
+    // A block reason is ordinary display data, but the native session reference names a resumable
+    // conversation on the user's agent account. Only a single-pane inspect discloses it; the bulk
+    // listing and the diagnostic that feeds debug bundles report presence alone.
+    let annotated = json(command(
+        &runtime,
+        &name,
+        &[
+            "report-agent",
+            "--agent",
+            "codex",
+            "--state",
+            "blocked",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "10",
+            "--message",
+            "waiting for approval: write src/main.rs",
+            "--agent-session-id",
+            "conversation-7",
+            "--pane-id",
+            "2",
+        ],
+    ));
+    assert_eq!(
+        annotated["agent"]["message"],
+        "waiting for approval: write src/main.rs"
+    );
+    assert_eq!(annotated["agent"]["session_present"], true);
+
+    let inspected = json(command(&runtime, &name, &["inspect", "--pane-id", "2"]));
+    assert_eq!(
+        inspected["pane"]["agent"]["agent_session"]["id"],
+        "conversation-7"
+    );
+
+    let listed = json(command(&runtime, &name, &["list-panes"]));
+    let pane = listed["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pane| pane["pane_id"] == 2)
+        .unwrap();
+    assert_eq!(pane["agent"]["session_present"], true);
+    assert!(pane["agent"]["agent_session"].is_null());
+    assert!(
+        !serde_json::to_string(&listed)
+            .unwrap()
+            .contains("conversation-7")
+    );
+
+    let diagnosed = json(command(
+        &runtime,
+        &name,
+        &["diagnose", "--pane-id", "2", "--trace-limit", "16"],
+    ));
+    assert!(
+        !serde_json::to_string(&diagnosed)
+            .unwrap()
+            .contains("conversation-7")
+    );
+
+    // A state-only report from the same source keeps the reference the resume path needs.
+    assert_success(&command(
+        &runtime,
+        &name,
+        &[
+            "report-agent",
+            "--agent",
+            "codex",
+            "--state",
+            "working",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "11",
+            "--pane-id",
+            "2",
+        ],
+    ));
+    let after_state_only = json(command(&runtime, &name, &["inspect", "--pane-id", "2"]));
+    assert_eq!(
+        after_state_only["pane"]["agent"]["agent_session"]["id"],
+        "conversation-7"
+    );
+    assert!(after_state_only["pane"]["agent"]["message"].is_null());
+
+    let oversized = command(
+        &runtime,
+        &name,
+        &[
+            "report-agent",
+            "--agent",
+            "codex",
+            "--state",
+            "blocked",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "12",
+            "--message",
+            &"m".repeat(257),
+            "--pane-id",
+            "2",
+        ],
+    );
+    assert!(!oversized.status.success());
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("invalid_params"));
+
+    assert_success(&command(
+        &runtime,
+        &name,
+        &[
+            "clear-agent-report",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "13",
+            "--pane-id",
+            "2",
+        ],
+    ));
+
     // Every agent mutation routes through one choke point, so a report that leaves the pane's
     // effective snapshot unchanged is not a transition and must not advance the session sequence.
     // Two consecutive inspects first establish that the session is otherwise quiet, so a failure
@@ -347,17 +470,17 @@ done
         ));
     };
 
-    report("working", "4");
+    report("working", "14");
     let after_transition = sequence_of(&["inspect", "--pane-id", "2"]);
     assert!(after_transition > quiet);
 
-    report("working", "5");
+    report("working", "15");
     assert_eq!(
         after_transition,
         sequence_of(&["inspect", "--pane-id", "2"])
     );
 
-    report("blocked", "6");
+    report("blocked", "16");
     assert!(sequence_of(&["inspect", "--pane-id", "2"]) > after_transition);
 
     assert_success(&command(
@@ -368,7 +491,7 @@ done
             "--source",
             "integration-test",
             "--sequence",
-            "7",
+            "17",
             "--pane-id",
             "2",
         ],

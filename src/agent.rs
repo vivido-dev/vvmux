@@ -19,6 +19,15 @@ use vvmux_terminal::pty::PtyControl;
 use crate::layout::PaneId;
 
 pub const MAX_REPORT_SOURCE_BYTES: usize = 128;
+/// Distinct reporting sources one pane retains sequence state for.
+///
+/// The sequence map is keyed by a caller-chosen string, so without a ceiling a chatty or hostile
+/// reporter could grow it without bound.
+pub const MAX_REPORT_SOURCES: usize = 32;
+/// Block reason carried by a report and shown beside a blocked agent.
+pub const MAX_REPORT_MESSAGE_BYTES: usize = 256;
+/// Native agent session identifier or path retained for a later resume.
+pub const MAX_AGENT_SESSION_BYTES: usize = 256;
 const IDLE_CONFIRMATIONS: u8 = 3;
 const IDLE_CONFIRMATION_LIMIT: Duration = Duration::from_millis(700);
 const IDLE_CONFIRMATION_RECHECK: Duration = Duration::from_millis(100);
@@ -145,6 +154,76 @@ pub struct AgentSnapshot {
     pub state: AgentState,
     pub status: AgentStatus,
     pub source: AgentSource,
+    /// Why the agent is blocked, as reported by its lifecycle integration.
+    pub message: Option<String>,
+    /// Whether a native session reference has been reported for this agent.
+    ///
+    /// Only presence travels in a snapshot. The reference itself is withheld; see
+    /// [`AgentSessionRef`].
+    pub session_present: bool,
+}
+
+/// A native agent session reference reported by a lifecycle integration.
+///
+/// Capability-adjacent: it names a resumable conversation belonging to the user's agent account,
+/// so it is disclosed only through an explicit single-pane inspect. Every other surface —
+/// `list-panes`, plugin `session.inspect`, `diagnose`, and the debug bundle built from it —
+/// reports presence alone.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentSessionRef {
+    id: Option<String>,
+    path: Option<String>,
+}
+
+impl AgentSessionRef {
+    /// Build a reference, or `None` when neither half was reported.
+    pub fn new(id: Option<String>, path: Option<String>) -> Option<Self> {
+        (id.is_some() || path.is_some()).then_some(Self { id, path })
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        let within_bound = |value: &Option<String>| {
+            value
+                .as_ref()
+                .is_none_or(|value| !value.is_empty() && value.len() <= MAX_AGENT_SESSION_BYTES)
+        };
+        (within_bound(&self.id) && within_bound(&self.path))
+            .then_some(())
+            .ok_or("agent session identity must contain 1..=256 bytes")
+    }
+}
+
+/// Redacted on purpose. This type exists to be withheld, and a derived `Debug` would leak it
+/// through any diagnostic that formats a pane, a runtime, or an actor event.
+impl fmt::Debug for AgentSessionRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentSessionRef")
+            .field("id", &self.id.is_some())
+            .field("path", &self.path.is_some())
+            .finish()
+    }
+}
+
+/// One authoritative lifecycle report from a named source.
+#[derive(Debug, Clone)]
+pub struct AgentReport {
+    pub identity: AgentIdentity,
+    pub state: AgentState,
+    pub source: String,
+    pub sequence: u64,
+    pub message: Option<String>,
+    /// Reported once by integrations that know it; a later state-only report from the same source
+    /// leaves the stored reference in place rather than erasing it.
+    pub session: Option<AgentSessionRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +231,7 @@ struct ReportedState {
     source: String,
     state: AgentState,
     sequence: u64,
+    message: Option<String>,
 }
 
 #[derive(Debug)]
@@ -165,6 +245,7 @@ pub struct AgentRuntime {
     pending_idle: Option<(Instant, u8)>,
     report: Option<ReportedState>,
     report_sequences: HashMap<String, u64>,
+    session: Option<AgentSessionRef>,
 }
 
 impl AgentRuntime {
@@ -179,6 +260,7 @@ impl AgentRuntime {
             pending_idle: None,
             report: None,
             report_sequences: HashMap::new(),
+            session: None,
         }
     }
 
@@ -197,7 +279,19 @@ impl AgentRuntime {
             state: self.state,
             status,
             source: self.source,
+            message: self
+                .report
+                .as_ref()
+                .and_then(|report| report.message.clone()),
+            session_present: self.session.is_some(),
         })
+    }
+
+    /// The native session reference reported for this agent, if any.
+    ///
+    /// Callers must treat the result as capability-adjacent: see [`AgentSessionRef`].
+    pub fn session(&self) -> Option<&AgentSessionRef> {
+        self.session.as_ref()
     }
 
     pub fn next_evaluation_delay(&self, now: Instant) -> Option<Duration> {
@@ -231,6 +325,7 @@ impl AgentRuntime {
             self.process_group = group;
             self.report = None;
             self.report_sequences.clear();
+            self.session = None;
             self.pending_idle = None;
             self.done = false;
             self.identity = identity;
@@ -242,6 +337,7 @@ impl AgentRuntime {
         if let Some(identity) = identity {
             if self.identity.as_ref() != Some(&identity) {
                 self.report = None;
+                self.session = None;
                 self.pending_idle = None;
                 self.done = false;
                 self.state = AgentState::Idle;
@@ -252,6 +348,7 @@ impl AgentRuntime {
         } else if self.identity.is_some() {
             self.report = None;
             self.report_sequences.clear();
+            self.session = None;
             self.pending_idle = None;
             self.identity = None;
             self.done = false;
@@ -261,23 +358,24 @@ impl AgentRuntime {
         false
     }
 
-    pub fn report(
-        &mut self,
-        identity: AgentIdentity,
-        state: AgentState,
-        source: String,
-        sequence: u64,
-        visible: bool,
-    ) -> Result<(), &'static str> {
-        if source.is_empty() || source.len() > MAX_REPORT_SOURCE_BYTES {
-            return Err("agent report source must contain 1..=128 bytes");
-        }
-        if self
-            .report_sequences
-            .get(&source)
-            .is_some_and(|previous| sequence <= *previous)
+    pub fn report(&mut self, report: AgentReport, visible: bool) -> Result<(), &'static str> {
+        let AgentReport {
+            identity,
+            state,
+            source,
+            sequence,
+            message,
+            session,
+        } = report;
+        self.check_sequence(&source, sequence)?;
+        if message
+            .as_ref()
+            .is_some_and(|message| message.is_empty() || message.len() > MAX_REPORT_MESSAGE_BYTES)
         {
-            return Err("agent report sequence is stale");
+            return Err("agent report message must contain 1..=256 bytes");
+        }
+        if let Some(session) = &session {
+            session.validate()?;
         }
         if self
             .identity
@@ -288,10 +386,16 @@ impl AgentRuntime {
         }
         self.identity = Some(identity);
         self.report_sequences.insert(source.clone(), sequence);
+        // A state-only report from an integration that already sent its session identity must not
+        // erase it: identity is reported once, state repeatedly.
+        if session.is_some() {
+            self.session = session;
+        }
         self.report = Some(ReportedState {
             source,
             state,
             sequence,
+            message,
         });
         self.pending_idle = None;
         self.commit(state, AgentSource::Report, visible);
@@ -299,16 +403,7 @@ impl AgentRuntime {
     }
 
     pub fn clear_report(&mut self, source: &str, sequence: u64) -> Result<(), &'static str> {
-        if source.is_empty() || source.len() > MAX_REPORT_SOURCE_BYTES {
-            return Err("agent report source must contain 1..=128 bytes");
-        }
-        if self
-            .report_sequences
-            .get(source)
-            .is_some_and(|previous| sequence <= *previous)
-        {
-            return Err("agent report sequence is stale");
-        }
+        self.check_sequence(source, sequence)?;
         self.report_sequences.insert(source.to_owned(), sequence);
         if self
             .report
@@ -317,6 +412,24 @@ impl AgentRuntime {
         {
             self.report = None;
             self.source = AgentSource::Screen;
+        }
+        Ok(())
+    }
+
+    /// Validate a source name and its sequence without recording either.
+    ///
+    /// The count ceiling is checked here rather than at insertion so a report that is going to be
+    /// rejected for another reason cannot claim one of the bounded source slots.
+    fn check_sequence(&self, source: &str, sequence: u64) -> Result<(), &'static str> {
+        if source.is_empty() || source.len() > MAX_REPORT_SOURCE_BYTES {
+            return Err("agent report source must contain 1..=128 bytes");
+        }
+        let known = self.report_sequences.get(source);
+        if known.is_some_and(|previous| sequence <= *previous) {
+            return Err("agent report sequence is stale");
+        }
+        if known.is_none() && self.report_sequences.len() >= MAX_REPORT_SOURCES {
+            return Err("agent report source limit reached");
         }
         Ok(())
     }
@@ -392,6 +505,7 @@ impl AgentRuntime {
         if stale {
             self.report = None;
             self.report_sequences.clear();
+            self.session = None;
             self.pending_idle = None;
             self.identity = None;
             self.done = false;
@@ -1443,6 +1557,23 @@ mod tests {
         catalog.identity(&id(value)).unwrap()
     }
 
+    /// A state-only report, the shape every integration sends most of the time.
+    fn state_report(
+        identity: AgentIdentity,
+        state: AgentState,
+        source: &str,
+        sequence: u64,
+    ) -> AgentReport {
+        AgentReport {
+            identity,
+            state,
+            source: source.into(),
+            sequence,
+            message: None,
+            session: None,
+        }
+    }
+
     fn custom_catalog() -> AgentCatalog {
         let manifest: vvmux_plugin_api::Manifest = toml::from_str(
             r#"manifest_version = 2
@@ -1553,19 +1684,23 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         let mut retained_runtime = AgentRuntime::new();
         removed_runtime
             .report(
-                identity(&full, "codex"),
-                AgentState::Blocked,
-                "codex-hook".into(),
-                1,
+                state_report(
+                    identity(&full, "codex"),
+                    AgentState::Blocked,
+                    "codex-hook",
+                    1,
+                ),
                 false,
             )
             .unwrap();
         retained_runtime
             .report(
-                identity(&retained, "openclaw"),
-                AgentState::Working,
-                "openclaw-hook".into(),
-                1,
+                state_report(
+                    identity(&retained, "openclaw"),
+                    AgentState::Working,
+                    "openclaw-hook",
+                    1,
+                ),
                 false,
             )
             .unwrap();
@@ -1578,6 +1713,187 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
             AgentState::Working
         );
         retained_runtime.clear_report("openclaw-hook", 2).unwrap();
+    }
+
+    #[test]
+    fn report_sources_are_bounded_without_blocking_known_sources() {
+        let catalog = catalog();
+        let mut runtime = AgentRuntime::new();
+        for index in 0..MAX_REPORT_SOURCES {
+            runtime
+                .report(
+                    state_report(
+                        identity(&catalog, "codex"),
+                        AgentState::Working,
+                        &format!("source-{index}"),
+                        1,
+                    ),
+                    false,
+                )
+                .unwrap();
+        }
+        // A new source cannot claim a slot once the table is full.
+        assert_eq!(
+            runtime.report(
+                state_report(
+                    identity(&catalog, "codex"),
+                    AgentState::Working,
+                    "one-too-many",
+                    1
+                ),
+                false,
+            ),
+            Err("agent report source limit reached")
+        );
+        // A source already in the table keeps working, so a full table degrades to "no new
+        // reporters" rather than to "this pane is stuck".
+        runtime
+            .report(
+                state_report(
+                    identity(&catalog, "codex"),
+                    AgentState::Blocked,
+                    "source-0",
+                    2,
+                ),
+                false,
+            )
+            .unwrap();
+        assert_eq!(runtime.snapshot().unwrap().state, AgentState::Blocked);
+        // Release also refuses to grow the table past the bound.
+        assert_eq!(
+            runtime.clear_report("another-new-source", 1),
+            Err("agent report source limit reached")
+        );
+    }
+
+    #[test]
+    fn session_identity_is_reported_once_and_survives_state_only_reports() {
+        let catalog = catalog();
+        let mut runtime = AgentRuntime::new();
+        runtime
+            .report(
+                AgentReport {
+                    identity: identity(&catalog, "codex"),
+                    state: AgentState::Working,
+                    source: "codex-hook".into(),
+                    sequence: 1,
+                    message: None,
+                    session: AgentSessionRef::new(Some("conversation-7".into()), None),
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(runtime.session().unwrap().id(), Some("conversation-7"));
+        assert!(runtime.snapshot().unwrap().session_present);
+
+        // Integrations report identity once and state repeatedly; the later state must not erase
+        // the reference the resume path depends on.
+        runtime
+            .report(
+                state_report(
+                    identity(&catalog, "codex"),
+                    AgentState::Blocked,
+                    "codex-hook",
+                    2,
+                ),
+                false,
+            )
+            .unwrap();
+        assert_eq!(runtime.session().unwrap().id(), Some("conversation-7"));
+
+        // An integration typically reports before the detector first observes the process, so the
+        // startup-grace path must preserve the reference rather than treat it as stale evidence.
+        assert!(!runtime.observe_process(Some(40), Some(identity(&catalog, "codex"))));
+        assert_eq!(runtime.session().unwrap().id(), Some("conversation-7"));
+
+        // A different foreground process is a different conversation.
+        assert!(runtime.observe_process(Some(41), Some(identity(&catalog, "codex"))));
+        assert!(runtime.session().is_none());
+        assert!(runtime.snapshot().unwrap().message.is_none());
+    }
+
+    #[test]
+    fn a_removed_provider_takes_its_session_reference_with_it() {
+        let full = catalog();
+        let mut runtime = AgentRuntime::new();
+        runtime
+            .report(
+                AgentReport {
+                    identity: identity(&full, "codex"),
+                    state: AgentState::Blocked,
+                    source: "codex-hook".into(),
+                    sequence: 1,
+                    message: Some("waiting for approval: write src/main.rs".into()),
+                    session: AgentSessionRef::new(None, Some("/tmp/codex/session.json".into())),
+                },
+                false,
+            )
+            .unwrap();
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(
+            snapshot.message.as_deref(),
+            Some("waiting for approval: write src/main.rs")
+        );
+        assert!(snapshot.session_present);
+
+        assert!(runtime.reconcile_catalog(&custom_catalog()));
+        assert!(runtime.snapshot().is_none());
+        assert!(runtime.session().is_none());
+    }
+
+    #[test]
+    fn oversized_report_annotations_are_rejected() {
+        let catalog = catalog();
+        let mut runtime = AgentRuntime::new();
+        let report = |message: Option<String>, session: Option<AgentSessionRef>| AgentReport {
+            identity: identity(&catalog, "codex"),
+            state: AgentState::Blocked,
+            source: "codex-hook".into(),
+            sequence: 1,
+            message,
+            session,
+        };
+        assert_eq!(
+            runtime.report(report(Some("m".repeat(257)), None), false),
+            Err("agent report message must contain 1..=256 bytes")
+        );
+        assert_eq!(
+            runtime.report(report(Some(String::new()), None), false),
+            Err("agent report message must contain 1..=256 bytes")
+        );
+        assert_eq!(
+            runtime.report(
+                report(None, AgentSessionRef::new(Some("s".repeat(257)), None)),
+                false
+            ),
+            Err("agent session identity must contain 1..=256 bytes")
+        );
+        // Nothing was committed by a rejected report, including its sequence slot.
+        assert!(runtime.snapshot().is_none());
+        runtime
+            .report(
+                state_report(
+                    identity(&catalog, "codex"),
+                    AgentState::Working,
+                    "codex-hook",
+                    1,
+                ),
+                false,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_session_reference_is_redacted_in_diagnostics() {
+        let session = AgentSessionRef::new(
+            Some("secret-conversation".into()),
+            Some("/home/user/.codex/secret.json".into()),
+        )
+        .unwrap();
+        let rendered = format!("{session:?}");
+        assert!(!rendered.contains("secret-conversation"));
+        assert!(!rendered.contains("secret.json"));
+        assert_eq!(rendered, "AgentSessionRef { id: true, path: true }");
     }
 
     #[test]
@@ -1615,29 +1931,30 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         let mut second = AgentRuntime::new();
         first
             .report(
-                identity(&catalog, "opencode"),
-                AgentState::Working,
-                "test".into(),
-                2,
+                state_report(
+                    identity(&catalog, "opencode"),
+                    AgentState::Working,
+                    "test",
+                    2,
+                ),
                 false,
             )
             .unwrap();
         second
             .report(
-                identity(&catalog, "opencode"),
-                AgentState::Idle,
-                "test".into(),
-                2,
+                state_report(identity(&catalog, "opencode"), AgentState::Idle, "test", 2),
                 false,
             )
             .unwrap();
         assert!(
             first
                 .report(
-                    identity(&catalog, "opencode"),
-                    AgentState::Blocked,
-                    "test".into(),
-                    1,
+                    state_report(
+                        identity(&catalog, "opencode"),
+                        AgentState::Blocked,
+                        "test",
+                        1
+                    ),
                     false
                 )
                 .is_err()
@@ -1710,10 +2027,12 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         let mut runtime = AgentRuntime::new();
         runtime
             .report(
-                identity(&catalog, "opencode"),
-                AgentState::Working,
-                "plugin".into(),
-                1,
+                state_report(
+                    identity(&catalog, "opencode"),
+                    AgentState::Working,
+                    "plugin",
+                    1,
+                ),
                 false,
             )
             .unwrap();
@@ -1724,10 +2043,12 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         assert!(
             runtime
                 .report(
-                    identity(&catalog, "codex"),
-                    AgentState::Blocked,
-                    "plugin".into(),
-                    2,
+                    state_report(
+                        identity(&catalog, "codex"),
+                        AgentState::Blocked,
+                        "plugin",
+                        2
+                    ),
                     false
                 )
                 .is_err()
@@ -1735,10 +2056,12 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
 
         runtime
             .report(
-                identity(&catalog, "opencode"),
-                AgentState::Working,
-                "plugin".into(),
-                3,
+                state_report(
+                    identity(&catalog, "opencode"),
+                    AgentState::Working,
+                    "plugin",
+                    3,
+                ),
                 false,
             )
             .unwrap();

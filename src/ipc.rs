@@ -100,6 +100,11 @@ pub enum AutomationMethod {
         state: crate::agent::AgentState,
         source: String,
         sequence: u64,
+        /// Why the agent is blocked, shown beside it in the agent navigator.
+        message: Option<String>,
+        /// Native session identity, retained for a later resume and never logged or bundled.
+        session_id: Option<String>,
+        session_path: Option<String>,
     },
     ClearAgentReport {
         source: String,

@@ -90,7 +90,7 @@ session-inspect
 list-tabs
 select-tab --tab-id ID [--wait outer|rendered] [--timeout DURATION]
 diagnose [--pane-id ID|--all-panes] [--trace-limit N]
-report-agent --agent claude|codex|opencode|hermes --state idle|working|blocked --source ID --sequence N [--pane-id ID]
+report-agent --agent claude|codex|opencode|hermes --state idle|working|blocked --source ID --sequence N [--message TEXT] [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
 clear-agent-report --source ID --sequence N [--pane-id ID]
 inspect [--pane-id ID]
 inspect-media [--pane-id ID]
@@ -145,8 +145,18 @@ queue is no longer available.
 Agent reports are authoritative for their pane until cleared or the foreground process group
 changes. They require an explicit pane ID or a same-session `VVMUX_PANE_ID`; they never guess the
 focused pane. Sequence numbers are monotonic per pane and source, and `done` is derived by vvmux
-rather than accepted from reporters. The agent ID must come from an enabled provider.
+rather than accepted from reporters. The agent ID must come from an enabled provider. One pane
+retains sequence state for at most 32 sources; a full table refuses new reporters rather than
+growing, and sources already in it keep working.
 `list-panes` and `inspect` expose the effective agent state, display label, and provider plugin.
+
+`--message` carries why the agent is blocked (up to 256 bytes) and appears beside it in the agent
+navigator. `--agent-session-id` and `--agent-session-path` record the agent's own session so it can
+be resumed later; report them once, since a later state-only report from the same source keeps the
+stored reference. That reference names a resumable conversation on your agent account, so it is
+returned only by `inspect` for a single pane. `list-panes`, the plugin host's `session.inspect`,
+`diagnose`, and the debug bundles built from them report `session_present` alone, and it is never
+written to a log.
 
 Agent detection is plugin-provided. vvmux bundles four immutable data-only providers: Claude Code
 and Codex are enabled by default, while OpenCode and Hermes are disabled by default. They use the

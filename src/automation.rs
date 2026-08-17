@@ -235,6 +235,17 @@ pub enum MsgCommand {
         source: String,
         #[arg(long)]
         sequence: u64,
+        /// Why the agent is blocked, shown beside it in the agent navigator.
+        #[arg(long)]
+        message: Option<String>,
+        /// The agent's own session identifier, retained so the session can be resumed later.
+        ///
+        /// Reported once; later state-only reports from the same source keep it.
+        #[arg(long = "agent-session-id")]
+        session_id: Option<String>,
+        /// The agent's own session file, for agents that identify a session by path.
+        #[arg(long = "agent-session-path")]
+        session_path: Option<String>,
         #[arg(long)]
         pane_id: Option<u64>,
     },
@@ -696,6 +707,9 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             state,
             source,
             sequence,
+            message,
+            session_id,
+            session_path,
             pane_id,
         } => (
             AutomationMethod::ReportAgent {
@@ -703,6 +717,9 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 state,
                 source,
                 sequence,
+                message,
+                session_id,
+                session_path,
             },
             pane_id,
             false,
