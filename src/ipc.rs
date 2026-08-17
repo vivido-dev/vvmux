@@ -109,6 +109,14 @@ pub enum AutomationMethod {
         session_id: Option<String>,
         session_path: Option<String>,
     },
+    /// Attach native session identity without claiming lifecycle-state authority.
+    ReportAgentSession {
+        agent: crate::agent::AgentId,
+        source: String,
+        sequence: u64,
+        session_id: Option<String>,
+        session_path: Option<String>,
+    },
     ClearAgentReport {
         source: String,
         sequence: u64,

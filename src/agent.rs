@@ -583,7 +583,7 @@ impl AgentRuntime {
         let changed_group = self.process_group != group;
         if changed_group {
             let startup_report_matches = self.process_group.is_none()
-                && self.report.is_some()
+                && (self.report.is_some() || self.session.is_some())
                 && identity.is_some()
                 && identity.as_ref().map(|value| &value.id)
                     == self.identity.as_ref().map(|value| &value.id)
@@ -672,6 +672,33 @@ impl AgentRuntime {
         });
         self.pending_idle = None;
         self.commit(state, AgentSource::Report, visible);
+        Ok(())
+    }
+
+    /// Store native session identity without changing lifecycle-state authority.
+    ///
+    /// Session-only hooks share the state/metadata report sequence table, but intentionally do
+    /// not create a reported state, message, pending-idle transition, or notification-worthy
+    /// snapshot change beyond `session_present`.
+    pub fn report_session(
+        &mut self,
+        identity: AgentIdentity,
+        source: &str,
+        sequence: u64,
+        session: AgentSessionRef,
+    ) -> Result<(), &'static str> {
+        self.check_sequence(source, sequence)?;
+        session.validate()?;
+        if self
+            .identity
+            .as_ref()
+            .is_some_and(|detected| detected.id != identity.id)
+        {
+            return Err("reported agent does not match the pane foreground process");
+        }
+        self.identity = Some(identity);
+        self.report_sequences.insert(source.to_owned(), sequence);
+        self.session = Some(session);
         Ok(())
     }
 
@@ -2365,6 +2392,78 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         assert!(runtime.observe_process(Some(41), Some(identity(&catalog, "codex"))));
         assert!(runtime.session().is_none());
         assert!(runtime.snapshot().unwrap().message.is_none());
+    }
+
+    #[test]
+    fn session_only_reports_preserve_screen_authority_and_share_ordering() {
+        let catalog = catalog();
+        let mut runtime = detected_runtime(&catalog, "codex");
+        runtime.commit(AgentState::Working, AgentSource::Screen, false);
+        let before = runtime.snapshot().unwrap();
+
+        runtime
+            .report_session(
+                identity(&catalog, "codex"),
+                "codex-hook",
+                5,
+                AgentSessionRef::new(Some("conversation-8".into()), None).unwrap(),
+            )
+            .unwrap();
+        let after = runtime.snapshot().unwrap();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.source, AgentSource::Screen);
+        assert_eq!(after.message, before.message);
+        assert!(after.session_present);
+        assert!(runtime.report.is_none());
+
+        assert_eq!(
+            runtime.report(
+                state_report(
+                    identity(&catalog, "codex"),
+                    AgentState::Blocked,
+                    "codex-hook",
+                    4,
+                ),
+                false,
+            ),
+            Err("agent report sequence is stale")
+        );
+
+        // A rejected identity mismatch must not consume sequence 6.
+        assert_eq!(
+            runtime.report_session(
+                identity(&catalog, "claude"),
+                "codex-hook",
+                6,
+                AgentSessionRef::new(Some("wrong".into()), None).unwrap(),
+            ),
+            Err("reported agent does not match the pane foreground process")
+        );
+        runtime
+            .report_session(
+                identity(&catalog, "codex"),
+                "codex-hook",
+                6,
+                AgentSessionRef::new(None, Some("/tmp/codex/session.json".into())).unwrap(),
+            )
+            .unwrap();
+
+        // The detector's first process observation keeps startup hook evidence; a later process
+        // group denotes another agent lifetime and clears it.
+        let mut startup = AgentRuntime::new();
+        startup
+            .report_session(
+                identity(&catalog, "codex"),
+                "codex-hook",
+                1,
+                AgentSessionRef::new(Some("startup-session".into()), None).unwrap(),
+            )
+            .unwrap();
+        assert!(!startup.observe_process(Some(40), Some(identity(&catalog, "codex"))));
+        assert!(startup.session().is_some());
+        assert!(startup.observe_process(Some(41), Some(identity(&catalog, "codex"))));
+        assert!(startup.session().is_none());
     }
 
     #[test]

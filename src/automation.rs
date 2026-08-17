@@ -249,6 +249,21 @@ pub enum MsgCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Report native agent session identity without overriding screen-classified state.
+    ReportAgentSession {
+        #[arg(long)]
+        agent: crate::agent::AgentId,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        sequence: u64,
+        #[arg(long = "agent-session-id", required_unless_present = "session_path")]
+        session_id: Option<String>,
+        #[arg(long = "agent-session-path", required_unless_present = "session_id")]
+        session_path: Option<String>,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Attach display-only metadata to one pane, without claiming lifecycle authority.
     ///
     /// Use this for progress and custom status text an integration wants shown; use
@@ -659,6 +674,7 @@ pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()>
         &method,
         AutomationMethod::ClosePane
             | AutomationMethod::ReportAgent { .. }
+            | AutomationMethod::ReportAgentSession { .. }
             | AutomationMethod::ClearAgentReport { .. }
             | AutomationMethod::ReportMetadata { .. }
     ) && pane_id.is_none()
@@ -890,6 +906,25 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 source,
                 sequence,
                 message,
+                session_id,
+                session_path,
+            },
+            pane_id,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::ReportAgentSession {
+            agent,
+            source,
+            sequence,
+            session_id,
+            session_path,
+            pane_id,
+        } => (
+            AutomationMethod::ReportAgentSession {
+                agent,
+                source,
+                sequence,
                 session_id,
                 session_path,
             },

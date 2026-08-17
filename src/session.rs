@@ -3003,6 +3003,41 @@ impl SessionActor {
                     ),
                 }
             }
+            AutomationMethod::ReportAgentSession {
+                agent,
+                source,
+                sequence,
+                session_id,
+                session_path,
+            } => {
+                let pane_id = pane_id.unwrap();
+                let result = self
+                    .agent_catalog
+                    .identity(&agent)
+                    .ok_or("agent definition is not enabled")
+                    .and_then(|identity| {
+                        let session = crate::agent::AgentSessionRef::new(session_id, session_path)
+                            .ok_or("agent session identity is required")?;
+                        self.panes
+                            .get_mut(&pane_id)
+                            .ok_or("pane no longer exists")?
+                            .agent
+                            .report_session(identity, &source, sequence, session)
+                    });
+                match result {
+                    Ok(()) => {
+                        let agent = self.panes[&pane_id].agent.snapshot().map(agent_json);
+                        self.reply_automation(
+                            target,
+                            serde_json::json!({"pane_id": pane_id, "agent": agent}),
+                        );
+                    }
+                    Err(message) => self.reply_automation_error(
+                        target,
+                        AutomationError::new("invalid_agent_report", message),
+                    ),
+                }
+            }
             AutomationMethod::ReportMetadata {
                 source,
                 sequence,
@@ -10703,6 +10738,7 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
     }
     match method {
         AutomationMethod::ReportAgent { source, .. }
+        | AutomationMethod::ReportAgentSession { source, .. }
         | AutomationMethod::ClearAgentReport { source, .. }
             if source.is_empty() || source.len() > crate::agent::MAX_REPORT_SOURCE_BYTES =>
         {
@@ -10724,6 +10760,11 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
             session_id,
             session_path,
             ..
+        }
+        | AutomationMethod::ReportAgentSession {
+            session_id,
+            session_path,
+            ..
         } if [session_id, session_path]
             .into_iter()
             .flatten()
@@ -10736,6 +10777,14 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 "agent session identity must contain 1..=256 bytes",
             ))
         }
+        AutomationMethod::ReportAgentSession {
+            session_id: None,
+            session_path: None,
+            ..
+        } => Err(AutomationError::new(
+            "invalid_params",
+            "agent session identity is required",
+        )),
         // Validated here as well as in the CLI parser, so a direct VVMX caller gets the same
         // answer rather than a silently different behavior.
         AutomationMethod::AgentStart { args, .. }
@@ -11052,7 +11101,7 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit",
             "wait_agent_state", "wait_media",
             "wait_media_track",
-            "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report",
+            "trace_media", "reload_config", "run", "action", "report_agent", "report_agent_session", "clear_agent_report",
             "report_metadata", "agent_explain", "agent_start", "agent_prompt",
             "agent_send_keys", "agent_read", "subscribe", "save_layout"
         ],
