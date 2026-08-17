@@ -293,7 +293,8 @@ impl AgentSessionRef {
         self.path.as_deref()
     }
 
-    fn validate(&self) -> Result<(), &'static str> {
+    /// Bounds check, applied to a reference from a report and again to one read back from disk.
+    pub fn validate(&self) -> Result<(), &'static str> {
         let within_bound = |value: &Option<String>| {
             value
                 .as_ref()
@@ -520,6 +521,12 @@ pub struct AgentRuntime {
     report: Option<ReportedState>,
     report_sequences: HashMap<String, u64>,
     session: Option<AgentSessionRef>,
+    /// The reporting source that supplied `session`.
+    ///
+    /// Kept because a resume is built from the reference, and a reference is only trustworthy when
+    /// the integration that reported it is the one that owns that agent kind. Without the source,
+    /// any caller able to report could choose which command a restored pane runs.
+    session_source: Option<String>,
     metadata: AgentMetadata,
     /// The name a user gave this agent, if any.
     ///
@@ -549,6 +556,7 @@ impl AgentRuntime {
             report: None,
             report_sequences: HashMap::new(),
             session: None,
+            session_source: None,
             metadata: AgentMetadata::default(),
             alias: None,
         }
@@ -599,6 +607,11 @@ impl AgentRuntime {
         self.session.as_ref()
     }
 
+    /// The reporting source that supplied the session reference, if one did.
+    pub fn session_source(&self) -> Option<&str> {
+        self.session_source.as_deref()
+    }
+
     pub fn metadata(&self) -> &AgentMetadata {
         &self.metadata
     }
@@ -606,6 +619,16 @@ impl AgentRuntime {
     /// The name a user gave this agent, if any.
     pub fn alias(&self) -> Option<&AgentAlias> {
         self.alias.as_ref()
+    }
+
+    /// Reattach a name to an agent being resumed, before detection has observed it.
+    ///
+    /// Separate from [`Self::set_alias`], which refuses a pane with no detected agent — correctly,
+    /// since a name there would belong to nothing. Here the agent's own resume command has just been
+    /// typed at the pane's shell, so the name has an owner arriving. If that agent never appears,
+    /// the name is cleared by the same process-observation path that clears every other trace of it.
+    pub fn adopt_alias(&mut self, alias: AgentAlias) {
+        self.alias = Some(alias);
     }
 
     /// Name this agent, or clear its name when `alias` is `None`.
@@ -696,6 +719,7 @@ impl AgentRuntime {
             self.report = None;
             self.report_sequences.clear();
             self.session = None;
+            self.session_source = None;
             self.metadata = AgentMetadata::default();
             self.alias = None;
             self.pending_idle = None;
@@ -710,6 +734,8 @@ impl AgentRuntime {
             if self.identity.as_ref() != Some(&identity) {
                 self.report = None;
                 self.session = None;
+                self.session_source = None;
+                self.session_source = None;
                 self.metadata = AgentMetadata::default();
                 self.alias = None;
                 self.pending_idle = None;
@@ -723,6 +749,7 @@ impl AgentRuntime {
             self.report = None;
             self.report_sequences.clear();
             self.session = None;
+            self.session_source = None;
             self.metadata = AgentMetadata::default();
             self.alias = None;
             self.pending_idle = None;
@@ -766,6 +793,7 @@ impl AgentRuntime {
         // erase it: identity is reported once, state repeatedly.
         if session.is_some() {
             self.session = session;
+            self.session_source = Some(source.clone());
         }
         self.report = Some(ReportedState {
             source,
@@ -802,6 +830,7 @@ impl AgentRuntime {
         self.identity = Some(identity);
         self.report_sequences.insert(source.to_owned(), sequence);
         self.session = Some(session);
+        self.session_source = Some(source.to_owned());
         Ok(())
     }
 
@@ -967,6 +996,7 @@ impl AgentRuntime {
             self.report = None;
             self.report_sequences.clear();
             self.session = None;
+            self.session_source = None;
             self.metadata = AgentMetadata::default();
             self.pending_idle = None;
             self.identity = None;
@@ -1010,6 +1040,8 @@ struct CompiledAgent {
     argv_contains: Vec<String>,
     /// The command name to type to start this agent, when its provider declares one.
     launch: Option<String>,
+    /// The argument template that reopens a previous conversation, when one is declared.
+    resume: Option<Vec<String>>,
     manifest: CompiledManifest,
 }
 
@@ -1064,6 +1096,11 @@ impl AgentCatalog {
                         .launch
                         .as_ref()
                         .map(|launch| launch.executable.clone()),
+                    resume: source
+                        .definition
+                        .launch
+                        .as_ref()
+                        .and_then(|launch| launch.resume.clone()),
                     manifest: CompiledManifest::compile(&source.definition),
                 },
             );
@@ -1081,6 +1118,43 @@ impl AgentCatalog {
     /// in combination with [`Self::identity`]; callers report those separately.
     pub fn launch_executable(&self, id: &AgentId) -> Option<&str> {
         self.definitions.get(id)?.launch.as_deref()
+    }
+
+    /// The command that reopens `session` for this agent, or `None` when it cannot be resumed.
+    ///
+    /// Gated on the reporting source as well as the agent kind. A session reference names a
+    /// conversation on the user's agent account, and this turns one into a command line that runs on
+    /// their machine — so the integration that supplied it has to be the one that owns the kind.
+    /// Without that check, anything able to call `report-agent-session` could choose what a restored
+    /// pane runs. The convention is the one the shipped installers use: source `vvmux:<kind>`.
+    pub fn resume_argv(
+        &self,
+        id: &AgentId,
+        source: &str,
+        session: &AgentSessionRef,
+    ) -> Option<Vec<String>> {
+        if source != format!("vvmux:{id}") {
+            return None;
+        }
+        let definition = self.definitions.get(id)?;
+        let template = definition.resume.as_ref()?;
+        let mut argv = vec![definition.launch.clone()?];
+        for argument in template {
+            let expanded = match (
+                argument.contains(vvmux_plugin_api::RESUME_ID_PLACEHOLDER),
+                argument.contains(vvmux_plugin_api::RESUME_PATH_PLACEHOLDER),
+            ) {
+                (true, _) => {
+                    argument.replace(vvmux_plugin_api::RESUME_ID_PLACEHOLDER, session.id()?)
+                }
+                (_, true) => {
+                    argument.replace(vvmux_plugin_api::RESUME_PATH_PLACEHOLDER, session.path()?)
+                }
+                _ => argument.clone(),
+            };
+            argv.push(expanded);
+        }
+        Some(argv)
     }
 
     pub fn describe(&self) -> Vec<serde_json::Value> {
@@ -3384,6 +3458,122 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
             Some(&alias),
             "the alias was dropped by the detector catching up to its own agent"
         );
+    }
+
+    /// A session reference names a conversation on the user's account, and this turns one into a
+    /// command line that runs on their machine. The gate is what stops anything able to report from
+    /// choosing what a restored pane executes.
+    #[test]
+    fn a_resume_is_built_only_from_the_integration_that_owns_the_agent() {
+        let catalog = catalog();
+        let session = AgentSessionRef::new(Some("CONV-42".into()), None).unwrap();
+
+        assert_eq!(
+            catalog.resume_argv(&id("codex"), "vvmux:codex", &session),
+            Some(vec!["codex".into(), "resume".into(), "CONV-42".into()])
+        );
+        for foreign in ["vvmux:claude", "codex", "attacker", "", "vvmux:codex "] {
+            assert!(
+                catalog
+                    .resume_argv(&id("codex"), foreign, &session)
+                    .is_none(),
+                "source {foreign:?} was allowed to build a codex resume"
+            );
+        }
+    }
+
+    /// Each shipped agent's own flag shape, expanded from its manifest rather than from a table
+    /// here — the point of the template is that a provider describes its own resume.
+    #[test]
+    fn every_shipped_agent_expands_its_own_resume_shape() {
+        let catalog = catalog();
+        let session = AgentSessionRef::new(Some("S1".into()), None).unwrap();
+        for (agent, expected) in [
+            ("claude", vec!["claude", "--resume", "S1"]),
+            ("codex", vec!["codex", "resume", "S1"]),
+            ("opencode", vec!["opencode", "--session", "S1"]),
+            ("hermes", vec!["hermes", "--resume", "S1"]),
+        ] {
+            assert_eq!(
+                catalog.resume_argv(&id(agent), &format!("vvmux:{agent}"), &session),
+                Some(expected.into_iter().map(ToOwned::to_owned).collect()),
+                "{agent}"
+            );
+        }
+    }
+
+    /// A template naming a path cannot be satisfied by a reference that only carries an id, and
+    /// must produce nothing rather than a command line with an empty argument in it.
+    #[test]
+    fn a_resume_refuses_a_reference_it_cannot_fill() {
+        let manifest: vvmux_plugin_api::Manifest = toml::from_str(
+            r#"manifest_version = 2
+[plugin]
+id = "com.example.pathy"
+name = "Pathy"
+version = "1.0.0"
+min_vvmux_version = "0.4.0"
+description = "d"
+platforms = ["linux"]
+permissions = []
+[[agents]]
+id = "pathy"
+name = "Pathy"
+process = { executables = ["pathy"] }
+launch = { executable = "pathy", resume = ["--session", "{session_path}"] }
+"#,
+        )
+        .unwrap();
+        let catalog = AgentCatalog::compile(
+            manifest
+                .agents
+                .into_iter()
+                .map(|definition| AgentCatalogSource {
+                    provider: "com.example.pathy".into(),
+                    fingerprint: "test".into(),
+                    definition,
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        let id_only = AgentSessionRef::new(Some("S1".into()), None).unwrap();
+        assert!(
+            catalog
+                .resume_argv(&id("pathy"), "vvmux:pathy", &id_only)
+                .is_none()
+        );
+        let with_path = AgentSessionRef::new(None, Some("/tmp/s1.json".into())).unwrap();
+        assert_eq!(
+            catalog.resume_argv(&id("pathy"), "vvmux:pathy", &with_path),
+            Some(vec![
+                "pathy".into(),
+                "--session".into(),
+                "/tmp/s1.json".into()
+            ])
+        );
+    }
+
+    /// The source travels with the reference, because a resume is only trustworthy when both agree.
+    #[test]
+    fn a_session_reference_remembers_which_integration_reported_it() {
+        let catalog = catalog();
+        let mut runtime = AgentRuntime::new();
+        runtime.observe_process(Some(7), Some(identity(&catalog, "codex")));
+        runtime
+            .report_session(
+                identity(&catalog, "codex"),
+                "vvmux:codex",
+                1,
+                AgentSessionRef::new(Some("C1".into()), None).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(runtime.session_source(), Some("vvmux:codex"));
+
+        // Cleared with the reference it describes, so a later agent cannot inherit its provenance.
+        runtime.observe_process(Some(9), Some(identity(&catalog, "codex")));
+        assert!(runtime.session().is_none());
+        assert!(runtime.session_source().is_none());
     }
 
     /// A rename is display state, not lifecycle state. If it reached the snapshot it would bump the

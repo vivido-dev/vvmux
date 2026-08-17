@@ -41,6 +41,12 @@ pub struct Session {
     /// whatever scrolled past, which includes tokens, keys, and command output. Enabling it writes
     /// that to disk in an owner-only file. Requires `auto_snapshot`.
     pub pane_history: bool,
+    /// Reopen each restored agent pane's conversation with the agent's own resume command.
+    ///
+    /// Armed at restore and fired when a client attaches, never at server start: a full-screen agent
+    /// launched against the placeholder geometry would paint itself for a terminal nobody is
+    /// looking at, and a session left detached should not be spawning agent processes at all.
+    pub resume_agents: bool,
 }
 
 impl Default for Session {
@@ -48,6 +54,7 @@ impl Default for Session {
         Self {
             auto_snapshot: true,
             pane_history: false,
+            resume_agents: true,
         }
     }
 }

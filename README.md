@@ -355,6 +355,7 @@ report it, resumable session identity. It is never added to a `debug-bundle`.
 [session]
 auto_snapshot = true    # default
 pane_history = false    # default
+resume_agents = true    # default
 ```
 
 Turning either off also discards what is already on disk, so opting out leaves nothing behind. Both
@@ -383,6 +384,46 @@ scrollback, so what is still on screen at shutdown is not part of it.
 Writes are debounced by five seconds and happen on a worker thread, so a burst of splits is one
 write and the session actor never blocks on the filesystem. A clean shutdown writes inline, so
 stopping a session does not lose the last few seconds of shape.
+
+#### Resuming agents
+
+An agent pane restores as a plain shell, and then reopens the conversation it had. If the agent's
+integration reported a session identity (`report-agent --agent-session-id`, which the bundled
+integrations do), vvmux types that agent's own resume command at the restored pane's shell:
+
+| Agent | Command |
+|---|---|
+| claude | `claude --resume <id>` |
+| codex | `codex resume <id>` |
+| opencode | `opencode --session <id>` |
+| hermes | `hermes --resume <id>` |
+
+These come from the provider's manifest, not from a table inside vvmux, so a plugin can make its own
+agent resumable:
+
+```toml
+launch = { executable = "myagent", resume = ["--continue", "{session_id}"] }
+```
+
+Exactly one argument carries `{session_id}` or `{session_path}`, either as the whole argument or
+after a `--flag=`. An agent with no `resume` restores as a plain shell.
+
+**A resume fires when a client attaches, never at server start.** A full-screen agent reads its
+terminal size as it starts, and one launched against the placeholder geometry would lay itself out
+for a window nobody is looking at — so a session left detached starts no agent processes at all.
+`inspect` reports `pending_resume` while one is armed.
+
+Three things make a resume not happen, each leaving a working shell: the reporting source does not
+own that agent kind (a session identity becomes a command line on your machine, so only the
+integration that owns the agent may supply one); two panes named the same conversation, in which case
+the first wins and the second stays a shell; or the pane is no longer sitting at its own shell.
+
+A pane that is about to resume gets no scrollback replay even with `pane_history` on — the agent
+repaints its own transcript, and replaying underneath would show it twice.
+
+The agent's name comes back with it, once the agent is actually detected again, so
+`--alias reviewer` keeps working across a restart. Set `resume_agents = false` to restore agent panes
+as plain shells.
 
 ### Naming an agent
 

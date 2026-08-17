@@ -13,7 +13,7 @@ permissions = []
 id = "opencode"
 name = "OpenCode"
 process = { executables = ["opencode", "opencode2", "open-code"], argv_contains = ["opencode-ai/bin/opencode"] }
-launch = { executable = "opencode" }
+launch = { executable = "opencode", resume = ["--session", "{session_id}"] }
 
 [[agents.rules]]
 id = "permission_required"

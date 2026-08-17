@@ -298,7 +298,24 @@ pub struct AgentLaunch {
     /// A bare name, never a path: the whole point is to run whatever the user's environment means
     /// by `claude`, and a manifest cannot know where that is.
     pub executable: String,
+    /// Arguments appended to `executable` to reopen a previous conversation.
+    ///
+    /// Exactly one element carries `{session_id}` or `{session_path}`, substituted with the identity
+    /// the agent's own integration reported. Absent means this agent cannot be resumed, and a
+    /// restored pane is a plain shell.
+    ///
+    /// A template rather than a hardcoded table, so a user's own provider plugin can make its agent
+    /// resumable without a vvmux release. The grammar is wide enough for every shape the shipped
+    /// agents use — `--resume <id>`, `resume <id>`, `--resume=<id>`, `--session <id>` — and no wider.
+    #[serde(default)]
+    pub resume: Option<Vec<String>>,
 }
+
+/// The placeholders a resume template may carry.
+pub const RESUME_ID_PLACEHOLDER: &str = "{session_id}";
+pub const RESUME_PATH_PLACEHOLDER: &str = "{session_path}";
+/// Arguments one resume template may hold.
+pub const MAX_AGENT_RESUME_ARGS: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -691,6 +708,9 @@ fn validate_agents(agents: &[Agent]) -> Result<(), ManifestError> {
                     agent.id
                 ));
             }
+            if let Some(resume) = &launch.resume {
+                validate_resume_template(&agent.id, resume)?;
+            }
         }
         if agent.rules.len() > MAX_AGENT_RULES {
             return invalid(format!("agent `{}` exceeds 64 rules", agent.id));
@@ -1015,6 +1035,55 @@ fn validate_plugin_id(id: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
+/// A resume template must name the session exactly once, and every argument must survive being
+/// typed at a shell.
+///
+/// One placeholder rather than any number: the substitution builds a command line, and a template
+/// that repeated the identity or omitted it would either run the wrong command or run one that
+/// resumes nothing. The placeholder is either the whole argument or the tail of a `--flag=` form,
+/// because those are the only two shapes an agent CLI actually uses and anything else would be a
+/// manifest constructing arguments rather than describing them.
+fn validate_resume_template(agent: &str, resume: &[String]) -> Result<(), ManifestError> {
+    if resume.is_empty() || resume.len() > MAX_AGENT_RESUME_ARGS {
+        return invalid(format!(
+            "agent `{agent}` resume must contain 1 through {MAX_AGENT_RESUME_ARGS} arguments"
+        ));
+    }
+    let mut placeholders = 0_usize;
+    for argument in resume {
+        if argument.is_empty()
+            || argument.len() > MAX_AGENT_EXECUTABLE_BYTES
+            || argument.chars().any(char::is_control)
+        {
+            return invalid(format!(
+                "agent `{agent}` resume arguments must each contain 1 through {MAX_AGENT_EXECUTABLE_BYTES} printable bytes"
+            ));
+        }
+        for placeholder in [RESUME_ID_PLACEHOLDER, RESUME_PATH_PLACEHOLDER] {
+            let occurrences = argument.matches(placeholder).count();
+            if occurrences == 0 {
+                continue;
+            }
+            placeholders = placeholders.saturating_add(occurrences);
+            let whole = argument == placeholder;
+            let flag_tail = argument
+                .strip_suffix(placeholder)
+                .is_some_and(|prefix| prefix.starts_with('-') && prefix.ends_with('='));
+            if !whole && !flag_tail {
+                return invalid(format!(
+                    "agent `{agent}` resume placeholder must be a whole argument or follow `--flag=`"
+                ));
+            }
+        }
+    }
+    if placeholders != 1 {
+        return invalid(format!(
+            "agent `{agent}` resume must name the session exactly once"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_local_id(id: &str, kind: &str) -> Result<(), ManifestError> {
     if id.is_empty() || id.len() > 64 || id.contains('.') || !valid_segment(id) {
         return invalid(format!("invalid {kind} id `{id}`"));
@@ -1100,6 +1169,79 @@ fn ensure_package_file(root: &Path, resolved: &Path, display: &Path) -> Result<(
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, ManifestError> {
     Err(ManifestError::Invalid(message.into()))
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    fn agent_with_resume(resume: &str) -> String {
+        format!(
+            r#"manifest_version = 2
+[plugin]
+id = "com.example.a"
+name = "A"
+version = "1.0.0"
+min_vvmux_version = "0.4.0"
+description = "d"
+platforms = ["linux"]
+permissions = []
+[[agents]]
+id = "demo"
+name = "Demo"
+process = {{ executables = ["demo"] }}
+launch = {{ executable = "demo", resume = {resume} }}
+"#
+        )
+    }
+
+    fn accepted(resume: &str) -> bool {
+        let manifest: Manifest = toml::from_str(&agent_with_resume(resume)).unwrap();
+        manifest.validate().is_ok()
+    }
+
+    /// Every shape the shipped agents actually use, and nothing that would let a manifest build
+    /// arguments rather than describe them.
+    #[test]
+    fn resume_templates_accept_real_agent_shapes_only() {
+        for valid in [
+            r#"["--resume", "{session_id}"]"#,  // claude, hermes
+            r#"["resume", "{session_id}"]"#,    // codex
+            r#"["--session", "{session_id}"]"#, // opencode
+            r#"["--resume={session_id}"]"#,     // copilot-style flag=value
+            r#"["--session", "{session_path}"]"#,
+        ] {
+            assert!(accepted(valid), "expected {valid} to be accepted");
+        }
+        for invalid in [
+            r#"[]"#,                               // names no session
+            r#"["--resume"]"#,                     // no placeholder
+            r#"["{session_id}", "{session_id}"]"#, // names it twice
+            r#"["{session_id}{session_path}"]"#,   // two kinds in one argument
+            r#"["--resume", "id-{session_id}"]"#,  // built rather than described
+            r#"["--resume", "{session_id}-suffix"]"#,
+            r#"["a","b","c","d","e","f","g","h","{session_id}"]"#, // over the argument bound
+        ] {
+            assert!(!accepted(invalid), "expected {invalid} to be refused");
+        }
+    }
+
+    #[test]
+    fn resume_arguments_are_bounded_and_printable() {
+        let long = "x".repeat(MAX_AGENT_EXECUTABLE_BYTES + 1);
+        assert!(!accepted(&format!(r#"["{long}", "{{session_id}}"]"#)));
+        assert!(!accepted(r#"["--resume\u0007", "{session_id}"]"#));
+    }
+
+    /// Absent means detection-only, which has to stay valid: most agents cannot be resumed.
+    #[test]
+    fn a_launchable_agent_need_not_be_resumable() {
+        let source = agent_with_resume(r#"["--resume", "{session_id}"]"#)
+            .replace(r#", resume = ["--resume", "{session_id}"]"#, "");
+        let manifest: Manifest = toml::from_str(&source).unwrap();
+        manifest.validate().unwrap();
+        assert!(manifest.agents[0].launch.as_ref().unwrap().resume.is_none());
+    }
 }
 
 #[cfg(test)]

@@ -103,6 +103,23 @@ Hyperlinks, graphics placements, anchors, cursor position, and modes are dropped
 restored. Restored lines enter scrollback, never the viewport, which belongs to the newly spawned
 program.
 
+Native agent resume is armed at restore and fired on attach. Arming records the agent kind, the
+reporting source, and the session reference; the command line is resolved only when the resume fires,
+because the agent catalog is compiled from the plugin registry and reaches the actor by event after
+it is constructed — there is nothing to resolve against at restore time, and resolving late also
+means a provider disabled in between simply does not resume. The resume argument template lives in
+the provider's manifest rather than in a table, so a plugin can declare its own. One conversation
+resumes once: the reference is reserved across the whole restore, and a second pane naming it stays a
+plain shell. The reporting source must own the agent kind, because a session reference becomes a
+command line on the user's machine.
+
+Firing waits for a client because a full-screen agent reads its terminal size as it starts, and the
+restore geometry is a placeholder until the first attach. The restored pane's shell is identified
+without a process scan — this session spawned it moments earlier with a shell it chose, so the
+foreground-group check settles it and the actor never reads `/proc`. A restored name is applied only
+once the agent is detected again, since the resume is typed at a shell and the agent's process
+arrives afterwards, when process observation would otherwise clear it.
+
 A snapshot is untrusted input. It is bounded before it is allocated, its schema is read before its
 body, and anything unusable starts a fresh session rather than failing to start one. It is owner-only
 and lives outside the config directory, because it records working directories and native agent

@@ -58,6 +58,19 @@ Later features adapted from the same HerdR commit, recorded as they land:
   lifecycle snapshot, so renaming cannot advance the transition counter `agent-prompt` reads as its
   stall baseline. And the name survives the detector's first observation of an agent that already
   reported itself, which is the one path where HerdR's equivalent state is rebuilt.
+- **Native agent session restore** (`AgentResumePlan` and the restore path in `session.rs`,
+  `[agents.launch] resume` in `vvmux-plugin-api`) — the resume command shapes, the reserve-before-arm
+  deduplication, the rule that an unsupported or duplicated reference restores as a plain shell, and
+  the decision to wait for a client rather than resume at server start are adapted from HerdR's
+  `src/agent_resume.rs` and `src/app/agent_resume.rs`. Four deliberate divergences. The per-agent
+  commands live in each provider's manifest as an argument template rather than in a hardcoded
+  sixteen-entry Rust match, so a user's own plugin can declare a resumable agent without a vvmux
+  release — the same providers-as-data decision the launch executable follows. The command line is
+  resolved when the resume fires rather than when it is armed, because vvmux compiles its agent
+  catalog from the plugin registry after the session actor exists. vvmux needs no equivalent of
+  HerdR's 750 ms host-theme wait, because its client sends geometry with the attach. And the restored
+  pane's shell is identified from what this session spawned rather than by scanning the process
+  table, which the session actor is not allowed to do.
 - **Agent prompt and bounded keys** (`agent_drive.rs`, `agent-prompt` and `agent-send-keys` in
   `session.rs`) — the prompt/submit split and 5 s no-transition stall gate are adapted from
   HerdR's agent automation path. vvmux routes both writes through its delayed, bounded PTY input

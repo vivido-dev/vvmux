@@ -86,6 +86,25 @@ const HISTORY_MAX_PANE_BYTES: usize = 256 * 1024;
 /// capture would be refused by its own writer.
 const HISTORY_MAX_SESSION_BYTES: usize = 4 * 1024 * 1024;
 
+/// A restored pane's agent and the conversation it will reopen.
+///
+/// Deliberately not the command line. The argv is resolved when the resume fires, not when it is
+/// armed: the agent catalog is compiled from the plugin registry and arrives by event *after* the
+/// actor is constructed, so at restore time there is nothing to resolve against. Resolving late also
+/// means a provider disabled between restore and attach simply does not resume, rather than running
+/// a command built from a registry that no longer applies.
+#[derive(Debug, Clone)]
+struct AgentResumePlan {
+    kind: crate::agent::AgentId,
+    /// The alias this agent carried, reapplied once it is actually running again.
+    alias: Option<crate::agent::AgentAlias>,
+    /// The integration that reported the session, checked against the provider at fire time.
+    source: String,
+    session: crate::agent::AgentSessionRef,
+    /// Identifies one conversation, so two panes cannot reopen the same one.
+    dedupe_key: String,
+}
+
 /// What one capture walk produces: the state a layout file cannot describe, and the slot-to-pane
 /// mapping that only the walk itself knows.
 #[derive(Default)]
@@ -670,6 +689,16 @@ struct Pane {
     /// only on lifecycle change. `screen_sequence` cannot answer: a spinner or a clock redraws
     /// constantly without the agent's state meaning anything different.
     agent_change_seq: u64,
+    /// A resume this pane will run once a client attaches, from a restored snapshot.
+    pending_resume: Option<AgentResumePlan>,
+    /// A name waiting for the agent it belongs to to come back.
+    ///
+    /// Held here rather than set on the agent runtime directly, because the resume has only just
+    /// been typed: the agent's process arrives a moment later, and `observe_process` clears the
+    /// runtime's alias when a new foreground group appears — correctly, since it cannot tell a
+    /// resumed agent from a different program the user started. The name is applied once the agent
+    /// is actually detected.
+    pending_alias: Option<crate::agent::AgentAlias>,
     copy: Option<CopyState>,
     mouse_selection: Option<MouseSelection>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
@@ -2504,6 +2533,10 @@ impl SessionActor {
                     MediaTraceKind::BridgeClientAttached { vivid },
                 );
                 self.resize_all();
+                // After the resize, never before: an agent reads its terminal size as it starts,
+                // and one launched against the placeholder geometry would lay itself out for a
+                // window that does not exist. This is also why a resume waits for an attach at all.
+                self.fire_pending_resumes();
                 self.sync_media(true);
                 self.schedule_render();
             }
@@ -5306,44 +5339,11 @@ impl SessionActor {
             );
             return;
         };
-        let Some(command) = crate::agent_drive::shell_command_line(&argv, &shell) else {
-            self.reply_automation_error(
-                reply,
-                AutomationError::new("invalid_params", "agent launch has no command"),
-            );
-            return;
-        };
-        let Some(pane) = self.panes.get(&pane_id) else {
-            self.reply_automation_error(
-                reply,
-                AutomationError::new("pane_not_found", "pane no longer exists"),
-            );
-            return;
-        };
-        let modes = pane.terminal.modes();
-        let enter = match encode_automation_key("Enter", &[], modes) {
-            Ok(enter) => enter,
-            Err(error) => {
-                self.reply_automation_error(reply, error);
-                return;
-            }
-        };
-        let mut bytes = sanitize_bracketed_paste(command.as_bytes());
-        if modes.bracketed_paste {
-            bytes.splice(0..0, b"\x1b[200~".iter().copied());
-            bytes.extend_from_slice(b"\x1b[201~");
-        }
-        // One write, like `submit`: a failure part way through would leave half an agent command
-        // sitting at the prompt for the user to find.
-        bytes.extend_from_slice(&enter);
-        if let Err(error) = pane.input.send(&bytes) {
+        if let Err(error) = self.type_agent_command(pane_id, &argv, &shell) {
             // Named rather than left to time out: a queue that refused the command is a different
             // problem from an agent that failed to start, and thirty seconds of waiting would
             // describe it as the second one.
-            self.reply_automation_error(
-                reply,
-                AutomationError::new("agent_start_input_failed", error.to_string()),
-            );
+            self.reply_automation_error(reply, error);
             return;
         }
         // The waiter is registered after the write but within the same actor turn, so no
@@ -5358,6 +5358,37 @@ impl SessionActor {
                 ready_after: Instant::now() + crate::agent_drive::AGENT_START_SETTLE,
             },
         });
+    }
+
+    /// Type one agent's command line at a pane's shell, as a single write.
+    ///
+    /// Shared by `agent-start` and by session restore, which need the same quoting, the same
+    /// bracketed-paste handling, and the same all-or-nothing write, and differ only in whether
+    /// anyone is waiting for the result. A failure part way through would leave half an agent
+    /// command sitting at the prompt for the user to find.
+    fn type_agent_command(
+        &mut self,
+        pane_id: PaneId,
+        argv: &[String],
+        shell: &str,
+    ) -> Result<(), AutomationError> {
+        let command = crate::agent_drive::shell_command_line(argv, shell)
+            .ok_or_else(|| AutomationError::new("invalid_params", "agent launch has no command"))?;
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
+        let modes = pane.terminal.modes();
+        let enter = encode_automation_key("Enter", &[], modes)?;
+        let mut bytes = sanitize_bracketed_paste(command.as_bytes());
+        if modes.bracketed_paste {
+            bytes.splice(0..0, b"\x1b[200~".iter().copied());
+            bytes.extend_from_slice(b"\x1b[201~");
+        }
+        bytes.extend_from_slice(&enter);
+        pane.input
+            .send(&bytes)
+            .map_err(|error| AutomationError::new("agent_start_input_failed", error.to_string()))
     }
 
     /// Answer a still-hosting probe.
@@ -5489,6 +5520,12 @@ impl SessionActor {
                 }
                 agent
             }),
+            // The kind alone, never the command: the argv embeds the session identity, and this
+            // is a broad listing rather than the exact-pane disclosure that identity is confined to.
+            "pending_resume": pane.pending_resume.as_ref().map(|plan| serde_json::json!({
+                "agent": plan.kind,
+                "armed": true,
+            })),
             "geometry": rect_json(outer),
             "content_geometry": rect_json(outer.content()),
             "columns": pane.terminal.cols(),
@@ -6332,6 +6369,7 @@ impl SessionActor {
     /// Consumers that react to a transition — lifecycle events, state waiters, notifications —
     /// belong in the loop below rather than at the six call sites.
     fn sync_agent_status(&mut self) {
+        self.adopt_pending_aliases();
         let mut transitions = Vec::new();
         for pane in self.panes.values_mut() {
             let current = pane.agent.snapshot();
@@ -9029,6 +9067,9 @@ impl SessionActor {
     ) -> io::Result<()> {
         let area = self.content_area();
         let mut restored_active = None;
+        // One conversation, one pane. Reserved across the whole restore rather than per tab,
+        // because a duplicate reference can appear in any two panes of the session.
+        let mut resumed_sessions: HashSet<String> = HashSet::new();
         for (plan_index, planned) in plan.tabs.into_iter().enumerate() {
             // Keyed by the plan's tab index, which is the index the capture walk emitted, not the
             // index this tab ends up at — a tab whose panes all failed to spawn is skipped below.
@@ -9132,12 +9173,25 @@ impl SessionActor {
             if extras.is_some_and(|extras| extras.active_tab == plan_index) {
                 restored_active = Some(self.tabs.len());
             }
+            if let Some(tab_extras) = tab_extras {
+                self.arm_pane_resumes(tab_extras, &slot_ids, &failed, &mut resumed_sessions);
+            }
             if let Some(tab_history) = tab_history {
                 for pane_history in &tab_history.panes {
                     let Some(pane_id) = slot_ids.get(pane_history.slot).copied() else {
                         continue;
                     };
                     if failed.contains(&pane_id) {
+                        continue;
+                    }
+                    // An agent about to reopen its own conversation repaints its own transcript.
+                    // Replaying the screen underneath it would show that transcript twice, so a
+                    // pane with a resume armed gets none.
+                    if self
+                        .panes
+                        .get(&pane_id)
+                        .is_some_and(|pane| pane.pending_resume.is_some())
+                    {
                         continue;
                     }
                     let rows = pane_history
@@ -9282,6 +9336,191 @@ impl SessionActor {
         Ok(LayoutFile::from_tabs(tabs))
     }
 
+    /// Arm the panes whose agents can reopen the conversation they had.
+    ///
+    /// Arms rather than launches: a restored pane is sitting at the placeholder geometry with no
+    /// client watching, and a full-screen agent started there would paint itself for a terminal
+    /// nobody is looking at and then have to be told the real size. The launch happens on attach.
+    ///
+    /// Everything here is re-validated rather than trusted. A snapshot is a file, so the agent kind,
+    /// the alias, and the session reference are all reparsed, and the reporting source is checked
+    /// against the provider that owns the kind — the resume becomes a command line on the user's
+    /// machine, so a reference from anywhere else is not one this may act on.
+    fn arm_pane_resumes(
+        &mut self,
+        tab_extras: &TabExtras,
+        slot_ids: &[PaneId],
+        failed: &HashSet<PaneId>,
+        resumed: &mut HashSet<String>,
+    ) {
+        if !self.config.session.resume_agents {
+            return;
+        }
+        for pane_extras in &tab_extras.panes {
+            let Some(pane_id) = slot_ids.get(pane_extras.slot).copied() else {
+                continue;
+            };
+            if failed.contains(&pane_id) {
+                continue;
+            }
+            let Some(agent) = pane_extras.agent.as_ref() else {
+                continue;
+            };
+            let Some(plan) = self.resume_plan(agent) else {
+                continue;
+            };
+            // Reserved before arming, so the second pane naming one conversation restores as the
+            // plain shell it will stay rather than racing the first to reopen it.
+            if !resumed.insert(plan.dedupe_key.clone()) {
+                continue;
+            }
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                pane.pending_resume = Some(plan);
+            }
+        }
+    }
+
+    /// Give a resumed agent back the name it had, once it is actually running.
+    ///
+    /// Waits for detection rather than racing it: the resume is typed at a shell, and the agent's
+    /// own process appears afterwards. Uniqueness is checked here rather than when the name was
+    /// recorded, because the session it is rejoining is not the one it left — another pane may
+    /// already hold the name.
+    fn adopt_pending_aliases(&mut self) {
+        let ready = self
+            .panes
+            .iter()
+            .filter(|(_, pane)| pane.pending_alias.is_some() && pane.agent.snapshot().is_some())
+            .map(|(pane_id, _)| *pane_id)
+            .collect::<Vec<_>>();
+        for pane_id in ready {
+            let Some(alias) = self
+                .panes
+                .get_mut(&pane_id)
+                .and_then(|pane| pane.pending_alias.take())
+            else {
+                continue;
+            };
+            if self.pane_with_agent_alias(&alias).is_some() {
+                continue;
+            }
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                pane.agent.adopt_alias(alias);
+            }
+        }
+    }
+
+    /// The shell a restored pane is sitting at, when it is sitting at one.
+    ///
+    /// Cheap by construction rather than by approximation. The foreground process group equalling
+    /// the pane's own child means nothing has taken the terminal from the shell, which is a
+    /// `tcgetpgrp` call; the shell's *name* needs no lookup at all, because this session chose it
+    /// when it spawned the pane. Refuses a shell this build cannot quote for, exactly as
+    /// `agent-start` does.
+    fn restored_pane_shell(&self, pane_id: PaneId) -> Option<String> {
+        let pane = self.panes.get(&pane_id)?;
+        if pane.child_pid == 0
+            || pane
+                .control
+                .foreground_process_group_id()
+                .is_some_and(|group| group != pane.child_pid)
+        {
+            return None;
+        }
+        let shell = self
+            .config
+            .general
+            .shell
+            .as_ref()
+            .map(|path| OsString::from(path.as_os_str()))
+            .or_else(default_shell)
+            .unwrap_or_else(fallback_shell);
+        let name = Path::new(&shell)
+            .file_name()?
+            .to_string_lossy()
+            .into_owned();
+        crate::agent_drive::is_pane_shell(&name).then_some(name)
+    }
+
+    /// Turn one pane's recorded agent into a resume plan, or nothing if it cannot be trusted.
+    fn resume_plan(&self, agent: &PaneAgentExtras) -> Option<AgentResumePlan> {
+        let kind = crate::agent::AgentId::new(agent.kind.clone()?).ok()?;
+        let source = agent.session_source.clone()?;
+        let session = crate::agent::AgentSessionRef::new(
+            agent.session_id.clone(),
+            agent.session_path.clone(),
+        )?;
+        session.validate().ok()?;
+        Some(AgentResumePlan {
+            // Reparsed rather than carried: an alias that no longer fits the grammar is dropped
+            // rather than becoming a target nothing else could have created.
+            alias: agent
+                .alias
+                .as_deref()
+                .and_then(|alias| crate::agent::AgentAlias::new(alias).ok()),
+            dedupe_key: format!(
+                "{source}\0{kind}\0{}\0{}",
+                session.id().unwrap_or_default(),
+                session.path().unwrap_or_default()
+            ),
+            kind,
+            source,
+            session,
+        })
+    }
+
+    /// Run every armed resume, now that a client has supplied real geometry.
+    ///
+    /// One attempt each, success or failure: a pane whose shell is busy, or whose write fails, is
+    /// left as the working shell it already is rather than retried into an unclear state. Nothing is
+    /// waiting on a reply, so a failure is reported to nobody and costs only the resume.
+    fn fire_pending_resumes(&mut self) {
+        if !self.config.session.resume_agents {
+            return;
+        }
+        let armed = self
+            .panes
+            .iter()
+            .filter(|(_, pane)| pane.pending_resume.is_some())
+            .map(|(pane_id, _)| *pane_id)
+            .collect::<Vec<_>>();
+        for pane_id in armed {
+            let Some(plan) = self
+                .panes
+                .get_mut(&pane_id)
+                .and_then(|pane| pane.pending_resume.take())
+            else {
+                continue;
+            };
+            // The pane's own shell has to be what is in the foreground, or the resume would be
+            // typed into whatever is. `agent-start` answers this by scanning the process table on a
+            // worker, because it cannot know what a user's pane is running. Restore can: this pane
+            // was spawned by this session moments ago with a shell this session chose, so the
+            // foreground-group check alone settles it, and the actor never touches `/proc`.
+            // Resolved now, against the catalog that actually applies, and refused if the
+            // provider no longer declares a resume or the reporting source does not own the kind.
+            let Some(argv) =
+                self.agent_catalog
+                    .resume_argv(&plan.kind, &plan.source, &plan.session)
+            else {
+                continue;
+            };
+            let Some(shell) = self.restored_pane_shell(pane_id) else {
+                continue;
+            };
+            if let Err(error) = self.type_agent_command(pane_id, &argv, &shell) {
+                eprintln!(
+                    "vvmux: could not resume {} in pane {pane_id}: {}",
+                    plan.kind, error.message
+                );
+                continue;
+            }
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                pane.pending_alias = plan.alias;
+            }
+        }
+    }
+
     /// One pane's scrollback, bounded and stripped to text and style.
     ///
     /// Bounded twice on purpose: by lines, so a pane that scrolled a gigabyte contributes what a
@@ -9367,9 +9606,7 @@ impl SessionActor {
             (snapshot.is_some() || alias.is_some()).then(|| PaneAgentExtras {
                 alias: alias.map(ToString::to_string),
                 kind: snapshot.map(|snapshot| snapshot.kind.to_string()),
-                // The reporting source that supplied the reference is not tracked today; native
-                // session restore adds it when it needs to gate a resume on it.
-                session_source: None,
+                session_source: pane.agent.session_source().map(ToOwned::to_owned),
                 session_id: session
                     .and_then(|session| session.id())
                     .map(ToOwned::to_owned),
@@ -9571,6 +9808,8 @@ impl SessionActor {
                 agent: AgentRuntime::new(),
                 agent_published: None,
                 agent_change_seq: 0,
+                pending_resume: None,
+                pending_alias: None,
                 copy: None,
                 mouse_selection: None,
                 vivid_metrics: None,

@@ -133,6 +133,13 @@ auto_snapshot = true
 # it off discards the file.
 pane_history = false
 
+# Reopen each restored agent pane's conversation with the agent's own resume command, using the
+# session identity its integration reported. Fires when a client attaches, never at server start: a
+# full-screen agent launched against the placeholder geometry would lay itself out for a window
+# nobody is looking at. Only the integration that owns an agent kind may supply the identity a
+# resume is built from. Off means agent panes restore as plain shells.
+resume_agents = true
+
 [plugins]
 # Live global kill switch. Disabling stops runtimes and the registry watcher for this session.
 # It also disables bundled and installed agent detection. Toggle individual bundled providers with

@@ -54,6 +54,11 @@ Use this release-matched workflow:
    writes whatever scrolled past a pane — including secrets — to disk. Never enable it on a user's
    behalf to make a task easier.
 
+15. After a restart, an agent pane reopens its own conversation when a client attaches — check
+   `inspect`'s `pending_resume` before concluding a pane is a bare shell, and do not launch a second
+   agent into it. A resume needs the agent's integration installed (`vvmux integration install`),
+   because the session identity it uses comes from that integration and only from it.
+
 Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
 needed. It proves the bytes reached the PTY writer, not that the child application consumed them.
 Use `wait media-track` only with complete producer/context/surface/track identity. Never address a

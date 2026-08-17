@@ -22,7 +22,10 @@ impl Fixture {
         builder.prefix("vvl-");
         let runtime = builder.tempdir_in("/tmp").unwrap();
         fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let shell = runtime.path().join("fixture-shell");
+        // Named `sh` because that is what it is: a POSIX shell wrapper. The name matters — vvmux
+        // recognizes a pane's shell by it, and refuses to type a command line at one whose quoting
+        // rules it does not implement.
+        let shell = runtime.path().join("sh");
         fs::write(
             &shell,
             br#"#!/bin/sh
@@ -68,6 +71,67 @@ while IFS= read -r line; do :; done
             .unwrap()
     }
 
+    /// Swap the pane shell for one that actually runs what is typed at it.
+    ///
+    /// The default fixture reads its input and discards it, which is right for tests that only need
+    /// a pane to exist. A resume is *typed at a shell*, so testing one needs a shell that executes.
+    /// Still named `sh`, because vvmux recognizes a pane's shell by name before quoting for it.
+    fn use_executing_shell(&self) {
+        let shell = self.runtime.path().join("sh");
+        fs::write(
+            &shell,
+            br#"#!/bin/sh
+if [ "$1" = "-c" ]; then
+    shift
+    exec /bin/sh -c "$@"
+fi
+printf 'READY pane=%s tab=%s
+' "$VVMUX_PANE_ID" "$VVMUX_TAB_ID"
+while IFS= read -r line; do
+    eval "$line"
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn append_config(&self, section: &str) {
+        let original = fs::read_to_string(&self.config).unwrap();
+        fs::write(&self.config, format!("{original}\n{section}\n")).unwrap();
+    }
+
+    /// Attach through a real pty, long enough for the server to apply geometry and act on it.
+    ///
+    /// A resume deliberately waits for an attach, so a test of one has to produce a genuine
+    /// attachment: a pipe is refused for having zero dimensions, which is exactly right and exactly
+    /// unhelpful here.
+    fn attach_briefly(&self, seconds: u64) {
+        let script = format!(
+            "import pty,os,time,fcntl,termios,struct,sys\n\
+             pid,fd = pty.fork()\n\
+             if pid == 0:\n\
+             \x20   os.environ['XDG_RUNTIME_DIR']={runtime:?}\n\
+             \x20   os.environ['XDG_CONFIG_HOME']={runtime:?}\n\
+             \x20   os.environ['XDG_STATE_HOME']={state:?}\n\
+             \x20   os.environ['HOME']={runtime:?}\n\
+             \x20   os.execvp({binary:?}, [{binary:?},'attach','--target',{name:?}])\n\
+             fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))\n\
+             time.sleep({seconds})\n\
+             os.kill(pid, 15)\n",
+            runtime = self.runtime.path().to_str().unwrap(),
+            state = self.runtime.path().join("state").to_str().unwrap(),
+            binary = env!("CARGO_BIN_EXE_vvmux"),
+            name = self.name,
+        );
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .status()
+            .unwrap();
+        assert!(status.success(), "attach helper failed");
+    }
+
     fn enable_pane_history(&self) {
         let original = fs::read_to_string(&self.config).unwrap();
         fs::write(
@@ -95,7 +159,22 @@ while IFS= read -r line; do :; done
     }
 
     fn start_without_layout(&self) -> Output {
-        common::vvmux_command(self.runtime.path())
+        let mut command = common::vvmux_command(self.runtime.path());
+        // The daemon's PATH is what a pane's shell resolves a bare command name against, so a
+        // fixture executable has to be on it. `HOME` is already isolated by the harness, which is
+        // what stops a developer's profile from reordering this out from under the test.
+        let bin = self.runtime.path().join("bin");
+        if bin.is_dir() {
+            command.env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+        }
+        command
             .args(["--config"])
             .arg(&self.config)
             .args(["new", "--session", &self.name, "--detached"])
@@ -152,6 +231,27 @@ while IFS= read -r line; do :; done
             .args(arguments)
             .output()
             .unwrap()
+    }
+
+    /// Run a `msg` command, retrying while the agent catalog is still being compiled.
+    ///
+    /// The builtin providers arrive from the plugin registry by event, after the session is already
+    /// answering requests, so a report sent immediately after `new` can be refused with
+    /// `agent definition is not enabled`. Retrying the same call is safe: a rejected report does not
+    /// consume its sequence slot, so the retry is identical rather than merely similar.
+    fn msg_when_agents_ready(&self, arguments: &[&str]) -> Output {
+        for _ in 0..100 {
+            let output = self.msg(arguments);
+            if output.status.success() {
+                return output;
+            }
+            if !String::from_utf8_lossy(&output.stderr).contains("agent definition is not enabled")
+            {
+                return output;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        self.msg(arguments)
     }
 
     fn panes(&self) -> Vec<Value> {
@@ -976,4 +1076,210 @@ fn history_size(fixture: &Fixture, pane: u64) -> u64 {
 fn text(output: Output) -> String {
     assert_success(&output);
     String::from_utf8(output.stdout).unwrap()
+}
+
+/// After a restart, an agent pane reopens the conversation it had — and does so only once someone
+/// is looking.
+#[test]
+fn a_restored_agent_pane_resumes_its_conversation_when_a_client_attaches() {
+    let fixture = Fixture::new("resume");
+    fixture.use_executing_shell();
+    // An executable named `codex` that records how it was invoked, then holds the pane while
+    // painting a marker the codex rules classify. It forks nothing: a fixture that spawned a child
+    // every second would flap detection, and every identity change correctly clears agent state.
+    let bin = fixture.runtime.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = fixture.runtime.path().join("argv.txt");
+    fs::write(
+        bin.join("codex"),
+        format!(
+            "#!/bin/sh\nprintf 'ARGV[%s]\\n' \"$@\" >> {log:?}\n\
+             printf '\\033[H\\033[2JAllow command? esc to interrupt\\n'\n\
+             while IFS= read -r line; do :; done\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    // The integration's own source name: the resume is gated on it, so reporting under any other
+    // name must not produce one.
+    assert_success(&fixture.msg_when_agents_ready(&[
+        "report-agent",
+        "--agent",
+        "codex",
+        "--state",
+        "idle",
+        "--source",
+        "vvmux:codex",
+        "--sequence",
+        "1",
+        "--agent-session-id",
+        "CONV-42",
+        "--pane-id",
+        "1",
+    ]));
+    assert_success(&fixture.msg(&["agent-rename", "--pane-id", "1", "--name", "reviewer"]));
+    fixture.kill();
+
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    // Armed, and deliberately not fired: nobody is attached, so nothing has been launched.
+    assert_eq!(
+        json(fixture.msg(&["inspect", "--pane-id", "1"]))["pane"]["pending_resume"]["agent"],
+        "codex"
+    );
+    assert!(
+        !log.exists(),
+        "an agent was launched into a session nobody is watching"
+    );
+
+    fixture.attach_briefly(8);
+
+    assert!(
+        log.exists(),
+        "the resume never ran: pane after attach = {}",
+        json(fixture.msg(&["inspect", "--pane-id", "1"]))["pane"]
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap().trim(),
+        "ARGV[resume]\nARGV[CONV-42]",
+        "the agent was not resumed with its own session"
+    );
+    let pane = json(fixture.msg(&["inspect", "--pane-id", "1"]))["pane"].clone();
+    assert!(pane["pending_resume"].is_null(), "the resume did not clear");
+    assert_eq!(pane["agent"]["kind"], "codex");
+    // The name comes back with the agent, so a script written before the restart still works.
+    assert_eq!(pane["agent"]["alias"], "reviewer");
+    assert_success(&fixture.msg(&["--alias", "reviewer", "agent-explain"]));
+}
+
+/// A session reference is only actionable when the integration that owns the agent reported it.
+/// Anything else restores as the plain shell it already is.
+#[test]
+fn a_session_reported_by_a_foreign_source_is_not_resumed() {
+    let fixture = Fixture::new("foreign");
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    assert_success(&fixture.msg_when_agents_ready(&[
+        "report-agent",
+        "--agent",
+        "codex",
+        "--state",
+        "idle",
+        // Not `vvmux:codex`: a source that does not own this agent kind.
+        "--source",
+        "some-other-tool",
+        "--sequence",
+        "1",
+        "--agent-session-id",
+        "CONV-42",
+        "--pane-id",
+        "1",
+    ]));
+    fixture.kill();
+
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    fixture.attach_briefly(4);
+    assert!(
+        json(fixture.msg(&["inspect", "--pane-id", "1"]))["pane"]["agent"].is_null(),
+        "a foreign source's session reference produced a resume"
+    );
+}
+
+/// Opting out has to mean no agent processes are started, whatever the snapshot says.
+#[test]
+fn resume_can_be_turned_off() {
+    let fixture = Fixture::new("noresume");
+    fixture.append_config("[session]\nresume_agents = false");
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    assert_success(&fixture.msg_when_agents_ready(&[
+        "report-agent",
+        "--agent",
+        "codex",
+        "--state",
+        "idle",
+        "--source",
+        "vvmux:codex",
+        "--sequence",
+        "1",
+        "--agent-session-id",
+        "CONV-42",
+        "--pane-id",
+        "1",
+    ]));
+    fixture.kill();
+
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    assert!(
+        json(fixture.msg(&["inspect", "--pane-id", "1"]))["pane"]["pending_resume"].is_null(),
+        "a resume was armed with resume_agents off"
+    );
+}
+
+/// An agent that reopens its own conversation repaints its own transcript. Replaying the screen
+/// underneath it would show that transcript twice, so a pane with a resume armed gets no history —
+/// while a pane beside it, with no agent, still does.
+#[test]
+fn a_resuming_pane_gets_no_history_replay_but_its_neighbour_does() {
+    let fixture = Fixture::new("resumehist");
+    fixture.use_executing_shell();
+    fixture.enable_pane_history();
+    let bin = fixture.runtime.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("codex"),
+        "#!/bin/sh\nprintf '\\033[H\\033[2JAllow command? esc to interrupt\\n'\nwhile IFS= read -r line; do :; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    fixture.wait_text(2, "READY pane=2");
+
+    // Both panes scroll, so both have history worth replaying; only one has an agent.
+    for pane in [1, 2] {
+        assert_success(&fixture.msg(&[
+            "submit",
+            "i=1; while [ $i -le 60 ]; do printf \"SCROLL-$i\\n\"; i=$((i+1)); done",
+            "--pane-id",
+            &pane.to_string(),
+        ]));
+        fixture.wait_text(pane, "SCROLL-60");
+    }
+    assert_success(&fixture.msg_when_agents_ready(&[
+        "report-agent",
+        "--agent",
+        "codex",
+        "--state",
+        "idle",
+        "--source",
+        "vvmux:codex",
+        "--sequence",
+        "1",
+        "--agent-session-id",
+        "CONV-9",
+        "--pane-id",
+        "1",
+    ]));
+    fixture.kill();
+
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(2, "READY pane=2");
+    // Pane 1 holds the agent, so its scrollback is left to the agent; pane 2 gets its own back.
+    assert_eq!(
+        history_size(&fixture, 1),
+        0,
+        "history was replayed under a pane that is about to resume its agent"
+    );
+    assert!(
+        history_size(&fixture, 2) > 0,
+        "the pane with no agent lost its history too"
+    );
 }
