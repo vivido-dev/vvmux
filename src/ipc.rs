@@ -144,6 +144,11 @@ pub enum AutomationMethod {
     AgentSendKeys {
         keys: Vec<String>,
     },
+    /// Read an idle agent's alternate-screen transcript, restoring its viewport afterward.
+    AgentRead {
+        lines: u16,
+        json: bool,
+    },
     Inspect,
     InspectMedia,
     TraceMedia {

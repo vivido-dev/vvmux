@@ -45,3 +45,9 @@ Later features adapted from the same HerdR commit, recorded as they land:
   vvmux's own detection startup grace, which HerdR does not have to consider because its
   classification has no equivalent forced-idle window. HerdR's agent names/aliases
   (`agent start <name>`, `agent rename`) are not ported here; vvmux targets panes by ID.
+- **Alternate-screen transcript reads** (`alt_read.rs`, `agent-read` in `session.rs`) — the
+  70%-similar viewport settling, 30%-overlap upward alignment, fixed-header-safe prepend merge,
+  soft-wrap reconstruction, three-event wheel steps, and bounded harvest/restore phases are
+  adapted from `src/server/alt_screen_read.rs` and `src/terminal/history_read.rs`. vvmux drives the
+  phases on its existing session-actor deadlines and writes through its bounded PTY input queue;
+  it additionally encodes synthetic coordinates in pixels when the application enabled DEC 1016.

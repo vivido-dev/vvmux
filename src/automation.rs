@@ -342,6 +342,15 @@ pub enum MsgCommand {
         #[arg(long = "key", value_name = "KEY")]
         keys: Vec<String>,
     },
+    /// Read an idle full-screen agent's application-owned scrollback.
+    AgentRead {
+        #[arg(long)]
+        pane_id: u64,
+        #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        lines: u16,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect one pane.
     Inspect(PaneTarget),
     /// Inspect sanitized Vivid media state owned by one pane.
@@ -977,9 +986,22 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 Output::Json,
             )
         }
-        MsgCommand::AgentSendKeys { pane_id, keys } => {
-            (AutomationMethod::AgentSendKeys { keys }, Some(pane_id), true, Output::Json)
-        }
+        MsgCommand::AgentSendKeys { pane_id, keys } => (
+            AutomationMethod::AgentSendKeys { keys },
+            Some(pane_id),
+            true,
+            Output::Json,
+        ),
+        MsgCommand::AgentRead {
+            pane_id,
+            lines,
+            json,
+        } => (
+            AutomationMethod::AgentRead { lines, json },
+            Some(pane_id),
+            false,
+            if json { Output::Json } else { Output::Text },
+        ),
         MsgCommand::Inspect(target) => (
             AutomationMethod::Inspect,
             target.pane_id,

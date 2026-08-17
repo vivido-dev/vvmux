@@ -283,7 +283,7 @@ pub enum AgentProbe {
 }
 
 #[derive(Debug, Clone)]
-struct PendingAgentPrompt {
+pub(crate) struct PendingAgentPrompt {
     text: String,
     wait: bool,
     until: Vec<crate::agent::AgentStatus>,
@@ -679,6 +679,13 @@ struct AutomationWaiter {
     kind: AutomationWaitKind,
 }
 
+struct PendingAgentRead {
+    reply: AutomationReplyTarget,
+    read: crate::alt_read::PendingAltRead,
+    lines: usize,
+    json: bool,
+}
+
 enum AutomationWaitKind {
     Text {
         pattern: AutomationTextPattern,
@@ -711,7 +718,6 @@ enum AutomationWaitKind {
     AgentPrompt {
         phase: AgentPromptPhase,
         until: Vec<AgentStatus>,
-        baseline_seq: u64,
         baseline_status: Option<AgentStatus>,
     },
     Media {
@@ -1422,6 +1428,7 @@ struct SessionActor {
     last_plugin_focus: Option<(bool, Option<u64>, Option<PaneId>)>,
     last_plugin_media_revision: u64,
     automation_waiters: Vec<AutomationWaiter>,
+    alt_reads: HashMap<PaneId, PendingAgentRead>,
     /// Input scheduled to reach a pane later, earliest first.
     delayed_inputs: BinaryHeap<Reverse<DelayedInput>>,
     #[allow(dead_code)]
@@ -1629,6 +1636,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         last_plugin_focus: None,
         last_plugin_media_revision: 0,
         automation_waiters: Vec::new(),
+        alt_reads: HashMap::new(),
         delayed_inputs: BinaryHeap::new(),
         next_delayed_input: 0,
         exit_tombstones: VecDeque::new(),
@@ -1680,6 +1688,7 @@ impl SessionActor {
             timeout = timeout.min(self.next_notice_deadline());
             timeout = timeout.min(self.next_sync_flush_delay());
             timeout = timeout.min(self.next_delayed_input_deadline());
+            timeout = timeout.min(self.next_alt_read_deadline());
             // Give ready media low-latency service, but force a general-queue turn after a bounded
             // batch. A bounded channel is not a bounded drain when its producer can refill it.
             if self.drain_media(&media_receiver) {
@@ -1711,6 +1720,7 @@ impl SessionActor {
                     // waiters itself for anything that changes state, so this only adds the sweep
                     // for the cases where classification changed nothing.
                     self.evaluate_agent_states();
+                    self.poll_alt_reads();
                     self.check_automation_waiters();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1731,6 +1741,7 @@ impl SessionActor {
                     // waiters itself for anything that changes state, so this only adds the sweep
                     // for the cases where classification changed nothing.
                     self.evaluate_agent_states();
+                    self.poll_alt_reads();
                     self.check_automation_waiters();
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1838,6 +1849,8 @@ impl SessionActor {
                     .retain(|(client_id, _)| *client_id != id);
                 self.automation_waiters
                     .retain(|waiter| waiter.reply.client_id != id);
+                self.alt_reads
+                    .retain(|_, pending| pending.reply.client_id != id);
                 self.plugin_event_subscriptions
                     .retain(|_, subscription| subscription.client_id != id);
                 if self.attached.as_ref().is_some_and(|client| client.id == id) {
@@ -3304,6 +3317,9 @@ impl SessionActor {
                 let pane_id = pane_id.unwrap();
                 self.agent_send_keys(target, pane_id, keys);
             }
+            AutomationMethod::AgentRead { lines, json } => {
+                self.agent_read(target, pane_id.unwrap(), usize::from(lines), json);
+            }
             AutomationMethod::GetText { rows, source } => {
                 match self.execute_session_command(
                     &caller,
@@ -4622,12 +4638,16 @@ impl SessionActor {
                     AutomationError::new("agent_prompt_failed", error.to_string()),
                 );
             } else {
-                self.reply_automation(reply, serde_json::json!({
-                    "pane_id": pane_id,
-                    "agent": agent_json(snapshot),
-                    "status": snapshot.status,
-                    "session_sequence": self.session_sequence,
-                }));
+                let status = snapshot.status;
+                self.reply_automation(
+                    reply,
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "agent": agent_json(snapshot),
+                        "status": status,
+                        "session_sequence": self.session_sequence,
+                    }),
+                );
             }
             return;
         }
@@ -4684,7 +4704,6 @@ impl SessionActor {
             kind: AutomationWaitKind::AgentPrompt {
                 phase,
                 until: std::mem::take(&mut pending.until),
-                baseline_seq: pending.baseline_seq,
                 baseline_status: pending.baseline_status,
             },
         });
@@ -4775,19 +4794,208 @@ impl SessionActor {
                     return;
                 }
             };
-            let encoded = match encode_automation_key(&normalized, &modifiers, pane.terminal.modes()) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    self.reply_automation_error(
-                        target,
-                        AutomationError::new("invalid_key", error.message),
-                    );
-                    return;
-                }
-            };
+            let encoded =
+                match encode_automation_key(&normalized, &modifiers, pane.terminal.modes()) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.reply_automation_error(
+                            target,
+                            AutomationError::new("invalid_key", error.message),
+                        );
+                        return;
+                    }
+                };
             bytes.extend_from_slice(&encoded);
         }
         self.automation_input(target, pane_id, bytes, false);
+    }
+
+    fn agent_read(
+        &mut self,
+        target: AutomationReplyTarget,
+        pane_id: PaneId,
+        lines: usize,
+        json: bool,
+    ) {
+        let Some(pane) = self.panes.get(&pane_id) else {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("pane_not_found", "pane no longer exists"),
+            );
+            return;
+        };
+        let Some(snapshot) = pane.agent.snapshot() else {
+            self.reply_automation_error(
+                target,
+                AutomationError::new(
+                    "agent_not_detected",
+                    "pane has no detected or reported agent",
+                ),
+            );
+            return;
+        };
+        if snapshot.status != AgentStatus::Idle {
+            self.reply_automation_error(
+                target,
+                AutomationError::new(
+                    "agent_not_idle",
+                    format!(
+                        "cannot read {lines} lines while {} is {}: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use get-text without --lines",
+                        snapshot.kind,
+                        snapshot.status.label(),
+                    ),
+                ),
+            );
+            return;
+        }
+        if !pane.terminal.alternate_screen() {
+            self.reply_automation_error(
+                target,
+                AutomationError::new(
+                    "not_alternate_screen",
+                    "agent is not using the alternate screen",
+                ),
+            );
+            return;
+        }
+        let modes = pane.terminal.modes();
+        if !(modes.mouse_clicks || modes.mouse_motion) {
+            self.reply_automation_error(
+                target,
+                AutomationError::new(
+                    "mouse_reporting_disabled",
+                    "agent has not enabled terminal mouse reporting",
+                ),
+            );
+            return;
+        }
+        if self.alt_reads.contains_key(&pane_id) {
+            self.reply_automation_error(
+                target,
+                AutomationError::new(
+                    "alt_read_in_progress",
+                    "an alternate-screen read is already in progress for this pane",
+                ),
+            );
+            return;
+        }
+        if self.alt_reads.len() >= crate::alt_read::MAX_ALT_SCREEN_READS {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("busy", "alternate-screen read concurrency limit reached"),
+            );
+            return;
+        }
+        if lines <= pane.terminal.rows() {
+            let text = crate::alt_read::visible_text(&pane.terminal, lines);
+            self.reply_agent_read(target, text, lines, false, false, "visible", json);
+            return;
+        }
+        self.alt_reads.insert(
+            pane_id,
+            PendingAgentRead {
+                reply: target,
+                read: crate::alt_read::PendingAltRead::start(&pane.terminal, lines, Instant::now()),
+                lines,
+                json,
+            },
+        );
+    }
+
+    fn next_alt_read_deadline(&self) -> Duration {
+        let now = Instant::now();
+        self.alt_reads
+            .values()
+            .map(|pending| pending.read.next_deadline().saturating_duration_since(now))
+            .min()
+            .unwrap_or(Duration::from_secs(1))
+    }
+
+    fn poll_alt_reads(&mut self) {
+        let now = Instant::now();
+        let cell_size = (self.last_display.cell_width, self.last_display.cell_height);
+        let reads = std::mem::take(&mut self.alt_reads);
+        let mut completed = Vec::new();
+        for (pane_id, pending) in reads {
+            let Some(pane) = self.panes.get(&pane_id) else {
+                completed.push((
+                    pending.reply,
+                    Err(AutomationError::new(
+                        "pane_not_found",
+                        "pane no longer exists",
+                    )),
+                ));
+                continue;
+            };
+            let idle = pane
+                .agent
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.status == AgentStatus::Idle);
+            match pending
+                .read
+                .poll(&pane.terminal, &pane.input, idle, cell_size, now)
+            {
+                crate::alt_read::PollOutcome::Pending(read) => {
+                    self.alt_reads
+                        .insert(pane_id, PendingAgentRead { read, ..pending });
+                }
+                crate::alt_read::PollOutcome::Success(result) => completed.push((
+                    pending.reply,
+                    Ok((
+                        result.text,
+                        pending.lines,
+                        result.truncated,
+                        false,
+                        "alternate_screen",
+                        pending.json,
+                    )),
+                )),
+                crate::alt_read::PollOutcome::Fallback => completed.push((
+                    pending.reply,
+                    Ok((
+                        crate::alt_read::visible_text(&pane.terminal, pane.terminal.rows()),
+                        pending.lines,
+                        true,
+                        true,
+                        "visible",
+                        pending.json,
+                    )),
+                )),
+            }
+        }
+        for (reply, result) in completed {
+            match result {
+                Ok((text, lines, truncated, fallback, source, json)) => {
+                    self.reply_agent_read(reply, text, lines, truncated, fallback, source, json)
+                }
+                Err(error) => self.reply_automation_error(reply, error),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reply_agent_read(
+        &mut self,
+        target: AutomationReplyTarget,
+        text: String,
+        lines: usize,
+        truncated: bool,
+        fallback: bool,
+        source: &'static str,
+        json: bool,
+    ) {
+        let result = if json {
+            serde_json::json!({
+                "text": text,
+                "lines": lines,
+                "truncated": truncated,
+                "fallback": fallback,
+                "source": source,
+            })
+        } else {
+            serde_json::Value::String(text)
+        };
+        self.reply_automation(target, result);
     }
 
     /// Validate and admit an agent launch, then park it on a fresh foreground probe.
@@ -5315,12 +5523,13 @@ impl SessionActor {
                     // wake then even if nothing else happens — otherwise an agent that starts
                     // silently is only noticed at the next unrelated wake.
                     (AutomationWaitKind::AgentLaunch { ready_after, .. }, _) => Some(*ready_after),
-                    (AutomationWaitKind::AgentPrompt { phase, .. }, _) => {
-                        let AgentPromptPhase::Stall { stall_deadline, .. } = phase else {
-                            None
-                        };
-                        Some(*stall_deadline)
-                    }
+                    (
+                        AutomationWaitKind::AgentPrompt {
+                            phase: AgentPromptPhase::Stall { stall_deadline, .. },
+                            ..
+                        },
+                        _,
+                    ) => Some(*stall_deadline),
                     _ => None,
                 };
                 stable_ready
@@ -5619,12 +5828,15 @@ impl SessionActor {
             AutomationWaitKind::AgentPrompt {
                 phase,
                 until,
-                baseline_seq,
                 baseline_status,
             } => {
                 let pane_id = waiter.pane_id?;
                 let Some(pane) = self.panes.get(&pane_id) else {
-                    if self.exit_tombstones.iter().any(|exit| exit.pane_id == pane_id) {
+                    if self
+                        .exit_tombstones
+                        .iter()
+                        .any(|exit| exit.pane_id == pane_id)
+                    {
                         if baseline_status.is_some_and(|status| until.contains(&status)) {
                             return Some(Ok(serde_json::json!({
                                 "pane_id": pane_id,
@@ -5649,7 +5861,7 @@ impl SessionActor {
                         .any(|exit| exit.pane_id == pane_id)
                     {
                         if let Some(status) = baseline_status {
-                            if until.contains(&status) {
+                            if until.contains(status) {
                                 Some(Ok(serde_json::json!({
                                     "pane_id": pane_id,
                                     "status": status,
@@ -5674,7 +5886,10 @@ impl SessionActor {
                         )))
                     };
                 };
-                if self.exit_tombstones.iter().any(|exit| exit.pane_id == pane_id)
+                if self
+                    .exit_tombstones
+                    .iter()
+                    .any(|exit| exit.pane_id == pane_id)
                     && !until.contains(&snapshot.status)
                 {
                     return Some(Err(AutomationError::new(
@@ -8775,6 +8990,12 @@ impl SessionActor {
     }
 
     fn close_pane(&mut self, pane_id: PaneId) {
+        if let Some(pending) = self.alt_reads.remove(&pane_id) {
+            self.reply_automation_error(
+                pending.reply,
+                AutomationError::new("pane_not_found", "pane closed during alternate-screen read"),
+            );
+        }
         self.invalidate_mouse_selection_for_pane(pane_id);
         self.clear_pane_hover(pane_id);
         // Pane IDs are reused, so a stale floor would silence the first notification of whatever
@@ -10600,6 +10821,14 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
             "invalid_key",
             "agent-send-keys takes at most 32 keys",
         )),
+        AutomationMethod::AgentRead { lines, .. }
+            if !(1..=crate::alt_read::MAX_READ_LINES as u16).contains(lines) =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "agent-read lines must be from 1 through 1000",
+            ))
+        }
         AutomationMethod::WaitAgentState { until, .. } if until.is_empty() || until.len() > 4 => {
             Err(AutomationError::new(
                 "invalid_params",
@@ -10825,7 +11054,7 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report",
             "report_metadata", "agent_explain", "agent_start", "agent_prompt",
-            "agent_send_keys", "subscribe", "save_layout"
+            "agent_send_keys", "agent_read", "subscribe", "save_layout"
         ],
         "limits": automation_limits(),
         "completion_waits": {
@@ -11054,6 +11283,8 @@ fn automation_limits() -> serde_json::Value {
         },
         "agent_prompt_until": 4,
         "agent_send_keys": 32,
+        "agent_read_lines": { "minimum": 1, "maximum": crate::alt_read::MAX_READ_LINES },
+        "agent_read_concurrency": crate::alt_read::MAX_ALT_SCREEN_READS,
         "timeout_ms": { "minimum": 1, "maximum": 24 * 60 * 60 * 1000_u64 },
         "pty_write_timeout_ms": 5000,
     })
@@ -11338,9 +11569,7 @@ fn normalize_agent_send_key(key: &str) -> Result<(String, Vec<String>), Automati
         ));
     }
     match key.to_ascii_lowercase().as_str() {
-        "c-c" | "c_c" | "ctrl+c" | "ctrl-c" => {
-            Ok(("c".to_owned(), vec!["Ctrl".to_owned()]))
-        }
+        "c-c" | "c_c" | "ctrl+c" | "ctrl-c" => Ok(("c".to_owned(), vec!["Ctrl".to_owned()])),
         "+" => Ok(("plus".to_owned(), Vec::new())),
         _ => Ok((key.to_owned(), Vec::new())),
     }
