@@ -15,6 +15,7 @@ pub const MAX_WORKFLOWS: usize = 128;
 pub const MAX_WORKFLOW_STEPS: usize = 32;
 pub const MAX_AGENTS_PER_PLUGIN: usize = 16;
 pub const MAX_AGENT_EXECUTABLES: usize = 32;
+pub const MAX_AGENT_EXECUTABLE_BYTES: usize = 128;
 pub const MAX_AGENT_ARGV_MARKERS: usize = 16;
 pub const MAX_AGENT_RULES: usize = 64;
 pub const MAX_AGENT_GATE_DEPTH: usize = 8;
@@ -277,8 +278,26 @@ pub struct Agent {
     pub id: String,
     pub name: String,
     pub process: AgentProcess,
+    /// How to start this agent, for providers that support being launched.
+    ///
+    /// Absent means detection-only: the agent is recognized when a user runs it, but `agent-start`
+    /// refuses rather than guessing a command from the detection matchers. Those matchers describe
+    /// what a running agent looks like — including wrapper scripts and package paths — which is not
+    /// the same thing as what to type to start one.
+    #[serde(default)]
+    pub launch: Option<AgentLaunch>,
     #[serde(default)]
     pub rules: Vec<AgentRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLaunch {
+    /// The command name to type, resolved by the pane's shell through PATH.
+    ///
+    /// A bare name, never a path: the whole point is to run whatever the user's environment means
+    /// by `claude`, and a manifest cannot know where that is.
+    pub executable: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -652,6 +671,27 @@ fn validate_agents(agents: &[Agent]) -> Result<(), ManifestError> {
             "argv marker",
             &agent.id,
         )?;
+        if let Some(launch) = &agent.launch {
+            let executable = &launch.executable;
+            if executable.is_empty()
+                || executable.len() > MAX_AGENT_EXECUTABLE_BYTES
+                || executable.chars().any(char::is_control)
+            {
+                return invalid(format!(
+                    "agent `{}` launch executable must contain 1 through {MAX_AGENT_EXECUTABLE_BYTES} printable bytes",
+                    agent.id
+                ));
+            }
+            // A path would be typed at a shell verbatim, so accepting one would let a manifest
+            // choose which binary runs rather than deferring to the user's PATH. Whitespace would
+            // split into two arguments once quoted, meaning the name would no longer be one word.
+            if executable.contains(['/', '\\']) || executable.chars().any(char::is_whitespace) {
+                return invalid(format!(
+                    "agent `{}` launch executable must be a bare command name",
+                    agent.id
+                ));
+            }
+        }
         if agent.rules.len() > MAX_AGENT_RULES {
             return invalid(format!("agent `{}` exceeds 64 rules", agent.id));
         }
@@ -1180,6 +1220,55 @@ contains = ["approval required"]
                 .to_string()
                 .contains("regex")
         );
+    }
+
+    #[test]
+    fn agent_launch_metadata_is_optional_and_must_be_a_bare_command_name() {
+        let source = r#"
+manifest_version = 2
+[plugin]
+id = "com.example.openclaw"
+name = "OpenClaw"
+version = "1.0.0"
+min_vvmux_version = "0.4.0"
+description = "OpenClaw detection"
+platforms = ["linux"]
+permissions = []
+[[agents]]
+id = "openclaw"
+name = "OpenClaw"
+process = { executables = ["openclaw"] }
+"#;
+        // Absent means detection-only, which is a valid provider rather than an incomplete one.
+        let detection_only: Manifest = toml::from_str(source).unwrap();
+        detection_only.validate().unwrap();
+        assert!(detection_only.agents[0].launch.is_none());
+
+        let launchable: Manifest = toml::from_str(&format!(
+            "{source}launch = {{ executable = \"openclaw\" }}\n"
+        ))
+        .unwrap();
+        launchable.validate().unwrap();
+        assert_eq!(
+            launchable.agents[0].launch.as_ref().unwrap().executable,
+            "openclaw"
+        );
+
+        // A path would let a manifest choose which binary runs instead of deferring to the user's
+        // PATH; whitespace would split into two arguments once the command line is quoted. Both
+        // are rejected rather than normalized, because either would silently run something else.
+        // TOML literal strings, so a Windows-style separator reaches the validator rather than
+        // failing as an escape at parse time.
+        for rejected in ["/usr/local/bin/openclaw", r"..\openclaw", "open claw", ""] {
+            let manifest: Manifest = toml::from_str(&format!(
+                "{source}launch = {{ executable = '{rejected}' }}\n"
+            ))
+            .unwrap();
+            assert!(
+                manifest.validate().is_err(),
+                "{rejected:?} should be rejected as a launch executable"
+            );
+        }
     }
 
     #[test]

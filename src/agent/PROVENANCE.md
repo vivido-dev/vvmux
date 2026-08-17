@@ -33,3 +33,15 @@ Later features adapted from the same HerdR commit, recorded as they land:
   detects the transition, because the hidden server must not learn anything about the outer
   terminal. HerdR's embedded mp3 playback is not ported; an optional user-configured
   `sound_command` replaces it, so vvmux ships no audio assets and no per-OS player table.
+- **Agent launch** (`agent_drive.rs`, `agent-start` in `session.rs`) — the pane-shell allow-list,
+  the "foreground group is the pane's own single shell" availability rule, and the POSIX and
+  PowerShell argument quoting are adapted from `src/platform/mod.rs` and `src/platform/macos.rs`;
+  the settle-then-detect readiness model follows `src/app/agents.rs` and
+  `reconcile_managed_agent_at` in `src/terminal/state.rs`, including the 3 s settle and the
+  3 s–300 s timeout bounds. Three deliberate divergences: `cmd` is excluded from the shell
+  allow-list, because this module produces neither quoting style it parses; the launch command
+  lives in the provider's plugin manifest (`[agents.launch]`) rather than in a hardcoded Rust
+  table, so users can add or override providers as data; and readiness additionally waits out
+  vvmux's own detection startup grace, which HerdR does not have to consider because its
+  classification has no equivalent forced-idle window. HerdR's agent names/aliases
+  (`agent start <name>`, `agent rename`) are not ported here; vvmux targets panes by ID.

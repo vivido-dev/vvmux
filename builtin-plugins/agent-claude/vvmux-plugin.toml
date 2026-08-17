@@ -13,6 +13,7 @@ permissions = []
 id = "claude"
 name = "Claude Code"
 process = { executables = ["claude", "claude-code"], argv_contains = ["@anthropic-ai/claude-code"] }
+launch = { executable = "claude" }
 
 [[agents.rules]]
 id = "osc_title_working"

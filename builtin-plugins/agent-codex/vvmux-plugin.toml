@@ -13,6 +13,7 @@ permissions = []
 id = "codex"
 name = "Codex"
 process = { executables = ["codex"], argv_contains = ["@openai/codex"] }
+launch = { executable = "codex" }
 
 [[agents.rules]]
 id = "osc_title_blocked"

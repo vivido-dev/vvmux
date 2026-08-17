@@ -266,8 +266,15 @@ impl PartialOrd for DelayedInput {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum AgentProbe {
-    /// Whether the pane is an available shell, for a caller about to type a command line into it.
-    ShellAvailable,
+    /// Whether the pane is an available shell, for a caller about to launch an agent in it.
+    ///
+    /// Carries the launch it gates, because the answer is only useful together with the command
+    /// the shell name decides how to quote.
+    ShellAvailable {
+        agent: crate::agent::AgentId,
+        argv: Vec<String>,
+        timeout_ms: u64,
+    },
     /// Whether `agent` is still the pane's foreground process, for a caller about to prompt it.
     HostsAgent { agent: crate::agent::AgentId },
 }
@@ -680,6 +687,13 @@ enum AutomationWaitKind {
         /// The status when the wait was registered, so a caller can see what it moved from.
         /// `None` when the pane had no agent yet.
         initial: Option<AgentStatus>,
+    },
+    /// A launch typed into a shell, waiting for that pane to be running the agent it named.
+    AgentLaunch {
+        agent: crate::agent::AgentId,
+        argv: Vec<String>,
+        /// When absence stops meaning "still starting" and starts meaning "did not start".
+        ready_after: Instant,
     },
     Media {
         after_virtual_revision: Option<u64>,
@@ -1663,8 +1677,14 @@ impl SessionActor {
                     } else if self.pending_render {
                         render_at = Instant::now() + interval;
                     }
-                    self.check_automation_waiters();
+                    // Classification runs before the waiter sweep so a wait decides against this
+                    // tick's screen. The ordering matters at exactly one moment: the wake that
+                    // ends detection's startup grace, where the stored status is still the graced
+                    // `idle` and the grace no longer guards it. `evaluate_agent_states` re-checks
+                    // waiters itself for anything that changes state, so this only adds the sweep
+                    // for the cases where classification changed nothing.
                     self.evaluate_agent_states();
+                    self.check_automation_waiters();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.flush_expired_sync_updates();
@@ -1677,8 +1697,14 @@ impl SessionActor {
                         render_at = Instant::now() + interval;
                     }
                     self.sync_media(false);
-                    self.check_automation_waiters();
+                    // Classification runs before the waiter sweep so a wait decides against this
+                    // tick's screen. The ordering matters at exactly one moment: the wake that
+                    // ends detection's startup grace, where the stored status is still the graced
+                    // `idle` and the grace no longer guards it. `evaluate_agent_states` re-checks
+                    // waiters itself for anything that changes state, so this only adds the sweep
+                    // for the cases where classification changed nothing.
                     self.evaluate_agent_states();
+                    self.check_automation_waiters();
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -3230,6 +3256,14 @@ impl SessionActor {
                 bytes.extend_from_slice(&enter);
                 self.automation_input(target, pane_id, bytes, report);
             }
+            AutomationMethod::AgentStart {
+                agent,
+                args,
+                timeout_ms,
+            } => {
+                let pane_id = pane_id.unwrap();
+                self.agent_start(target, pane_id, agent, args, timeout_ms);
+            }
             AutomationMethod::GetText { rows, source } => {
                 match self.execute_session_command(
                     &caller,
@@ -4457,10 +4491,14 @@ impl SessionActor {
         let child_pid = pane.child_pid;
         let group = pane.control.foreground_process_group_id();
         match probe {
-            AgentProbe::ShellAvailable => {
+            AgentProbe::ShellAvailable {
+                agent,
+                argv,
+                timeout_ms,
+            } => {
                 let shell =
                     crate::agent_drive::available_pane_shell(child_pid, group, &job.processes);
-                self.resolve_shell_available_probe(reply, pane_id, shell);
+                self.launch_agent_in_shell(reply, pane_id, agent, argv, timeout_ms, shell);
             }
             AgentProbe::HostsAgent { agent } => {
                 let hosts = job
@@ -4472,28 +4510,147 @@ impl SessionActor {
         }
     }
 
-    /// Answer a shell-availability probe.
+    /// Validate and admit an agent launch, then park it on a fresh foreground probe.
     ///
-    /// Task 0 lands the probe path with no caller; `agent-start` attaches its launch here.
-    fn resolve_shell_available_probe(
+    /// Everything cheap and certain is decided here; the one question that needs the process table
+    /// — is this pane actually sitting at its own shell prompt — is answered off the actor, because
+    /// a stale answer types a command line into whatever is really running.
+    fn agent_start(
+        &mut self,
+        target: AutomationReplyTarget,
+        pane_id: PaneId,
+        agent: crate::agent::AgentId,
+        args: Vec<String>,
+        timeout_ms: u64,
+    ) {
+        let Some(pane) = self.panes.get(&pane_id) else {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("pane_not_found", "pane no longer exists"),
+            );
+            return;
+        };
+        // A pane already hosting an agent is not available, and saying so now beats discovering it
+        // from a probe: the answer does not depend on the process table.
+        if let Some(existing) = pane.agent.snapshot() {
+            self.reply_automation_error(
+                target,
+                AutomationError::new(
+                    "agent_pane_busy",
+                    format!("pane is already running {}", existing.label),
+                ),
+            );
+            return;
+        }
+        if self.agent_catalog.identity(&agent).is_none() {
+            self.reply_automation_error(
+                target,
+                AutomationError::new(
+                    "invalid_agent_kind",
+                    format!("agent `{agent}` is not enabled"),
+                ),
+            );
+            return;
+        }
+        // Detection-only providers are refused rather than guessed at. The detection matchers
+        // describe a *running* agent — wrapper scripts, package paths — which is not the command
+        // that starts one.
+        let Some(executable) = self.agent_catalog.launch_executable(&agent) else {
+            self.reply_automation_error(
+                target,
+                AutomationError::new(
+                    "agent_not_launchable",
+                    format!("agent `{agent}` declares no launch command"),
+                ),
+            );
+            return;
+        };
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(executable.to_owned());
+        argv.extend(args);
+        self.probe_agent_foreground(
+            target,
+            pane_id,
+            AgentProbe::ShellAvailable {
+                agent,
+                argv,
+                timeout_ms,
+            },
+        );
+    }
+
+    /// Type an agent's command at a pane's shell, then wait for that pane to be running it.
+    fn launch_agent_in_shell(
         &mut self,
         reply: AutomationReplyTarget,
         pane_id: PaneId,
+        agent: crate::agent::AgentId,
+        argv: Vec<String>,
+        timeout_ms: u64,
         shell: Option<String>,
     ) {
-        match shell {
-            Some(shell) => self.reply_automation(
-                reply,
-                serde_json::json!({ "pane_id": pane_id, "shell": shell }),
-            ),
-            None => self.reply_automation_error(
+        let Some(shell) = shell else {
+            self.reply_automation_error(
                 reply,
                 AutomationError::new(
                     "agent_pane_busy",
                     "pane is not an available shell: its foreground is running something else",
                 ),
-            ),
+            );
+            return;
+        };
+        let Some(command) = crate::agent_drive::shell_command_line(&argv, &shell) else {
+            self.reply_automation_error(
+                reply,
+                AutomationError::new("invalid_params", "agent launch has no command"),
+            );
+            return;
+        };
+        let Some(pane) = self.panes.get(&pane_id) else {
+            self.reply_automation_error(
+                reply,
+                AutomationError::new("pane_not_found", "pane no longer exists"),
+            );
+            return;
+        };
+        let modes = pane.terminal.modes();
+        let enter = match encode_automation_key("Enter", &[], modes) {
+            Ok(enter) => enter,
+            Err(error) => {
+                self.reply_automation_error(reply, error);
+                return;
+            }
+        };
+        let mut bytes = sanitize_bracketed_paste(command.as_bytes());
+        if modes.bracketed_paste {
+            bytes.splice(0..0, b"\x1b[200~".iter().copied());
+            bytes.extend_from_slice(b"\x1b[201~");
         }
+        // One write, like `submit`: a failure part way through would leave half an agent command
+        // sitting at the prompt for the user to find.
+        bytes.extend_from_slice(&enter);
+        if let Err(error) = pane.input.send(&bytes) {
+            // Named rather than left to time out: a queue that refused the command is a different
+            // problem from an agent that failed to start, and thirty seconds of waiting would
+            // describe it as the second one.
+            self.reply_automation_error(
+                reply,
+                AutomationError::new("agent_start_input_failed", error.to_string()),
+            );
+            return;
+        }
+        // The waiter is registered after the write but within the same actor turn, so no
+        // transition can slip past unobserved — nothing else runs in between.
+        self.add_automation_waiter(AutomationWaiter {
+            reply,
+            pane_id: Some(pane_id),
+            deadline: deadline(timeout_ms),
+            kind: AutomationWaitKind::AgentLaunch {
+                agent,
+                argv,
+                ready_after: Instant::now() + crate::agent_drive::AGENT_START_SETTLE,
+            },
+        });
     }
 
     /// Answer a still-hosting probe.
@@ -4874,6 +5031,10 @@ impl SessionActor {
                         .panes
                         .get(&pane)
                         .map(|pane| pane.last_screen_change + *quiet),
+                    // A launch is unanswerable until its settle window ends, so the actor has to
+                    // wake then even if nothing else happens — otherwise an agent that starts
+                    // silently is only noticed at the next unrelated wake.
+                    (AutomationWaitKind::AgentLaunch { ready_after, .. }, _) => Some(*ready_after),
                     _ => None,
                 };
                 stable_ready
@@ -4900,11 +5061,8 @@ impl SessionActor {
                             .query(after_sequence, limit, waiter.pane_id, filter);
                     self.reply_automation(waiter.reply, serde_json::to_value(result).unwrap());
                 } else {
-                    let message = self.automation_timeout_message(&waiter);
-                    self.reply_automation_error(
-                        waiter.reply,
-                        AutomationError::new("timeout", message),
-                    );
+                    let (code, message) = self.automation_timeout_error(&waiter);
+                    self.reply_automation_error(waiter.reply, AutomationError::new(code, message));
                 }
                 continue;
             }
@@ -4916,12 +5074,19 @@ impl SessionActor {
         }
     }
 
-    /// Explain a timeout where the generic message would leave a caller guessing.
+    /// Name an expired wait as specifically as the wait's own kind allows.
     ///
     /// An agent-state wait that never saw an agent is almost always the wrong pane rather than a
     /// slow agent — the diagnosis a registration-time rejection used to give, kept without making
-    /// the common "launch, then wait" flow fail.
-    fn automation_timeout_message(&self, waiter: &AutomationWaiter) -> String {
+    /// the common "launch, then wait" flow fail. A launch that expires is not a generic timeout at
+    /// all: the caller asked for an agent to be running, and it is not.
+    fn automation_timeout_error(&self, waiter: &AutomationWaiter) -> (&'static str, String) {
+        if let AutomationWaitKind::AgentLaunch { agent, .. } = &waiter.kind {
+            return (
+                "agent_start_failed",
+                format!("`{agent}` did not start in this pane before the timeout"),
+            );
+        }
         let never_detected = matches!(waiter.kind, AutomationWaitKind::AgentState { .. })
             && waiter.pane_id.is_some_and(|pane_id| {
                 self.panes
@@ -4929,9 +5094,12 @@ impl SessionActor {
                     .is_none_or(|pane| pane.agent.snapshot().is_none())
             });
         if never_detected {
-            "automation wait timed out; no agent was ever detected in this pane".to_owned()
+            (
+                "timeout",
+                "automation wait timed out; no agent was ever detected in this pane".to_owned(),
+            )
         } else {
-            "automation wait timed out".to_owned()
+            ("timeout", "automation wait timed out".to_owned())
         }
     }
 
@@ -5093,6 +5261,70 @@ impl SessionActor {
                         "pane_id": pane_id,
                         "status": snapshot.status,
                         "initial_status": initial,
+                        "agent": agent_json(snapshot),
+                        "session_sequence": self.session_sequence,
+                    }))
+                })
+            }
+            AutomationWaitKind::AgentLaunch {
+                agent,
+                argv,
+                ready_after,
+            } => {
+                let pane_id = waiter.pane_id?;
+                if !self.panes.contains_key(&pane_id) {
+                    return Some(Err(AutomationError::new(
+                        "pane_not_found",
+                        "pane closed while the agent was starting",
+                    )));
+                }
+                // A shell that exited took the launch with it — the command was typed but never
+                // became an agent. Reporting it now beats waiting out the whole timeout.
+                if self
+                    .exit_tombstones
+                    .iter()
+                    .any(|exit| exit.pane_id == pane_id)
+                {
+                    return Some(Err(AutomationError::new(
+                        "agent_start_failed",
+                        format!("pane exited before `{agent}` started"),
+                    )));
+                }
+                let snapshot = self.panes.get(&pane_id)?.agent.snapshot();
+                // Detection identifies the process before classification settles, so a different
+                // agent is knowable immediately and is never going to become the right one.
+                if let Some(found) = &snapshot
+                    && found.kind != *agent
+                {
+                    return Some(Err(AutomationError::new(
+                        "agent_kind_mismatch",
+                        format!("pane is running {} rather than `{agent}`", found.label),
+                    )));
+                }
+                if now < *ready_after {
+                    return None;
+                }
+                // Detection holds a newly identified agent at `idle` regardless of its screen, so
+                // answering during that window would report a status classification has not
+                // actually reached. The two graces are independent: this one starts when the
+                // command is typed, detection's starts when it first sees the process, which is
+                // necessarily later.
+                if self
+                    .panes
+                    .get(&pane_id)
+                    .is_some_and(|pane| pane.agent.status_is_provisional(now))
+                {
+                    return None;
+                }
+                // Ready means the agent is up and has settled somewhere a caller can act on.
+                // `working` is excluded deliberately: an agent painting its first screen can look
+                // busy, and answering then would report readiness the caller cannot yet use.
+                let snapshot = snapshot?;
+                matches!(snapshot.status, AgentStatus::Idle | AgentStatus::Blocked).then(|| {
+                    Ok(serde_json::json!({
+                        "pane_id": pane_id,
+                        "status": snapshot.status,
+                        "argv": argv,
                         "agent": agent_json(snapshot),
                         "session_sequence": self.session_sequence,
                     }))
@@ -9839,6 +10071,10 @@ fn event_sequence(envelope: &PluginEventEnvelope) -> Option<u64> {
     }
 }
 
+fn millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn validate_automation_method(method: &AutomationMethod) -> Result<(), AutomationError> {
     let input = match method {
         AutomationMethod::Typing { text, .. }
@@ -9885,6 +10121,43 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
             Err(AutomationError::new(
                 "invalid_params",
                 "agent session identity must contain 1..=256 bytes",
+            ))
+        }
+        // Validated here as well as in the CLI parser, so a direct VVMX caller gets the same
+        // answer rather than a silently different behavior.
+        AutomationMethod::AgentStart { args, .. }
+            if args.len() > crate::agent_drive::MAX_AGENT_START_ARGS =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                format!(
+                    "agent start takes at most {} arguments",
+                    crate::agent_drive::MAX_AGENT_START_ARGS
+                ),
+            ))
+        }
+        AutomationMethod::AgentStart { args, .. }
+            if args.iter().any(|argument| {
+                argument.len() > crate::agent_drive::MAX_AGENT_START_ARG_BYTES
+                    || argument.chars().any(char::is_control)
+            }) =>
+        {
+            Err(AutomationError::new(
+                "invalid_agent_argument",
+                format!(
+                    "each agent argument must contain at most {} printable bytes",
+                    crate::agent_drive::MAX_AGENT_START_ARG_BYTES
+                ),
+            ))
+        }
+        AutomationMethod::AgentStart { timeout_ms, .. }
+            if !(millis(crate::agent_drive::AGENT_START_MIN_TIMEOUT)
+                ..=millis(crate::agent_drive::AGENT_START_MAX_TIMEOUT))
+                .contains(timeout_ms) =>
+        {
+            Err(AutomationError::new(
+                "invalid_agent_timeout",
+                "agent start timeout must be from 3s through 300s",
             ))
         }
         AutomationMethod::WaitAgentState { until, .. } if until.is_empty() || until.len() > 4 => {
@@ -10111,7 +10384,7 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "wait_agent_state", "wait_media",
             "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report",
-            "report_metadata", "agent_explain", "subscribe", "save_layout"
+            "report_metadata", "agent_explain", "agent_start", "subscribe", "save_layout"
         ],
         "limits": automation_limits(),
         "completion_waits": {
@@ -10328,6 +10601,12 @@ fn automation_limits() -> serde_json::Value {
         "media_trace_events": crate::media_trace::MAX_MEDIA_TRACE_EVENTS,
         "media_trace_bytes": crate::media_trace::MAX_MEDIA_TRACE_BYTES,
         "media_trace_query_events": crate::media_trace::MAX_MEDIA_TRACE_QUERY_EVENTS,
+        "agent_start_args": crate::agent_drive::MAX_AGENT_START_ARGS,
+        "agent_start_arg_bytes": crate::agent_drive::MAX_AGENT_START_ARG_BYTES,
+        "agent_start_timeout_ms": {
+            "minimum": millis(crate::agent_drive::AGENT_START_MIN_TIMEOUT),
+            "maximum": millis(crate::agent_drive::AGENT_START_MAX_TIMEOUT),
+        },
         "timeout_ms": { "minimum": 1, "maximum": 24 * 60 * 60 * 1000_u64 },
         "pty_write_timeout_ms": 5000,
     })

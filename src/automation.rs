@@ -295,6 +295,25 @@ pub enum MsgCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Start a recognized agent in a pane that is sitting at a shell prompt.
+    ///
+    /// Types the agent's command at the pane's shell and returns once that same pane is detected
+    /// running it. The pane must be an available shell: its own shell, at its prompt, with nothing
+    /// else in the foreground. Arguments after `--` are passed to the agent verbatim.
+    AgentStart {
+        /// Agent kind, as reported by `list-panes` and `agent-explain` — for example `claude`.
+        #[arg(long)]
+        kind: crate::agent::AgentId,
+        /// The pane to start the agent in. Required: a launch is never guessed at the focused pane.
+        #[arg(long)]
+        pane_id: u64,
+        /// How long to wait for the agent to come up before giving up.
+        #[arg(long, default_value = "30s", value_parser = parse_agent_start_timeout)]
+        timeout: Duration,
+        /// Arguments passed to the agent verbatim.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Inspect one pane.
     Inspect(PaneTarget),
     /// Inspect sanitized Vivid media state owned by one pane.
@@ -880,6 +899,21 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
         MsgCommand::AgentExplain { pane_id } => {
             (AutomationMethod::AgentExplain, pane_id, true, Output::Json)
         }
+        MsgCommand::AgentStart {
+            kind,
+            pane_id,
+            timeout,
+            args,
+        } => (
+            AutomationMethod::AgentStart {
+                agent: kind,
+                args,
+                timeout_ms: millis(timeout),
+            },
+            Some(pane_id),
+            false,
+            Output::Json,
+        ),
         MsgCommand::Inspect(target) => (
             AutomationMethod::Inspect,
             target.pane_id,
@@ -1391,6 +1425,22 @@ fn parse_metadata_state_label(
         .parse::<crate::agent::AgentStatus>()
         .map_err(str::to_owned)?;
     Ok((status, (!label.is_empty()).then(|| label.to_owned())))
+}
+
+/// Parse an `agent-start` readiness timeout.
+///
+/// Narrower than the general wait bounds at both ends. The floor is the settle delay: a shorter
+/// timeout could only ever expire before detection is allowed to conclude anything, so it would
+/// report a launch failure for every launch. The ceiling keeps a mistyped unit from parking a
+/// request for a day.
+fn parse_agent_start_timeout(value: &str) -> Result<Duration, String> {
+    let timeout = parse_timeout(value)?;
+    if !(crate::agent_drive::AGENT_START_MIN_TIMEOUT..=crate::agent_drive::AGENT_START_MAX_TIMEOUT)
+        .contains(&timeout)
+    {
+        return Err("agent start timeout must be from 3s through 300s".into());
+    }
+    Ok(timeout)
 }
 
 fn parse_timeout(value: &str) -> Result<Duration, String> {

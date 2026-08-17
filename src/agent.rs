@@ -447,6 +447,12 @@ pub struct AgentRuntime {
     source: AgentSource,
     done: bool,
     identified_at: Instant,
+    /// When classification last ran for this identity, or `None` before it ever has.
+    ///
+    /// Distinguishes "the startup grace has ended" from "a status computed after it ended has
+    /// been stored", which are different instants: the grace ends on a clock, the status changes
+    /// only when `evaluate_terminal` next runs.
+    evaluated_at: Option<Instant>,
     pending_idle: Option<(Instant, u8)>,
     report: Option<ReportedState>,
     report_sequences: HashMap<String, u64>,
@@ -463,12 +469,28 @@ impl AgentRuntime {
             source: AgentSource::Screen,
             done: false,
             identified_at: Instant::now(),
+            evaluated_at: None,
             pending_idle: None,
             report: None,
             report_sequences: HashMap::new(),
             session: None,
             metadata: AgentMetadata::default(),
         }
+    }
+
+    /// Whether the stored status may still be the one the startup grace forced rather than one
+    /// classification actually reached.
+    ///
+    /// During the grace, status is `idle` no matter what the screen says. The stored value stays
+    /// that way until the next `evaluate_terminal`, so the grace ending is not by itself proof the
+    /// status is real — `evaluated_at` is. A caller that treats idle as "settled" before then acts
+    /// on a state detection never concluded. A report supersedes the screen, and with it the grace.
+    pub fn status_is_provisional(&self, now: Instant) -> bool {
+        if self.identity.is_none() || self.report.is_some() {
+            return false;
+        }
+        let grace_end = self.identified_at + STARTUP_GRACE;
+        now < grace_end || self.evaluated_at.is_none_or(|at| at < grace_end)
     }
 
     pub fn snapshot(&self) -> Option<AgentSnapshot> {
@@ -541,7 +563,15 @@ impl AgentRuntime {
         }
         let grace_end = self.identified_at + STARTUP_GRACE;
         if now < grace_end {
-            return Some(grace_end.saturating_duration_since(now));
+            // Wake just past the boundary rather than exactly on it: waking at `grace_end` can
+            // reach classification while `now < grace_end` still holds, which re-forces idle and
+            // schedules the same wake again.
+            return Some(grace_end.saturating_duration_since(now) + Duration::from_millis(1));
+        }
+        // One more pass once the grace has ended, so the first status computed from the real
+        // screen replaces the forced idle even when nothing else wakes the actor.
+        if self.evaluated_at.is_none_or(|at| at < grace_end) {
+            return Some(Duration::ZERO);
         }
         self.pending_idle
             .is_some()
@@ -687,6 +717,10 @@ impl AgentRuntime {
         let Some(identity) = self.identity.as_ref() else {
             return;
         };
+        // Recorded for every path that reaches classification, including the ones that decline to
+        // change state: what a caller needs to know is that the stored status was computed at this
+        // instant, not that it moved.
+        self.evaluated_at = Some(now);
         if let Some(report) = &self.report {
             let state = report.state;
             self.commit(state, AgentSource::Report, visible);
@@ -844,6 +878,8 @@ struct CompiledAgent {
     identity: AgentIdentity,
     executables: BTreeSet<String>,
     argv_contains: Vec<String>,
+    /// The command name to type to start this agent, when its provider declares one.
+    launch: Option<String>,
     manifest: CompiledManifest,
 }
 
@@ -893,6 +929,11 @@ impl AgentCatalog {
                         .iter()
                         .map(|value| value.to_ascii_lowercase())
                         .collect(),
+                    launch: source
+                        .definition
+                        .launch
+                        .as_ref()
+                        .map(|launch| launch.executable.clone()),
                     manifest: CompiledManifest::compile(&source.definition),
                 },
             );
@@ -902,6 +943,14 @@ impl AgentCatalog {
 
     pub fn identity(&self, id: &AgentId) -> Option<AgentIdentity> {
         self.definitions.get(id).map(|value| value.identity.clone())
+    }
+
+    /// The command name that starts this agent, when its provider declares one.
+    ///
+    /// `None` distinguishes "this agent is not enabled" from "this agent is detection-only" only
+    /// in combination with [`Self::identity`]; callers report those separately.
+    pub fn launch_executable(&self, id: &AgentId) -> Option<&str> {
+        self.definitions.get(id)?.launch.as_deref()
     }
 
     pub fn describe(&self) -> Vec<serde_json::Value> {

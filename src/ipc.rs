@@ -127,6 +127,12 @@ pub enum AutomationMethod {
     },
     /// Replay agent classification for one pane and report which rule decided its state.
     AgentExplain,
+    /// Launch a recognized agent in a pane that is sitting at a shell prompt.
+    AgentStart {
+        agent: crate::agent::AgentId,
+        args: Vec<String>,
+        timeout_ms: u64,
+    },
     Inspect,
     InspectMedia,
     TraceMedia {

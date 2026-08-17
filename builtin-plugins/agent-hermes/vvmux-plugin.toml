@@ -13,6 +13,7 @@ permissions = []
 id = "hermes"
 name = "Hermes"
 process = { executables = ["hermes", "hermes-agent", "hermes_agent"], argv_contains = [] }
+launch = { executable = "hermes" }
 
 [[agents.rules]]
 id = "osc_title_blocked"

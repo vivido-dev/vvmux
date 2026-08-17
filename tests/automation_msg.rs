@@ -1265,12 +1265,213 @@ fn a_detected_agent_reaches_blocked_from_its_screen_alone() {
     );
 }
 
+#[test]
+fn agent_start_launches_into_a_shell_pane_and_refuses_everything_else() {
+    let directory = tempfile::Builder::new()
+        .prefix("vvd-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = directory.path().to_path_buf();
+
+    // `agent-start` types a bare command name and lets the shell resolve it, so the fixture has to
+    // be reachable through PATH rather than by path — which is also what proves the launch really
+    // went through a shell.
+    let bin = directory.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let agent = bin.join("codex");
+    fs::write(
+        &agent,
+        // Echoes its arguments so the test can prove what the shell parsed, then spends its first
+        // seconds matching codex's `screen_working_fallback` rule before settling on
+        // `live_strong_blocker`. That order is the point: an agent painting its first screen looks
+        // busy, and a launch must not report ready until it settles somewhere actionable. The busy
+        // window outlasts the 3 s settle delay so the gate is genuinely under test.
+        "#!/bin/sh\n\
+         printf 'ARGV[%s]\\n' \"$@\" > \"$VVMUX_TEST_ARGV\"\n\
+         i=0\n\
+         while [ $i -lt 12 ]; do\n\
+         printf '\\033[H\\033[2J• Working (5s esc to interrupt)\\n'\n\
+         i=$((i+1))\n\
+         sleep 1\n\
+         done\n\
+         printf '\\033[H\\033[2JAllow command? esc to interrupt\\n'\n\
+         while :; do sleep 1; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let config = directory.path().join("vvmux.toml");
+    fs::write(
+        &config,
+        "[general]\nshell = \"/bin/sh\"\nrender_interval_ms = 1\n",
+    )
+    .unwrap();
+
+    // Written by the fixture agent, so the argument vector the shell actually parsed outlives the
+    // screen the agent clears.
+    let argv_log = directory.path().join("argv.txt");
+    let name = format!("start-test-{}", std::process::id());
+    let path = format!(
+        "{}:{}",
+        bin.to_str().unwrap(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    assert_success(
+        &common::vvmux_command(&runtime)
+            .env("PATH", &path)
+            .env("VVMUX_TEST_ARGV", &argv_log)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "new",
+                "-s",
+                &name,
+                "-d",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let _guard = SessionGuard {
+        runtime: runtime.clone(),
+        name: name.clone(),
+    };
+
+    // An agent kind with no launch metadata is refused rather than guessed at from its detection
+    // matchers. `list-panes` is the cheapest way to confirm the session is up first.
+    assert_success(&command(&runtime, &name, &["list-panes"]));
+
+    let unknown = error_code(command(
+        &runtime,
+        &name,
+        &["agent-start", "--kind", "nosuchagent", "--pane-id", "1"],
+    ));
+    assert_eq!(unknown, "invalid_agent_kind");
+
+    // The pane is a shell at its prompt, so the launch is admitted, and the reply means the agent
+    // is running rather than that the command was typed.
+    let started = json(command(
+        &runtime,
+        &name,
+        &[
+            "agent-start",
+            "--kind",
+            "codex",
+            "--pane-id",
+            "1",
+            "--timeout",
+            "60s",
+            "--",
+            "--model",
+            "gpt 5.4",
+        ],
+    ));
+    assert_eq!(started["agent"]["kind"], "codex");
+    assert_eq!(started["pane_id"], 1);
+    // Readiness is a settled state, never `working`. The fixture is deliberately busy across the
+    // whole settle window, so a launch that answered on mere detection would report `working`
+    // here — this assertion is what separates "the agent exists" from "the agent is ready".
+    assert_eq!(started["status"], "blocked");
+    assert_eq!(started["argv"][0], "codex");
+    assert_eq!(started["argv"][2], "gpt 5.4");
+
+    // The shell parsed the quoted argument back into one word. Recorded by the fixture to a file
+    // rather than asserted from the screen, which the agent clears once it is running. Without
+    // quoting `gpt 5.4` arrives as two arguments, which is the failure this proves cannot happen.
+    let recorded = fs::read_to_string(&argv_log).unwrap();
+    assert_eq!(
+        recorded.lines().collect::<Vec<_>>(),
+        ["ARGV[--model]", "ARGV[gpt 5.4]"],
+        "argument did not survive quoting"
+    );
+
+    // A pane already running an agent is not available for another one.
+    let busy = error_code(command(
+        &runtime,
+        &name,
+        &["agent-start", "--kind", "codex", "--pane-id", "1"],
+    ));
+    assert_eq!(busy, "agent_pane_busy");
+}
+
+#[test]
+fn agent_start_refuses_a_pane_whose_foreground_is_not_its_shell() {
+    let directory = tempfile::Builder::new()
+        .prefix("vvd-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = directory.path().to_path_buf();
+
+    let config = directory.path().join("vvmux.toml");
+    fs::write(
+        &config,
+        "[general]\nshell = \"/bin/sh\"\nrender_interval_ms = 1\n",
+    )
+    .unwrap();
+
+    let name = format!("busy-test-{}", std::process::id());
+    assert_success(
+        &common::vvmux_command(&runtime)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "new",
+                "-s",
+                &name,
+                "-d",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let _guard = SessionGuard {
+        runtime: runtime.clone(),
+        name: name.clone(),
+    };
+
+    // A pane running a foreground command is not at a prompt, so typing into it would feed the
+    // command rather than start an agent. `sleep` is not an agent, so nothing else refuses first —
+    // this is the availability check itself being tested.
+    assert_success(&command(
+        &runtime,
+        &name,
+        &["submit", "--pane-id", "1", "sleep 30"],
+    ));
+    wait_text(&runtime, &name, 1, "sleep 30");
+
+    let busy = error_code(command(
+        &runtime,
+        &name,
+        &["agent-start", "--kind", "codex", "--pane-id", "1"],
+    ));
+    assert_eq!(busy, "agent_pane_busy");
+}
+
 fn command(runtime: &Path, session: &str, arguments: &[&str]) -> Output {
     common::vvmux_command(runtime)
         .args(["msg", "--target", session])
         .args(arguments)
         .output()
         .unwrap()
+}
+
+/// The error code of a command that was expected to fail.
+///
+/// Errors reach the CLI as `vvmux: <code>: <message>` on stderr, so the code is what a script can
+/// branch on and what these tests assert.
+fn error_code(output: Output) -> String {
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .trim()
+        .strip_prefix("vvmux: ")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(code, _)| code.to_owned())
+        .unwrap_or_else(|| panic!("unrecognized error format: {stderr}"))
 }
 
 fn wait_text(runtime: &Path, session: &str, pane: u64, pattern: &str) {

@@ -94,6 +94,7 @@ report-agent --agent claude|codex|opencode|hermes --state idle|working|blocked -
 report-metadata --source ID --sequence N [--token NAME=VALUE]... [--ttl-ms MS] [--display-agent TEXT] [--state-label STATUS=TEXT]... [--title TEXT] [--pane-id ID]
 clear-agent-report --source ID --sequence N [--pane-id ID]
 agent-explain [--pane-id ID]
+agent-start --kind AGENT --pane-id ID [--timeout DURATION] [-- ARGS...]
 inspect [--pane-id ID]
 inspect-media [--pane-id ID]
 split vertical|horizontal [--pane-id ID]
@@ -312,9 +313,47 @@ vvmux msg wait agent-state --pane-id 2 --until blocked,done --timeout 30m
 It resolves immediately when the state already holds, and answers with the reached `status`, the
 `initial_status` the pane had when the wait was registered, and the agent. `done` means the agent
 finished while you were not looking; focusing its pane in the navigator acknowledges that back to
-`idle`. A wait is scoped to its pane — another pane reaching the state does not satisfy it. Waiting
-on a pane with no detected or reported agent fails with `agent_not_detected` rather than blocking,
-and an agent that leaves mid-wait ends the wait with the same error instead of timing out silently.
+`idle`. A wait is scoped to its pane — another pane reaching the state does not satisfy it. A pane with no
+agent yet is simply not matching, so "launch an agent, then wait for it" works; if the wait times
+out without one ever appearing, the error says so.
+
+`agent-start` launches a recognized agent in a pane that is sitting at a shell prompt, and returns
+only once that same pane is detected running it:
+
+```sh
+vvmux msg agent-start --kind claude --pane-id 2
+vvmux msg agent-start --kind codex --pane-id 2 --timeout 60s -- --model gpt-5.4
+```
+
+The pane must be an *available shell*: its own shell, at its prompt, with nothing else in the
+foreground. A pane running a command, holding an editor, or already hosting an agent is refused
+with `agent_pane_busy` — the check is a fresh look at the process table, not a cached one, because
+typing into a pane that is busy would feed whatever is running there instead. Arguments after `--`
+are passed through verbatim and quoted for the pane's shell, so an argument containing spaces stays
+one argument.
+
+The reply means the agent is running, not that the command was typed: it resolves on `idle` or
+`blocked`, never on `working`, since an agent painting its first screen can look busy before it can
+accept anything. Failures are named rather than left to a timeout — `invalid_agent_kind` for an
+agent that is not enabled, `agent_not_launchable` for a detection-only provider that declares no
+launch command, `agent_kind_mismatch` when a different agent appears, and `agent_start_failed` when
+the pane exits or nothing starts before `--timeout` (3s–300s, default 30s).
+
+Providers declare their launch command in the manifest:
+
+```toml
+[[agents]]
+id = "claude"
+name = "Claude Code"
+process = { executables = ["claude", "claude-code"] }
+launch = { executable = "claude" }
+```
+
+The executable is a bare command name resolved through the pane's `PATH`, never a path — the point
+is to run whatever the user's environment means by `claude`. An agent with no `launch` block is
+detection-only: it is still recognized when a user starts it by hand, but `agent-start` refuses it
+rather than guessing a command from the detection matchers, which describe a *running* agent
+(wrapper scripts, package paths) and not the way to start one.
 
 `agent-explain` answers why a pane shows the state it shows. It replays the live detection
 snapshot through the active manifest and reports the rule that decided, every rule that was

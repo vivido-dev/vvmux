@@ -13,6 +13,26 @@
 //! features depend on them and neither should re-derive process-table or shell-quoting rules.
 #![allow(dead_code)]
 
+use std::time::Duration;
+
+/// How long after typing an agent's command before detection is allowed to conclude a launch
+/// failed.
+///
+/// An agent takes a moment to replace the shell and paint its first screen, and until it does the
+/// pane still looks like the shell it was. Without this, every launch would report failure in its
+/// first instants; with it, "no agent yet" only becomes an answer after the agent has had time to
+/// appear. Matches herdr's `AGENT_START_SETTLE_DELAY`.
+pub const AGENT_START_SETTLE: Duration = Duration::from_secs(3);
+/// Floor for an `agent-start` readiness timeout: below the settle delay, a launch could only ever
+/// time out.
+pub const AGENT_START_MIN_TIMEOUT: Duration = AGENT_START_SETTLE;
+/// Ceiling for an `agent-start` readiness timeout.
+pub const AGENT_START_MAX_TIMEOUT: Duration = Duration::from_secs(300);
+/// Arguments one launch may pass through to an agent.
+pub const MAX_AGENT_START_ARGS: usize = 32;
+/// Bytes in one launch argument.
+pub const MAX_AGENT_START_ARG_BYTES: usize = 4096;
+
 /// Shells whose foreground prompt will run a typed command line.
 ///
 /// `cmd` is deliberately absent, unlike herdr's list: this module quotes POSIX-style or
