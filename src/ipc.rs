@@ -133,6 +133,17 @@ pub enum AutomationMethod {
         args: Vec<String>,
         timeout_ms: u64,
     },
+    /// Write text to a detected agent and optionally wait for its status transition.
+    AgentPrompt {
+        text: String,
+        wait: bool,
+        until: Vec<crate::agent::AgentStatus>,
+        timeout_ms: u64,
+    },
+    /// Send one or more keys to one agent-aware pane.
+    AgentSendKeys {
+        keys: Vec<String>,
+    },
     Inspect,
     InspectMedia,
     TraceMedia {

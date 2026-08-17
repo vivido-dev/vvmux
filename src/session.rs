@@ -276,7 +276,20 @@ pub enum AgentProbe {
         timeout_ms: u64,
     },
     /// Whether `agent` is still the pane's foreground process, for a caller about to prompt it.
-    HostsAgent { agent: crate::agent::AgentId },
+    HostsAgent {
+        agent: crate::agent::AgentId,
+        prompt: Option<PendingAgentPrompt>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PendingAgentPrompt {
+    text: String,
+    wait: bool,
+    until: Vec<crate::agent::AgentStatus>,
+    timeout_ms: u64,
+    baseline_seq: u64,
+    baseline_status: Option<AgentStatus>,
 }
 
 /// One foreground probe's result: the agent the job resolves to, plus the raw job behind it.
@@ -695,6 +708,12 @@ enum AutomationWaitKind {
         /// When absence stops meaning "still starting" and starts meaning "did not start".
         ready_after: Instant,
     },
+    AgentPrompt {
+        phase: AgentPromptPhase,
+        until: Vec<AgentStatus>,
+        baseline_seq: u64,
+        baseline_status: Option<AgentStatus>,
+    },
     Media {
         after_virtual_revision: Option<u64>,
         after_outer_revision: Option<u64>,
@@ -714,6 +733,14 @@ enum AutomationWaitKind {
         identity: MediaTrackIdentity,
         condition: MediaTrackWaitCondition,
     },
+}
+
+enum AgentPromptPhase {
+    Stall {
+        baseline_seq: u64,
+        stall_deadline: Instant,
+    },
+    Settle,
 }
 
 enum AutomationTextPattern {
@@ -3264,6 +3291,19 @@ impl SessionActor {
                 let pane_id = pane_id.unwrap();
                 self.agent_start(target, pane_id, agent, args, timeout_ms);
             }
+            AutomationMethod::AgentPrompt {
+                text,
+                wait,
+                until,
+                timeout_ms,
+            } => {
+                let pane_id = pane_id.unwrap();
+                self.agent_prompt(target, pane_id, text, wait, until, timeout_ms);
+            }
+            AutomationMethod::AgentSendKeys { keys } => {
+                let pane_id = pane_id.unwrap();
+                self.agent_send_keys(target, pane_id, keys);
+            }
             AutomationMethod::GetText { rows, source } => {
                 match self.execute_session_command(
                     &caller,
@@ -4500,14 +4540,254 @@ impl SessionActor {
                     crate::agent_drive::available_pane_shell(child_pid, group, &job.processes);
                 self.launch_agent_in_shell(reply, pane_id, agent, argv, timeout_ms, shell);
             }
-            AgentProbe::HostsAgent { agent } => {
+            AgentProbe::HostsAgent { agent, prompt } => {
                 let hosts = job
                     .identity
                     .as_ref()
                     .is_some_and(|identity| identity.id == agent);
-                self.resolve_hosts_agent_probe(reply, pane_id, agent, hosts);
+                match prompt {
+                    Some(pending) => {
+                        self.resolve_hosted_prompt(reply, pane_id, pending, agent, hosts);
+                    }
+                    None => {
+                        self.resolve_hosts_agent_probe(reply, pane_id, agent, hosts);
+                    }
+                }
             }
         }
+    }
+
+    fn resolve_hosted_prompt(
+        &mut self,
+        reply: AutomationReplyTarget,
+        pane_id: PaneId,
+        pending: PendingAgentPrompt,
+        agent: crate::agent::AgentId,
+        hosts: bool,
+    ) {
+        if !hosts {
+            self.reply_automation_error(
+                reply,
+                AutomationError::new(
+                    "agent_not_ready",
+                    format!("{agent} is no longer the pane foreground process"),
+                ),
+            );
+            return;
+        }
+        self.submit_agent_prompt(reply, pane_id, pending, agent);
+    }
+
+    /// Submit prompt text to a pane whose foreground host check just confirmed it still owns
+    /// `agent`.
+    fn submit_agent_prompt(
+        &mut self,
+        reply: AutomationReplyTarget,
+        pane_id: PaneId,
+        mut pending: PendingAgentPrompt,
+        agent: crate::agent::AgentId,
+    ) {
+        let Some(pane) = self.panes.get(&pane_id) else {
+            self.reply_automation_error(
+                reply,
+                AutomationError::new("pane_not_found", "pane no longer exists"),
+            );
+            return;
+        };
+        let Some(snapshot) = pane.agent.snapshot() else {
+            self.reply_automation_error(
+                reply,
+                AutomationError::new("agent_not_ready", format!("{agent} is no longer detected")),
+            );
+            return;
+        };
+        let mut bytes = sanitize_bracketed_paste(pending.text.as_bytes());
+        if pane.terminal.modes().bracketed_paste {
+            bytes.splice(0..0, b"\x1b[200~".iter().copied());
+            bytes.extend_from_slice(b"\x1b[201~");
+        }
+
+        if !pending.wait {
+            let enter = match encode_automation_key("Enter", &[], pane.terminal.modes()) {
+                Ok(enter) => enter,
+                Err(error) => {
+                    self.reply_automation_error(reply, error);
+                    return;
+                }
+            };
+            bytes.extend_from_slice(&enter);
+            if let Err(error) = pane.input.send(&bytes) {
+                self.reply_automation_error(
+                    reply,
+                    AutomationError::new("agent_prompt_failed", error.to_string()),
+                );
+            } else {
+                self.reply_automation(reply, serde_json::json!({
+                    "pane_id": pane_id,
+                    "agent": agent_json(snapshot),
+                    "status": snapshot.status,
+                    "session_sequence": self.session_sequence,
+                }));
+            }
+            return;
+        }
+
+        if let Err(error) = pane.input.send(&bytes) {
+            self.reply_automation_error(
+                reply,
+                AutomationError::new("agent_prompt_failed", error.to_string()),
+            );
+            return;
+        }
+
+        let enter = match encode_automation_key("Enter", &[], pane.terminal.modes()) {
+            Ok(enter) => enter,
+            Err(error) => {
+                self.reply_automation_error(reply, error);
+                return;
+            }
+        };
+
+        if !self.queue_delayed_input(
+            pane_id,
+            enter,
+            crate::agent_drive::AGENT_PROMPT_SUBMIT_DELAY,
+        ) {
+            self.reply_automation_error(
+                reply,
+                AutomationError::new(
+                    "agent_prompt_failed",
+                    "agent prompt queued enter on a full input queue",
+                ),
+            );
+            return;
+        }
+
+        let now = Instant::now();
+        let timeout = deadline(pending.timeout_ms);
+        let stall_window = std::cmp::min(
+            crate::agent_drive::AGENT_PROMPT_EFFECT_TIMEOUT,
+            timeout.saturating_duration_since(now),
+        );
+        let phase = if snapshot.status == AgentStatus::Working {
+            AgentPromptPhase::Settle
+        } else {
+            AgentPromptPhase::Stall {
+                baseline_seq: pending.baseline_seq,
+                stall_deadline: now + stall_window,
+            }
+        };
+        self.add_automation_waiter(AutomationWaiter {
+            reply,
+            pane_id: Some(pane_id),
+            deadline: timeout,
+            kind: AutomationWaitKind::AgentPrompt {
+                phase,
+                until: std::mem::take(&mut pending.until),
+                baseline_seq: pending.baseline_seq,
+                baseline_status: pending.baseline_status,
+            },
+        });
+    }
+
+    fn agent_prompt(
+        &mut self,
+        target: AutomationReplyTarget,
+        pane_id: PaneId,
+        text: String,
+        wait: bool,
+        until: Vec<crate::agent::AgentStatus>,
+        timeout_ms: u64,
+    ) {
+        let until = if wait && until.is_empty() {
+            vec![
+                crate::agent::AgentStatus::Idle,
+                crate::agent::AgentStatus::Blocked,
+                crate::agent::AgentStatus::Done,
+            ]
+        } else {
+            until
+        };
+        let Some(pane) = self.panes.get(&pane_id) else {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("pane_not_found", "pane no longer exists"),
+            );
+            return;
+        };
+        let Some(snapshot) = pane.agent.snapshot() else {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("agent_not_ready", "no agent is detected in this pane"),
+            );
+            return;
+        };
+        let agent = snapshot.kind.clone();
+        self.probe_agent_foreground(
+            target,
+            pane_id,
+            AgentProbe::HostsAgent {
+                agent: agent.clone(),
+                prompt: Some(PendingAgentPrompt {
+                    text,
+                    wait,
+                    until,
+                    timeout_ms,
+                    baseline_seq: pane.agent_change_seq,
+                    baseline_status: Some(snapshot.status),
+                }),
+            },
+        );
+    }
+
+    fn agent_send_keys(
+        &mut self,
+        target: AutomationReplyTarget,
+        pane_id: PaneId,
+        keys: Vec<String>,
+    ) {
+        let pane = match self.panes.get(&pane_id) {
+            Some(pane) => pane,
+            None => {
+                self.reply_automation_error(
+                    target,
+                    AutomationError::new("pane_not_found", "pane no longer exists"),
+                );
+                return;
+            }
+        };
+        if pane.agent.snapshot().is_none() {
+            self.reply_automation_error(
+                target,
+                AutomationError::new(
+                    "agent_not_ready",
+                    format!("no agent is detected in pane {pane_id}"),
+                ),
+            );
+            return;
+        }
+        let mut bytes = Vec::new();
+        for key in keys {
+            let (normalized, modifiers) = match normalize_agent_send_key(&key) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.reply_automation_error(target, error);
+                    return;
+                }
+            };
+            let encoded = match encode_automation_key(&normalized, &modifiers, pane.terminal.modes()) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("invalid_key", error.message),
+                    );
+                    return;
+                }
+            };
+            bytes.extend_from_slice(&encoded);
+        }
+        self.automation_input(target, pane_id, bytes, false);
     }
 
     /// Validate and admit an agent launch, then park it on a fresh foreground probe.
@@ -5035,6 +5315,12 @@ impl SessionActor {
                     // wake then even if nothing else happens — otherwise an agent that starts
                     // silently is only noticed at the next unrelated wake.
                     (AutomationWaitKind::AgentLaunch { ready_after, .. }, _) => Some(*ready_after),
+                    (AutomationWaitKind::AgentPrompt { phase, .. }, _) => {
+                        let AgentPromptPhase::Stall { stall_deadline, .. } = phase else {
+                            None
+                        };
+                        Some(*stall_deadline)
+                    }
                     _ => None,
                 };
                 stable_ready
@@ -5329,6 +5615,111 @@ impl SessionActor {
                         "session_sequence": self.session_sequence,
                     }))
                 })
+            }
+            AutomationWaitKind::AgentPrompt {
+                phase,
+                until,
+                baseline_seq,
+                baseline_status,
+            } => {
+                let pane_id = waiter.pane_id?;
+                let Some(pane) = self.panes.get(&pane_id) else {
+                    if self.exit_tombstones.iter().any(|exit| exit.pane_id == pane_id) {
+                        if baseline_status.is_some_and(|status| until.contains(&status)) {
+                            return Some(Ok(serde_json::json!({
+                                "pane_id": pane_id,
+                                "status": baseline_status.unwrap(),
+                                "session_sequence": self.session_sequence,
+                            })));
+                        }
+                        return Some(Err(AutomationError::new(
+                            "agent_not_running",
+                            "agent exited while waiting for prompt",
+                        )));
+                    }
+                    return Some(Err(AutomationError::new(
+                        "pane_not_found",
+                        "pane closed while waiting for prompt",
+                    )));
+                };
+                let Some(snapshot) = pane.agent.snapshot() else {
+                    return if self
+                        .exit_tombstones
+                        .iter()
+                        .any(|exit| exit.pane_id == pane_id)
+                    {
+                        if let Some(status) = baseline_status {
+                            if until.contains(&status) {
+                                Some(Ok(serde_json::json!({
+                                    "pane_id": pane_id,
+                                    "status": status,
+                                    "session_sequence": self.session_sequence,
+                                })))
+                            } else {
+                                Some(Err(AutomationError::new(
+                                    "agent_not_running",
+                                    "agent exited while waiting for prompt",
+                                )))
+                            }
+                        } else {
+                            Some(Err(AutomationError::new(
+                                "agent_not_running",
+                                "agent exited while waiting for prompt",
+                            )))
+                        }
+                    } else {
+                        Some(Err(AutomationError::new(
+                            "agent_not_ready",
+                            format!("{pane_id} no longer has a detected agent"),
+                        )))
+                    };
+                };
+                if self.exit_tombstones.iter().any(|exit| exit.pane_id == pane_id)
+                    && !until.contains(&snapshot.status)
+                {
+                    return Some(Err(AutomationError::new(
+                        "agent_not_running",
+                        "agent exited while waiting for prompt",
+                    )));
+                }
+                match phase {
+                    AgentPromptPhase::Stall {
+                        baseline_seq,
+                        stall_deadline,
+                    } => {
+                        if pane.agent_change_seq > *baseline_seq {
+                            if until.contains(&snapshot.status) {
+                                return Some(Ok(serde_json::json!({
+                                    "pane_id": pane_id,
+                                    "status": snapshot.status,
+                                    "agent": agent_json(snapshot),
+                                    "session_sequence": self.session_sequence,
+                                })));
+                            }
+                            None
+                        } else if now >= *stall_deadline {
+                            Some(Err(AutomationError::new(
+                                "agent_prompt_stalled",
+                                format!(
+                                    "agent status remained {:?} with no transition after {}ms (change_sequence={})",
+                                    baseline_status.unwrap_or(snapshot.status),
+                                    crate::agent_drive::AGENT_PROMPT_EFFECT_TIMEOUT.as_millis(),
+                                    baseline_seq,
+                                ),
+                            )))
+                        } else {
+                            None
+                        }
+                    }
+                    AgentPromptPhase::Settle => until.contains(&snapshot.status).then(|| {
+                        Ok(serde_json::json!({
+                            "pane_id": pane_id,
+                            "status": snapshot.status,
+                            "agent": agent_json(snapshot),
+                            "session_sequence": self.session_sequence,
+                        }))
+                    }),
+                }
             }
             AutomationWaitKind::Exit => {
                 let pane_id = waiter.pane_id?;
@@ -7655,9 +8046,9 @@ impl SessionActor {
     /// write has no request left to fail. Delivery is best effort by design: the pane can close,
     /// and a queue full of a slow reader's input must not become actor backpressure.
     #[allow(dead_code)]
-    fn queue_delayed_input(&mut self, pane_id: PaneId, bytes: Vec<u8>, delay: Duration) {
+    fn queue_delayed_input(&mut self, pane_id: PaneId, bytes: Vec<u8>, delay: Duration) -> bool {
         if bytes.is_empty() || self.delayed_inputs.len() >= MAX_DELAYED_INPUTS {
-            return;
+            return false;
         }
         let sequence = self.next_delayed_input;
         self.next_delayed_input = self.next_delayed_input.saturating_add(1);
@@ -7667,6 +8058,7 @@ impl SessionActor {
             pane_id,
             bytes,
         }));
+        true
     }
 
     /// Deliver every delayed input whose moment has arrived.
@@ -10160,6 +10552,54 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 "agent start timeout must be from 3s through 300s",
             ))
         }
+        AutomationMethod::AgentPrompt {
+            text,
+            wait,
+            until,
+            timeout_ms,
+        } => {
+            if text.is_empty() {
+                return Err(AutomationError::new(
+                    "empty_agent_prompt",
+                    "agent prompt text must be non-empty",
+                ));
+            }
+            if !(millis(crate::agent_drive::AGENT_START_MIN_TIMEOUT)
+                ..=millis(crate::agent_drive::AGENT_START_MAX_TIMEOUT))
+                .contains(timeout_ms)
+            {
+                return Err(AutomationError::new(
+                    "invalid_agent_timeout",
+                    "agent prompt timeout must be from 3s through 300s",
+                ));
+            }
+            if until.len() > 4 {
+                Err(AutomationError::new(
+                    "invalid_params",
+                    "until must name from 1 through 4 agent statuses",
+                ))
+            } else if !wait && !until.is_empty() {
+                Err(AutomationError::new(
+                    "invalid_params",
+                    "agent-prompt --until requires --wait",
+                ))
+            } else if !wait && *timeout_ms != 30_000 {
+                Err(AutomationError::new(
+                    "invalid_params",
+                    "agent-prompt --timeout requires --wait",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        AutomationMethod::AgentSendKeys { keys } if keys.is_empty() => Err(AutomationError::new(
+            "invalid_key",
+            "agent-send-keys requires at least one key",
+        )),
+        AutomationMethod::AgentSendKeys { keys } if keys.len() > 32 => Err(AutomationError::new(
+            "invalid_key",
+            "agent-send-keys takes at most 32 keys",
+        )),
         AutomationMethod::WaitAgentState { until, .. } if until.is_empty() || until.len() > 4 => {
             Err(AutomationError::new(
                 "invalid_params",
@@ -10384,7 +10824,8 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "wait_agent_state", "wait_media",
             "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report",
-            "report_metadata", "agent_explain", "agent_start", "subscribe", "save_layout"
+            "report_metadata", "agent_explain", "agent_start", "agent_prompt",
+            "agent_send_keys", "subscribe", "save_layout"
         ],
         "limits": automation_limits(),
         "completion_waits": {
@@ -10607,6 +11048,12 @@ fn automation_limits() -> serde_json::Value {
             "minimum": millis(crate::agent_drive::AGENT_START_MIN_TIMEOUT),
             "maximum": millis(crate::agent_drive::AGENT_START_MAX_TIMEOUT),
         },
+        "agent_prompt_timeout_ms": {
+            "minimum": millis(crate::agent_drive::AGENT_START_MIN_TIMEOUT),
+            "maximum": millis(crate::agent_drive::AGENT_START_MAX_TIMEOUT),
+        },
+        "agent_prompt_until": 4,
+        "agent_send_keys": 32,
         "timeout_ms": { "minimum": 1, "maximum": 24 * 60 * 60 * 1000_u64 },
         "pty_write_timeout_ms": 5000,
     })
@@ -10875,6 +11322,28 @@ fn exit_result(pane_id: PaneId, status: Option<PtyExitStatus>) -> serde_json::Va
         "success": status.is_some_and(|status| status.success),
         "status_available": status.is_some(),
     })
+}
+
+fn normalize_agent_send_key(key: &str) -> Result<(String, Vec<String>), AutomationError> {
+    if key.is_empty() {
+        return Err(AutomationError::new(
+            "invalid_key",
+            "agent-send-keys keys must be non-empty",
+        ));
+    }
+    if key.chars().any(char::is_control) {
+        return Err(AutomationError::new(
+            "invalid_key",
+            "agent-send-keys keys may not contain control characters",
+        ));
+    }
+    match key.to_ascii_lowercase().as_str() {
+        "c-c" | "c_c" | "ctrl+c" | "ctrl-c" => {
+            Ok(("c".to_owned(), vec!["Ctrl".to_owned()]))
+        }
+        "+" => Ok(("plus".to_owned(), Vec::new())),
+        _ => Ok((key.to_owned(), Vec::new())),
+    }
 }
 
 fn changed_rows(previous: &[Vec<Cell>], current: &[Vec<Cell>]) -> Vec<usize> {

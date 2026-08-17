@@ -32,6 +32,13 @@ pub const AGENT_START_MAX_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_AGENT_START_ARGS: usize = 32;
 /// Bytes in one launch argument.
 pub const MAX_AGENT_START_ARG_BYTES: usize = 4096;
+/// Delay between prompt submit text and delayed Enter.
+///
+/// Full-screen agents can absorb Enter while it arrives in the same paste packet, so the text and
+/// submit key are intentionally separated in time.
+pub const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+/// Maximum stall window before `agent-prompt` marks the transition as stalled.
+pub const AGENT_PROMPT_EFFECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shells whose foreground prompt will run a typed command line.
 ///

@@ -314,6 +314,34 @@ pub enum MsgCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Send text to a detected agent process and optionally wait for a status transition.
+    ///
+    /// This is the runtime-equivalent of typing a prompt and pressing Enter at the same
+    /// pane. The Enter is intentionally delayed so the prompt does not remain embedded in the
+    /// text on submit-heavy full-screen agents.
+    AgentPrompt {
+        /// The pane with the detected agent to receive the prompt text.
+        #[arg(long)]
+        pane_id: u64,
+        /// Text to send to the agent.
+        text: String,
+        /// Wait for an agent status change after submit.
+        #[arg(long)]
+        wait: bool,
+        /// Stop waiting when the prompt results in any of these statuses.
+        #[arg(value_enum)]
+        until: Vec<crate::agent::AgentStatus>,
+        /// How long to wait after submit, before reporting timeout/failure.
+        #[arg(long, default_value = "30s", value_parser = parse_agent_prompt_timeout)]
+        timeout: Duration,
+    },
+    /// Send one or more key strokes to one detected agent.
+    AgentSendKeys {
+        #[arg(long)]
+        pane_id: u64,
+        #[arg(long = "key", value_name = "KEY")]
+        keys: Vec<String>,
+    },
     /// Inspect one pane.
     Inspect(PaneTarget),
     /// Inspect sanitized Vivid media state owned by one pane.
@@ -914,6 +942,44 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             false,
             Output::Json,
         ),
+        MsgCommand::AgentPrompt {
+            pane_id,
+            text,
+            wait,
+            until,
+            timeout,
+        } => {
+            validate_input(&text)?;
+            if !wait && !until.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "agent-prompt --until requires --wait",
+                ));
+            }
+            let until = if wait && until.is_empty() {
+                vec![
+                    crate::agent::AgentStatus::Idle,
+                    crate::agent::AgentStatus::Blocked,
+                    crate::agent::AgentStatus::Done,
+                ]
+            } else {
+                until
+            };
+            (
+                AutomationMethod::AgentPrompt {
+                    text,
+                    wait,
+                    until,
+                    timeout_ms: millis(timeout),
+                },
+                Some(pane_id),
+                true,
+                Output::Json,
+            )
+        }
+        MsgCommand::AgentSendKeys { pane_id, keys } => {
+            (AutomationMethod::AgentSendKeys { keys }, Some(pane_id), true, Output::Json)
+        }
         MsgCommand::Inspect(target) => (
             AutomationMethod::Inspect,
             target.pane_id,
@@ -1441,6 +1507,10 @@ fn parse_agent_start_timeout(value: &str) -> Result<Duration, String> {
         return Err("agent start timeout must be from 3s through 300s".into());
     }
     Ok(timeout)
+}
+
+fn parse_agent_prompt_timeout(value: &str) -> Result<Duration, String> {
+    parse_agent_start_timeout(value)
 }
 
 fn parse_timeout(value: &str) -> Result<Duration, String> {
