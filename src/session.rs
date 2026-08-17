@@ -26,7 +26,7 @@ use crate::ipc::{
     BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey,
     ClientMessage, Direction, DisplayMetrics, FloatingEditCommand, FloatingEditKind,
     MediaTrackIdentity, MediaTrackWaitCondition, MouseEvent, MouseKind, PluginEventEnvelope,
-    ServerMessage, SharedWriter,
+    ServerMessage, SharedWriter, TextSource,
 };
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
@@ -118,6 +118,7 @@ enum SessionCommand {
     ReadPaneText {
         pane_id: Option<PaneId>,
         rows: Option<usize>,
+        source: TextSource,
         max_bytes: usize,
     },
     WritePaneInput {
@@ -3097,12 +3098,13 @@ impl SessionActor {
                 }
                 self.automation_input(target, pane_id, bytes, report);
             }
-            AutomationMethod::GetText { rows } => {
+            AutomationMethod::GetText { rows, source } => {
                 match self.execute_session_command(
                     &caller,
                     SessionCommand::ReadPaneText {
                         pane_id,
                         rows: rows.map(usize::from),
+                        source,
                         max_bytes: AUTOMATION_REPLY_LIMIT,
                     },
                 ) {
@@ -5982,6 +5984,7 @@ impl SessionActor {
             SessionCommand::ReadPaneText {
                 pane_id,
                 rows,
+                source,
                 max_bytes,
             } => {
                 authorize_session_capability(caller, vvmux_plugin_api::Permission::PaneRead)?;
@@ -5989,20 +5992,34 @@ impl SessionActor {
                 let pane = self.panes.get(&pane_id).ok_or_else(|| {
                     AutomationError::new("pane_not_found", format!("pane {pane_id} does not exist"))
                 })?;
-                let text = rows.map_or_else(
-                    || {
-                        pane.terminal
-                            .visible_text(pane.copy.as_ref().map_or(0, |copy| copy.offset))
-                    },
-                    |rows| pane.terminal.latest_text(rows),
-                );
+                // A row count defaults to one screenful, so `recent` reads stay bounded without
+                // the caller having to know the pane's geometry.
+                let rows = rows.unwrap_or_else(|| pane.terminal.rows());
+                let text = match source {
+                    TextSource::Visible => pane
+                        .terminal
+                        .visible_text(pane.copy.as_ref().map_or(0, |copy| copy.offset)),
+                    TextSource::Recent => pane.terminal.latest_text_physical(rows),
+                    TextSource::RecentUnwrapped => pane.terminal.latest_text(rows),
+                    TextSource::Detection => crate::agent::detection_snapshot(&pane.terminal),
+                };
                 if text.len() > max_bytes {
                     return Err(AutomationError::new(
                         "limit_exceeded",
                         "pane text exceeds the bounded command result",
                     ));
                 }
-                Ok(serde_json::Value::String(text))
+                Ok(match source {
+                    // Detection is only meaningful beside the OSC fields the classifier also
+                    // reads, so it answers with a record rather than bare text.
+                    TextSource::Detection => serde_json::json!({
+                        "text": text,
+                        "osc_title": pane.terminal.agent_osc_title(),
+                        "osc_progress": pane.terminal.agent_osc_progress(),
+                        "rows": pane.terminal.rows(),
+                    }),
+                    _ => serde_json::Value::String(text),
+                })
             }
             SessionCommand::WritePaneInput { pane_id, bytes } => {
                 authorize_session_capability(caller, vvmux_plugin_api::Permission::PaneInput)?;
@@ -6216,6 +6233,11 @@ impl SessionActor {
                     SessionCommand::ReadPaneText {
                         pane_id: Some(pane_id),
                         rows,
+                        // Pinned to the pre-existing meaning of this host call rather than to the
+                        // CLI default, so no installed plugin changes behavior. New sources are
+                        // an automation surface; widening the plugin contract is a separate
+                        // decision with its own compatibility story.
+                        source: rows.map_or(TextSource::Visible, |_| TextSource::RecentUnwrapped),
                         max_bytes: vvmux_plugin_api::MAX_FRAME_BYTES / 2,
                     },
                 )
@@ -9434,9 +9456,25 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
         AutomationMethod::Key { repeat, .. } if !(1..=1000).contains(repeat) => Err(
             AutomationError::new("invalid_params", "key repeat must be from 1 through 1000"),
         ),
-        AutomationMethod::GetText { rows: Some(rows) } if !(1..=1000).contains(rows) => Err(
-            AutomationError::new("invalid_params", "rows must be from 1 through 1000"),
-        ),
+        AutomationMethod::GetText {
+            rows: Some(rows), ..
+        } if !(1..=1000).contains(rows) => Err(AutomationError::new(
+            "invalid_params",
+            "rows must be from 1 through 1000",
+        )),
+        AutomationMethod::GetText {
+            rows: Some(_),
+            source: source @ (TextSource::Visible | TextSource::Detection),
+        } => Err(AutomationError::new(
+            "invalid_params",
+            format!(
+                "rows does not apply to the {} source",
+                match source {
+                    TextSource::Detection => "detection",
+                    _ => "visible",
+                }
+            ),
+        )),
         AutomationMethod::GetGrid {
             start_line,
             row_count,
@@ -13009,8 +13047,27 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate_automation_method(&AutomationMethod::GetText { rows: Some(1001) }).is_err()
+            validate_automation_method(&AutomationMethod::GetText {
+                rows: Some(1001),
+                source: TextSource::RecentUnwrapped,
+            })
+            .is_err()
         );
+        // A row count is meaningless for the viewport and for the fixed classification snapshot,
+        // so it is refused rather than silently ignored.
+        for source in [TextSource::Visible, TextSource::Detection] {
+            assert!(
+                validate_automation_method(&AutomationMethod::GetText {
+                    rows: Some(10),
+                    source,
+                })
+                .is_err()
+            );
+            assert!(
+                validate_automation_method(&AutomationMethod::GetText { rows: None, source })
+                    .is_ok()
+            );
+        }
         assert!(
             validate_automation_method(&AutomationMethod::GetGrid {
                 start_line: Some(0),

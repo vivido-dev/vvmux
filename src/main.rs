@@ -522,7 +522,10 @@ fn debug_bundle(
             if include_text {
                 let text = automation::request_json(
                     target,
-                    ipc::AutomationMethod::GetText { rows: None },
+                    ipc::AutomationMethod::GetText {
+                        rows: None,
+                        source: ipc::TextSource::Visible,
+                    },
                     Some(pane_id),
                     false,
                 )?;

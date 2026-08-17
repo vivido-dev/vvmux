@@ -1075,7 +1075,7 @@ fn region_preview(text: &str) -> String {
 /// Shared by [`AgentRuntime::evaluate_terminal`] and [`AgentRuntime::explain`] on purpose: an
 /// explanation built from a separately-derived snapshot could disagree with the classifier it
 /// claims to describe, which is worse than no explanation at all.
-fn detection_snapshot(terminal: &Terminal) -> String {
+pub(crate) fn detection_snapshot(terminal: &Terminal) -> String {
     let mut screen = terminal.latest_text(terminal.rows());
     if screen.len() > MAX_DETECTION_BYTES {
         let mut start = screen.len() - MAX_DETECTION_BYTES;

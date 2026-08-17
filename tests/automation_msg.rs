@@ -768,6 +768,110 @@ done
     let stale = command(&runtime, &name, &["get-text", "--pane-id", "4"]);
     assert!(!stale.status.success());
     assert!(String::from_utf8_lossy(&stale.stderr).contains("pane_not_found"));
+    // Kept last: the wide echo scrolls the pane it writes to, and earlier assertions depend
+    // on each pane still showing its READY banner. Pane 3 rather than 4, which has exited.
+    // Read sources. Echo a line wider than the pane so the terminal must soft-wrap it, which is
+    // the only condition under which the joined and physical readings differ.
+    let wide = "W".repeat(200);
+    assert_success(&command(
+        &runtime,
+        &name,
+        &["typing", &wide, "--pane-id", "3"],
+    ));
+    assert_success(&command(
+        &runtime,
+        &name,
+        &["key", "Enter", "--pane-id", "3"],
+    ));
+    wait_text(&runtime, &name, 3, "OUT pane=3:WWWW");
+
+    let unwrapped = text(command(
+        &runtime,
+        &name,
+        &[
+            "get-text",
+            "--pane-id",
+            "3",
+            "--source",
+            "recent-unwrapped",
+            "--rows",
+            "40",
+        ],
+    ));
+    let physical = text(command(
+        &runtime,
+        &name,
+        &[
+            "get-text",
+            "--pane-id",
+            "3",
+            "--source",
+            "recent",
+            "--rows",
+            "40",
+        ],
+    ));
+    // The echoed line survives intact only when soft wraps are joined.
+    assert!(unwrapped.contains(&format!("OUT pane=3:{wide}")));
+    assert!(!physical.contains(&format!("OUT pane=3:{wide}")));
+    assert!(physical.contains("WWWW"));
+    // Same content either way; only the line breaks differ.
+    assert_eq!(
+        unwrapped.replace('\n', ""),
+        physical.replace('\n', ""),
+        "wrap handling changed the characters, not just the breaks"
+    );
+    // No --source keeps the historical meaning of --rows.
+    assert_eq!(
+        unwrapped,
+        text(command(
+            &runtime,
+            &name,
+            &["get-text", "--pane-id", "3", "--rows", "40"],
+        ))
+    );
+
+    // The detection source answers with the classifier's input beside the OSC fields it also
+    // reads, so it is JSON rather than bare text.
+    let detection = json(command(
+        &runtime,
+        &name,
+        &["get-text", "--pane-id", "2", "--source", "detection"],
+    ));
+    assert!(detection["text"].is_string());
+    assert!(detection["osc_title"].is_string());
+    assert!(detection["osc_progress"].is_string());
+    assert!(detection["rows"].as_u64().unwrap() > 0);
+    // It is the same snapshot agent-explain reports measuring.
+    let explained_pane2 = json(command(
+        &runtime,
+        &name,
+        &["agent-explain", "--pane-id", "2"],
+    ));
+    assert_eq!(
+        explained_pane2["explain"]["detection_bytes"]
+            .as_u64()
+            .unwrap(),
+        detection["text"].as_str().unwrap().len() as u64
+    );
+
+    // A row count is meaningless for the viewport and the fixed classification snapshot.
+    for source in ["visible", "detection"] {
+        let rejected = command(
+            &runtime,
+            &name,
+            &[
+                "get-text",
+                "--pane-id",
+                "4",
+                "--source",
+                source,
+                "--rows",
+                "10",
+            ],
+        );
+        assert!(!rejected.status.success(), "--rows accepted for {source}");
+    }
 }
 
 fn command(runtime: &Path, session: &str, arguments: &[&str]) -> Output {

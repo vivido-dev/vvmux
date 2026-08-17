@@ -161,6 +161,7 @@ pub enum AutomationMethod {
     },
     GetText {
         rows: Option<u16>,
+        source: TextSource,
     },
     GetGrid {
         start_line: Option<isize>,
@@ -225,6 +226,21 @@ pub enum AutomationMethod {
         condition: MediaTrackWaitCondition,
         timeout_ms: u64,
     },
+}
+
+/// Which terminal text a pane read returns.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum TextSource {
+    /// The current viewport, honoring copy-mode scroll. Soft wraps are joined.
+    Visible,
+    /// The last N rows, one line per physical terminal row.
+    Recent,
+    /// The last N rows with soft wraps joined, so output reads as the lines a command wrote.
+    RecentUnwrapped,
+    /// The exact bottom-buffer snapshot and OSC fields agent classification runs against.
+    Detection,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

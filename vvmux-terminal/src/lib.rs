@@ -817,15 +817,39 @@ impl Terminal {
         self.extract_rows(start, rows)
     }
 
+    /// The last `rows` rows, with soft-wrapped rows joined into one logical line.
+    ///
+    /// This is the log-friendly read: a command's output comes back as the lines it wrote, not as
+    /// the lines the terminal happened to break them into at the current width.
     pub fn latest_text(&self, rows: usize) -> String {
+        self.latest_text_with(rows, true)
+    }
+
+    /// The last `rows` rows, one line per physical terminal row.
+    ///
+    /// Preserves the wrap points a reader sees on screen, which is what a caller wants when
+    /// reasoning about layout rather than about content.
+    pub fn latest_text_physical(&self, rows: usize) -> String {
+        self.latest_text_with(rows, false)
+    }
+
+    fn latest_text_with(&self, rows: usize, join_wrapped: bool) -> String {
         let available = self.history.len().saturating_add(self.rows);
         let count = rows.min(available);
         let start_absolute = available.saturating_sub(count);
         let start = start_absolute as isize - self.history.len() as isize;
-        self.extract_rows(start, count)
+        self.extract_rows_with(start, count, join_wrapped)
     }
 
     pub fn extract_rows(&self, start_line: isize, row_count: usize) -> String {
+        self.extract_rows_with(start_line, row_count, true)
+    }
+
+    pub fn extract_rows_physical(&self, start_line: isize, row_count: usize) -> String {
+        self.extract_rows_with(start_line, row_count, false)
+    }
+
+    fn extract_rows_with(&self, start_line: isize, row_count: usize, join_wrapped: bool) -> String {
         let mut text = String::new();
         let mut previous_wrapped = false;
         for index in 0..row_count {
@@ -833,7 +857,7 @@ impl Terminal {
             let Some(cells) = self.viewport_line(line) else {
                 continue;
             };
-            if index > 0 && !previous_wrapped {
+            if index > 0 && !(join_wrapped && previous_wrapped) {
                 text.push('\n');
             }
             append_row_text(&mut text, &cells[..cells.len().min(self.cols)]);
@@ -2894,6 +2918,26 @@ mod tests {
         hard.feed(b"ab\r\ncd");
         assert_eq!(hard.line_wrapped(0), Some(false));
         assert_eq!(hard.visible_text(0), "ab\ncd");
+    }
+
+    #[test]
+    fn physical_text_keeps_the_wrap_points_logical_text_joins() {
+        let mut terminal = Terminal::new(2, 4, 10);
+        terminal.feed(b"abcde");
+        assert_eq!(terminal.line_wrapped(0), Some(true));
+
+        // Same rows, two readings: one as the lines a command wrote, one as the lines the
+        // terminal drew at this width.
+        assert_eq!(terminal.latest_text(2), "abcde");
+        assert_eq!(terminal.latest_text_physical(2), "abcd\ne");
+        assert_eq!(terminal.extract_rows(0, 2), "abcde");
+        assert_eq!(terminal.extract_rows_physical(0, 2), "abcd\ne");
+
+        // A hard newline is a real line break in both readings.
+        let mut hard = Terminal::new(2, 4, 10);
+        hard.feed(b"ab\r\ncd");
+        assert_eq!(hard.latest_text(2), "ab\ncd");
+        assert_eq!(hard.latest_text_physical(2), "ab\ncd");
     }
 
     #[test]

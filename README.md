@@ -103,7 +103,7 @@ close-pane --pane-id ID
 typing TEXT [--pane-id ID] [--report]
 key KEY [--mods Shift,Alt,Ctrl,Super] [--repeat N] [--pane-id ID] [--report]
 paste TEXT [--pane-id ID] [--report]
-get-text [--rows N] [--pane-id ID]
+get-text [--rows N] [--source visible|recent|recent-unwrapped|detection] [--pane-id ID]
 get-grid [--start-line LINE --row-count N | --since-screen SEQ] [--pane-id ID]
 search --pattern TEXT [--regex] [--direction forward|backward] [--start-line LINE --start-column COLUMN] [--limit N] [--pane-id ID]
 sync-input (--on|--off) [--pane-id ID]
@@ -124,6 +124,26 @@ With `--report`, input prints the pane, encoded byte count, request sequence, an
 completion, without claiming the child consumed it. `outer` waits for the foreground Vivid bridge
 to apply the resulting projection; `rendered` waits for the attached client's terminal-frame ACK.
 Vivido's separate `wait frame` is the GPU-presentation assertion.
+
+`get-text --source` chooses which text comes back:
+
+| Source | Returns |
+|---|---|
+| `visible` | the current viewport, honoring copy-mode scroll |
+| `recent-unwrapped` | the last `--rows N` rows with soft wraps joined, so output reads as the lines a command wrote |
+| `recent` | the same rows, one line per physical terminal row |
+| `detection` | the exact bottom-buffer snapshot and OSC fields agent classification runs against |
+
+Without `--source`, `--rows N` means `recent-unwrapped` and its absence means `visible` — the
+long-standing behavior. `--rows` applies only to the two `recent` sources and is refused elsewhere
+rather than ignored. `detection` prints JSON (`text`, `osc_title`, `osc_progress`, `rows`) because
+the snapshot is only meaningful beside the OSC fields the classifier also reads; pair it with
+`agent-explain` when a rule is not matching what you expect.
+
+```sh
+vvmux msg get-text --pane-id 2 --source recent-unwrapped --rows 200 | grep -i error
+vvmux msg get-text --pane-id 2 --source detection | jq -r .text
+```
 
 For automation discovery and support collection use `vvmux list --json`, `vvmux doctor --target
 NAME --json`, and `vvmux debug-bundle --target NAME --output FILE`. Bundles are atomic and

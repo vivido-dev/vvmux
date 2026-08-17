@@ -9,7 +9,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use crate::ipc::{
     Action, AutomationCompletion, AutomationMethod, AutomationRequest, AutomationResponse, Axis,
     ClientMessage, Direction, MediaTrackIdentity, MediaTrackWaitCondition, PluginMethod,
-    RunPlacement, ServerMessage,
+    RunPlacement, ServerMessage, TextSource,
 };
 use crate::media_trace::{
     MAX_MEDIA_TRACE_QUERY_EVENTS, MediaTraceBatch, MediaTraceCategory, MediaTraceFilter,
@@ -404,9 +404,15 @@ pub enum MsgCommand {
         report: bool,
     },
     /// Print pane text exactly, without a trailing newline.
+    ///
+    /// Without `--source`, `--rows N` reads the last N rows with soft wraps joined and no `--rows`
+    /// reads the current viewport — the long-standing behavior. `--source detection` prints JSON
+    /// instead of text, since it carries the OSC fields alongside the snapshot.
     GetText {
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=1000))]
         rows: Option<u16>,
+        #[arg(long, value_enum)]
+        source: Option<crate::ipc::TextSource>,
         #[arg(long)]
         pane_id: Option<u64>,
     },
@@ -967,12 +973,36 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 if report { Output::Json } else { Output::Silent },
             )
         }
-        MsgCommand::GetText { rows, pane_id } => (
-            AutomationMethod::GetText { rows },
+        MsgCommand::GetText {
+            rows,
+            source,
             pane_id,
-            true,
-            Output::Text,
-        ),
+        } => {
+            // Preserve the historical default exactly: `--rows N` has always meant "the last N
+            // rows with wraps joined", and its absence "the current viewport".
+            let source = source.unwrap_or(if rows.is_some() {
+                TextSource::RecentUnwrapped
+            } else {
+                TextSource::Visible
+            });
+            if rows.is_some() && matches!(source, TextSource::Visible | TextSource::Detection) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--rows applies only to --source recent or recent-unwrapped",
+                ));
+            }
+            (
+                AutomationMethod::GetText { rows, source },
+                pane_id,
+                true,
+                // Detection carries OSC fields beside the snapshot, so it cannot be bare text.
+                if matches!(source, TextSource::Detection) {
+                    Output::Json
+                } else {
+                    Output::Text
+                },
+            )
+        }
         MsgCommand::GetGrid {
             start_line,
             row_count,
