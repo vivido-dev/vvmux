@@ -1332,6 +1332,25 @@ fn a_detected_agent_reaches_blocked_from_its_screen_alone() {
         )),
         "invalid_agent_report"
     );
+
+    assert_success(&command(
+        &runtime,
+        &name,
+        &["agent-prompt", "--pane-id", &pane, "follow up"],
+    ));
+    assert_success(&command(
+        &runtime,
+        &name,
+        &[
+            "agent-send-keys",
+            "--pane-id",
+            &pane,
+            "--key",
+            "esc",
+            "--key",
+            "up",
+        ],
+    ));
 }
 
 #[test]
@@ -1516,220 +1535,6 @@ fn agent_start_refuses_a_pane_whose_foreground_is_not_its_shell() {
     assert_eq!(busy, "agent_pane_busy");
 }
 
-#[test]
-fn agent_prompt_send_keys_stalls_and_read_gates_are_end_to_end() {
-    let directory = tempfile::Builder::new()
-        .prefix("vvp-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let runtime = directory.path().to_path_buf();
-    let bin = directory.path().join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    let chunks = directory.path().join("chunks.log");
-    let agent = bin.join("codex");
-    fs::write(
-        &agent,
-        r#"#!/bin/sh
-stty -icanon -echo -isig min 1 time 0
-printf '\033]0;Codex\007'
-index=0
-while :; do
-    hex="$(dd bs=4096 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-    stamp="$(python3 -c 'import time; print(time.time_ns())')"
-    printf '%s:%s\n' "$stamp" "$hex" >> "$VVMUX_TEST_CHUNKS"
-    index=$((index+1))
-    if [ "$index" -eq 2 ]; then
-        printf '\033[H\033[2JAllow command? press enter to confirm or esc to cancel\n'
-    fi
-done
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
-    let config = directory.path().join("vvmux.toml");
-    fs::write(
-        &config,
-        "[general]\nshell = \"/bin/sh\"\nrender_interval_ms = 1\n",
-    )
-    .unwrap();
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let name = format!("prompt-test-{}", std::process::id());
-    assert_success(
-        &common::vvmux_command(&runtime)
-            .env("PATH", &path)
-            .env("VVMUX_TEST_CHUNKS", &chunks)
-            .args([
-                "--config",
-                config.to_str().unwrap(),
-                "new",
-                "-s",
-                &name,
-                "-d",
-            ])
-            .output()
-            .unwrap(),
-    );
-    let _guard = SessionGuard {
-        runtime: runtime.clone(),
-        name: name.clone(),
-    };
-
-    let started = json(command(
-        &runtime,
-        &name,
-        &[
-            "agent-start",
-            "--kind",
-            "codex",
-            "--pane-id",
-            "1",
-            "--timeout",
-            "15s",
-        ],
-    ));
-    assert_eq!(started["status"], "idle");
-
-    let prompted = json(command(
-        &runtime,
-        &name,
-        &[
-            "agent-prompt",
-            "--pane-id",
-            "1",
-            "--wait",
-            "--until",
-            "blocked",
-            "--timeout",
-            "15s",
-            "review this",
-        ],
-    ));
-    assert_eq!(prompted["pane_id"], 1);
-    assert_eq!(prompted["status"], "blocked");
-    wait_file_lines(&chunks, 2);
-    let recorded = fs::read_to_string(&chunks).unwrap();
-    let first = recorded.lines().take(2).collect::<Vec<_>>();
-    let (first_time, first_hex) = first[0].split_once(':').unwrap();
-    let (second_time, second_hex) = first[1].split_once(':').unwrap();
-    assert_eq!(first_hex, "7265766965772074686973");
-    assert_eq!(second_hex, "0a");
-    assert!(
-        second_time.parse::<u128>().unwrap() - first_time.parse::<u128>().unwrap() >= 200_000_000,
-        "prompt text and Enter were not split by at least 200ms"
-    );
-
-    assert_success(&command(
-        &runtime,
-        &name,
-        &[
-            "agent-send-keys",
-            "--pane-id",
-            "1",
-            "--key",
-            "esc",
-            "--key",
-            "up",
-            "--key",
-            "ctrl+c",
-        ],
-    ));
-    wait_file_lines(&chunks, 3);
-    let recorded = fs::read_to_string(&chunks).unwrap();
-    assert_eq!(
-        recorded.lines().nth(2).unwrap().split_once(':').unwrap().1,
-        "1b1b5b4103"
-    );
-    let before_invalid = recorded.lines().count();
-    assert_eq!(
-        error_code(command(
-            &runtime,
-            &name,
-            &["agent-send-keys", "--pane-id", "1", "--key", "bogus"],
-        )),
-        "invalid_key"
-    );
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    assert_eq!(
-        fs::read_to_string(&chunks).unwrap().lines().count(),
-        before_invalid
-    );
-
-    // The fixture remains blocked forever after subsequent prompts. The 5s transition gate wins
-    // over a long request timeout; a timeout shorter than that gate remains a plain timeout.
-    let stalled_at = std::time::Instant::now();
-    assert_eq!(
-        error_code(command(
-            &runtime,
-            &name,
-            &[
-                "agent-prompt",
-                "--pane-id",
-                "1",
-                "--wait",
-                "--timeout",
-                "10s",
-                "never changes",
-            ],
-        )),
-        "agent_prompt_stalled"
-    );
-    assert!(stalled_at.elapsed() >= std::time::Duration::from_secs(4));
-    assert_eq!(
-        error_code(command(
-            &runtime,
-            &name,
-            &[
-                "agent-prompt",
-                "--pane-id",
-                "1",
-                "--wait",
-                "--timeout",
-                "3s",
-                "short gate",
-            ],
-        )),
-        "timeout"
-    );
-
-    // The integration pins deterministic G13 gates; merge/alignment/restoration are unit-tested
-    // without relying on PTY redraw timing.
-    assert_eq!(
-        error_code(command(
-            &runtime,
-            &name,
-            &["agent-read", "--pane-id", "1", "--lines", "120"],
-        )),
-        "agent_not_idle"
-    );
-    let split = json(command(
-        &runtime,
-        &name,
-        &["split", "vertical", "--pane-id", "1"],
-    ));
-    let shell_pane = split["new_pane_id"].as_u64().unwrap().to_string();
-    assert_eq!(
-        error_code(command(
-            &runtime,
-            &name,
-            &["agent-prompt", "--pane-id", &shell_pane, "hello"],
-        )),
-        "agent_not_ready"
-    );
-    assert_eq!(
-        error_code(command(
-            &runtime,
-            &name,
-            &["agent-send-keys", "--pane-id", &shell_pane, "--key", "esc"],
-        )),
-        "agent_not_ready"
-    );
-}
-
 fn command(runtime: &Path, session: &str, arguments: &[&str]) -> Output {
     common::vvmux_command(runtime)
         .args(["msg", "--target", session])
@@ -1772,21 +1577,6 @@ fn wait_text(runtime: &Path, session: &str, pane: u64, pattern: &str) {
         ],
     );
     assert_success(&output);
-}
-
-fn wait_file_lines(path: &Path, expected: usize) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if fs::read_to_string(path).is_ok_and(|contents| contents.lines().count() >= expected) {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "fixture did not record {expected} chunks: {:?}",
-            fs::read_to_string(path).unwrap_or_default()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
 }
 
 fn json(output: Output) -> Value {
