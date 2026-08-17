@@ -310,6 +310,22 @@ pub enum MsgCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Give the agent in one pane a name, or clear the name it has.
+    ///
+    /// A name is a stable target: pass `--alias NAME` to any other `msg` command instead of
+    /// `--pane-id`, and it keeps working when the pane is split, moved, or renumbered. Names belong
+    /// to the agent process, so one is cleared when its agent exits or is replaced.
+    AgentRename {
+        /// The pane holding the agent to name.
+        #[arg(long)]
+        pane_id: Option<u64>,
+        /// The name to give it.
+        #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
+        name: Option<crate::agent::AgentAlias>,
+        /// Remove the agent's current name.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Start a recognized agent in a pane that is sitting at a shell prompt.
     ///
     /// Types the agent's command at the pane's shell and returns once that same pane is detected
@@ -335,9 +351,9 @@ pub enum MsgCommand {
     /// pane. The Enter is intentionally delayed so the prompt does not remain embedded in the
     /// text on submit-heavy full-screen agents.
     AgentPrompt {
-        /// The pane with the detected agent to receive the prompt text.
+        /// The pane with the detected agent to receive the prompt text. Omit to use `--alias`.
         #[arg(long)]
-        pane_id: u64,
+        pane_id: Option<u64>,
         /// Text to send to the agent.
         text: String,
         /// Wait for an agent status change after submit.
@@ -352,15 +368,17 @@ pub enum MsgCommand {
     },
     /// Send one or more key strokes to one detected agent.
     AgentSendKeys {
+        /// The pane with the detected agent. Omit to use `--alias`.
         #[arg(long)]
-        pane_id: u64,
+        pane_id: Option<u64>,
         #[arg(long = "key", value_name = "KEY")]
         keys: Vec<String>,
     },
     /// Read an idle full-screen agent's application-owned scrollback.
     AgentRead {
+        /// The pane with the detected agent. Omit to use `--alias`.
         #[arg(long)]
-        pane_id: u64,
+        pane_id: Option<u64>,
         #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u16).range(1..=1000))]
         lines: u16,
         #[arg(long)]
@@ -655,7 +673,11 @@ pub enum WaitCommand {
     },
 }
 
-pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()> {
+pub fn run(
+    explicit_target: Option<&str>,
+    alias: Option<crate::agent::AgentAlias>,
+    command: MsgCommand,
+) -> io::Result<()> {
     let target = explicit_target
         .map(ToOwned::to_owned)
         .or_else(|| {
@@ -669,7 +691,15 @@ pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()>
         .then(inherited_pane_from_environment)
         .flatten();
     let (method, explicit_pane, allow_focused, output) = build_request(command)?;
-    let pane_id = explicit_pane.or(inherited_pane);
+    if alias.is_some() && explicit_pane.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--alias and --pane-id name different panes; pass one",
+        ));
+    }
+    // An alias overrides an inherited pane, but an explicit `--pane-id` still wins over both. A
+    // caller inside a pane who names an agent means that agent, not the pane they happen to be in.
+    let pane_id = explicit_pane.or_else(|| alias.is_none().then_some(inherited_pane).flatten());
     if matches!(
         &method,
         AutomationMethod::ClosePane
@@ -678,15 +708,20 @@ pub fn run(explicit_target: Option<&str>, command: MsgCommand) -> io::Result<()>
             | AutomationMethod::ClearAgentReport { .. }
             | AutomationMethod::ReportMetadata { .. }
     ) && pane_id.is_none()
+        && alias.is_none()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "command requires --pane-id or a same-session VVMUX_PANE_ID",
+            "command requires --pane-id, --alias, or a same-session VVMUX_PANE_ID",
         ));
     }
+    // `agent-start` needs no case of its own: it needs a pane with no agent in it, an alias only
+    // ever names an agent already running, and its `--pane-id` is required — so passing `--alias`
+    // to it is already refused above as the contradiction it is.
     let request = AutomationRequest {
         id: 1,
         pane_id,
+        agent: alias,
         allow_focused,
         method,
     };
@@ -757,6 +792,7 @@ pub(crate) fn request_json(
     let request = AutomationRequest {
         id: 1,
         pane_id,
+        agent: None,
         allow_focused,
         method,
     };
@@ -971,6 +1007,20 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
         MsgCommand::AgentExplain { pane_id } => {
             (AutomationMethod::AgentExplain, pane_id, true, Output::Json)
         }
+        MsgCommand::AgentRename {
+            pane_id,
+            name,
+            clear,
+        } => (
+            // `--clear` and `--name` are mutually exclusive at the parser, so `clear` set means
+            // `name` is absent, and the absent alias *is* the clear.
+            AutomationMethod::AgentRename {
+                alias: if clear { None } else { name },
+            },
+            pane_id,
+            false,
+            Output::Json,
+        ),
         MsgCommand::AgentStart {
             kind,
             pane_id,
@@ -1016,14 +1066,14 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                     until,
                     timeout_ms: millis(timeout),
                 },
-                Some(pane_id),
+                pane_id,
                 true,
                 Output::Json,
             )
         }
         MsgCommand::AgentSendKeys { pane_id, keys } => (
             AutomationMethod::AgentSendKeys { keys },
-            Some(pane_id),
+            pane_id,
             true,
             Output::Json,
         ),
@@ -1033,7 +1083,7 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             json,
         } => (
             AutomationMethod::AgentRead { lines, json },
-            Some(pane_id),
+            pane_id,
             false,
             if json { Output::Json } else { Output::Text },
         ),

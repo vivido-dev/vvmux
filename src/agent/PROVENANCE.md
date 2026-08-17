@@ -43,8 +43,21 @@ Later features adapted from the same HerdR commit, recorded as they land:
   lives in the provider's plugin manifest (`[agents.launch]`) rather than in a hardcoded Rust
   table, so users can add or override providers as data; and readiness additionally waits out
   vvmux's own detection startup grace, which HerdR does not have to consider because its
-  classification has no equivalent forced-idle window. HerdR's agent names/aliases
-  (`agent start <name>`, `agent rename`) are not ported here; vvmux targets panes by ID.
+  classification has no equivalent forced-idle window.
+- **Agent names** (`AgentAlias` in `agent.rs`, `agent-rename` and target resolution in
+  `session.rs`) — the grammar is ported from HerdR's `valid_agent_name` (`src/app/agents.rs`):
+  one to thirty-two characters, leading lowercase letter, lowercase letters, digits, `-` and `_`.
+  The lifecycle matches HerdR's too — a name belongs to the agent process rather than the pane, is
+  unique among live agents, is refused for a pane with no agent or a launch in flight, and is
+  released explicitly. Four deliberate divergences. The flag is `--alias` rather than HerdR's
+  positional name-or-pane target, because vvmux already spells an agent *kind* `--agent` on
+  `report-agent`, and because a single global flag resolves for every `msg` verb instead of each
+  verb growing its own target parser. Resolution is strict: an explicit `--pane-id` wins, then an
+  alias, then the focused pane, and naming both is refused rather than silently preferring one —
+  HerdR resolves a single target string and reports ambiguity instead. The name is held outside the
+  lifecycle snapshot, so renaming cannot advance the transition counter `agent-prompt` reads as its
+  stall baseline. And the name survives the detector's first observation of an agent that already
+  reported itself, which is the one path where HerdR's equivalent state is rebuilt.
 - **Agent prompt and bounded keys** (`agent_drive.rs`, `agent-prompt` and `agent-send-keys` in
   `session.rs`) — the prompt/submit split and 5 s no-transition stall gate are adapted from
   HerdR's agent automation path. vvmux routes both writes through its delayed, bounded PTY input

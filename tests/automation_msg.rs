@@ -1535,6 +1535,267 @@ fn agent_start_refuses_a_pane_whose_foreground_is_not_its_shell() {
     assert_eq!(busy, "agent_pane_busy");
 }
 
+#[test]
+fn an_agent_alias_targets_its_pane_and_belongs_to_the_agent_that_earned_it() {
+    let directory = tempfile::Builder::new()
+        .prefix("vva-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = directory.path().to_path_buf();
+    let shell = directory.path().join("fixture-shell");
+    fs::write(
+        &shell,
+        br#"#!/bin/sh
+printf 'READY pane=%s\n' "$VVMUX_PANE_ID"
+while IFS= read -r line; do
+    if [ "$line" = exit ]; then
+        exit 0
+    fi
+done
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = directory.path().join("vvmux.toml");
+    fs::write(
+        &config,
+        format!(
+            "[general]\nshell = {}\nrender_interval_ms = 1\n",
+            toml_string(&shell)
+        ),
+    )
+    .unwrap();
+
+    let name = format!("alias-test-{}", std::process::id());
+    assert_success(
+        &common::vvmux_command(&runtime)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "new",
+                "-s",
+                &name,
+                "-d",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let _guard = SessionGuard {
+        runtime: runtime.clone(),
+        name: name.clone(),
+    };
+    wait_text(&runtime, &name, 1, "READY pane=1");
+    assert_success(&command(&runtime, &name, &["split", "vertical"]));
+    wait_text(&runtime, &name, 2, "READY pane=2");
+
+    // Two panes, each reporting a different agent, so every assertion below can tell "the right
+    // pane" from "the only pane".
+    for (pane, agent, sequence) in [("1", "claude", "1"), ("2", "codex", "2")] {
+        assert_success(&command(
+            &runtime,
+            &name,
+            &[
+                "report-agent",
+                "--agent",
+                agent,
+                "--state",
+                "idle",
+                "--source",
+                "alias-test",
+                "--sequence",
+                sequence,
+                "--pane-id",
+                pane,
+            ],
+        ));
+    }
+
+    // A pane with no agent cannot be named: the alias would belong to whatever ran there next.
+    assert_success(&command(&runtime, &name, &["split", "horizontal"]));
+    wait_text(&runtime, &name, 3, "READY pane=3");
+    assert_eq!(
+        error_code(command(
+            &runtime,
+            &name,
+            &["agent-rename", "--pane-id", "3", "--name", "nobody"],
+        )),
+        "agent_not_detected"
+    );
+
+    let named = json(command(
+        &runtime,
+        &name,
+        &["agent-rename", "--pane-id", "1", "--name", "reviewer"],
+    ));
+    assert_eq!(named["pane_id"], 1);
+    assert_eq!(named["alias"], "reviewer");
+    assert_eq!(named["changed"], true);
+
+    // The alias resolves to its pane, and resolves to the *right* pane: pane 2 holds a different
+    // agent, so a resolver that simply picked the first agent pane would answer `codex` here.
+    let explained = json(command(
+        &runtime,
+        &name,
+        &["--alias", "reviewer", "agent-explain"],
+    ));
+    assert_eq!(explained["pane_id"], 1);
+    assert_eq!(explained["explain"]["agent"], "claude");
+
+    // Same answer whether the flag precedes or follows the subcommand, since it is declared once
+    // for every `msg` verb rather than per verb.
+    assert_eq!(
+        json(command(
+            &runtime,
+            &name,
+            &["agent-explain", "--alias", "reviewer"],
+        ))["pane_id"],
+        1
+    );
+
+    // The alias is reported back where a caller would look for a target to use.
+    let listed = json(command(&runtime, &name, &["list-panes"]));
+    // The agent kind travels with the alias here on purpose: reading only the alias would pass
+    // just as well if pane 2 had no agent at all, and pane 2 holding a *different* agent is what
+    // makes every "the right pane" assertion in this test meaningful.
+    let agents = listed["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pane| {
+            (
+                pane["pane_id"].as_u64().unwrap(),
+                pane["agent"]["kind"].as_str().map(ToOwned::to_owned),
+                pane["agent"]["alias"].as_str().map(ToOwned::to_owned),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        agents,
+        [
+            (1, Some("claude".to_owned()), Some("reviewer".to_owned())),
+            (2, Some("codex".to_owned()), None),
+            (3, None, None),
+        ]
+    );
+
+    // One name, one agent. Without the uniqueness check the second pane would silently steal the
+    // target and every later `--alias reviewer` would drive the wrong agent.
+    assert_eq!(
+        error_code(command(
+            &runtime,
+            &name,
+            &["agent-rename", "--pane-id", "2", "--name", "reviewer"],
+        )),
+        "agent_alias_taken"
+    );
+    // Renaming a pane to the name it already has is not a collision with itself.
+    assert_eq!(
+        json(command(
+            &runtime,
+            &name,
+            &["agent-rename", "--pane-id", "1", "--name", "reviewer"],
+        ))["changed"],
+        false
+    );
+
+    assert_eq!(
+        error_code(command(
+            &runtime,
+            &name,
+            &["--alias", "nobody", "agent-explain"],
+        )),
+        "agent_alias_not_found"
+    );
+    // Naming both an alias and a pane is a contradiction the CLI refuses rather than silently
+    // preferring one.
+    assert!(
+        !command(
+            &runtime,
+            &name,
+            &["--alias", "reviewer", "agent-explain", "--pane-id", "2"],
+        )
+        .status
+        .success()
+    );
+
+    // The layout changes underneath the alias: closing pane 3 reshuffles the tree without touching
+    // pane 1's agent, and the name must still find it.
+    assert_success(&command(&runtime, &name, &["close-pane", "--pane-id", "3"]));
+    assert_eq!(
+        json(command(
+            &runtime,
+            &name,
+            &["--alias", "reviewer", "agent-explain"],
+        ))["pane_id"],
+        1
+    );
+
+    // Withdrawing a lifecycle report is not the agent leaving: `clear-agent-report` drops the
+    // report and falls back to screen classification, but the agent is still detected in that pane,
+    // so its name still belongs to it. (An agent actually ending clears the name; that lives in the
+    // `AgentRuntime` unit tests, which can drive the process-observation paths directly.)
+    assert_success(&command(
+        &runtime,
+        &name,
+        &[
+            "clear-agent-report",
+            "--source",
+            "alias-test",
+            "--sequence",
+            "10",
+            "--pane-id",
+            "1",
+        ],
+    ));
+    let after_clear = json(command(
+        &runtime,
+        &name,
+        &["--alias", "reviewer", "agent-explain"],
+    ));
+    assert_eq!(after_clear["pane_id"], 1);
+    assert_eq!(after_clear["explain"]["source"], "screen");
+
+    // Clearing the name leaves the agent itself untouched, and frees the name for another agent.
+    let cleared = json(command(
+        &runtime,
+        &name,
+        &["agent-rename", "--pane-id", "1", "--clear"],
+    ));
+    assert!(cleared["alias"].is_null());
+    assert_eq!(cleared["agent"]["kind"], "claude");
+    assert_eq!(
+        error_code(command(
+            &runtime,
+            &name,
+            &["--alias", "reviewer", "agent-explain"],
+        )),
+        "agent_alias_not_found"
+    );
+
+    // Two owners, the whole way through: pane 2 held its own agent while pane 1 was named,
+    // collided with, renamed, and cleared, and it neither inherited the name nor lost its state.
+    let survivor = json(command(&runtime, &name, &["inspect", "--pane-id", "2"]));
+    assert_eq!(survivor["pane"]["agent"]["kind"], "codex");
+    assert!(survivor["pane"]["agent"]["alias"].is_null());
+
+    // The freed name now lands on the agent that asks for it, in the other pane.
+    let renamed = json(command(
+        &runtime,
+        &name,
+        &["agent-rename", "--pane-id", "2", "--name", "reviewer"],
+    ));
+    assert_eq!(renamed["alias"], "reviewer");
+    assert_eq!(
+        json(command(
+            &runtime,
+            &name,
+            &["--alias", "reviewer", "agent-explain"],
+        ))["pane_id"],
+        2
+    );
+}
+
 fn command(runtime: &Path, session: &str, arguments: &[&str]) -> Output {
     common::vvmux_command(runtime)
         .args(["msg", "--target", session])

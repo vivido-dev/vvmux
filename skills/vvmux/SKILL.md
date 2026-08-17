@@ -37,8 +37,13 @@ Use this release-matched workflow:
    polling each one. Treat a `gap` record as missed events, not as an error; it is never filtered
    out even when the stream is narrowed.
 
-G15 aliases will resolve at the same target-resolution point where `--pane-id` resolves today.
-Until that surface exists, always use stable pane IDs and do not invent alias syntax.
+12. Name an agent you will come back to: `agent-rename --pane-id ID --name reviewer`. Then target it
+   with `--alias reviewer` on any `msg` command instead of `--pane-id`, which keeps working after
+   splits, closes, and renumbering. Names are unique per session (`agent_alias_taken`), belong to
+   the agent process rather than the pane, and are cleared when that agent exits or is replaced —
+   so `agent_alias_not_found` means the agent is gone, not that you mistyped. Use
+   `agent-rename --pane-id ID --clear` to release a name. Pane IDs remain correct for everything
+   else; a name is for an agent you drive repeatedly.
 
 Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
 needed. It proves the bytes reached the PTY writer, not that the child application consumed them.

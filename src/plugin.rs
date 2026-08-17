@@ -2073,6 +2073,7 @@ fn session_capabilities(target: &str) -> io::Result<Value> {
         .send(&ClientMessage::Automation(AutomationRequest {
             id: 1,
             pane_id: None,
+            agent: None,
             allow_focused: false,
             method: AutomationMethod::Capabilities,
         }))?;
@@ -2095,6 +2096,7 @@ fn invoke_via_session(
         .send(&ClientMessage::Automation(AutomationRequest {
             id: 1,
             pane_id: None,
+            agent: None,
             allow_focused: false,
             method: AutomationMethod::Plugin(PluginMethod::Invoke {
                 reference,
@@ -2153,6 +2155,7 @@ fn events(target: &str, after_sequence: Option<u64>) -> io::Result<()> {
         .send(&ClientMessage::Automation(AutomationRequest {
             id: 1,
             pane_id: None,
+            agent: None,
             allow_focused: false,
             method: AutomationMethod::Plugin(PluginMethod::EventSubscribe { after_sequence }),
         }))?;
@@ -2194,6 +2197,7 @@ fn plugin_session_request(target: &str, method: crate::ipc::PluginMethod) -> io:
         .send(&ClientMessage::Automation(AutomationRequest {
             id: 1,
             pane_id: None,
+            agent: None,
             allow_focused: false,
             method: AutomationMethod::Plugin(method),
         }))?;

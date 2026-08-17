@@ -105,6 +105,14 @@ enum Command {
     Msg {
         #[arg(short = 't', long = "target")]
         target: Option<String>,
+        /// Target the pane whose agent carries this name, instead of `--pane-id`.
+        ///
+        /// Declared once here rather than per subcommand: which pane a request addresses is a
+        /// property of the request, not of the verb, and the server resolves all three forms
+        /// (pane ID, agent name, focused pane) in one place. Named `--alias` because `--agent`
+        /// already means an agent *kind* on `report-agent`.
+        #[arg(long, global = true)]
+        alias: Option<crate::agent::AgentAlias>,
         #[command(subcommand)]
         command: Box<automation::MsgCommand>,
     },
@@ -279,7 +287,11 @@ fn run(cli: Cli) -> io::Result<()> {
             runtime::validate_session_name(&target)?;
             client::kill(&target)
         }
-        Some(Command::Msg { target, command }) => automation::run(target.as_deref(), *command),
+        Some(Command::Msg {
+            target,
+            alias,
+            command,
+        }) => automation::run(target.as_deref(), alias, *command),
         Some(Command::Plugin { command }) => plugin::run(command),
         Some(Command::Integration { command }) => integration::run(command),
         #[cfg(feature = "server-capability")]

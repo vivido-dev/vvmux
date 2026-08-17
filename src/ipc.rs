@@ -80,6 +80,13 @@ const AUTOMATION_CHUNK_BYTES: usize = 512 * 1024;
 pub struct AutomationRequest {
     pub id: u64,
     pub pane_id: Option<u64>,
+    /// Target the pane whose agent carries this alias, when no `pane_id` is given.
+    ///
+    /// A second field rather than a target enum replacing `pane_id`: every existing caller and every
+    /// server-side path keeps its exact meaning, and the two are reconciled in the one place that
+    /// already resolves a request's pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<crate::agent::AgentAlias>,
     pub allow_focused: bool,
     pub method: AutomationMethod,
 }
@@ -138,6 +145,10 @@ pub enum AutomationMethod {
     },
     /// Replay agent classification for one pane and report which rule decided its state.
     AgentExplain,
+    /// Name the agent in one pane, or clear its name when `alias` is absent.
+    AgentRename {
+        alias: Option<crate::agent::AgentAlias>,
+    },
     /// Launch a recognized agent in a pane that is sitting at a shell prompt.
     AgentStart {
         agent: crate::agent::AgentId,

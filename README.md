@@ -95,10 +95,11 @@ report-agent-session --agent claude|codex|hermes --source ID --sequence N [--age
 report-metadata --source ID --sequence N [--token NAME=VALUE]... [--ttl-ms MS] [--display-agent TEXT] [--state-label STATUS=TEXT]... [--title TEXT] [--pane-id ID]
 clear-agent-report --source ID --sequence N [--pane-id ID]
 agent-explain [--pane-id ID]
+agent-rename [--pane-id ID] --name NAME | --clear
 agent-start --kind AGENT --pane-id ID [--timeout DURATION] [-- ARGS...]
-agent-prompt --pane-id ID [--wait] [--until idle|working|blocked|done[,...]] [--timeout DURATION] TEXT
-agent-send-keys --pane-id ID --key KEY [--key KEY]...
-agent-read --pane-id ID [--lines N]
+agent-prompt [--pane-id ID] [--wait] [--until idle|working|blocked|done[,...]] [--timeout DURATION] TEXT
+agent-send-keys [--pane-id ID] --key KEY [--key KEY]...
+agent-read [--pane-id ID] [--lines N]
 inspect [--pane-id ID]
 inspect-media [--pane-id ID]
 split vertical|horizontal [--pane-id ID]
@@ -320,6 +321,41 @@ finished while you were not looking; focusing its pane in the navigator acknowle
 `idle`. A wait is scoped to its pane — another pane reaching the state does not satisfy it. A pane with no
 agent yet is simply not matching, so "launch an agent, then wait for it" works; if the wait times
 out without one ever appearing, the error says so.
+
+### Naming an agent
+
+A pane ID is a stable handle to a *pane*. When you are driving one agent repeatedly, name the agent
+instead:
+
+```sh
+vvmux msg agent-rename --pane-id 2 --name reviewer
+vvmux msg --alias reviewer agent-prompt --wait --until blocked,done 'review the diff'
+vvmux msg --alias reviewer agent-read --lines 200
+vvmux msg agent-rename --pane-id 2 --clear
+```
+
+`--alias NAME` works on every `msg` command in place of `--pane-id`, and keeps resolving after
+splits, closes, and renumbering, because the name belongs to the agent process rather than to the
+pane or the layout. It is spelled `--alias` rather than `--agent` because `report-agent --agent`
+already names an agent *kind*.
+
+A name is one to thirty-two characters, starts with a lowercase letter, and holds lowercase letters,
+digits, `-`, and `_`. That is narrower than it needs to be on purpose: a name is typed next to
+numeric pane IDs, so anything that could read as a number, a flag, or a differently-cased spelling
+of another name is refused.
+
+Names are unique within a session — a second pane asking for a name in use is refused with
+`agent_alias_taken` rather than quietly stealing the target. A name requires a detected agent
+(`agent_not_detected`), and cannot be attached to a pane whose launch is still in flight
+(`agent_launch_pending`), since the agent it would name may never arrive.
+
+A name is cleared when its agent exits or is replaced, so `agent_alias_not_found` means the agent is
+gone rather than that you mistyped. Withdrawing a lifecycle report is not the agent leaving: the
+agent is still detected in that pane, and keeps its name. Renaming is display state, not lifecycle
+state — it never advances the change counter `agent-prompt` uses to detect a stalled prompt.
+
+`agent-start` is the one command a name cannot target: it needs a pane with *no* agent in it, and a
+name only ever refers to an agent already running. Its `--pane-id` stays required.
 
 `agent-start` launches a recognized agent in a pane that is sitting at a shell prompt, and returns
 only once that same pane is detected running it:

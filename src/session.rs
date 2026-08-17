@@ -2860,7 +2860,11 @@ impl SessionActor {
                 }) {
                 Ok(request.pane_id.unwrap())
             } else {
-                self.resolve_automation_pane(request.pane_id, request.allow_focused)
+                self.resolve_automation_pane(
+                    request.pane_id,
+                    request.agent.as_ref(),
+                    request.allow_focused,
+                )
             };
             match resolved {
                 Ok(pane) => Some(pane),
@@ -3104,6 +3108,61 @@ impl SessionActor {
                         target,
                         AutomationError::new("invalid_agent_report", message),
                     ),
+                }
+            }
+            AutomationMethod::AgentRename { alias } => {
+                let pane_id = pane_id.unwrap();
+                // A launch in flight has no agent yet, and the one it is waiting for may never
+                // arrive. Naming it now would attach the alias to whatever the pane's shell is
+                // running instead, so the caller is told to wait for the launch to settle.
+                let launch_pending = self.automation_waiters.iter().any(|waiter| {
+                    waiter.pane_id == Some(pane_id)
+                        && matches!(waiter.kind, AutomationWaitKind::AgentLaunch { .. })
+                });
+                let taken = alias
+                    .as_ref()
+                    .and_then(|alias| self.pane_with_agent_alias(alias))
+                    .filter(|holder| *holder != pane_id);
+                let result = if launch_pending {
+                    Err(AutomationError::new(
+                        "agent_launch_pending",
+                        format!("pane {pane_id} is still starting an agent"),
+                    ))
+                } else if let Some(holder) = taken {
+                    Err(AutomationError::new(
+                        "agent_alias_taken",
+                        format!(
+                            "{} already names the agent in pane {holder}",
+                            alias.as_ref().expect("taken implies an alias")
+                        ),
+                    ))
+                } else {
+                    self.panes
+                        .get_mut(&pane_id)
+                        .ok_or("pane no longer exists")
+                        .and_then(|pane| pane.agent.set_alias(alias))
+                        .map_err(|message| AutomationError::new("agent_not_detected", message))
+                };
+                match result {
+                    Ok(changed) => {
+                        if changed {
+                            // The navigator and status row show the alias, so a rename is a display
+                            // change. It is deliberately not a lifecycle change: see the `alias`
+                            // field on `AgentRuntime`.
+                            self.note_agent_display_change();
+                        }
+                        let pane = &self.panes[&pane_id];
+                        self.reply_automation(
+                            target,
+                            serde_json::json!({
+                                "pane_id": pane_id,
+                                "changed": changed,
+                                "alias": pane.agent.alias(),
+                                "agent": pane.agent.snapshot().map(agent_json),
+                            }),
+                        );
+                    }
+                    Err(error) => self.reply_automation_error(target, error),
                 }
             }
             AutomationMethod::AgentExplain => {
@@ -3796,9 +3855,23 @@ impl SessionActor {
         self.attached.as_ref().is_some_and(|client| client.id == id)
     }
 
+    /// The pane holding the agent named `alias`, if one does.
+    ///
+    /// A linear scan rather than a reverse index: a session holds at most
+    /// [`crate::layout_file::MAX_LAYOUT_PANES`] panes, and an index would be a second copy of state
+    /// that has to be invalidated everywhere an alias is cleared — including the process-exit paths
+    /// inside `AgentRuntime`, which know nothing about the session. Scanning cannot go stale.
+    fn pane_with_agent_alias(&self, alias: &crate::agent::AgentAlias) -> Option<PaneId> {
+        self.panes
+            .iter()
+            .find(|(_, pane)| pane.agent.alias() == Some(alias))
+            .map(|(pane_id, _)| *pane_id)
+    }
+
     fn resolve_automation_pane(
         &self,
         requested: Option<PaneId>,
+        alias: Option<&crate::agent::AgentAlias>,
         allow_focused: bool,
     ) -> Result<PaneId, AutomationError> {
         if let Some(pane) = requested {
@@ -3809,6 +3882,17 @@ impl SessionActor {
                 .ok_or_else(|| {
                     AutomationError::new("pane_not_found", format!("pane {pane} does not exist"))
                 });
+        }
+        // An alias outranks the focused pane but never an explicit pane ID: a caller that named both
+        // is answered by the more specific one, and a caller that named an agent meant that agent
+        // rather than wherever focus happens to be.
+        if let Some(alias) = alias {
+            return self.pane_with_agent_alias(alias).ok_or_else(|| {
+                AutomationError::new(
+                    "agent_alias_not_found",
+                    format!("no agent is named {alias}"),
+                )
+            });
         }
         if allow_focused {
             return self
@@ -5292,6 +5376,9 @@ impl SessionActor {
                 if !pane.agent.metadata().is_empty() {
                     agent["metadata"] = agent_metadata_json(pane.agent.metadata());
                 }
+                // Always present, unlike metadata: an alias is a target a caller may need to
+                // discover, so `null` is a useful answer where an absent key would not be.
+                agent["alias"] = serde_json::to_value(pane.agent.alias()).unwrap_or_default();
                 if disclosure == AgentDisclosure::Full
                     && let Some(session) = pane.agent.session()
                 {
@@ -7616,8 +7703,14 @@ impl SessionActor {
                             .title()
                             .map_or_else(|| format!("pane {pane_id}"), ToOwned::to_owned)
                     }),
-                    label: metadata
-                        .display_agent()
+                    // Most specific name wins: the one the user chose, then the one the integration
+                    // reported, then the provider's. A user who named an agent `reviewer` is
+                    // looking for `reviewer` in this list.
+                    label: pane
+                        .agent
+                        .alias()
+                        .map(crate::agent::AgentAlias::as_str)
+                        .or_else(|| metadata.display_agent())
                         .unwrap_or(agent.label.as_str())
                         .to_owned(),
                     status_label: metadata
@@ -11102,7 +11195,7 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "wait_agent_state", "wait_media",
             "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "report_agent_session", "clear_agent_report",
-            "report_metadata", "agent_explain", "agent_start", "agent_prompt",
+            "report_metadata", "agent_explain", "agent_rename", "agent_start", "agent_prompt",
             "agent_send_keys", "agent_read", "subscribe", "save_layout"
         ],
         "limits": automation_limits(),
@@ -11312,6 +11405,7 @@ fn automation_limits() -> serde_json::Value {
         "agent_report_sources": crate::agent::MAX_REPORT_SOURCES,
         "agent_report_message_bytes": crate::agent::MAX_REPORT_MESSAGE_BYTES,
         "agent_session_bytes": crate::agent::MAX_AGENT_SESSION_BYTES,
+        "agent_alias_bytes": crate::agent::MAX_AGENT_ALIAS_BYTES,
         "agent_metadata_tokens": crate::agent::MAX_METADATA_TOKENS,
         "agent_metadata_key_bytes": crate::agent::MAX_METADATA_KEY_BYTES,
         "agent_metadata_value_bytes": crate::agent::MAX_METADATA_VALUE_BYTES,

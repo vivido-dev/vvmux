@@ -78,6 +78,16 @@ identity changes. `report-agent-session` stores only resumable native identity a
 reported state, blocked message, or lifecycle transition. Broad inspection surfaces expose only
 `session_present`; the session ID/path remain confined to exact-pane inspection.
 
+A request names its pane by ID, by agent name, or not at all, and one function on the actor
+reconciles all three: an explicit pane ID wins, then a live agent's name, then the focused pane for
+the verbs that permit it. Naming both a pane and an agent is refused rather than resolved. Agent
+names are held on the per-pane agent runtime rather than on the pane, so they are released by the
+same process-observation paths that release reports, session identity, and metadata — a name cannot
+outlive the agent it was given to, and cannot be inherited by whatever runs in that pane next. They
+are deliberately outside the lifecycle snapshot: renaming an agent is a display change, and folding
+it into the snapshot would advance the per-pane transition counter that `agent-prompt` reads as its
+stall baseline.
+
 The config watcher is the third worker that wakes the actor, after the PTY readers and the media
 wakeup. It polls the config path, requires one further identical observation before acting so a
 half-written file is never read, and treats a missing file as no change rather than a reset to

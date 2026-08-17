@@ -28,6 +28,8 @@ pub const MAX_REPORT_SOURCES: usize = 32;
 pub const MAX_REPORT_MESSAGE_BYTES: usize = 256;
 /// Native agent session identifier or path retained for a later resume.
 pub const MAX_AGENT_SESSION_BYTES: usize = 256;
+/// User-assigned agent alias, usable as an automation target.
+pub const MAX_AGENT_ALIAS_BYTES: usize = 32;
 /// Display-only tokens one pane retains.
 pub const MAX_METADATA_TOKENS: usize = 16;
 pub const MAX_METADATA_KEY_BYTES: usize = 32;
@@ -99,6 +101,67 @@ impl Serialize for AgentId {
 }
 
 impl<'de> Deserialize<'de> for AgentId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A name a user gives one live agent, usable as an automation target in place of a pane ID.
+///
+/// Deliberately narrower than [`AgentId`]: lowercase, starting with a letter, at most 32 bytes.
+/// An alias is typed on a command line and compared against pane IDs, so it must never be mistaken
+/// for a number, a flag, or a differently-cased spelling of another alias. Ported from herdr's
+/// `valid_agent_name` (`src/app/agents.rs`); see `agent/PROVENANCE.md`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentAlias(String);
+
+impl AgentAlias {
+    pub fn new(value: impl Into<String>) -> Result<Self, &'static str> {
+        let value = value.into();
+        let mut bytes = value.bytes();
+        let valid = value.len() <= MAX_AGENT_ALIAS_BYTES
+            && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+            && bytes.all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            });
+        valid.then_some(Self(value)).ok_or(
+            "agent alias must start with a lowercase letter and contain only lowercase letters, \
+             digits, '-' or '_' (1..=32 bytes)",
+        )
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AgentAlias {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for AgentAlias {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for AgentAlias {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentAlias {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -458,6 +521,18 @@ pub struct AgentRuntime {
     report_sequences: HashMap<String, u64>,
     session: Option<AgentSessionRef>,
     metadata: AgentMetadata,
+    /// The name a user gave this agent, if any.
+    ///
+    /// Held here rather than on the pane so it belongs to the *process*: it is cleared wherever
+    /// `session` and `metadata` are, which is exactly where the foreground agent stops being the one
+    /// the name was given to. A pane that is split, moved, or renumbered keeps the same
+    /// `AgentRuntime`, so the alias follows the agent rather than the layout.
+    ///
+    /// Deliberately outside [`AgentSnapshot`], for the reason [`AgentMetadata`] is: a snapshot is
+    /// the lifecycle fact waiters, notifications, and `agent_change_seq` react to, and a rename is
+    /// not a lifecycle event. Folding it in would make renaming an agent look like the agent
+    /// responding, which `agent-prompt` reads as its stall baseline.
+    alias: Option<AgentAlias>,
 }
 
 impl AgentRuntime {
@@ -475,6 +550,7 @@ impl AgentRuntime {
             report_sequences: HashMap::new(),
             session: None,
             metadata: AgentMetadata::default(),
+            alias: None,
         }
     }
 
@@ -525,6 +601,25 @@ impl AgentRuntime {
 
     pub fn metadata(&self) -> &AgentMetadata {
         &self.metadata
+    }
+
+    /// The name a user gave this agent, if any.
+    pub fn alias(&self) -> Option<&AgentAlias> {
+        self.alias.as_ref()
+    }
+
+    /// Name this agent, or clear its name when `alias` is `None`.
+    ///
+    /// Refuses a pane with no detected agent: an alias names a running agent, and one attached to
+    /// nothing would either be silently adopted by whatever started next or linger as a target that
+    /// resolves to a bare shell. Callers enforce uniqueness before calling.
+    pub fn set_alias(&mut self, alias: Option<AgentAlias>) -> Result<bool, &'static str> {
+        if self.identity.is_none() {
+            return Err("pane has no detected agent to name");
+        }
+        let changed = self.alias != alias;
+        self.alias = alias;
+        Ok(changed)
     }
 
     /// Attach display-only metadata from a named source.
@@ -589,6 +684,11 @@ impl AgentRuntime {
                     == self.identity.as_ref().map(|value| &value.id)
                 && self.identified_at.elapsed() < STARTUP_GRACE;
             if startup_report_matches {
+                // The report, session, metadata, and alias all survive here, and the alias for the
+                // same reason as the rest: this branch is the detector catching up to an agent that
+                // already reported itself, not a different agent arriving. A report sets `identity`,
+                // so an agent can be named in this window, and that name belongs to the process now
+                // being observed.
                 self.process_group = group;
                 return false;
             }
@@ -597,6 +697,7 @@ impl AgentRuntime {
             self.report_sequences.clear();
             self.session = None;
             self.metadata = AgentMetadata::default();
+            self.alias = None;
             self.pending_idle = None;
             self.done = false;
             self.identity = identity;
@@ -610,6 +711,7 @@ impl AgentRuntime {
                 self.report = None;
                 self.session = None;
                 self.metadata = AgentMetadata::default();
+                self.alias = None;
                 self.pending_idle = None;
                 self.done = false;
                 self.state = AgentState::Idle;
@@ -622,6 +724,7 @@ impl AgentRuntime {
             self.report_sequences.clear();
             self.session = None;
             self.metadata = AgentMetadata::default();
+            self.alias = None;
             self.pending_idle = None;
             self.identity = None;
             self.done = false;
@@ -3159,5 +3262,143 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
             .unwrap();
         assert!(!runtime.observe_process(Some(11), None));
         assert!(runtime.snapshot().is_none());
+    }
+
+    /// The grammar is deliberately narrower than `AgentId`'s: an alias is typed on a command line
+    /// beside numeric pane IDs, so anything that could be read as a number, a flag, or a
+    /// differently-cased spelling of another alias is refused.
+    #[test]
+    fn agent_aliases_use_a_small_command_line_safe_grammar() {
+        for valid in [
+            "a",
+            "r1",
+            "reviewer",
+            "code-review",
+            "code_review",
+            &"a".repeat(32),
+        ] {
+            assert!(
+                AgentAlias::new(valid).is_ok(),
+                "expected {valid:?} to parse"
+            );
+        }
+        for invalid in [
+            "",              // nothing to name
+            "Reviewer",      // case would make two aliases look like one
+            "1reviewer",     // could be read as a pane ID
+            "-reviewer",     // could be read as a flag
+            "_reviewer",     // reserved-looking, and not a letter
+            "review er",     // would split into two arguments
+            "review.er",     // '.' is a session-name separator elsewhere
+            "review/er",     // path-like
+            &"a".repeat(33), // over the bound
+        ] {
+            assert!(
+                AgentAlias::new(invalid).is_err(),
+                "expected {invalid:?} to be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alias_needs_a_detected_agent_and_reports_whether_it_changed() {
+        let catalog = catalog();
+        let mut runtime = AgentRuntime::new();
+        let alias = AgentAlias::new("reviewer").unwrap();
+
+        // Nothing detected: an alias would name whatever ran next, so it is refused.
+        assert!(runtime.set_alias(Some(alias.clone())).is_err());
+        assert!(runtime.alias().is_none());
+
+        runtime.observe_process(Some(7), Some(identity(&catalog, "claude")));
+        assert!(runtime.set_alias(Some(alias.clone())).unwrap());
+        assert_eq!(runtime.alias(), Some(&alias));
+        // Setting the same name again is not a change, so callers do not repaint for nothing.
+        assert!(!runtime.set_alias(Some(alias.clone())).unwrap());
+        assert!(runtime.set_alias(None).unwrap());
+        assert!(runtime.alias().is_none());
+    }
+
+    /// An alias belongs to the agent process, not the pane. It must die with the agent through every
+    /// path that ends one, or a later agent would inherit a name it was never given.
+    #[test]
+    fn an_alias_dies_with_the_agent_it_named() {
+        let catalog = catalog();
+        let alias = AgentAlias::new("reviewer").unwrap();
+
+        for (label, end_it) in [
+            (
+                "foreground group changed",
+                Box::new(|runtime: &mut AgentRuntime, catalog: &AgentCatalog| {
+                    runtime.observe_process(Some(9), Some(identity(catalog, "claude")));
+                }) as Box<dyn Fn(&mut AgentRuntime, &AgentCatalog)>,
+            ),
+            (
+                "a different agent took the pane",
+                Box::new(|runtime: &mut AgentRuntime, catalog: &AgentCatalog| {
+                    runtime.observe_process(Some(7), Some(identity(catalog, "codex")));
+                }),
+            ),
+            (
+                "the agent exited",
+                Box::new(|runtime: &mut AgentRuntime, _: &AgentCatalog| {
+                    runtime.observe_process(Some(7), None);
+                }),
+            ),
+        ] {
+            let mut runtime = AgentRuntime::new();
+            runtime.observe_process(Some(7), Some(identity(&catalog, "claude")));
+            runtime.set_alias(Some(alias.clone())).unwrap();
+            assert_eq!(runtime.alias(), Some(&alias), "{label}: setup");
+
+            end_it(&mut runtime, &catalog);
+            assert!(
+                runtime.alias().is_none(),
+                "{label}: alias outlived its agent"
+            );
+        }
+    }
+
+    /// The startup grace is the one path that must *keep* an alias. A report sets identity, so an
+    /// agent can be named before the detector first sees its process; that branch is the detector
+    /// catching up to the same agent, not a new one arriving.
+    #[test]
+    fn an_alias_survives_the_detector_catching_up_to_a_reporting_agent() {
+        let catalog = catalog();
+        let alias = AgentAlias::new("reviewer").unwrap();
+        let mut runtime = AgentRuntime::new();
+
+        // The hook reports before the detector has observed any process.
+        runtime
+            .report(
+                state_report(identity(&catalog, "claude"), AgentState::Idle, "hook", 1),
+                false,
+            )
+            .unwrap();
+        runtime.set_alias(Some(alias.clone())).unwrap();
+
+        // The detector now sees the same agent for the first time.
+        assert!(!runtime.observe_process(Some(7), Some(identity(&catalog, "claude"))));
+        assert_eq!(
+            runtime.alias(),
+            Some(&alias),
+            "the alias was dropped by the detector catching up to its own agent"
+        );
+    }
+
+    /// A rename is display state, not lifecycle state. If it reached the snapshot it would bump the
+    /// change counter `agent-prompt` uses as its stall baseline, and renaming an agent would read as
+    /// the agent responding to a prompt.
+    #[test]
+    fn renaming_an_agent_does_not_change_its_lifecycle_snapshot() {
+        let catalog = catalog();
+        let mut runtime = AgentRuntime::new();
+        runtime.observe_process(Some(7), Some(identity(&catalog, "claude")));
+
+        let before = runtime.snapshot().unwrap();
+        runtime
+            .set_alias(Some(AgentAlias::new("reviewer").unwrap()))
+            .unwrap();
+        assert_eq!(runtime.snapshot().unwrap(), before);
     }
 }
