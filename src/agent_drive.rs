@@ -8,10 +8,8 @@
 //!
 //! Adapted from herdr (Apache-2.0, commit `6c6ddcd`) — see `crate::agent`'s PROVENANCE.md.
 //!
-//! Only the SGR encoder has a caller so far. The availability and quoting halves are exercised by
-//! their tests and attach to `agent-start` and `agent-prompt`; they live here now because both
-//! features depend on them and neither should re-derive process-table or shell-quoting rules.
-#![allow(dead_code)]
+//! Shared by `agent-start`, `agent-prompt`, and session restore, none of which should re-derive
+//! process-table or shell-quoting rules.
 
 use std::time::Duration;
 

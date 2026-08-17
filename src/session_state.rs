@@ -27,7 +27,6 @@
 //! persists at all, and the opt-in pane history, which is large, holds whatever scrolled past a
 //! terminal, and is therefore kept in its own file so enabling or disabling it never rewrites the
 //! shape.
-#![allow(dead_code)]
 
 use std::io;
 use std::path::Path;

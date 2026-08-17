@@ -5393,7 +5393,8 @@ impl SessionActor {
 
     /// Answer a still-hosting probe.
     ///
-    /// Task 0 lands the probe path with no caller; `agent-prompt` attaches its submit here.
+    /// The probe runs on a worker so the actor never reads the process table; this applies its
+    /// answer. `agent-prompt` submits through here.
     fn resolve_hosts_agent_probe(
         &mut self,
         reply: AutomationReplyTarget,
@@ -12133,6 +12134,15 @@ fn automation_limits() -> serde_json::Value {
         "agent_report_message_bytes": crate::agent::MAX_REPORT_MESSAGE_BYTES,
         "agent_session_bytes": crate::agent::MAX_AGENT_SESSION_BYTES,
         "agent_alias_bytes": crate::agent::MAX_AGENT_ALIAS_BYTES,
+        // Persistence bounds. A caller cannot raise these, but it can tell from them why a long
+        // scrollback came back shorter than it went in, which is the difference between a bound and
+        // a mystery.
+        "session_snapshot_bytes": crate::session_state::MAX_SNAPSHOT_BYTES,
+        "session_history_bytes": crate::session_state::MAX_HISTORY_BYTES,
+        "pane_history_rows": HISTORY_MAX_ROWS,
+        "pane_history_bytes": HISTORY_MAX_PANE_BYTES,
+        "session_history_capture_bytes": HISTORY_MAX_SESSION_BYTES,
+        "agent_resume_args": vvmux_plugin_api::MAX_AGENT_RESUME_ARGS,
         "agent_metadata_tokens": crate::agent::MAX_METADATA_TOKENS,
         "agent_metadata_key_bytes": crate::agent::MAX_METADATA_KEY_BYTES,
         "agent_metadata_value_bytes": crate::agent::MAX_METADATA_VALUE_BYTES,

@@ -231,17 +231,14 @@ impl RuntimePaths {
 ///
 /// Named by session, because unlike herdr's single server each vvmux session is its own daemon.
 ///
-/// Nothing resolves these paths yet; the snapshot-restore task attaches them to the server's start
-/// and shutdown. They live here rather than in `session_state` because deciding *where* a session's
-/// state may be written is the same decision as [`runtime_root`] and belongs beside it.
-#[allow(dead_code)]
+/// They live here rather than in `session_state` because deciding *where* a session's state may be
+/// written is the same decision as [`runtime_root`] and belongs beside it.
 #[derive(Debug, Clone)]
 pub struct SnapshotPaths {
     pub snapshot: PathBuf,
     pub history: PathBuf,
 }
 
-#[allow(dead_code)]
 impl SnapshotPaths {
     pub fn for_session(name: &str) -> io::Result<Self> {
         validate_session_name(name)?;
@@ -658,8 +655,7 @@ fn runtime_root() -> io::Result<PathBuf> {
 /// agent session identity, which is capability-adjacent, and the config directory is a place users
 /// share, commit, and symlink through dotfile managers.
 ///
-/// Reached only through [`SnapshotPaths`], which nothing wires up until the snapshot-restore task.
-#[allow(dead_code)]
+/// Reached only through [`SnapshotPaths`].
 #[cfg(unix)]
 fn state_root() -> io::Result<PathBuf> {
     let uid = unsafe { libc::geteuid() };
@@ -691,7 +687,6 @@ fn state_root() -> io::Result<PathBuf> {
     Ok(base)
 }
 
-#[allow(dead_code)]
 #[cfg(windows)]
 fn state_root() -> io::Result<PathBuf> {
     crate::platform::windows_state_root()
