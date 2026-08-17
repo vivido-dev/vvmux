@@ -260,6 +260,27 @@ region = "whole_recent"
 contains = ["esc to interrupt"]
 ```
 
+When a background agent blocks or finishes, the attached client raises a desktop notification, so
+you do not have to watch every pane. `[notifications]` controls it:
+
+```toml
+[notifications]
+enabled = true
+on = ["blocked", "done"]
+min_interval_ms = 2000
+# sound_command = ["afplay", "/System/Library/Sounds/Glass.aiff"]
+```
+
+The session decides *whether* to notify; the foreground client decides *how*, because only it knows
+your real terminal — the hidden server never learns anything about it. Ghostty, iTerm2, WezTerm,
+and Vivido get OSC 9; kitty gets OSC 99; inside tmux the escape is wrapped for passthrough. A
+terminal vvmux does not recognize gets **no** escape rather than a stray one printed into your
+session, and a browser attach gets no notification at all. `done` is only ever derived when the
+pane was not visible, so neither default fires for an agent you are already watching, and
+`min_interval_ms` keeps a flapping agent from spamming the desktop. `sound_command` is run by the
+client, detached, with no stdio; because the client owns it, a live reload reports
+`notifications.sound_command` as deferred until you reattach.
+
 `subscribe` streams session events as NDJSON, so automation can react instead of poll. It does not
 require plugins to be enabled — these events describe the session, not the plugin system.
 

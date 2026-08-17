@@ -259,6 +259,16 @@ pub fn attach(
                     ServerMessage::Bell => {
                         output_thread.enqueue_control(b"\x07".to_vec());
                     }
+                    ServerMessage::Notify { title, body, .. } => {
+                        if let Some(sequence) =
+                            crate::notify::notification_sequence(&title, body.as_deref())
+                        {
+                            output_thread.enqueue_control(sequence);
+                        }
+                        // Independent of the escape: a terminal vvmux cannot notify through can
+                        // still make a sound.
+                        crate::notify::play_sound(&client_config.notifications.sound_command);
+                    }
                     ServerMessage::Clipboard(text) => {
                         output_thread.enqueue_control(clipboard_control_sequence(&text));
                     }

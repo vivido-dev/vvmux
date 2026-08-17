@@ -1036,6 +1036,9 @@ async fn handle_session_message(
         // Browser input is already normalized by the web client and does not use the host TTY's
         // Kitty keyboard encoder.
         ServerMessage::InputMode { .. } => {}
+        // Dropped rather than forwarded: VVWS has no notification record, and a browser tab is not
+        // the terminal these escapes are meant for. Browser attach gets no desktop notification.
+        ServerMessage::Notify { .. } => {}
         ServerMessage::Detached { reason } => {
             writer.send(Frame::Binary(Payload::from_static(TERMINAL_LEAVE)))?;
             send_control(writer, &ServerControl::Detached { reason })?;

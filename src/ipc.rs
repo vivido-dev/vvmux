@@ -244,6 +244,14 @@ pub enum AutomationMethod {
     },
 }
 
+/// Why a notification fired.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyKind {
+    AgentBlocked,
+    AgentDone,
+}
+
 /// Narrows an event stream. An empty filter accepts everything.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventFilter {
@@ -627,6 +635,15 @@ pub enum ServerMessage {
     },
     Title(String),
     Bell,
+    /// Ask the foreground client to raise a desktop notification.
+    ///
+    /// The server decides whether to notify and what to say; the client alone knows the outer
+    /// terminal and decides how to render it. Nothing about the outer terminal travels back.
+    Notify {
+        kind: NotifyKind,
+        title: String,
+        body: Option<String>,
+    },
     Clipboard(String),
     Status(String),
     MediaSnapshot {

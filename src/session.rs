@@ -1284,6 +1284,8 @@ struct SessionActor {
     status_notice: Option<StatusNotice>,
     agent_catalog: Arc<crate::agent::AgentCatalog>,
     agent_catalog_generation: u64,
+    /// Per-pane notification floor. Bounded by the pane set, and pruned with it.
+    last_notified: HashMap<PaneId, Instant>,
     next_float_mode: u64,
     session_sequence: u64,
     /// Direct count of general-queue actor wakeups for fairness/compatibility diagnostics.
@@ -1487,6 +1489,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         status_notice: None,
         agent_catalog: Arc::new(crate::agent::AgentCatalog::default()),
         agent_catalog_generation: 0,
+        last_notified: HashMap::new(),
         next_float_mode: 0,
         session_sequence: 1,
         actor_wakeups: 0,
@@ -5042,12 +5045,57 @@ impl SessionActor {
                 Some(pane_id),
                 None,
             );
+            self.notify_agent_status(pane_id, current.as_ref());
         }
         // Resolve state waits here rather than leaving them to the next actor tick. A report
         // arrives as an event and the run loop checks waiters after handling one, but screen
         // classification runs in `evaluate_agent_states`, which the loop calls *after* that check
         // — so a screen-detected transition would otherwise sit unnoticed until the next wake.
         self.check_automation_waiters();
+    }
+
+    /// Ask the attached client to raise a desktop notification for a transition worth interrupting
+    /// for.
+    ///
+    /// `done` is already derived only when the pane was not visible, so the default set never
+    /// fires for an agent the user is watching. The per-pane floor keeps a flapping agent from
+    /// spamming the desktop.
+    fn notify_agent_status(&mut self, pane_id: PaneId, current: Option<&AgentSnapshot>) {
+        let settings = &self.config.notifications;
+        let Some(agent) = current else {
+            return;
+        };
+        let Some(kind) = notification_kind(agent.status, settings) else {
+            return;
+        };
+        let Some(client) = self.attached.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if !notification_allowed(
+            self.last_notified.get(&pane_id).copied(),
+            now,
+            Duration::from_millis(settings.min_interval_ms),
+        ) {
+            return;
+        }
+        self.last_notified.insert(pane_id, now);
+        let title = match kind {
+            crate::ipc::NotifyKind::AgentBlocked => format!("{} needs you", agent.label),
+            crate::ipc::NotifyKind::AgentDone => format!("{} finished", agent.label),
+        };
+        let body = agent
+            .message
+            .clone()
+            .unwrap_or_else(|| format!("pane {pane_id}"));
+        let _ = crate::ipc::send(
+            &client.writer,
+            &ServerMessage::Notify {
+                kind,
+                title: bounded_notification_text(&title),
+                body: Some(bounded_notification_text(&body)),
+            },
+        );
     }
 
     /// Record an observable agent-related change: advance the session sequence and repaint.
@@ -7810,6 +7858,9 @@ impl SessionActor {
     fn close_pane(&mut self, pane_id: PaneId) {
         self.invalidate_mouse_selection_for_pane(pane_id);
         self.clear_pane_hover(pane_id);
+        // Pane IDs are reused, so a stale floor would silence the first notification of whatever
+        // owns this ID next.
+        self.last_notified.remove(&pane_id);
         if let Some(drag) = &self.pointer_drag {
             self.cancel_pointer_drag(drag.pane() != Some(pane_id));
         }
@@ -8005,6 +8056,13 @@ impl SessionActor {
         }
         if next.keys.prefix != self.config.keys.prefix {
             report.deferred.push("keys.prefix".to_owned());
+        }
+        // The client reads its own config at attach and owns the sound command, exactly as it owns
+        // prefix parsing. The rest of `[notifications]` is session policy and applies at once.
+        if next.notifications.sound_command != self.config.notifications.sound_command {
+            report
+                .deferred
+                .push("notifications.sound_command".to_owned());
         }
         if next.general.shell != self.config.general.shell
             || next.general.default_cwd != self.config.general.default_cwd
@@ -10023,6 +10081,48 @@ fn agent_row_detail(message: Option<&str>, metadata: &crate::agent::AgentMetadat
         .join(" · ")
 }
 
+/// Which notification, if any, a status warrants under the configured policy.
+fn notification_kind(
+    status: AgentStatus,
+    settings: &crate::config::Notifications,
+) -> Option<crate::ipc::NotifyKind> {
+    if !settings.enabled {
+        return None;
+    }
+    match status {
+        AgentStatus::Blocked if settings.on.contains(&crate::config::NotifyOn::Blocked) => {
+            Some(crate::ipc::NotifyKind::AgentBlocked)
+        }
+        AgentStatus::Done if settings.on.contains(&crate::config::NotifyOn::Done) => {
+            Some(crate::ipc::NotifyKind::AgentDone)
+        }
+        // `working` and `idle` are never notifications: they are the states an agent passes
+        // through while you are not being interrupted.
+        _ => None,
+    }
+}
+
+/// Whether a pane's notification floor has elapsed.
+fn notification_allowed(last: Option<Instant>, now: Instant, floor: Duration) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= floor)
+}
+
+/// Clamp notification text on a char boundary.
+///
+/// A block reason is bounded at 256 bytes on its own, but a title composed with an agent label
+/// still needs a ceiling before it reaches an escape sequence.
+fn bounded_notification_text(text: &str) -> String {
+    const MAX: usize = 160;
+    if text.len() <= MAX {
+        return text.to_owned();
+    }
+    let mut end = MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 /// The `agent.status_changed` payload.
 ///
 /// Carries the lifecycle fact only. Display-only metadata is deliberately absent: it can change on
@@ -11612,6 +11712,76 @@ fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_states_worth_interrupting_for_notify() {
+        use crate::config::{Notifications, NotifyOn};
+        use crate::ipc::NotifyKind;
+
+        let settings = Notifications::default();
+        assert_eq!(
+            notification_kind(AgentStatus::Blocked, &settings),
+            Some(NotifyKind::AgentBlocked)
+        );
+        assert_eq!(
+            notification_kind(AgentStatus::Done, &settings),
+            Some(NotifyKind::AgentDone)
+        );
+        // States an agent passes through while not asking for anything.
+        assert_eq!(notification_kind(AgentStatus::Working, &settings), None);
+        assert_eq!(notification_kind(AgentStatus::Idle, &settings), None);
+
+        // `on` narrows without disabling.
+        let blocked_only = Notifications {
+            on: vec![NotifyOn::Blocked],
+            ..Notifications::default()
+        };
+        assert_eq!(notification_kind(AgentStatus::Done, &blocked_only), None);
+        assert_eq!(
+            notification_kind(AgentStatus::Blocked, &blocked_only),
+            Some(NotifyKind::AgentBlocked)
+        );
+
+        // The kill switch beats the list.
+        let off = Notifications {
+            enabled: false,
+            ..Notifications::default()
+        };
+        assert_eq!(notification_kind(AgentStatus::Blocked, &off), None);
+    }
+
+    #[test]
+    fn the_notification_floor_is_per_pane_and_first_notifications_pass() {
+        let now = Instant::now();
+        let floor = Duration::from_millis(2_000);
+        // A pane that has never notified is never throttled.
+        assert!(notification_allowed(None, now, floor));
+        assert!(!notification_allowed(
+            Some(now - Duration::from_millis(500)),
+            now,
+            floor
+        ));
+        assert!(notification_allowed(
+            Some(now - Duration::from_millis(2_000)),
+            now,
+            floor
+        ));
+        // A zero floor disables throttling rather than blocking everything.
+        assert!(notification_allowed(Some(now), now, Duration::ZERO));
+    }
+
+    #[test]
+    fn notification_text_is_clamped_on_a_char_boundary() {
+        let plain = bounded_notification_text("codex needs you");
+        assert_eq!(plain, "codex needs you");
+
+        // Multi-byte characters must not be split when the limit lands mid-character.
+        let wide = "é".repeat(200);
+        let clamped = bounded_notification_text(&wide);
+        assert!(clamped.len() <= 163);
+        assert!(clamped.ends_with('…'));
+        assert!(wide.starts_with(clamped.trim_end_matches('…')));
+    }
 
     #[test]
     fn kitty_transfers_are_pane_isolated_bounded_and_drained_in_order() {

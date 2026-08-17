@@ -19,6 +19,7 @@ pub struct Config {
     pub floating: Floating,
     pub hyperlinks: Hyperlinks,
     pub clipboard: Clipboard,
+    pub notifications: Notifications,
     pub plugins: Plugins,
     pub server: Server,
 }
@@ -136,6 +137,43 @@ impl Osc52 {
     pub fn allows_load(self) -> bool {
         matches!(self, Self::OnlyPaste | Self::CopyPaste)
     }
+}
+
+/// Desktop notifications for agent lifecycle transitions.
+///
+/// The session decides *whether* to notify; the foreground client decides *how*, because only it
+/// knows the outer terminal. `sound_command` is therefore client-owned and, like the prefix keys,
+/// is reported as deferred on a live reload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Notifications {
+    pub enabled: bool,
+    /// Which transitions notify. `done` already means "finished while you were not looking", so
+    /// the defaults never fire for an agent you are watching.
+    pub on: Vec<NotifyOn>,
+    /// Per-pane floor between notifications, so a flapping agent cannot spam the desktop.
+    pub min_interval_ms: u64,
+    /// Optional command run by the client when a notification fires, for an audible cue.
+    /// Run detached with no stdio; its output is neither shown nor awaited.
+    pub sound_command: Vec<String>,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            on: vec![NotifyOn::Blocked, NotifyOn::Done],
+            min_interval_ms: 2_000,
+            sound_command: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyOn {
+    Blocked,
+    Done,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

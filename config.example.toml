@@ -102,6 +102,21 @@ open = "delegate"
 #   "copy_paste" — both directions. Enable only where every pane is as trusted as you are.
 osc52 = "only_copy"
 
+[notifications]
+# Desktop notification when a background agent needs you or finishes, so you do not have to watch
+# every pane. The session decides whether to notify; the attached client renders it into your real
+# terminal (OSC 9, or OSC 99 on kitty). A terminal vvmux does not recognize gets no escape rather
+# than a stray one printed into your session, and a browser attach gets none at all.
+enabled = true
+# Which transitions interrupt you. "done" is only ever derived when the pane was not visible, so
+# neither default fires for an agent you are already watching.
+on = ["blocked", "done"]
+# Per-pane floor, so a flapping agent cannot spam your desktop.
+min_interval_ms = 2000
+# Optional audible cue, run by the client, detached, with no stdio. Because the client owns it, a
+# live config reload reports `notifications.sound_command` as deferred until you reattach.
+# sound_command = ["afplay", "/System/Library/Sounds/Glass.aiff"]
+
 [plugins]
 # Live global kill switch. Disabling stops runtimes and the registry watcher for this session.
 # It also disables bundled and installed agent detection. Toggle individual bundled providers with

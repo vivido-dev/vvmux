@@ -14,6 +14,7 @@ mod layout_file;
 mod media;
 mod media_trace;
 mod metrics;
+mod notify;
 mod platform;
 mod plugin;
 mod plugin_component;

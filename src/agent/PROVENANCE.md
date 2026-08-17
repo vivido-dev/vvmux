@@ -27,3 +27,9 @@ Later features adapted from the same HerdR commit, recorded as they land:
   a separate pane record, keeps them out of `AgentSnapshot` so lifecycle waiters and events do not
   observe display churn, and shares the existing per-source report sequence table instead of
   HerdR's separate one.
+- **Terminal notifications** (`notify.rs`) — backend detection and the OSC 9 / OSC 99 / tmux
+  passthrough encodings are adapted from `src/terminal_notify.rs`. vvmux emits them from the
+  foreground client on an explicit `ServerMessage::Notify` rather than from the process that
+  detects the transition, because the hidden server must not learn anything about the outer
+  terminal. HerdR's embedded mp3 playback is not ported; an optional user-configured
+  `sound_command` replaces it, so vvmux ships no audio assets and no per-OS player table.
