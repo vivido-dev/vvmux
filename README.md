@@ -103,6 +103,7 @@ close-pane --pane-id ID
 typing TEXT [--pane-id ID] [--report]
 key KEY [--mods Shift,Alt,Ctrl,Super] [--repeat N] [--pane-id ID] [--report]
 paste TEXT [--pane-id ID] [--report]
+submit TEXT [--pane-id ID] [--report]
 get-text [--rows N] [--source visible|recent|recent-unwrapped|detection] [--pane-id ID]
 get-grid [--start-line LINE --row-count N | --since-screen SEQ] [--pane-id ID]
 search --pattern TEXT [--regex] [--direction forward|backward] [--start-line LINE --start-column COLUMN] [--limit N] [--pane-id ID]
@@ -124,6 +125,17 @@ With `--report`, input prints the pane, encoded byte count, request sequence, an
 completion, without claiming the child consumed it. `outer` waits for the foreground Vivid bridge
 to apply the resulting projection; `rendered` waits for the attached client's terminal-frame ACK.
 Vivido's separate `wait frame` is the GPU-presentation assertion.
+
+`submit` sends one line to a pane that is already running something, putting the text and its
+Enter into a single PTY write. `typing` followed by `key Enter` is two calls, and a failure
+between them strands a half-typed command at the prompt — which is why retry loops should prefer
+`submit`. It honors bracketed-paste mode like `paste`, and refuses embedded newlines so "submit
+one line" is never ambiguous about how many commands ran. To open a *new* pane for a command, use
+`run` instead. (This is herdr's `pane run`; `run` was already taken here.)
+
+```sh
+vvmux msg submit 'cargo test --workspace' --pane-id 2
+```
 
 `get-text --source` chooses which text comes back:
 

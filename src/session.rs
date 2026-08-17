@@ -3098,6 +3098,34 @@ impl SessionActor {
                 }
                 self.automation_input(target, pane_id, bytes, report);
             }
+            AutomationMethod::SubmitLine { text, report } => {
+                let pane_id = pane_id.unwrap();
+                let Some(pane) = self.panes.get(&pane_id) else {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("pane_not_found", "pane no longer exists"),
+                    );
+                    return;
+                };
+                let modes = pane.terminal.modes();
+                let enter = match encode_automation_key("Enter", &[], modes) {
+                    Ok(enter) => enter,
+                    Err(error) => {
+                        self.reply_automation_error(target, error);
+                        return;
+                    }
+                };
+                let mut bytes = sanitize_bracketed_paste(text.as_bytes());
+                if modes.bracketed_paste {
+                    bytes.splice(0..0, b"\x1b[200~".iter().copied());
+                    bytes.extend_from_slice(b"\x1b[201~");
+                }
+                // One buffer, one write, one completion. Splitting this into `typing` then
+                // `key Enter` is what lets a failure between them strand a half-typed command at
+                // the prompt, which is exactly what a retry loop must not have to reason about.
+                bytes.extend_from_slice(&enter);
+                self.automation_input(target, pane_id, bytes, report);
+            }
             AutomationMethod::GetText { rows, source } => {
                 match self.execute_session_command(
                     &caller,
@@ -9358,9 +9386,9 @@ fn event_sequence(envelope: &PluginEventEnvelope) -> Option<u64> {
 
 fn validate_automation_method(method: &AutomationMethod) -> Result<(), AutomationError> {
     let input = match method {
-        AutomationMethod::Typing { text, .. } | AutomationMethod::Paste { text, .. } => {
-            Some(text.len())
-        }
+        AutomationMethod::Typing { text, .. }
+        | AutomationMethod::Paste { text, .. }
+        | AutomationMethod::SubmitLine { text, .. } => Some(text.len()),
         _ => None,
     };
     if input.is_some_and(|length| length > 1024 * 1024) {
@@ -9402,6 +9430,12 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
             Err(AutomationError::new(
                 "invalid_params",
                 "agent session identity must contain 1..=256 bytes",
+            ))
+        }
+        AutomationMethod::SubmitLine { text, .. } if text.contains(['\n', '\r']) => {
+            Err(AutomationError::new(
+                "invalid_params",
+                "submit takes one line; use paste for multi-line input",
             ))
         }
         AutomationMethod::Run { command, .. } if command.trim().is_empty() => Err(
@@ -9610,7 +9644,8 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
         "methods": [
             "capabilities", "list_panes", "session_inspect", "list_tabs", "select_tab", "diagnose",
             "inspect", "inspect_media", "split", "focus", "focus_wait", "close_pane",
-            "typing", "key", "paste", "get_text", "get_grid", "search", "set_sync_input", "wait_text",
+            "typing", "key", "paste", "submit_line", "get_text", "get_grid", "search",
+            "set_sync_input", "wait_text",
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
             "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report",

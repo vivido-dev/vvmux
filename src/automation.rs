@@ -403,6 +403,18 @@ pub enum MsgCommand {
         #[arg(long)]
         report: bool,
     },
+    /// Submit one line to a pane that is already running something.
+    ///
+    /// The text and its Enter reach the PTY as a single write, so a failed call cannot leave half
+    /// a command sitting at the prompt. Use this instead of `typing` followed by `key Enter` in
+    /// retry loops. To open a *new* pane for a command, use `run`.
+    Submit {
+        text: String,
+        #[arg(long)]
+        pane_id: Option<u64>,
+        #[arg(long)]
+        report: bool,
+    },
     /// Print pane text exactly, without a trailing newline.
     ///
     /// Without `--source`, `--rows N` reads the last N rows with soft wraps joined and no `--rows`
@@ -968,6 +980,26 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             validate_input(&text)?;
             (
                 AutomationMethod::Paste { text, report },
+                pane_id,
+                true,
+                if report { Output::Json } else { Output::Silent },
+            )
+        }
+        MsgCommand::Submit {
+            text,
+            pane_id,
+            report,
+        } => {
+            validate_input(&text)?;
+            // "Submit one line" must not be ambiguous about how many commands ran.
+            if text.contains(['\n', '\r']) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "submit takes one line; use paste for multi-line input",
+                ));
+            }
+            (
+                AutomationMethod::SubmitLine { text, report },
                 pane_id,
                 true,
                 if report { Output::Json } else { Output::Silent },

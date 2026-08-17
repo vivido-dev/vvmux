@@ -159,6 +159,11 @@ pub enum AutomationMethod {
         text: String,
         report: bool,
     },
+    /// Submit one line to a pane: the text and its Enter in a single PTY write.
+    SubmitLine {
+        text: String,
+        report: bool,
+    },
     GetText {
         rows: Option<u16>,
         source: TextSource,

@@ -768,6 +768,54 @@ done
     let stale = command(&runtime, &name, &["get-text", "--pane-id", "4"]);
     assert!(!stale.status.success());
     assert!(String::from_utf8_lossy(&stale.stderr).contains("pane_not_found"));
+    // `submit` puts the text and its Enter into one PTY write, so the fixture shell sees exactly
+    // one line without a separate `key Enter` call.
+    let submitted = json(command(
+        &runtime,
+        &name,
+        &["submit", "submitted-line", "--pane-id", "3", "--report"],
+    ));
+    assert_eq!(submitted["pane_id"], 3);
+    assert_eq!(submitted["pty_write_completed"], true);
+    // The encoded write carries the text plus the Enter encoding, so it exceeds the text alone.
+    assert!(
+        submitted["encoded_byte_count"].as_u64().unwrap() > "submitted-line".len() as u64,
+        "submit did not include its Enter in the same write"
+    );
+    wait_text(&runtime, &name, 3, "OUT pane=3:submitted-line");
+
+    // Exactly one command ran: a second identical line would produce a second OUT line, so
+    // count them.
+    let after_submit = text(command(
+        &runtime,
+        &name,
+        &[
+            "get-text",
+            "--pane-id",
+            "3",
+            "--source",
+            "recent",
+            "--rows",
+            "40",
+        ],
+    ));
+    assert_eq!(
+        after_submit
+            .lines()
+            .filter(|line| line.contains("OUT pane=3:submitted-line"))
+            .count(),
+        1
+    );
+
+    // "Submit one line" must not be ambiguous about how many commands ran.
+    let multiline = command(
+        &runtime,
+        &name,
+        &["submit", "first\nsecond", "--pane-id", "3"],
+    );
+    assert!(!multiline.status.success());
+    assert!(String::from_utf8_lossy(&multiline.stderr).contains("one line"));
+
     // Kept last: the wide echo scrolls the pane it writes to, and earlier assertions depend
     // on each pane still showing its READY banner. Pane 3 rather than 4, which has exited.
     // Read sources. Echo a line wider than the pane so the terminal must soft-wrap it, which is
