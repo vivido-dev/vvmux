@@ -115,28 +115,7 @@ impl RuntimePaths {
             socket: None,
         };
         let bytes = serde_json::to_vec(&registry).map_err(io::Error::other)?;
-        let temporary = self.registry.with_extension(format!(
-            "json.{}.{}.tmp",
-            std::process::id(),
-            &registry.instance_nonce[..16]
-        ));
-        #[cfg(unix)]
-        let mut file = {
-            let mut options = OpenOptions::new();
-            options.create_new(true).write(true).mode(0o600);
-            options.open(&temporary)?
-        };
-        #[cfg(windows)]
-        let mut file = crate::platform::create_secure_windows_registry_file(&temporary)?;
-        let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
-        drop(file);
-        let write_result = write_result.and_then(|()| atomic_replace(&temporary, &self.registry));
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        write_result?;
-        #[cfg(windows)]
-        crate::platform::validate_windows_registry_file(&self.registry)?;
+        write_private_atomic(&self.registry, &bytes, &registry.instance_nonce[..16])?;
         Ok(registry)
     }
 
@@ -243,6 +222,47 @@ impl RuntimePaths {
     }
 }
 
+/// Where one session's persisted state lives.
+///
+/// Two files rather than one, following the same split herdr uses: the shape snapshot is small,
+/// always written, and safe to keep, while pane history is large, opt-in, and may contain whatever
+/// scrolled past in a terminal. Keeping them apart means enabling or disabling history never
+/// rewrites the shape, and clearing history never risks the shape.
+///
+/// Named by session, because unlike herdr's single server each vvmux session is its own daemon.
+///
+/// Nothing resolves these paths yet; the snapshot-restore task attaches them to the server's start
+/// and shutdown. They live here rather than in `session_state` because deciding *where* a session's
+/// state may be written is the same decision as [`runtime_root`] and belongs beside it.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct SnapshotPaths {
+    pub snapshot: PathBuf,
+    pub history: PathBuf,
+}
+
+#[allow(dead_code)]
+impl SnapshotPaths {
+    pub fn for_session(name: &str) -> io::Result<Self> {
+        validate_session_name(name)?;
+        Ok(Self::within(&state_root()?, name))
+    }
+
+    /// Split from [`Self::for_session`] so the naming rule can be tested against a temporary root.
+    /// The alternative — pointing `for_session` somewhere else by setting `XDG_STATE_HOME` — would
+    /// mean mutating process environment from a test, which races with every other thread's `getenv`
+    /// and is why nothing else in this crate does it.
+    fn within(root: &Path, name: &str) -> Self {
+        // A distinct domain from the registry and endpoint hashes, so a snapshot filename can never
+        // collide with, or be mistaken for, a runtime file for the same session name.
+        let hash = hex(&domain_hash(b"vvmux snapshot filename v1\0", name.as_bytes())[..16]);
+        Self {
+            snapshot: root.join(format!("session-{hash}.json")),
+            history: root.join(format!("session-{hash}-history.json")),
+        }
+    }
+}
+
 pub fn validate_session_name(name: &str) -> io::Result<()> {
     if name.is_empty()
         || name.len() > 64
@@ -325,8 +345,51 @@ fn decode_registry(bytes: &[u8]) -> io::Result<SessionRegistry> {
     Ok(registry)
 }
 
+/// Write `bytes` to `path` privately and atomically: into a fresh owner-only temporary, flushed to
+/// disk, then renamed over the destination.
+///
+/// The mode is not a parameter because every caller writes something only the owner may read — a
+/// session registry, a session snapshot, or a pane's screen history. `tag` distinguishes concurrent
+/// writers' temporaries, and the name always keeps the destination's own name plus a `.tmp` suffix so
+/// a partially written file can never be mistaken for a finished one by a directory scan.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8], tag: &str) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let temporary = path.with_file_name(format!("{name}.{}.{tag}.tmp", std::process::id()));
+    #[cfg(unix)]
+    let mut file = {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true).mode(0o600);
+        options.open(&temporary)?
+    };
+    #[cfg(windows)]
+    let mut file = crate::platform::create_secure_windows_registry_file(&temporary)?;
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = result.and_then(|()| atomic_replace(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    #[cfg(windows)]
+    crate::platform::validate_windows_registry_file(path)?;
+    Ok(())
+}
+
+/// Read a file only the owner may read, refusing symlinks, foreign ownership, group or other access,
+/// and anything longer than `limit`.
+///
+/// The length is checked before the allocation and again after the read, because the file may grow
+/// between the two — the second check is what makes the bound a bound rather than a hint.
 #[cfg(unix)]
-fn read_registry_bytes(path: &Path, _delete_access: bool) -> io::Result<Vec<u8>> {
+pub(crate) fn read_private_bytes(
+    path: &Path,
+    _delete_access: bool,
+    limit: u64,
+    what: &str,
+) -> io::Result<Vec<u8>> {
     let uid = unsafe { libc::geteuid() };
     let mut options = OpenOptions::new();
     options.read(true).custom_flags(libc::O_NOFOLLOW);
@@ -335,37 +398,54 @@ fn read_registry_bytes(path: &Path, _delete_access: bool) -> io::Result<Vec<u8>>
     if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "unsafe Unix session registry",
+            format!("unsafe {what}"),
         ));
     }
-    read_bounded_registry(&mut file, metadata.len())
+    read_bounded(&mut file, metadata.len(), limit, what)
 }
 
 #[cfg(windows)]
-fn read_registry_bytes(path: &Path, delete_access: bool) -> io::Result<Vec<u8>> {
+pub(crate) fn read_private_bytes(
+    path: &Path,
+    delete_access: bool,
+    limit: u64,
+    what: &str,
+) -> io::Result<Vec<u8>> {
     let mut file = crate::platform::open_windows_registry_file(path, delete_access)?;
     let length = file.metadata()?.len();
-    read_bounded_registry(&mut file, length)
+    read_bounded(&mut file, length, limit, what)
 }
 
-fn read_bounded_registry(reader: &mut impl Read, length: u64) -> io::Result<Vec<u8>> {
-    if length > MAX_REGISTRY_BYTES {
-        return Err(io::Error::new(
+fn read_registry_bytes(path: &Path, delete_access: bool) -> io::Result<Vec<u8>> {
+    read_private_bytes(path, delete_access, MAX_REGISTRY_BYTES, "session registry")
+}
+
+fn read_bounded(
+    reader: &mut impl Read,
+    length: u64,
+    limit: u64,
+    what: &str,
+) -> io::Result<Vec<u8>> {
+    let too_large = || {
+        io::Error::new(
             io::ErrorKind::InvalidData,
-            "session registry exceeds 16 KiB",
-        ));
+            format!("{what} exceeds {limit} bytes"),
+        )
+    };
+    if length > limit {
+        return Err(too_large());
     }
     let mut bytes = Vec::with_capacity(length as usize);
-    reader
-        .take(MAX_REGISTRY_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_REGISTRY_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "session registry exceeds 16 KiB",
-        ));
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(too_large());
     }
     Ok(bytes)
+}
+
+#[cfg(windows)]
+fn read_bounded_registry(reader: &mut impl Read, length: u64) -> io::Result<Vec<u8>> {
+    read_bounded(reader, length, MAX_REGISTRY_BYTES, "session registry")
 }
 
 #[cfg(windows)]
@@ -551,7 +631,7 @@ fn runtime_root() -> io::Result<PathBuf> {
     let uid = unsafe { libc::geteuid() };
     let base = if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {
         let path = PathBuf::from(path);
-        validate_parent(&path, uid)?;
+        validate_parent(&path, uid, "XDG_RUNTIME_DIR")?;
         path.join("vvmux")
     } else {
         PathBuf::from(format!("/tmp/vvmux-{uid}"))
@@ -565,13 +645,55 @@ fn runtime_root() -> io::Result<PathBuf> {
     crate::platform::windows_runtime_root()
 }
 
+/// Where session state that must outlive a reboot lives.
+///
+/// Deliberately neither of the two directories vvmux already has. Not [`runtime_root`], because that
+/// is `$XDG_RUNTIME_DIR`, which a reboot clears — a snapshot whose whole job is to survive a restart
+/// cannot live somewhere that does not. Not `config::config_dir`, because a snapshot records native
+/// agent session identity, which is capability-adjacent, and the config directory is a place users
+/// share, commit, and symlink through dotfile managers.
+///
+/// Reached only through [`SnapshotPaths`], which nothing wires up until the snapshot-restore task.
+#[allow(dead_code)]
 #[cfg(unix)]
-fn validate_parent(path: &Path, uid: u32) -> io::Result<()> {
+fn state_root() -> io::Result<PathBuf> {
+    let uid = unsafe { libc::geteuid() };
+    let base = if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
+        let path = PathBuf::from(path);
+        validate_parent(&path, uid, "XDG_STATE_HOME")?;
+        path.join("vvmux")
+    } else {
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "neither XDG_STATE_HOME nor HOME is set, so session state has nowhere to live",
+            )
+        })?;
+        // `~/.local/state` is frequently absent on a fresh account, and unlike the leaf it is an
+        // ordinary user directory that other tools share, so it is created and ownership-checked
+        // rather than held to the 0700 requirement.
+        let parent = PathBuf::from(home).join(".local/state");
+        fs::create_dir_all(&parent)?;
+        validate_parent(&parent, uid, "~/.local/state")?;
+        parent.join("vvmux")
+    };
+    ensure_private_directory(&base, uid)?;
+    Ok(base)
+}
+
+#[allow(dead_code)]
+#[cfg(windows)]
+fn state_root() -> io::Result<PathBuf> {
+    crate::platform::windows_state_root()
+}
+
+#[cfg(unix)]
+fn validate_parent(path: &Path, uid: u32, label: &str) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "XDG_RUNTIME_DIR must be an owner-controlled directory",
+            format!("{label} must be an owner-controlled directory"),
         ));
     }
     Ok(())
@@ -686,8 +808,61 @@ mod tests {
     fn domain_hashes_do_not_alias_raw_session_hashes() {
         let registry = domain_hash(b"vvmux registry filename v1\0", b"work");
         let endpoint = domain_hash(b"vvmux endpoint identity v1\0", b"work");
+        let snapshot = domain_hash(b"vvmux snapshot filename v1\0", b"work");
         assert_ne!(registry, endpoint);
+        assert_ne!(registry, snapshot);
+        assert_ne!(endpoint, snapshot);
         assert_eq!(hex(&registry).len(), 64);
+    }
+
+    /// A session's two files must be distinct from each other and from another session's, and a name
+    /// that could escape the state directory must be refused before any path is built.
+    #[test]
+    fn snapshot_paths_are_session_scoped_and_distinguishable() {
+        let root = Path::new("/state");
+        let work = SnapshotPaths::within(root, "work");
+        let other = SnapshotPaths::within(root, "other");
+        assert_ne!(work.snapshot, other.snapshot);
+        assert_ne!(work.history, other.history);
+        assert_ne!(work.snapshot, work.history);
+        assert!(work.snapshot.starts_with(root));
+        assert!(work.history.to_string_lossy().ends_with("-history.json"));
+        assert!(SnapshotPaths::within(root, "work").snapshot == work.snapshot);
+
+        for escape in ["../escape", "/etc/passwd", ".hidden", ""] {
+            assert!(
+                SnapshotPaths::for_session(escape).is_err(),
+                "accepted {escape:?}"
+            );
+        }
+    }
+
+    /// The state directory holds working directories and resumable agent identity, so its mode is
+    /// part of the feature. Exercised directly because both roots depend on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_directory_is_created_locked_down_and_refused_when_widened() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let directory = parent.path().join("vvmux");
+
+        ensure_private_directory(&directory, uid).unwrap();
+        let mode = fs::metadata(&directory).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "mode was {:o}", mode & 0o777);
+
+        // Idempotent for an already-correct directory, so a second server start is not an error.
+        ensure_private_directory(&directory, uid).unwrap();
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = ensure_private_directory(&directory, uid).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        // A symlink is refused even when it points somewhere legitimate.
+        let link = parent.path().join("link");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        let error = ensure_private_directory(&link, uid).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

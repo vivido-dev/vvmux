@@ -16,6 +16,9 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
+/// Version 23 carries agent-name targeting and the session-state surface: a request may address a
+/// pane by the alias its agent was given, and a session's shape is snapshotted and restored across
+/// daemon restarts. One bump covers the batch.
 /// Version 22 carries the agent-runtime drive surface: launching an agent into a shell pane,
 /// prompting it, and reading its alternate-screen transcript. One bump covers the batch, so a
 /// session started by an older binary must be restarted before those methods exist.
@@ -30,7 +33,7 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 22;
+pub const VERSION: u16 = 23;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump

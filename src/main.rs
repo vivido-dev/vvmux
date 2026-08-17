@@ -27,6 +27,7 @@ mod screen;
 mod search;
 mod server;
 mod session;
+mod session_state;
 mod theme;
 
 use std::fs;
@@ -495,6 +496,13 @@ fn debug_bundle(
             "credentials": false,
             "media_payloads": false,
             "frame_hashes": false,
+            // A bundle is assembled from named entries, never by scanning a directory, so persisted
+            // session state is excluded by construction. Declared anyway: the snapshot records
+            // working directories and resumable agent session identity, and the pane-history file
+            // records whatever scrolled past, so their absence is a promise worth stating in the
+            // artifact rather than only in the code that builds it.
+            "session_snapshot": false,
+            "pane_history": false,
         },
     });
     let mut entries = vec![

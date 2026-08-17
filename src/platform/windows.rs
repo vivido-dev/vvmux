@@ -632,6 +632,20 @@ pub fn windows_config_path() -> Option<PathBuf> {
 }
 
 pub fn windows_runtime_root() -> io::Result<PathBuf> {
+    windows_private_subdirectory("runtime")
+}
+
+/// Where session state that must outlive a reboot lives.
+///
+/// A sibling of the runtime root rather than a child: the runtime directory holds endpoints and
+/// identity for a *live* server and is cleaned of stale instances, while this one holds files whose
+/// whole purpose is to be found again after the server that wrote them is gone.
+pub fn windows_state_root() -> io::Result<PathBuf> {
+    windows_private_subdirectory("state")
+}
+
+/// `%LOCALAPPDATA%\vvmux\<name>`, with both it and its parent locked to the current user.
+fn windows_private_subdirectory(name: &str) -> io::Result<PathBuf> {
     let mut raw = ptr::null_mut();
     let result =
         unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, ptr::null_mut(), &mut raw) };
@@ -653,9 +667,9 @@ pub fn windows_runtime_root() -> io::Result<PathBuf> {
     let security = SecurityDescriptor::for_current_user(true)?;
     let root = PathBuf::from(local).join("vvmux");
     ensure_secure_directory(&root, &security)?;
-    let runtime = root.join("runtime");
-    ensure_secure_directory(&runtime, &security)?;
-    Ok(runtime)
+    let directory = root.join(name);
+    ensure_secure_directory(&directory, &security)?;
+    Ok(directory)
 }
 
 pub fn validate_windows_registry_file(path: &std::path::Path) -> io::Result<()> {
