@@ -1023,7 +1023,9 @@ done
     assert_eq!(untouched["pane"]["agent"]["status"], "blocked");
     assert_eq!(untouched["pane"]["agent"]["source"], "report");
 
-    // A wait that is not satisfied fails with a timeout rather than hanging.
+    // A wait that is not satisfied fails with a timeout rather than hanging. Pane 2 has a blocked
+    // agent, so the "no agent was ever detected" hint must not appear here: that hint exists to
+    // point at a wrong pane, and firing it while an agent is present would point away from one.
     let timed_out = command(
         &runtime,
         &name,
@@ -1039,7 +1041,9 @@ done
         ],
     );
     assert!(!timed_out.status.success());
-    assert!(String::from_utf8_lossy(&timed_out.stderr).contains("timeout"));
+    let timed_out_error = String::from_utf8_lossy(&timed_out.stderr);
+    assert!(timed_out_error.contains("timeout"));
+    assert!(!timed_out_error.contains("no agent was ever detected"));
 
     // `subscribe` streams session events as NDJSON. It works with plugins disabled, because these
     // events describe the session rather than the plugin system.
@@ -1098,7 +1102,9 @@ done
     let _ = streaming.kill();
     let _ = streaming.wait();
 
-    // A pane with no agent names that, instead of blocking until the timeout.
+    // A pane with no agent is "not matching yet", not an error: detection lags a launch, so
+    // rejecting at registration would break launch-then-wait. The timeout still names the likely
+    // cause rather than leaving the caller to guess.
     let no_agent = command(
         &runtime,
         &name,
@@ -1108,13 +1114,128 @@ done
             "--until",
             "idle",
             "--timeout",
-            "5s",
+            "300ms",
             "--pane-id",
             "3",
         ],
     );
     assert!(!no_agent.status.success());
-    assert!(String::from_utf8_lossy(&no_agent.stderr).contains("agent_not_detected"));
+    let no_agent_error = String::from_utf8_lossy(&no_agent.stderr);
+    assert!(no_agent_error.contains("timeout"));
+    assert!(no_agent_error.contains("no agent was ever detected"));
+}
+
+/// End-to-end agent detection: a real process, identified by name, classified from its screen.
+///
+/// The rest of the agent coverage drives state through `report-agent`, which bypasses process
+/// discovery and manifest evaluation entirely. This exercises the path an unhooked agent actually
+/// takes — foreground process → catalog identity → screen rule → published transition — by running
+/// an executable literally named `codex`, which is how the bundled provider identifies it.
+#[test]
+fn a_detected_agent_reaches_blocked_from_its_screen_alone() {
+    let directory = tempfile::Builder::new()
+        .prefix("vvd-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = directory.path().to_path_buf();
+
+    // A real shell, unlike the scripted fixture the other test uses: `msg run` hands its command
+    // to the shell with `-c`, and this test needs that `exec` to actually happen.
+
+    // The basename is the whole point: `AgentCatalog::identify` normalizes argv[0] to its file
+    // name and matches the codex provider's `executables = ["codex"]`.
+    let agent = directory.path().join("codex");
+    fs::write(
+        &agent,
+        // Matches codex's `live_strong_blocker` rule, then holds the pane so the foreground
+        // process group stays identifiable.
+        "#!/bin/sh\nprintf 'Allow command? esc to interrupt\\n'\nwhile :; do sleep 1; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let config = directory.path().join("vvmux.toml");
+    fs::write(
+        &config,
+        format!(
+            "[general]\nshell = {}\nrender_interval_ms = 1\n",
+            toml_string(&agent)
+        ),
+    )
+    .unwrap();
+
+    let name = format!("detect-test-{}", std::process::id());
+    assert_success(
+        &common::vvmux_command(&runtime)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "new",
+                "-s",
+                &name,
+                "-d",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let _guard = SessionGuard {
+        runtime: runtime.clone(),
+        name: name.clone(),
+    };
+
+    // `exec` replaces the shell, so the pane's foreground process is named `codex` rather than a
+    // shell that happens to have spawned one.
+    let opened = json(command(
+        &runtime,
+        &name,
+        &["run", &format!("exec {}", agent.to_str().unwrap())],
+    ));
+    let pane = opened["pane_id"].as_u64().unwrap().to_string();
+
+    // Detection polls the process tree, and a freshly identified agent is held idle through its
+    // startup grace before any rule is allowed to decide, so allow well past both.
+    let blocked = json(command(
+        &runtime,
+        &name,
+        &[
+            "wait",
+            "agent-state",
+            "--until",
+            "blocked",
+            "--timeout",
+            "30s",
+            "--pane-id",
+            &pane,
+        ],
+    ));
+    assert_eq!(blocked["status"], "blocked");
+    assert_eq!(blocked["agent"]["kind"], "codex");
+    // Nothing reported this: the state came from the screen.
+    assert_eq!(blocked["agent"]["source"], "screen");
+
+    // The classification is explainable, and the rule that decided is the manifest's own.
+    let explained = json(command(
+        &runtime,
+        &name,
+        &["agent-explain", "--pane-id", &pane],
+    ));
+    assert_eq!(explained["explain"]["decision"], "rule_matched");
+    assert_eq!(explained["explain"]["matched_rule"], "live_strong_blocker");
+    assert_eq!(explained["explain"]["effective_status"], "blocked");
+    assert!(explained["explain"]["report"].is_null());
+    // Detection reads the bottom buffer, so the marker it matched is in what it reports reading.
+    let detection = json(command(
+        &runtime,
+        &name,
+        &["get-text", "--pane-id", &pane, "--source", "detection"],
+    ));
+    assert!(
+        detection["text"]
+            .as_str()
+            .unwrap()
+            .contains("Allow command?")
+    );
 }
 
 fn command(runtime: &Path, session: &str, arguments: &[&str]) -> Output {

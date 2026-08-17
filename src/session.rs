@@ -602,7 +602,8 @@ enum AutomationWaitKind {
     AgentState {
         until: Vec<AgentStatus>,
         /// The status when the wait was registered, so a caller can see what it moved from.
-        initial: AgentStatus,
+        /// `None` when the pane had no agent yet.
+        initial: Option<AgentStatus>,
     },
     Media {
         after_virtual_revision: Option<u64>,
@@ -3514,30 +3515,21 @@ impl SessionActor {
             }
             AutomationMethod::WaitAgentState { until, timeout_ms } => {
                 let pane_id = pane_id.unwrap();
-                let Some(snapshot) = self
+                // A pane without an agent is not an error: detection needs a process-tree poll and
+                // a startup grace, so "launch an agent, then wait for it" — the flow this command
+                // exists for — always registers before the agent is visible. Absence is simply
+                // "not matching yet", and the caller's timeout is what bounds it. A wait that ends
+                // without an agent ever appearing says so.
+                let initial = self
                     .panes
                     .get(&pane_id)
                     .and_then(|pane| pane.agent.snapshot())
-                else {
-                    // Blocking until timeout on a pane that has no agent would look like a slow
-                    // agent rather than the wrong target.
-                    self.reply_automation_error(
-                        target,
-                        AutomationError::new(
-                            "agent_not_detected",
-                            "pane has no detected or reported agent",
-                        ),
-                    );
-                    return;
-                };
+                    .map(|snapshot| snapshot.status);
                 self.add_automation_waiter(AutomationWaiter {
                     reply: target,
                     pane_id: Some(pane_id),
                     deadline: deadline(timeout_ms),
-                    kind: AutomationWaitKind::AgentState {
-                        until,
-                        initial: snapshot.status,
-                    },
+                    kind: AutomationWaitKind::AgentState { until, initial },
                 });
             }
             AutomationMethod::WaitExit { timeout_ms } => {
@@ -4668,9 +4660,10 @@ impl SessionActor {
                             .query(after_sequence, limit, waiter.pane_id, filter);
                     self.reply_automation(waiter.reply, serde_json::to_value(result).unwrap());
                 } else {
+                    let message = self.automation_timeout_message(&waiter);
                     self.reply_automation_error(
                         waiter.reply,
-                        AutomationError::new("timeout", "automation wait timed out"),
+                        AutomationError::new("timeout", message),
                     );
                 }
                 continue;
@@ -4680,6 +4673,25 @@ impl SessionActor {
                 Some(Err(error)) => self.reply_automation_error(waiter.reply, error),
                 None => self.automation_waiters.push(waiter),
             }
+        }
+    }
+
+    /// Explain a timeout where the generic message would leave a caller guessing.
+    ///
+    /// An agent-state wait that never saw an agent is almost always the wrong pane rather than a
+    /// slow agent — the diagnosis a registration-time rejection used to give, kept without making
+    /// the common "launch, then wait" flow fail.
+    fn automation_timeout_message(&self, waiter: &AutomationWaiter) -> String {
+        let never_detected = matches!(waiter.kind, AutomationWaitKind::AgentState { .. })
+            && waiter.pane_id.is_some_and(|pane_id| {
+                self.panes
+                    .get(&pane_id)
+                    .is_none_or(|pane| pane.agent.snapshot().is_none())
+            });
+        if never_detected {
+            "automation wait timed out; no agent was ever detected in this pane".to_owned()
+        } else {
+            "automation wait timed out".to_owned()
         }
     }
 
@@ -4833,14 +4845,9 @@ impl SessionActor {
                         "pane closed while waiting",
                     )));
                 };
-                let Some(snapshot) = pane.agent.snapshot() else {
-                    // The agent this wait names stopped existing, so no state it could reach will
-                    // ever arrive. Reporting that beats timing out with no explanation.
-                    return Some(Err(AutomationError::new(
-                        "agent_not_detected",
-                        "agent left the pane while waiting",
-                    )));
-                };
+                // No agent is "not matching yet", the same before detection and after an agent
+                // exits. One rule, bounded by the caller's timeout.
+                let snapshot = pane.agent.snapshot()?;
                 until.contains(&snapshot.status).then(|| {
                     Ok(serde_json::json!({
                         "pane_id": pane_id,
