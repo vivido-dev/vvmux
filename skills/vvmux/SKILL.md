@@ -45,6 +45,11 @@ Use this release-matched workflow:
    `agent-rename --pane-id ID --clear` to release a name. Pane IDs remain correct for everything
    else; a name is for an agent you drive repeatedly.
 
+13. A session's shape survives its server restarting, so do not rebuild it by hand after a restart.
+   `snapshot` reports whether this session came from one. Pane IDs are reassigned on restore — they
+   are stable only within one run of a server — so never persist a pane ID across a restart; name
+   the agent and target it by name instead.
+
 Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
 needed. It proves the bytes reached the PTY writer, not that the child application consumed them.
 Use `wait media-track` only with complete producer/context/surface/track identity. Never address a

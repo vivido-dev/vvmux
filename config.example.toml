@@ -117,6 +117,14 @@ min_interval_ms = 2000
 # live config reload reports `notifications.sound_command` as deferred until you reattach.
 # sound_command = ["afplay", "/System/Library/Sounds/Glass.aiff"]
 
+[session]
+# Persist this session's shape and restore it when the server starts again. On by default: a
+# multiplexer whose panes vanish on a reboot or an upgrade has lost the thing it exists to provide.
+# Turning it off also discards the snapshot already on disk, so opting out leaves nothing behind.
+# The file lives under $XDG_STATE_HOME/vvmux, owner-only, and is never added to a debug bundle.
+# Commands are not recorded, so a restored pane is a plain shell in its saved directory.
+auto_snapshot = true
+
 [plugins]
 # Live global kill switch. Disabling stops runtimes and the registry watcher for this session.
 # It also disables bundled and installed agent detection. Toggle individual bundled providers with

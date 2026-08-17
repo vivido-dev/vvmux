@@ -256,9 +256,14 @@ impl SnapshotPaths {
         // A distinct domain from the registry and endpoint hashes, so a snapshot filename can never
         // collide with, or be mistaken for, a runtime file for the same session name.
         let hash = hex(&domain_hash(b"vvmux snapshot filename v1\0", name.as_bytes())[..16]);
+        // `snapshot-`/`history-` rather than the registry's `session-` prefix. The two directories
+        // are normally distinct, but nothing stops `XDG_STATE_HOME` and `XDG_RUNTIME_DIR` from
+        // naming the same one — the test harness does exactly that — and `list_registries` scans
+        // for `session-*.json`. A distinct hash domain already keeps the names from colliding;
+        // a distinct prefix keeps them from being mistaken for each other.
         Self {
-            snapshot: root.join(format!("session-{hash}.json")),
-            history: root.join(format!("session-{hash}-history.json")),
+            snapshot: root.join(format!("snapshot-{hash}.json")),
+            history: root.join(format!("history-{hash}.json")),
         }
     }
 }
@@ -660,6 +665,11 @@ fn state_root() -> io::Result<PathBuf> {
     let uid = unsafe { libc::geteuid() };
     let base = if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
         let path = PathBuf::from(path);
+        // Created rather than required: the XDG base-directory spec has the *user* own this path,
+        // and a fresh account frequently has no state directory at all. Ownership is still checked
+        // afterwards, so creating it does not weaken the check — it only removes a reason to fail
+        // on a machine where nothing has needed state before.
+        fs::create_dir_all(&path)?;
         validate_parent(&path, uid, "XDG_STATE_HOME")?;
         path.join("vvmux")
     } else {
@@ -826,7 +836,17 @@ mod tests {
         assert_ne!(work.history, other.history);
         assert_ne!(work.snapshot, work.history);
         assert!(work.snapshot.starts_with(root));
-        assert!(work.history.to_string_lossy().ends_with("-history.json"));
+        assert!(work.snapshot.to_string_lossy().contains("snapshot-"));
+        assert!(work.history.to_string_lossy().contains("history-"));
+        // Never mistakable for a session registry, which `list_registries` finds by scanning for
+        // `session-*.json` in a directory these files may share.
+        for path in [&work.snapshot, &work.history] {
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                !file.starts_with("session-"),
+                "{file} looks like a registry"
+            );
+        }
         assert!(SnapshotPaths::within(root, "work").snapshot == work.snapshot);
 
         for escape in ["../escape", "/etc/passwd", ".hidden", ""] {

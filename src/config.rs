@@ -22,6 +22,27 @@ pub struct Config {
     pub notifications: Notifications,
     pub plugins: Plugins,
     pub server: Server,
+    pub session: Session,
+}
+
+/// What a session remembers about itself across a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Session {
+    /// Persist the live session shape and restore it when the server starts again.
+    ///
+    /// On by default: a detachable multiplexer whose panes vanish on a reboot or an upgrade has
+    /// lost the thing it exists to provide. Turning it off also discards any snapshot already on
+    /// disk, so opting out leaves nothing behind.
+    pub auto_snapshot: bool,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            auto_snapshot: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

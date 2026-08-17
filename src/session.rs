@@ -44,6 +44,9 @@ use crate::search::{
     PromptAction, SearchDirection, SearchMatch, SearchPattern, apply_prompt_key, find_all,
     find_next, find_on_line, row_text_with_columns,
 };
+use crate::session_state::{
+    FloatExtras, PaneAgentExtras, PaneExtras, SessionSnapshot, SnapshotExtras, TabExtras,
+};
 
 const EVENT_QUEUE: usize = 1024;
 /// Slots on the dedicated media-event receiver.
@@ -66,6 +69,13 @@ const INPUT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_AUTOMATION_REQUESTS_PER_CLIENT: usize = 64;
 const MAX_AUTOMATION_WAITERS: usize = 256;
 const MAX_PENDING_ACTOR_WORK: usize = 256;
+/// How long shape changes coalesce before a snapshot is written.
+///
+/// Long enough that dragging a split or opening several panes is one write, short enough that a
+/// crash loses a few seconds of shape rather than a session.
+const SNAPSHOT_DEBOUNCE: Duration = Duration::from_secs(5);
+/// How long to wait before retrying a capture that found a write already in flight.
+const SNAPSHOT_WRITE_RETRY: Duration = Duration::from_millis(250);
 /// Delayed writes outstanding across the session.
 ///
 /// One prompt schedules one Enter, so this is far above any real load; it exists so a caller
@@ -169,6 +179,10 @@ pub enum ActorEvent {
     PluginComplete {
         reply: AutomationReplyTarget,
         result: Result<serde_json::Value, AutomationError>,
+    },
+    /// A session snapshot write finished on its worker.
+    SnapshotWritten {
+        result: Result<(), String>,
     },
     PluginNotice {
         reference: String,
@@ -1349,6 +1363,20 @@ struct SessionActor {
     #[allow(dead_code)]
     config_path: Option<PathBuf>,
     sender: mpsc::SyncSender<ActorEvent>,
+    /// Where this session's persisted state lives, when it persists any.
+    snapshot_paths: Option<crate::runtime::SnapshotPaths>,
+    /// Set when the live shape has diverged from the last snapshot written.
+    ///
+    /// A payload-free dirty bit rather than a queue of changes, for the reason the config watcher
+    /// uses one: a hundred splits in a second are one snapshot, and the capture reads current state
+    /// anyway.
+    snapshot_dirty: bool,
+    /// When the debounce expires and a capture is due. `None` when nothing is pending.
+    snapshot_due: Option<Instant>,
+    /// A write is on a worker thread; the actor holds off starting another.
+    snapshot_writing: bool,
+    /// Whether this session's shape came from a snapshot, for `msg snapshot` to report.
+    restored_from_snapshot: bool,
     agent_detector: DetectorHandle,
     panes: BTreeMap<PaneId, Pane>,
     tabs: Vec<Tab>,
@@ -1464,6 +1492,13 @@ pub struct SessionOptions {
     pub config_path: Option<PathBuf>,
     pub vivid_endpoint: VirtualPresenterEndpoint,
     pub layout: Option<LayoutPlan>,
+    /// Session state a layout plan cannot describe, when this session is being restored.
+    ///
+    /// Separate from `layout` because the two come from different places: a plan may equally have
+    /// come from `--layout` or `startup.toml`, and only a snapshot carries extras.
+    pub restore: Option<SnapshotExtras>,
+    /// Where to persist this session's shape, or `None` to persist nothing.
+    pub snapshot_paths: Option<crate::runtime::SnapshotPaths>,
 }
 
 pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
@@ -1473,6 +1508,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         config_path,
         vivid_endpoint,
         layout,
+        restore,
+        snapshot_paths,
     } = options;
     let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE);
     let (media_sender, media_receiver) = mpsc::sync_channel(MEDIA_EVENT_QUEUE);
@@ -1568,6 +1605,11 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         config,
         config_path,
         sender: sender.clone(),
+        snapshot_paths,
+        snapshot_dirty: false,
+        snapshot_due: None,
+        snapshot_writing: false,
+        restored_from_snapshot: restore.is_some(),
         agent_detector,
         panes: BTreeMap::new(),
         tabs: Vec::new(),
@@ -1650,7 +1692,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         client_ipc: None,
     };
     match layout {
-        Some(layout) => actor.apply_layout_plan(layout)?,
+        Some(layout) => actor.apply_layout_plan(layout, restore.as_ref())?,
         None => actor.new_tab()?,
     }
     let actor_terminated = terminated.clone();
@@ -1689,6 +1731,7 @@ impl SessionActor {
             timeout = timeout.min(self.next_sync_flush_delay());
             timeout = timeout.min(self.next_delayed_input_deadline());
             timeout = timeout.min(self.next_alt_read_deadline());
+            timeout = timeout.min(self.next_snapshot_deadline());
             // Give ready media low-latency service, but force a general-queue turn after a bounded
             // batch. A bounded channel is not a bounded drain when its producer can refill it.
             if self.drain_media(&media_receiver) {
@@ -1705,6 +1748,7 @@ impl SessionActor {
                     self.sync_pending_media_projection();
                     self.expire_status_notice();
                     self.flush_delayed_inputs();
+                    self.flush_snapshot();
                     if self.pending_render && render_at <= Instant::now() {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -1729,6 +1773,7 @@ impl SessionActor {
                     self.sync_pending_media_projection();
                     self.expire_status_notice();
                     self.flush_delayed_inputs();
+                    self.flush_snapshot();
                     if self.pending_render {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -1750,6 +1795,11 @@ impl SessionActor {
                 break;
             }
         }
+        // Written inline rather than through the worker: there is no loop left to deliver the
+        // completion to, and the debounce must not be why a clean shutdown loses the last few
+        // seconds of shape. A session that ended because its last tab closed is the one case where
+        // there is deliberately nothing to save, and the capture reports that itself.
+        self.write_snapshot_now();
         self.terminate_children();
         if let Some(stop) = self.plugin_watch_shutdown.take() {
             stop.store(true, Ordering::Release);
@@ -1968,6 +2018,16 @@ impl SessionActor {
                     self.reply_automation_error(reply, AutomationError::new("pty_closed", message));
                 }
             },
+            ActorEvent::SnapshotWritten { result } => {
+                self.snapshot_writing = false;
+                if let Err(error) = result {
+                    // Re-arm rather than give up: the next change will try again, and a session
+                    // that cannot persist is still a session that works.
+                    eprintln!("vvmux: could not write the session snapshot: {error}");
+                    self.snapshot_dirty = true;
+                    self.snapshot_due = Some(Instant::now() + SNAPSHOT_DEBOUNCE);
+                }
+            }
             ActorEvent::PluginComplete { reply, result } => {
                 self.complete_pending_actor_work(&reply);
                 match result {
@@ -3109,6 +3169,22 @@ impl SessionActor {
                         AutomationError::new("invalid_agent_report", message),
                     ),
                 }
+            }
+            AutomationMethod::SessionSnapshot => {
+                let path = self.snapshot_paths.as_ref().map(|paths| &paths.snapshot);
+                let written = path.and_then(|path| std::fs::metadata(path).ok());
+                self.reply_automation(
+                    target,
+                    serde_json::json!({
+                        "enabled": self.snapshot_paths.is_some(),
+                        "path": path.map(|path| path.display().to_string()),
+                        "schema": crate::session_state::SNAPSHOT_SCHEMA,
+                        "bytes": written.as_ref().map(std::fs::Metadata::len),
+                        "written": written.is_some(),
+                        "restored_from_snapshot": self.restored_from_snapshot,
+                        "pending_write": self.snapshot_dirty || self.snapshot_writing,
+                    }),
+                );
             }
             AutomationMethod::AgentRename { alias } => {
                 let pane_id = pane_id.unwrap();
@@ -8376,6 +8452,116 @@ impl SessionActor {
         }
     }
 
+    /// Mark the session shape as diverged from the last snapshot written.
+    ///
+    /// Cheap and idempotent on purpose: it is called from every mutation that changes shape, and a
+    /// burst of them costs one snapshot rather than one each.
+    fn mark_snapshot_dirty(&mut self) {
+        if self.snapshot_paths.is_none() {
+            return;
+        }
+        self.snapshot_dirty = true;
+        self.snapshot_due
+            .get_or_insert_with(|| Instant::now() + SNAPSHOT_DEBOUNCE);
+    }
+
+    /// Start or stop persisting this session, following the live config.
+    ///
+    /// Turning it off discards the snapshot already on disk. Leaving a stale one behind would mean
+    /// a session that opted out still gets restored from whatever it looked like when it did, which
+    /// is the opposite of what the setting says.
+    fn apply_snapshot_setting(&mut self) {
+        if self.config.session.auto_snapshot {
+            if self.snapshot_paths.is_none() {
+                self.snapshot_paths = crate::runtime::SnapshotPaths::for_session(&self.name).ok();
+                self.mark_snapshot_dirty();
+            }
+            return;
+        }
+        let Some(paths) = self.snapshot_paths.take() else {
+            return;
+        };
+        self.snapshot_dirty = false;
+        self.snapshot_due = None;
+        if let Err(error) = crate::session_state::clear(&paths.snapshot) {
+            eprintln!("vvmux: could not discard the session snapshot: {error}");
+        }
+    }
+
+    fn next_snapshot_deadline(&self) -> Duration {
+        self.snapshot_due
+            .map(|due| due.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::MAX)
+    }
+
+    /// Capture on the actor, write on a worker.
+    ///
+    /// The capture reads live state, so it has to run here; the write is filesystem I/O, which the
+    /// actor must never block on. One write is in flight at a time — a second would race the first
+    /// to the same path for no benefit — and a change arriving during one re-arms the debounce
+    /// rather than being lost.
+    fn flush_snapshot(&mut self) {
+        if self.snapshot_due.is_some_and(|due| Instant::now() < due) {
+            return;
+        }
+        self.snapshot_due = None;
+        if !self.snapshot_dirty {
+            return;
+        }
+        if self.snapshot_writing {
+            self.snapshot_due = Some(Instant::now() + SNAPSHOT_WRITE_RETRY);
+            return;
+        }
+        let Some(paths) = self.snapshot_paths.clone() else {
+            self.snapshot_dirty = false;
+            return;
+        };
+        let Some(snapshot) = self.capture_session_snapshot() else {
+            // A session with nothing saveable in it — every pane a plugin pane, say — has no shape
+            // worth recording. Leave any previous snapshot alone rather than blanking it.
+            self.snapshot_dirty = false;
+            return;
+        };
+        self.snapshot_dirty = false;
+        self.snapshot_writing = true;
+        let sender = self.sender.clone();
+        let spawn = std::thread::Builder::new()
+            .name("vvmux-session-snapshot".into())
+            .spawn(move || {
+                let result = crate::session_state::save_snapshot(&paths.snapshot, &snapshot);
+                let _ = sender.send(ActorEvent::SnapshotWritten {
+                    result: result.map_err(|error| error.to_string()),
+                });
+            });
+        if spawn.is_err() {
+            self.snapshot_writing = false;
+            self.snapshot_dirty = true;
+        }
+    }
+
+    /// The live session as a persistable snapshot, or `None` when it has no saveable shape.
+    fn capture_session_snapshot(&self) -> Option<SessionSnapshot> {
+        let mut extras = SnapshotExtras::default();
+        let layout = self.capture_layout_with_extras(Some(&mut extras)).ok()?;
+        Some(SessionSnapshot::new(layout, extras))
+    }
+
+    /// Write the current shape before the session goes away, without a worker to wait on.
+    ///
+    /// The debounce exists so a busy session does not write constantly; it must not be the reason a
+    /// clean shutdown loses the last few seconds of shape.
+    fn write_snapshot_now(&mut self) {
+        let Some(paths) = self.snapshot_paths.clone() else {
+            return;
+        };
+        let Some(snapshot) = self.capture_session_snapshot() else {
+            return;
+        };
+        if let Err(error) = crate::session_state::save_snapshot(&paths.snapshot, &snapshot) {
+            eprintln!("vvmux: could not write the session snapshot: {error}");
+        }
+    }
+
     fn next_notice_deadline(&self) -> Duration {
         self.status_notice
             .as_ref()
@@ -8757,9 +8943,17 @@ impl SessionActor {
         Ok(())
     }
 
-    fn apply_layout_plan(&mut self, plan: LayoutPlan) -> io::Result<()> {
+    fn apply_layout_plan(
+        &mut self,
+        plan: LayoutPlan,
+        extras: Option<&SnapshotExtras>,
+    ) -> io::Result<()> {
         let area = self.content_area();
-        for planned in plan.tabs {
+        let mut restored_active = None;
+        for (plan_index, planned) in plan.tabs.into_iter().enumerate() {
+            // Keyed by the plan's tab index, which is the index the capture walk emitted, not the
+            // index this tab ends up at — a tab whose panes all failed to spawn is skipped below.
+            let tab_extras = extras.and_then(|extras| extras.tabs.get(plan_index));
             let tab_id = self.next_tab_id;
             self.next_tab_id = self.next_tab_id.wrapping_add(1);
 
@@ -8797,7 +8991,26 @@ impl SessionActor {
                     planned_float.height_percent,
                 );
                 floating.set_pinned(pane_id, planned_float.pinned);
-                if index != 0
+                // A snapshot knows where the float actually sat; a hand-written layout does not, so
+                // it falls back to cascading each float clear of the one before it.
+                let restored = tab_extras.and_then(|tab| {
+                    tab.floats
+                        .iter()
+                        .find(|float| float.slot == planned_float.slot)
+                });
+                if let Some(restored) = restored {
+                    if let Some(rect) = floating.get(pane_id).map(|float| float.rect) {
+                        floating.set_rect(
+                            pane_id,
+                            Rect {
+                                x: percent_of(restored.x_percent, area.width),
+                                y: percent_of(restored.y_percent, area.height),
+                                ..rect
+                            },
+                            area,
+                        );
+                    }
+                } else if index != 0
                     && let Some(rect) = floating.get(pane_id).map(|float| float.rect)
                 {
                     floating.set_rect(
@@ -8829,6 +9042,16 @@ impl SessionActor {
                 .or_else(|| floating.focus_candidate())
                 .or(last_focused_tiled)
                 .expect("a surviving layout tab has a focusable pane");
+            // A zoomed slot whose pane failed to spawn restores unzoomed rather than zooming
+            // something else: zoom names one leaf, and the wrong leaf is worse than none.
+            let zoomed = tab_extras
+                .and_then(|tab| tab.zoomed)
+                .and_then(|slot| slot_ids.get(slot).copied())
+                .filter(|pane_id| !failed.contains(pane_id))
+                .filter(|pane_id| tree.as_ref().is_some_and(|tree| tree.contains(*pane_id)));
+            if extras.is_some_and(|extras| extras.active_tab == plan_index) {
+                restored_active = Some(self.tabs.len());
+            }
             self.tabs.push(Tab {
                 id: tab_id,
                 name: planned.name,
@@ -8836,14 +9059,15 @@ impl SessionActor {
                 floating,
                 focused,
                 last_focused_tiled,
-                zoomed: None,
-                sync_input: false,
+                zoomed,
+                sync_input: tab_extras.is_some_and(|tab| tab.sync_input),
             });
         }
         if self.tabs.is_empty() {
             return self.new_tab();
         }
-        self.active_tab = 0;
+        // Clamped by construction: `restored_active` is only ever an index this loop pushed.
+        self.active_tab = restored_active.unwrap_or(0);
         self.schedule_render();
         Ok(())
     }
@@ -8854,22 +9078,45 @@ impl SessionActor {
     /// as shells, and zoom and synchronized input are projection/tab state rather than layout.
     /// Weights are rescaled into the parser's accepted range while preserving their ratio.
     fn capture_layout(&self) -> io::Result<LayoutFile> {
+        self.capture_layout_with_extras(None)
+    }
+
+    /// Capture the live session's shape, and optionally everything a layout file cannot describe.
+    ///
+    /// One traversal produces both, because the two are keyed to each other: `lower` assigns a pane
+    /// slot per label in the order this walk emits them, so extras keyed by slot are only correct
+    /// while they are collected by the same walk that assigns the labels. Building them in a second
+    /// pass would leave two orderings to keep in agreement, and the skipped-tab rule below is
+    /// exactly the kind of thing that would drift.
+    fn capture_layout_with_extras(
+        &self,
+        mut extras: Option<&mut SnapshotExtras>,
+    ) -> io::Result<LayoutFile> {
         let area = self.content_area();
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut tabs = Vec::new();
         let mut total_panes = 0_usize;
-        for tab in &self.tabs {
+        for (tab_index, tab) in self.tabs.iter().enumerate() {
             let mut labels: Vec<(PaneId, String)> = Vec::new();
             let tiled = tab
                 .tree
                 .as_ref()
                 .and_then(|tree| self.capture_node(tree, home.as_deref(), &mut labels));
             let mut floating = Vec::new();
+            let mut float_extras = Vec::new();
             for float in tab.floating.panes() {
                 let Some(pane) = self.core_pane(float.pane_id) else {
                     continue;
                 };
                 let label = format!("p{}", labels.len() + 1);
+                float_extras.push(FloatExtras {
+                    slot: labels.len(),
+                    // A layout file records a float's size but not where it sat, because a
+                    // hand-written layout should not have to place windows. A snapshot describes a
+                    // session that existed, so it records both.
+                    x_percent: saved_position_percent(float.rect.x, area.width),
+                    y_percent: saved_position_percent(float.rect.y, area.height),
+                });
                 labels.push((float.pane_id, label.clone()));
                 floating.push(LayoutFloat::new(
                     label,
@@ -8881,7 +9128,25 @@ impl SessionActor {
                 ));
             }
             if tiled.is_none() && floating.is_empty() {
+                // Skipped here and skipped in the extras below, so the two stay index-aligned.
                 continue;
+            }
+            if let Some(extras) = extras.as_deref_mut() {
+                if tab_index == self.active_tab {
+                    extras.active_tab = extras.tabs.len();
+                }
+                extras.tabs.push(TabExtras {
+                    zoomed: tab.zoomed.and_then(|zoomed| {
+                        labels.iter().position(|(pane_id, _)| *pane_id == zoomed)
+                    }),
+                    sync_input: tab.sync_input,
+                    floats: float_extras,
+                    panes: labels
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, (pane_id, _))| self.capture_pane_extras(slot, *pane_id))
+                        .collect(),
+                });
             }
             let focus = labels
                 .iter()
@@ -8909,6 +9174,38 @@ impl SessionActor {
             ));
         }
         Ok(LayoutFile::from_tabs(tabs))
+    }
+
+    /// What a snapshot records about one pane beyond its place in the layout.
+    fn capture_pane_extras(&self, slot: usize, pane_id: PaneId) -> PaneExtras {
+        let agent = self.panes.get(&pane_id).and_then(|pane| {
+            let snapshot = pane.agent.snapshot();
+            let alias = pane.agent.alias();
+            let session = pane.agent.session();
+            // Nothing worth recording about an agent that has none of the three.
+            (snapshot.is_some() || alias.is_some()).then(|| PaneAgentExtras {
+                alias: alias.map(ToString::to_string),
+                kind: snapshot.map(|snapshot| snapshot.kind.to_string()),
+                // The reporting source that supplied the reference is not tracked today; native
+                // session restore adds it when it needs to gate a resume on it.
+                session_source: None,
+                session_id: session
+                    .and_then(|session| session.id())
+                    .map(ToOwned::to_owned),
+                session_path: session
+                    .and_then(|session| session.path())
+                    .map(ToOwned::to_owned),
+            })
+        });
+        PaneExtras {
+            slot,
+            title: self
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| pane.terminal.title())
+                .map(ToOwned::to_owned),
+            agent,
+        }
     }
 
     /// Capture one tiled subtree, collapsing away branches whose panes are not saveable so the
@@ -9368,8 +9665,14 @@ impl SessionActor {
         }
 
         let status_changed = next.general.status_visible != self.config.general.status_visible;
+        let snapshot_changed = next.session.auto_snapshot != self.config.session.auto_snapshot;
         self.config = next;
         self.config_path = Some(path);
+
+        if snapshot_changed {
+            self.apply_snapshot_setting();
+            report.applied.push("session.auto_snapshot".into());
+        }
 
         if status_changed {
             // The status row is outside the pane area, so the usable height just changed. The
@@ -9400,6 +9703,7 @@ impl SessionActor {
 
     fn relayout(&mut self) {
         self.invalidate_mouse_selection_state();
+        self.mark_snapshot_dirty();
         self.layout_revision = self.layout_revision.wrapping_add(1);
         self.session_sequence = self.session_sequence.wrapping_add(1);
         self.resize_all();
@@ -9416,6 +9720,7 @@ impl SessionActor {
     /// no rectangle changed: occlusion and quota priority depend on them. No PTY resizing is
     /// needed on this path.
     fn projection_changed(&mut self) {
+        self.mark_snapshot_dirty();
         self.layout_revision = self.layout_revision.wrapping_add(1);
         self.session_sequence = self.session_sequence.wrapping_add(1);
         self.schedule_render();
@@ -10798,6 +11103,7 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
             | AutomationMethod::WaitRendered { .. }
             | AutomationMethod::ReloadConfig
             | AutomationMethod::SaveLayout { .. }
+            | AutomationMethod::SessionSnapshot
             | AutomationMethod::Plugin(_)
             // Session-wide. Its filter may name a pane, but that narrows the stream rather than
             // targeting the request.
@@ -11195,7 +11501,7 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "wait_agent_state", "wait_media",
             "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "report_agent_session", "clear_agent_report",
-            "report_metadata", "agent_explain", "agent_rename", "agent_start", "agent_prompt",
+            "report_metadata", "agent_explain", "agent_rename", "snapshot", "agent_start", "agent_prompt",
             "agent_send_keys", "agent_read", "subscribe", "save_layout"
         ],
         "limits": automation_limits(),
@@ -12026,6 +12332,22 @@ fn saved_sizes(first: u32, second: u32) -> Vec<u32> {
 }
 
 /// A float's size as a percentage of the content area, inside the parser's accepted range.
+/// Where a float sat, as a percentage of the host area.
+///
+/// Unlike [`saved_percent`], which describes an extent and so has a 10% floor, a position of zero is
+/// an ordinary answer: a float flush against the left edge is where the user put it.
+fn saved_position_percent(offset: u16, available: u16) -> u16 {
+    if available == 0 {
+        return 0;
+    }
+    ((u32::from(offset) * 100) / u32::from(available)).min(100) as u16
+}
+
+/// The inverse of [`saved_position_percent`], for restoring a recorded position into a live area.
+fn percent_of(percent: u16, available: u16) -> u16 {
+    ((u32::from(percent) * u32::from(available)) / 100).min(u32::from(u16::MAX)) as u16
+}
+
 fn saved_percent(extent: u16, available: u16) -> u16 {
     if available == 0 {
         return 60;

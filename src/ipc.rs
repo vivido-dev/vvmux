@@ -145,6 +145,8 @@ pub enum AutomationMethod {
     },
     /// Replay agent classification for one pane and report which rule decided its state.
     AgentExplain,
+    /// Report where this session's state is persisted, and whether it was restored from one.
+    SessionSnapshot,
     /// Name the agent in one pane, or clear its name when `alias` is absent.
     AgentRename {
         alias: Option<crate::agent::AgentAlias>,

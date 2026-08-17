@@ -94,6 +94,7 @@ report-agent --agent claude|codex|opencode|hermes --state idle|working|blocked -
 report-agent-session --agent claude|codex|hermes --source ID --sequence N [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
 report-metadata --source ID --sequence N [--token NAME=VALUE]... [--ttl-ms MS] [--display-agent TEXT] [--state-label STATUS=TEXT]... [--title TEXT] [--pane-id ID]
 clear-agent-report --source ID --sequence N [--pane-id ID]
+snapshot
 agent-explain [--pane-id ID]
 agent-rename [--pane-id ID] --name NAME | --clear
 agent-start --kind AGENT --pane-id ID [--timeout DURATION] [-- ARGS...]
@@ -321,6 +322,46 @@ finished while you were not looking; focusing its pane in the navigator acknowle
 `idle`. A wait is scoped to its pane — another pane reaching the state does not satisfy it. A pane with no
 agent yet is simply not matching, so "launch an agent, then wait for it" works; if the wait times
 out without one ever appearing, the error says so.
+
+### Session state
+
+A session's shape is written to disk as it changes, and restored when its server starts again — no
+`save-layout`, no `startup.toml`, no ritual:
+
+```sh
+vvmux msg snapshot     # where it lives, how big it is, whether this session came from one
+```
+
+What is recorded is what a layout file records — tab names, split axes and weights, floating size,
+position and pin state, the focused pane, each pane's spawn `cwd` — plus what a layout file
+deliberately cannot: which tab was active, which pane was zoomed, and synchronized input. Commands
+are still not recorded, so a restored pane is a plain shell in its saved directory rather than a
+re-run of whatever was in it. Plugin panes are skipped.
+
+**Pane IDs are not preserved.** They are assigned in layout-tree order when a session is built, so a
+restored pane can come back with a different ID than it had. Use an agent's name (below) as a durable
+target; a pane ID is only stable within one run of a server.
+
+Precedence when a session starts: an explicit `--layout` wins, then a snapshot, then `startup.toml`,
+then `[general].default_layout`. A snapshot that is missing, unreadable, from a newer vvmux, or not a
+usable layout is reported and skipped — a lost restore is a disappointment, but a multiplexer that
+will not start is broken.
+
+The snapshot lives in an owner-only file under `$XDG_STATE_HOME/vvmux` (`~/.local/state/vvmux` by
+default), separate from the config directory because it holds working directories and, once agents
+report it, resumable session identity. It is never added to a `debug-bundle`.
+
+```toml
+[session]
+auto_snapshot = true   # default
+```
+
+Turning it off also discards the snapshot already on disk, so opting out leaves nothing behind. The
+setting is live-reloadable.
+
+Writes are debounced by five seconds and happen on a worker thread, so a burst of splits is one
+write and the session actor never blocks on the filesystem. A clean shutdown writes inline, so
+stopping a session does not lose the last few seconds of shape.
 
 ### Naming an agent
 

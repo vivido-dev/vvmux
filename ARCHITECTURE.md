@@ -78,6 +78,26 @@ identity changes. `report-agent-session` stores only resumable native identity a
 reported state, blocked message, or lifecycle transition. Broad inspection surfaces expose only
 `session_present`; the session ID/path remain confined to exact-pane inspection.
 
+Session shape is persisted by the same discipline every other actor-owned periodic job follows. A
+payload-free dirty bit coalesces changes, a five-second debounce turns a burst into one write, and
+the capture runs on the actor — it reads live state, so it must — while the serialization and the
+filesystem write run on a named worker that reports back through an actor event. One write is in
+flight at a time; a change arriving during one re-arms the debounce rather than being lost. Shutdown
+writes inline, because there is no loop left to deliver a completion to.
+
+Restore reuses the startup-layout path rather than reimplementing it: a snapshot embeds the layout
+schema, is lowered by the same `lower`, and is applied by the same `apply_layout_plan`, so slot
+pre-allocation, failed-leaf pruning, and float placement have one implementation. What a layout file
+cannot describe — active tab, zoom, synchronized input, float position — rides alongside as extras
+keyed by the pane slots that lowering assigns, and both are produced by a single capture walk so the
+two orderings cannot drift. Pane IDs are assigned in layout-tree order and are therefore not stable
+across a restart; agent names are the durable target.
+
+A snapshot is untrusted input. It is bounded before it is allocated, its schema is read before its
+body, and anything unusable starts a fresh session rather than failing to start one. It is owner-only
+and lives outside the config directory, because it records working directories and native agent
+session identity.
+
 A request names its pane by ID, by agent name, or not at all, and one function on the actor
 reconciles all three: an explicit pane ID wins, then a live agent's name, then the focused pane for
 the verbs that permit it. Naming both a pane and an agent is refused rather than resolved. Agent

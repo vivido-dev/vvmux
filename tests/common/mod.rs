@@ -605,7 +605,10 @@ pub fn vvmux_command(runtime: &std::path::Path) -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vvmux"));
     command.env("XDG_RUNTIME_DIR", runtime);
     command.env("XDG_CONFIG_HOME", runtime);
-    command.env("XDG_STATE_HOME", runtime);
+    // A subdirectory, not the runtime directory itself: in production these are genuinely different
+    // places, and sharing one here would put persisted session state beside the runtime artifacts
+    // that tests assert are cleaned up on shutdown.
+    command.env("XDG_STATE_HOME", runtime.join("state"));
     command.env("HOME", runtime);
     command
 }

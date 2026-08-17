@@ -135,6 +135,28 @@ while IFS= read -r line; do :; done
             .clone()
     }
 
+    fn kill(&self) {
+        assert_success(
+            &common::vvmux_command(self.runtime.path())
+                .args(["kill-session", "--target", &self.name])
+                .output()
+                .unwrap(),
+        );
+        // The daemon writes its final snapshot and reaps its panes after the request is answered,
+        // so a restart racing that write would read a file from one change ago.
+        for _ in 0..100 {
+            if common::vvmux_command(self.runtime.path())
+                .args(["msg", "--target", &self.name, "list-panes"])
+                .output()
+                .is_ok_and(|output| !output.status.success())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
     fn wait_text(&self, pane: u64, text: &str) {
         assert_success(&self.msg(&[
             "wait",
@@ -619,4 +641,178 @@ fn assert_success(output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The shape a session had must come back when its server does, with no user ritual and no layout
+/// file — which is the whole point, since a layout file is the ritual.
+#[test]
+fn a_session_restores_the_shape_it_had_when_its_server_restarts() {
+    let fixture = Fixture::new("restore");
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1 tab=1");
+
+    // A shape nothing would produce by default: an uneven split, a nested one, a second tab, and a
+    // zoomed pane that is not the one focus would land on.
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["action", "new-tab"]));
+    for pane in 1..=4 {
+        fixture.wait_text(pane, &format!("READY pane={pane}"));
+    }
+    assert_success(&fixture.msg(&["action", "toggle-zoom", "--pane-id", "2"]));
+
+    let before = shape(&fixture);
+    assert_eq!(before.len(), 4, "expected four panes: {before:?}");
+    assert!(
+        before.iter().any(|pane| pane.contains("\"zoomed\":true")),
+        "setup did not zoom a pane: {before:?}"
+    );
+
+    let snapshot = json(fixture.msg(&["snapshot"]));
+    assert_eq!(snapshot["enabled"], true);
+    assert_eq!(snapshot["restored_from_snapshot"], false);
+    let path = PathBuf::from(snapshot["path"].as_str().unwrap());
+
+    // Force the debounced write rather than sleeping through it: the shutdown path writes inline.
+    fixture.kill();
+    assert!(path.exists(), "no snapshot at {}", path.display());
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "a snapshot records working directories and agent identity"
+    );
+
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    let after = shape(&fixture);
+    assert_eq!(
+        after, before,
+        "the restored session does not have the shape it had"
+    );
+    assert_eq!(
+        json(fixture.msg(&["snapshot"]))["restored_from_snapshot"],
+        true
+    );
+}
+
+/// Nothing here may make a session fail to start. A snapshot is a file, and a file can be anything.
+#[test]
+fn an_unusable_snapshot_starts_a_fresh_session_instead_of_failing() {
+    for (label, contents) in [
+        ("garbage", "not json at all"),
+        ("truncated", "{\"schema\":1,\"layout\":"),
+        (
+            "newer",
+            "{\"schema\":9999,\"layout\":{\"tabs\":[]},\"extras\":{}}",
+        ),
+        (
+            "empty-layout",
+            "{\"schema\":1,\"layout\":{\"tabs\":[]},\"extras\":{}}",
+        ),
+    ] {
+        let fixture = Fixture::new(&format!("bad-{label}"));
+        // Start once so the state directory exists and the snapshot path is known, then replace it.
+        assert_success(&fixture.start_without_layout());
+        fixture.wait_text(1, "READY pane=1");
+        let path = PathBuf::from(json(fixture.msg(&["snapshot"]))["path"].as_str().unwrap());
+        fixture.kill();
+
+        fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_success(&fixture.start_without_layout());
+        fixture.wait_text(1, "READY pane=1");
+        let panes = fixture.panes();
+        assert_eq!(panes.len(), 1, "{label}: expected one fresh shell");
+        assert_eq!(
+            json(fixture.msg(&["snapshot"]))["restored_from_snapshot"],
+            false,
+            "{label}: claimed to restore from an unusable snapshot"
+        );
+    }
+}
+
+/// An explicit `--layout` is a request, and a request outranks whatever the session used to be.
+#[test]
+fn an_explicit_layout_outranks_a_snapshot() {
+    let fixture = Fixture::new("precedence");
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    fixture.wait_text(2, "READY pane=2");
+    fixture.kill();
+
+    let layout = fixture.write_layout(
+        "one.toml",
+        "[[tabs]]\nname = \"asked-for\"\n[tabs.layout]\npane = \"only\"\n",
+    );
+    assert_success(&fixture.start(&layout));
+    fixture.wait_text(1, "READY pane=1");
+    let panes = fixture.panes();
+    assert_eq!(panes.len(), 1, "the snapshot won over an explicit --layout");
+    assert_eq!(panes[0]["tab_name"], "asked-for");
+}
+
+/// Opting out must also discard what was already written, or the setting would only stop new
+/// snapshots while an old one kept restoring.
+#[test]
+fn turning_snapshots_off_discards_the_one_on_disk() {
+    let fixture = Fixture::new("optout");
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    fixture.wait_text(2, "READY pane=2");
+    let path = PathBuf::from(json(fixture.msg(&["snapshot"]))["path"].as_str().unwrap());
+    fixture.kill();
+    assert!(path.exists());
+
+    let original = fs::read_to_string(&fixture.config).unwrap();
+    fs::write(
+        &fixture.config,
+        format!("{original}\n[session]\nauto_snapshot = false\n"),
+    )
+    .unwrap();
+
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    let status = json(fixture.msg(&["snapshot"]));
+    assert_eq!(status["enabled"], false);
+    assert_eq!(status["restored_from_snapshot"], false);
+    assert_eq!(
+        fixture.panes().len(),
+        1,
+        "a disabled session still restored"
+    );
+    // Not merely unread: a snapshot holds the directories a user was working in, so opting out has
+    // to remove it rather than leave it for whenever the setting is turned back on.
+    assert!(!path.exists(), "opting out left {} on disk", path.display());
+}
+
+/// The identity a caller can compare across a restart.
+///
+/// Sorted, because pane IDs do not survive a restart and are not meant to: `apply_layout_plan`
+/// assigns them in the order the layout tree is walked, exactly as it does for `startup.toml`, so a
+/// pane that was second by ID can come back third. Everything that describes the *shape* — geometry,
+/// zoom, focus, and which tab a pane is in — still has to match exactly, and does. This is also why
+/// agent names exist: they are the durable target a pane ID cannot be.
+fn shape(fixture: &Fixture) -> Vec<String> {
+    let mut shape = fixture
+        .panes()
+        .iter()
+        .map(|pane| {
+            serde_json::json!({
+                "tab_name": pane["tab_name"],
+                "width": pane["geometry"]["width"],
+                "height": pane["geometry"]["height"],
+                "zoomed": pane["zoomed"],
+                "focused": pane["focused"],
+                "active_tab": pane["active_tab"],
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    shape.sort();
+    shape
 }

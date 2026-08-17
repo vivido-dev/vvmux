@@ -310,6 +310,8 @@ pub enum MsgCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Report where this session's shape is persisted and when it was last written.
+    Snapshot,
     /// Give the agent in one pane a name, or clear the name it has.
     ///
     /// A name is a stable target: pass `--alias NAME` to any other `msg` command instead of
@@ -1004,6 +1006,7 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             false,
             Output::Json,
         ),
+        MsgCommand::Snapshot => (AutomationMethod::SessionSnapshot, None, false, Output::Json),
         MsgCommand::AgentExplain { pane_id } => {
             (AutomationMethod::AgentExplain, pane_id, true, Output::Json)
         }

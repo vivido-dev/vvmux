@@ -183,6 +183,16 @@ impl LayoutFile {
         Self::parse(&source, path, home.as_deref())
     }
 
+    /// Lower a layout that arrived as a value rather than as a file.
+    ///
+    /// A session snapshot carries this schema directly, so it needs the same lowering, bounds, and
+    /// pane-slot assignment `startup.toml` goes through — the restore path is deliberately not a
+    /// second implementation of any of that.
+    pub fn into_plan(self) -> io::Result<LayoutPlan> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.lower(home.as_deref())
+    }
+
     fn parse(source: &str, path: &Path, home: Option<&Path>) -> io::Result<LayoutPlan> {
         let file: Self = toml::from_str(source)
             .map_err(|error| invalid(format!("invalid layout {}: {error}", path.display())))?;

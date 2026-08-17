@@ -81,12 +81,41 @@ fn run_inner(
             paths.remove_instance(&registry);
             context("load startup layout", error)
         })?;
+    // Resolved even when persistence is off, because opting out has to discard what a previous run
+    // wrote: a snapshot records working directories, and later native agent session identity, so
+    // leaving one behind would keep that data for a session that asked not to have any. Failing to
+    // resolve is not fatal — a session that cannot persist is still a session that works.
+    let snapshot_paths = crate::runtime::SnapshotPaths::for_session(&name).ok();
+    let snapshot_paths = match (config.session.auto_snapshot, snapshot_paths) {
+        (true, paths) => paths,
+        (false, Some(paths)) => {
+            if let Err(error) = crate::session_state::clear(&paths.snapshot) {
+                eprintln!("vvmux: could not discard the session snapshot: {error}");
+            }
+            None
+        }
+        (false, None) => None,
+    };
+    // Precedence: an explicit `--layout` is a request and wins; otherwise a snapshot restores the
+    // session that existed; otherwise the conventional startup layout builds a new one. A snapshot
+    // that cannot be used is reported and skipped, never fatal — losing a restore is a
+    // disappointment, but failing to start is a broken multiplexer.
+    let (layout, restore) = match (layout, snapshot_paths.as_ref()) {
+        (Some(layout), _) => (Some(layout), None),
+        (None, Some(paths)) => match restore_snapshot(&paths.snapshot) {
+            Some((layout, extras)) => (Some(layout), Some(extras)),
+            None => (None, None),
+        },
+        (None, None) => (None, None),
+    };
     let actor = session::start(session::SessionOptions {
         name,
         config,
         config_path: resolved_config_path,
         vivid_endpoint: paths.vivid_socket.clone(),
         layout,
+        restore,
+        snapshot_paths,
     })
     .map_err(|error| {
         paths.remove_instance(&registry);
@@ -123,6 +152,39 @@ fn run_inner(
     }
     paths.remove_instance(&registry);
     Ok(())
+}
+
+/// Load a session snapshot and lower its shape, or report why it will not be used.
+///
+/// Every failure is the same outcome — start fresh — but they are not the same event, so each is
+/// named on the way past. A missing file is the ordinary first run and says nothing.
+fn restore_snapshot(
+    path: &std::path::Path,
+) -> Option<(
+    crate::layout_file::LayoutPlan,
+    crate::session_state::SnapshotExtras,
+)> {
+    let snapshot = match crate::session_state::load_snapshot(path) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!(
+                "vvmux: ignoring session snapshot {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    match snapshot.layout.into_plan() {
+        Ok(plan) => Some((plan, snapshot.extras)),
+        Err(error) => {
+            eprintln!(
+                "vvmux: session snapshot {} does not describe a usable layout: {error}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn context(operation: &str, error: io::Error) -> io::Error {
