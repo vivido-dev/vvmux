@@ -381,10 +381,7 @@ impl PendingAltRead {
                     if stable_checks >= 1 {
                         if self.valid {
                             let truncated = !self.reached_top || self.history.len() > self.lines;
-                            PollOutcome::Success(ReadResult {
-                                text: snapshot_text(&self.history, self.lines),
-                                truncated,
-                            })
+                            PollOutcome::Success(read_result(&self.history, self.lines, truncated))
                         } else {
                             PollOutcome::Fallback
                         }
@@ -473,6 +470,13 @@ impl PendingAltRead {
 
 pub(crate) fn visible_text(terminal: &Terminal, lines: usize) -> String {
     snapshot_text(&ScreenSnapshot::capture(terminal).rows, lines)
+}
+
+fn read_result(rows: &[ScreenRow], lines: usize, truncated: bool) -> ReadResult {
+    ReadResult {
+        text: snapshot_text(rows, lines),
+        truncated,
+    }
 }
 
 fn send_wheel(
@@ -586,5 +590,8 @@ mod tests {
             row("   "),
         ];
         assert_eq!(snapshot_text(&rows, rows.len()), "wrappedline\ntail\n");
+        let limited = read_result(&rows, 2, true);
+        assert_eq!(limited.text, "tail\n");
+        assert!(limited.truncated);
     }
 }

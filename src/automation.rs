@@ -344,7 +344,7 @@ pub enum MsgCommand {
         #[arg(long)]
         wait: bool,
         /// Stop waiting when the prompt results in any of these statuses.
-        #[arg(value_enum)]
+        #[arg(long, value_enum)]
         until: Vec<crate::agent::AgentStatus>,
         /// How long to wait after submit, before reporting timeout/failure.
         #[arg(long, default_value = "30s", value_parser = parse_agent_prompt_timeout)]
