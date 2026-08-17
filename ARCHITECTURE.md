@@ -59,6 +59,25 @@ the actor continues servicing media delivery, rendering, client events, and unre
 Vivid queries, waits, device operations, and status work use the same pattern.
 Workers must never mutate `SessionActor` state directly or write session replies themselves.
 
+Agent launch uses the same pattern for fresh process-table probes. The actor admits and scopes the
+request, but a bounded probe worker performs `/proc` and platform process inspection; the actor
+never performs process I/O. Its typed result is revalidated against pane identity before launch.
+Prompt submission uses the bounded PTY input path with a delayed-input queue: prompt bytes and the
+later Enter are separate ordered writes, while the actor remains free to process unrelated work.
+
+Alternate-screen reads are a bounded actor-owned state machine rather than a blocking transcript
+scrape. Admission requires an idle detected agent, alternate-screen mode, mouse reporting, and no
+copy mode. Upward wheel steps, stable-snapshot checks, overlap alignment, fixed-header-safe merges,
+and viewport restoration advance on actor deadlines through the PTY queue. A read is capped at
+1000 lines, the session admits at most eight concurrently, and each operation uses its frozen
+admission snapshot so concurrent terminal changes cannot silently redefine its merge baseline.
+
+Lifecycle state reports and session-only reports share one monotonic source sequence but have
+different authority. `report-agent` may supersede screen classification until cleared or process
+identity changes. `report-agent-session` stores only resumable native identity and never creates a
+reported state, blocked message, or lifecycle transition. Broad inspection surfaces expose only
+`session_present`; the session ID/path remain confined to exact-pane inspection.
+
 The config watcher is the third worker that wakes the actor, after the PTY readers and the media
 wakeup. It polls the config path, requires one further identical observation before acting so a
 half-written file is never read, and treats a missing file as no change rather than a reset to

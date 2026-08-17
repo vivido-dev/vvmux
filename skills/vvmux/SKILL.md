@@ -9,8 +9,9 @@ Use this release-matched workflow:
 
 1. Discover with `vvmux list --json`, then check the selected session with `vvmux doctor --target
    SESSION --json`.
-2. Capability-discover with `vvmux msg --target SESSION capabilities` and capture
-   `session-inspect`, `list-tabs`, and `list-panes`. Use exact stable tab and pane IDs.
+2. Capability-discover with `vvmux msg --target SESSION capabilities`. Its method and limit lists
+   are authoritative for that release; do not rely on a remembered surface. Capture
+   `session-inspect`, `list-tabs`, and `list-panes`, then use exact stable tab and pane IDs.
 3. Capture the relevant screen, session, outer-projection, or trace sequence before acting.
 4. Use `focus` or `select-tab --tab-id ID` with `--wait outer` when media projection is the
    assertion, or `--wait rendered` for the attached terminal frame. Use Vivido `wait frame`
@@ -21,16 +22,23 @@ Use this release-matched workflow:
 7. When a pane's reported agent state looks wrong, use `agent-explain --pane-id ID` before
    changing anything: it names the rule that decided and shows every rule's evidence. `diagnose`
    covers infrastructure, not classification.
-8. To drive an agent pane, use `submit TEXT` for one atomic line, then
-   `wait agent-state --until blocked,done` rather than polling `get-text`. Waits are pane-scoped;
-   a pane with no agent yet is simply not matching, so launching and then waiting is safe.
-9. To start an agent, use `agent-start --kind KIND --pane-id ID` rather than `submit`ing its name:
-   it verifies the pane is a shell at its prompt, quotes arguments for that shell, and returns only
-   once the agent is detected and settled. `agent_pane_busy` means the pane is running something
-   else; `agent_not_launchable` means that provider is detection-only.
-10. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
+8. To run Codex in an available shell pane, use `agent-start --kind codex --pane-id ID`. Then send
+   work with `agent-prompt --pane-id ID --wait --until blocked,done TEXT`; it separates prompt text
+   from Enter and waits on agent lifecycle rather than screen text. Use `agent-send-keys` only for
+   its bounded allow-listed control/navigation keys.
+9. For prior full-screen context, use `agent-read --pane-id ID --lines 200`. It requires an idle
+   alternate-screen agent and restores the viewport. If those gates do not hold, ask the agent to
+   write a Markdown file and read it directly. When state looks wrong, inspect
+   `agent-explain --pane-id ID` before changing anything.
+10. `agent-start` verifies the pane is a shell at its prompt, quotes arguments for that shell, and
+   returns only once the agent is detected and settled. `agent_pane_busy` means the pane is running
+   something else; `agent_not_launchable` means that provider is detection-only.
+11. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
    polling each one. Treat a `gap` record as missed events, not as an error; it is never filtered
    out even when the stream is narrowed.
+
+G15 aliases will resolve at the same target-resolution point where `--pane-id` resolves today.
+Until that surface exists, always use stable pane IDs and do not invent alias syntax.
 
 Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
 needed. It proves the bytes reached the PTY writer, not that the child application consumed them.

@@ -96,6 +96,9 @@ report-metadata --source ID --sequence N [--token NAME=VALUE]... [--ttl-ms MS] [
 clear-agent-report --source ID --sequence N [--pane-id ID]
 agent-explain [--pane-id ID]
 agent-start --kind AGENT --pane-id ID [--timeout DURATION] [-- ARGS...]
+agent-prompt --pane-id ID [--wait] [--until idle|working|blocked|done[,...]] [--timeout DURATION] TEXT
+agent-send-keys --pane-id ID --key KEY [--key KEY]...
+agent-read --pane-id ID [--lines N]
 inspect [--pane-id ID]
 inspect-media [--pane-id ID]
 split vertical|horizontal [--pane-id ID]
@@ -356,6 +359,36 @@ detection-only: it is still recognized when a user starts it by hand, but `agent
 rather than guessing a command from the detection matchers, which describe a *running* agent
 (wrapper scripts, package paths) and not the way to start one.
 
+`agent-prompt` is the agent-aware input path. It writes the prompt first, waits at least 200 ms,
+then writes Enter separately so full-screen agents do not receive one pasted submission. With
+`--wait`, it returns when one of the comma-separated `--until` states is reached. A pane that does
+not transition within 5 seconds after submission returns `agent_prompt_stalled`; the request's
+3s-300s timeout still wins when it is shorter. `agent-send-keys` sends up to 32 allow-listed
+navigation/control keys in one ordered write. Both commands require a detected agent that is ready
+for input and refuse an ordinary shell pane.
+
+```sh
+vvmux msg agent-prompt --pane-id 2 --wait --until blocked,done --timeout 5m \
+  'Implement the parser change and report any ambiguity.'
+vvmux msg agent-send-keys --pane-id 2 --key esc --key up
+```
+
+`agent-read` retrieves prior context owned by an idle alternate-screen application. It temporarily
+scrolls upward, merges stable snapshots, restores the original viewport, and returns at most
+`--lines` 1000 lines. At most eight reads may run per session. It refuses non-agent, non-idle,
+primary-screen, mouse-less, and copy-mode panes rather than injecting speculative input. When a
+full-screen application does not satisfy these gates, ask the agent to write a Markdown file and
+read that file directly instead of scraping the terminal.
+
+```sh
+vvmux msg agent-read --pane-id 2 --lines 200
+vvmux msg agent-explain --pane-id 2
+```
+
+Agent launch accepts at most 32 arguments of at most 4096 bytes each. POSIX shells and PowerShell
+are supported; Windows `cmd` is deliberately excluded because vvmux does not implement its quoting
+rules.
+
 `agent-explain` answers why a pane shows the state it shows. It replays the live detection
 snapshot through the active manifest and reports the rule that decided, every rule that was
 evaluated with its region and evidence, and the reason when none matched — `rule_matched`,
@@ -397,7 +430,10 @@ and rewritten as JSON, so comments are not retained; an unparsable file is refus
 Codex keeps `[features] hooks = true` after uninstall, matching Codex's global feature semantics.
 Hermes plugin files are installed safely, but its YAML is not edited without a YAML dependency:
 the command prints the exact `plugins.enabled` stanza that must be added manually. Uninstalling an
-adapter leaves the bundled provider's chosen enable state unchanged.
+adapter leaves the bundled provider's chosen enable state unchanged. OpenCode uses its JavaScript
+plugin and reports lifecycle plus native session identity; Claude installs settings-driven start
+and stop hooks; Codex installs a shell hook; Hermes installs Python plugin files but requires the
+printed manual YAML enablement step.
 
 ## Startup layouts
 

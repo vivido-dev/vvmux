@@ -45,14 +45,26 @@ Later features adapted from the same HerdR commit, recorded as they land:
   vvmux's own detection startup grace, which HerdR does not have to consider because its
   classification has no equivalent forced-idle window. HerdR's agent names/aliases
   (`agent start <name>`, `agent rename`) are not ported here; vvmux targets panes by ID.
+- **Agent prompt and bounded keys** (`agent_drive.rs`, `agent-prompt` and `agent-send-keys` in
+  `session.rs`) — the prompt/submit split and 5 s no-transition stall gate are adapted from
+  HerdR's agent automation path. vvmux routes both writes through its delayed, bounded PTY input
+  queue, keeps lifecycle waits pane-scoped, and exposes a fixed key allow-list instead of arbitrary
+  terminal input. The 3 s-300 s request bound is shared with launch.
 - **Alternate-screen transcript reads** (`alt_read.rs`, `agent-read` in `session.rs`) — the
   70%-similar viewport settling, 30%-overlap upward alignment, fixed-header-safe prepend merge,
   soft-wrap reconstruction, three-event wheel steps, and bounded harvest/restore phases are
   adapted from `src/server/alt_screen_read.rs` and `src/terminal/history_read.rs`. vvmux drives the
   phases on its existing session-actor deadlines and writes through its bounded PTY input queue;
-  it additionally encodes synthetic coordinates in pixels when the application enabled DEC 1016.
-- **Lifecycle hook assets** (`integration/claude.*`, `integration/codex.sh`, and
-  `integration/hermes_plugin.*`) — the stdin JSON transport, subagent exclusion, Codex inherited
-  session check, Hermes interactive-platform filter, and bounded best-effort subprocess calls are
-  adapted from `src/integration/assets/{claude,codex,hermes}`. vvmux routes them through its
-  owner-only `msg report-agent-session` method instead of HerdR's socket protocol.
+  it additionally encodes synthetic coordinates in pixels when the application enabled DEC 1016
+  and freezes each admitted snapshot rather than sharing mutable harvest state across concurrent
+  reads.
+- **Lifecycle hook assets** (`integration/claude_hook.py`, `integration/claude_settings.json`,
+  `integration/codex.sh`, `integration/hermes_plugin.py`, and
+  `integration/hermes_plugin.yaml`) — each asset preserves its HerdR copyright notice. The stdin
+  JSON transport, subagent exclusion, Codex inherited-session check, Hermes interactive-platform
+  filter, and bounded best-effort subprocess calls are adapted from
+  `src/integration/assets/{claude,codex,hermes}`. vvmux routes them through its owner-only
+  `msg report-agent-session` method instead of HerdR's socket protocol. Its installer uses a
+  strict JSON editor for Claude settings, which deliberately drops JSONC comments rather than
+  attempting a lossy comment-preserving rewrite, and leaves Hermes YAML enablement manual when no
+  YAML dependency is available.
