@@ -221,6 +221,11 @@ pub enum AutomationMethod {
     WaitExit {
         timeout_ms: u64,
     },
+    /// Wait until a pane's agent reaches one of the given lifecycle states.
+    WaitAgentState {
+        until: Vec<crate::agent::AgentStatus>,
+        timeout_ms: u64,
+    },
     WaitMedia {
         after_virtual_revision: Option<u64>,
         after_outer_revision: Option<u64>,

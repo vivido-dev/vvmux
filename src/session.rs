@@ -598,6 +598,11 @@ enum AutomationWaitKind {
         after_session: u64,
     },
     Exit,
+    AgentState {
+        until: Vec<AgentStatus>,
+        /// The status when the wait was registered, so a caller can see what it moved from.
+        initial: AgentStatus,
+    },
     Media {
         after_virtual_revision: Option<u64>,
         after_outer_revision: Option<u64>,
@@ -3492,6 +3497,34 @@ impl SessionActor {
                     });
                 }
             }
+            AutomationMethod::WaitAgentState { until, timeout_ms } => {
+                let pane_id = pane_id.unwrap();
+                let Some(snapshot) = self
+                    .panes
+                    .get(&pane_id)
+                    .and_then(|pane| pane.agent.snapshot())
+                else {
+                    // Blocking until timeout on a pane that has no agent would look like a slow
+                    // agent rather than the wrong target.
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "agent_not_detected",
+                            "pane has no detected or reported agent",
+                        ),
+                    );
+                    return;
+                };
+                self.add_automation_waiter(AutomationWaiter {
+                    reply: target,
+                    pane_id: Some(pane_id),
+                    deadline: deadline(timeout_ms),
+                    kind: AutomationWaitKind::AgentState {
+                        until,
+                        initial: snapshot.status,
+                    },
+                });
+            }
             AutomationMethod::WaitExit { timeout_ms } => {
                 self.add_automation_waiter(AutomationWaiter {
                     reply: target,
@@ -4762,6 +4795,32 @@ impl SessionActor {
                     }))
                 })
             }
+            AutomationWaitKind::AgentState { until, initial } => {
+                let pane_id = waiter.pane_id?;
+                let Some(pane) = self.panes.get(&pane_id) else {
+                    return Some(Err(AutomationError::new(
+                        "pane_not_found",
+                        "pane closed while waiting",
+                    )));
+                };
+                let Some(snapshot) = pane.agent.snapshot() else {
+                    // The agent this wait names stopped existing, so no state it could reach will
+                    // ever arrive. Reporting that beats timing out with no explanation.
+                    return Some(Err(AutomationError::new(
+                        "agent_not_detected",
+                        "agent left the pane while waiting",
+                    )));
+                };
+                until.contains(&snapshot.status).then(|| {
+                    Ok(serde_json::json!({
+                        "pane_id": pane_id,
+                        "status": snapshot.status,
+                        "initial_status": initial,
+                        "agent": agent_json(snapshot),
+                        "session_sequence": self.session_sequence,
+                    }))
+                })
+            }
             AutomationWaitKind::Exit => {
                 let pane_id = waiter.pane_id?;
                 self.exit_tombstones
@@ -4949,6 +5008,11 @@ impl SessionActor {
             return;
         }
         self.note_agent_display_change();
+        // Resolve state waits here rather than leaving them to the next actor tick. A report
+        // arrives as an event and the run loop checks waiters after handling one, but screen
+        // classification runs in `evaluate_agent_states`, which the loop calls *after* that check
+        // — so a screen-detected transition would otherwise sit unnoticed until the next wake.
+        self.check_automation_waiters();
     }
 
     /// Record an observable agent-related change: advance the session sequence and repaint.
@@ -9432,6 +9496,12 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 "agent session identity must contain 1..=256 bytes",
             ))
         }
+        AutomationMethod::WaitAgentState { until, .. } if until.is_empty() || until.len() > 4 => {
+            Err(AutomationError::new(
+                "invalid_params",
+                "until must name from 1 through 4 agent statuses",
+            ))
+        }
         AutomationMethod::SubmitLine { text, .. } if text.contains(['\n', '\r']) => {
             Err(AutomationError::new(
                 "invalid_params",
@@ -9646,7 +9716,8 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "inspect", "inspect_media", "split", "focus", "focus_wait", "close_pane",
             "typing", "key", "paste", "submit_line", "get_text", "get_grid", "search",
             "set_sync_input", "wait_text",
-            "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
+            "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit",
+            "wait_agent_state", "wait_media",
             "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report",
             "report_metadata", "agent_explain", "save_layout"

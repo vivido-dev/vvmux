@@ -518,6 +518,19 @@ pub enum WaitCommand {
         #[arg(long, default_value = "30s", value_parser = parse_timeout)]
         timeout: Duration,
     },
+    /// Wait until a pane's agent reaches one of the given lifecycle states.
+    ///
+    /// The orchestration primitive: submit work, then block until the agent needs you or is
+    /// finished, instead of polling `get-text`. `done` means the agent finished while you were not
+    /// looking at it; focusing the pane in the navigator acknowledges it back to `idle`.
+    AgentState {
+        #[arg(long, value_enum, value_delimiter = ',', required = true)]
+        until: Vec<crate::agent::AgentStatus>,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Wait for a pane process to exit.
     Exit {
         #[arg(long, default_value = "30s", value_parser = parse_timeout)]
@@ -1145,6 +1158,19 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 },
                 None,
                 false,
+                Output::Json,
+            ),
+            WaitCommand::AgentState {
+                until,
+                timeout,
+                pane_id,
+            } => (
+                AutomationMethod::WaitAgentState {
+                    until,
+                    timeout_ms: millis(timeout),
+                },
+                pane_id,
+                true,
                 Output::Json,
             ),
             WaitCommand::Exit { timeout, pane_id } => (

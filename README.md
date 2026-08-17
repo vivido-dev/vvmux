@@ -112,6 +112,7 @@ wait text TEXT [--regex] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID
 wait screen-change [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait screen-stable [--quiet DURATION] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait rendered --after-session SEQ [--timeout DURATION]
+wait agent-state --until idle|working|blocked|done[,...] [--timeout DURATION] [--pane-id ID]
 wait exit [--timeout DURATION] [--pane-id ID]
 wait media [--after-virtual REV] [--after-outer REV] [--timeout DURATION] [--pane-id ID]
 wait media-track CONDITION --producer-id ID --context-id ID --surface-id ID --track-id ID [--timeout DURATION] [--pane-id ID]
@@ -257,6 +258,21 @@ priority = 500
 region = "whole_recent"
 contains = ["esc to interrupt"]
 ```
+
+`wait agent-state` blocks until a pane's agent reaches one of the states you name, so a script can
+submit work and then wait for the agent to need it or finish, instead of polling:
+
+```sh
+vvmux msg submit 'refactor the parser' --pane-id 2
+vvmux msg wait agent-state --pane-id 2 --until blocked,done --timeout 30m
+```
+
+It resolves immediately when the state already holds, and answers with the reached `status`, the
+`initial_status` the pane had when the wait was registered, and the agent. `done` means the agent
+finished while you were not looking; focusing its pane in the navigator acknowledges that back to
+`idle`. A wait is scoped to its pane — another pane reaching the state does not satisfy it. Waiting
+on a pane with no detected or reported agent fails with `agent_not_detected` rather than blocking,
+and an agent that leaves mid-wait ends the wait with the same error instead of timing out silently.
 
 `agent-explain` answers why a pane shows the state it shows. It replays the live detection
 snapshot through the active manifest and reports the rule that decided, every rule that was

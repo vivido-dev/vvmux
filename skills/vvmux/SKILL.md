@@ -21,6 +21,9 @@ Use this release-matched workflow:
 7. When a pane's reported agent state looks wrong, use `agent-explain --pane-id ID` before
    changing anything: it names the rule that decided and shows every rule's evidence. `diagnose`
    covers infrastructure, not classification.
+8. To drive an agent pane, use `submit TEXT` for one atomic line, then
+   `wait agent-state --until blocked,done` rather than polling `get-text`. Waits are pane-scoped
+   and fail fast with `agent_not_detected` on a pane that has no agent.
 
 Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
 needed. It proves the bytes reached the PTY writer, not that the child application consumed them.

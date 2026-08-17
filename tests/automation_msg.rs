@@ -920,6 +920,144 @@ done
         );
         assert!(!rejected.status.success(), "--rows accepted for {source}");
     }
+
+    // `wait agent-state` is the orchestration primitive: block until the agent needs you or is
+    // finished, rather than polling. Pane 2 already holds a codex agent.
+    let report_pane = |pane: &str, state: &str, sequence: &str| {
+        assert_success(&command(
+            &runtime,
+            &name,
+            &[
+                "report-agent",
+                "--agent",
+                "codex",
+                "--state",
+                state,
+                "--source",
+                "integration-test",
+                "--sequence",
+                sequence,
+                "--pane-id",
+                pane,
+            ],
+        ));
+    };
+
+    // A state that already holds resolves without needing a transition at all.
+    report_pane("2", "working", "25");
+    let already = json(command(
+        &runtime,
+        &name,
+        &[
+            "wait",
+            "agent-state",
+            "--until",
+            "working",
+            "--timeout",
+            "5s",
+            "--pane-id",
+            "2",
+        ],
+    ));
+    assert_eq!(already["status"], "working");
+    assert_eq!(already["initial_status"], "working");
+    assert_eq!(already["agent"]["kind"], "codex");
+
+    // A wait registered before the transition is woken by it, from another connection.
+    let wait_runtime = runtime.clone();
+    let wait_name = name.clone();
+    let waiting = std::thread::spawn(move || {
+        command(
+            &wait_runtime,
+            &wait_name,
+            &[
+                "wait",
+                "agent-state",
+                "--until",
+                "blocked,done",
+                "--timeout",
+                "20s",
+                "--pane-id",
+                "2",
+            ],
+        )
+    });
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(
+        !waiting.is_finished(),
+        "wait resolved before any transition"
+    );
+
+    // Sequences are per pane and source, so pane 1 reports independently of pane 2. Its
+    // transition must not satisfy a wait scoped to another pane.
+    report_pane("1", "working", "1");
+    report_pane("1", "blocked", "2");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(
+        !waiting.is_finished(),
+        "another pane's transition resolved this pane's wait"
+    );
+
+    report_pane("2", "blocked", "26");
+    let waited = json(waiting.join().unwrap());
+    assert_eq!(waited["pane_id"], 2);
+    assert_eq!(waited["status"], "blocked");
+    assert_eq!(waited["initial_status"], "working");
+
+    // Clearing one pane's report leaves the other owner's agent intact, even though both reported
+    // through the same source name.
+    assert_success(&command(
+        &runtime,
+        &name,
+        &[
+            "clear-agent-report",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "3",
+            "--pane-id",
+            "1",
+        ],
+    ));
+    let untouched = json(command(&runtime, &name, &["inspect", "--pane-id", "2"]));
+    assert_eq!(untouched["pane"]["agent"]["status"], "blocked");
+    assert_eq!(untouched["pane"]["agent"]["source"], "report");
+
+    // A wait that is not satisfied fails with a timeout rather than hanging.
+    let timed_out = command(
+        &runtime,
+        &name,
+        &[
+            "wait",
+            "agent-state",
+            "--until",
+            "idle",
+            "--timeout",
+            "300ms",
+            "--pane-id",
+            "2",
+        ],
+    );
+    assert!(!timed_out.status.success());
+    assert!(String::from_utf8_lossy(&timed_out.stderr).contains("timeout"));
+
+    // A pane with no agent names that, instead of blocking until the timeout.
+    let no_agent = command(
+        &runtime,
+        &name,
+        &[
+            "wait",
+            "agent-state",
+            "--until",
+            "idle",
+            "--timeout",
+            "5s",
+            "--pane-id",
+            "3",
+        ],
+    );
+    assert!(!no_agent.status.success());
+    assert!(String::from_utf8_lossy(&no_agent.stderr).contains("agent_not_detected"));
 }
 
 fn command(runtime: &Path, session: &str, arguments: &[&str]) -> Output {
