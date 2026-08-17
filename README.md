@@ -353,11 +353,32 @@ report it, resumable session identity. It is never added to a `debug-bundle`.
 
 ```toml
 [session]
-auto_snapshot = true   # default
+auto_snapshot = true    # default
+pane_history = false    # default
 ```
 
-Turning it off also discards the snapshot already on disk, so opting out leaves nothing behind. The
-setting is live-reloadable.
+Turning either off also discards what is already on disk, so opting out leaves nothing behind. Both
+are live-reloadable.
+
+#### Pane history
+
+`pane_history` additionally persists what was on each pane's screen and restores it as scrollback.
+It is **off by default, and that is a privacy decision**: pane output is whatever scrolled past —
+tokens, keys, command output — and enabling it writes that to a file. The file is owner-only and
+never enters a `debug-bundle`, but it exists, and it holds what your terminal held.
+
+What is stored is text and style only. Hyperlinks are dropped, because a restored OSC 8 target would
+make a URL from a previous session clickable in this one. Graphics placements, media anchors, cursor
+position, and terminal modes are dropped too. Restored lines go into scrollback, never onto the
+screen: the viewport belongs to the shell that just started.
+
+Persisted history is **never fed back through the terminal parser**. Cells are placed directly, so a
+line containing a clipboard-write sequence, a device query, or a media anchor comes back as inert
+text rather than acting a second time.
+
+Each pane contributes at most 2000 lines or 256 KiB, whichever comes first, and a whole session at
+most 4 MiB, oldest lines dropped first. Only lines that actually scrolled off a pane are in
+scrollback, so what is still on screen at shutdown is not part of it.
 
 Writes are debounced by five seconds and happen on a worker thread, so a burst of splits is one
 write and the session actor never blocks on the filesystem. A clean shutdown writes inline, so

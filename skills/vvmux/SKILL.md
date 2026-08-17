@@ -50,6 +50,10 @@ Use this release-matched workflow:
    are stable only within one run of a server — so never persist a pane ID across a restart; name
    the agent and target it by name instead.
 
+14. Pane history (`[session] pane_history`) is off by default and must stay a user decision: it
+   writes whatever scrolled past a pane — including secrets — to disk. Never enable it on a user's
+   behalf to make a task easier.
+
 Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
 needed. It proves the bytes reached the PTY writer, not that the child application consumed them.
 Use `wait media-track` only with complete producer/context/surface/track identity. Never address a

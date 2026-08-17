@@ -23,9 +23,10 @@
 //! directory. `startup.toml` is something users write, share, and commit; this is machine state
 //! holding secrets-adjacent material, and the two must not be the same file.
 //!
-//! Only the schema and its IO exist so far. Capture and restore attach in the snapshot-restore task,
-//! and [`MAX_HISTORY_BYTES`] belongs to the pane-history task that adds the second document; they
-//! live here now because the file format, its bounds, and its privacy posture are one decision.
+//! Two documents share all of this: the shape snapshot, which is always written when a session
+//! persists at all, and the opt-in pane history, which is large, holds whatever scrolled past a
+//! terminal, and is therefore kept in its own file so enabling or disabling it never rewrites the
+//! shape.
 #![allow(dead_code)]
 
 use std::io;
@@ -52,12 +53,17 @@ pub const SNAPSHOT_SCHEMA: u16 = 1;
 /// enough that a corrupted length is not a memory problem.
 pub const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024;
 
-/// Ceiling for a whole session's persisted pane history.
+/// Ceiling for the pane-history *file*, on both read and write.
 ///
-/// Deliberately a hard cap rather than herdr's uncapped capture, which serializes the entire
-/// scrollback of every pane. Per-pane limits belong to the capture path; this is the backstop that
-/// bounds the file itself.
-pub const MAX_HISTORY_BYTES: u64 = 4 * 1024 * 1024;
+/// Deliberately above the capture budget rather than equal to it. Capture measures the text it
+/// collects; the file additionally carries JSON structure and escaping, so a capture that filled a
+/// 4 MiB budget exactly would serialize past it and be refused on every write. The headroom means a
+/// maximal capture always fits, while a corrupted or hostile length is still bounded before it is
+/// allocated.
+///
+/// A hard cap either way, unlike herdr, which serializes the entire scrollback of every pane with no
+/// limit at all.
+pub const MAX_HISTORY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Everything needed to rebuild a session's shape.
 ///
@@ -236,6 +242,113 @@ pub fn clear(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// What a pane's screen looked like, in a form the ANSI parser never sees again.
+///
+/// Text and style only. Hyperlinks, graphics placements, media anchors, cursor position, and
+/// terminal modes are all dropped: a hyperlink is an attacker-influenced URL that would come back
+/// clickable, graphics transfer state is explicitly never retained session state, and an anchor
+/// belongs to a capability that died with the daemon that issued it. What survives is what a person
+/// would recognize as "what was on the screen".
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SessionHistory {
+    pub schema: u16,
+    pub tabs: Vec<TabHistory>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TabHistory {
+    pub panes: Vec<PaneHistory>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PaneHistory {
+    /// The pane slot this belongs to, keyed exactly as [`PaneExtras`] is.
+    pub slot: usize,
+    /// Whether older lines were dropped to stay inside the budget.
+    pub truncated: bool,
+    /// Distinct styles, referenced by index from every run below.
+    pub styles: Vec<HistoryStyle>,
+    /// Scrollback lines, oldest first.
+    pub rows: Vec<HistoryRow>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HistoryRow {
+    /// Whether this line continues into the next, so a restored log rewraps as it did.
+    pub wrapped: bool,
+    pub runs: Vec<HistoryRun>,
+}
+
+/// A stretch of text sharing one style, which is how a terminal line actually looks: a prompt, a
+/// path, a diff marker. Storing per cell would multiply a line by its width for no fidelity.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HistoryRun {
+    pub style: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HistoryStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fg: Option<HistoryColor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bg: Option<HistoryColor>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub bold: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub dim: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub italic: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub underline: u8,
+    #[serde(skip_serializing_if = "is_false")]
+    pub blink: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub inverse: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub strikeout: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryColor {
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
+impl SessionHistory {
+    pub fn new(tabs: Vec<TabHistory>) -> Self {
+        Self {
+            schema: SNAPSHOT_SCHEMA,
+            tabs,
+        }
+    }
+}
+
+pub fn load_history(path: &Path) -> io::Result<Option<SessionHistory>> {
+    load(path, MAX_HISTORY_BYTES, "session pane history")
+}
+
+pub fn save_history(path: &Path, history: &SessionHistory) -> io::Result<()> {
+    save(path, history, MAX_HISTORY_BYTES, "session pane history")
 }
 
 pub fn load_snapshot(path: &Path) -> io::Result<Option<SessionSnapshot>> {

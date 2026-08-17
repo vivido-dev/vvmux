@@ -89,24 +89,46 @@ fn run_inner(
     let snapshot_paths = match (config.session.auto_snapshot, snapshot_paths) {
         (true, paths) => paths,
         (false, Some(paths)) => {
-            if let Err(error) = crate::session_state::clear(&paths.snapshot) {
-                eprintln!("vvmux: could not discard the session snapshot: {error}");
+            for path in [&paths.snapshot, &paths.history] {
+                if let Err(error) = crate::session_state::clear(path) {
+                    eprintln!("vvmux: could not discard {}: {error}", path.display());
+                }
             }
             None
         }
         (false, None) => None,
     };
+    // Pane history is discarded the moment it is not wanted, without waiting for a write to be
+    // triggered by something else. Output alone never marks the shape dirty, so a session that only
+    // scrolls would otherwise keep a file full of its own output long after the setting was turned
+    // off — and that file is the one holding whatever scrolled past.
+    if !config.session.pane_history
+        && let Some(paths) = snapshot_paths.as_ref()
+        && let Err(error) = crate::session_state::clear(&paths.history)
+    {
+        eprintln!("vvmux: could not discard pane history: {error}");
+    }
     // Precedence: an explicit `--layout` is a request and wins; otherwise a snapshot restores the
     // session that existed; otherwise the conventional startup layout builds a new one. A snapshot
     // that cannot be used is reported and skipped, never fatal — losing a restore is a
     // disappointment, but failing to start is a broken multiplexer.
-    let (layout, restore) = match (layout, snapshot_paths.as_ref()) {
-        (Some(layout), _) => (Some(layout), None),
+    let (layout, restore, history) = match (layout, snapshot_paths.as_ref()) {
+        (Some(layout), _) => (Some(layout), None, None),
         (None, Some(paths)) => match restore_snapshot(&paths.snapshot) {
-            Some((layout, extras)) => (Some(layout), Some(extras)),
-            None => (None, None),
+            Some((layout, extras)) => {
+                // Only read when the shape it belongs to was usable: history is keyed by the slots
+                // that shape assigns, so replaying it against a different layout would put one
+                // pane's output in another's scrollback.
+                let history = config
+                    .session
+                    .pane_history
+                    .then(|| restore_history(&paths.history))
+                    .flatten();
+                (Some(layout), Some(extras), history)
+            }
+            None => (None, None, None),
         },
-        (None, None) => (None, None),
+        (None, None) => (None, None, None),
     };
     let actor = session::start(session::SessionOptions {
         name,
@@ -115,6 +137,7 @@ fn run_inner(
         vivid_endpoint: paths.vivid_socket.clone(),
         layout,
         restore,
+        history,
         snapshot_paths,
     })
     .map_err(|error| {
@@ -182,6 +205,17 @@ fn restore_snapshot(
                 "vvmux: session snapshot {} does not describe a usable layout: {error}",
                 path.display()
             );
+            None
+        }
+    }
+}
+
+/// Load persisted pane history, or report why it will not be used.
+fn restore_history(path: &std::path::Path) -> Option<crate::session_state::SessionHistory> {
+    match crate::session_state::load_history(path) {
+        Ok(history) => history,
+        Err(error) => {
+            eprintln!("vvmux: ignoring pane history {}: {error}", path.display());
             None
         }
     }

@@ -807,6 +807,38 @@ impl Terminal {
         }
     }
 
+    /// The most recent `rows` lines of scrollback, oldest first, with each line's wrap flag.
+    ///
+    /// Scrollback only — never the live grid. What is on screen belongs to whatever is running in
+    /// the pane, and a restored session has a different program in it.
+    pub fn history_tail(&self, rows: usize) -> Vec<(&[Cell], bool)> {
+        let start = self.history.len().saturating_sub(rows);
+        self.history
+            .iter()
+            .skip(start)
+            .zip(self.history_wrapped.iter().skip(start))
+            .map(|(cells, wrapped)| (cells.as_slice(), *wrapped))
+            .collect()
+    }
+
+    /// Seed scrollback with lines from a previous session, oldest first.
+    ///
+    /// Deliberately not `feed`: these bytes came from a file, and the parser turns bytes into
+    /// events — clipboard writes, device replies, media anchors, graphics. Restoring what a pane
+    /// looked like must not re-run what it *did*, so the cells are placed directly and nothing is
+    /// interpreted. Returns no events for the same reason.
+    ///
+    /// Replaces rather than appends: this runs on a pane that has just been created, and a pane with
+    /// scrollback of its own is not one being restored.
+    pub fn restore_history(&mut self, rows: Vec<(Vec<Cell>, bool)>) {
+        self.history.clear();
+        self.history_wrapped.clear();
+        for (cells, wrapped) in rows.into_iter().rev().take(self.history_limit).rev() {
+            self.history.push_back(cells);
+            self.history_wrapped.push_back(wrapped);
+        }
+    }
+
     pub fn alternate_screen(&self) -> bool {
         self.alternate_screen
     }
@@ -2122,6 +2154,119 @@ fn push_bytes(chunks: &mut Vec<VividChunk>, bytes: &[u8]) {
         previous.extend_from_slice(bytes);
     } else {
         chunks.push(VividChunk::Bytes(bytes.to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn scrolled(lines: usize) -> Terminal {
+        let mut terminal = Terminal::new(4, 20, 200);
+        for line in 0..lines {
+            terminal.feed(format!("line-{line}\r\n").as_bytes());
+        }
+        terminal
+    }
+
+    #[test]
+    fn history_tail_returns_the_most_recent_lines_oldest_first() {
+        let terminal = scrolled(20);
+        let tail = terminal.history_tail(3);
+        assert_eq!(tail.len(), 3);
+        let text = |cells: &[Cell]| cells.iter().map(|cell| cell.ch).collect::<String>();
+        let rendered = tail
+            .iter()
+            .map(|(cells, _)| text(cells).trim_end().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            rendered.windows(2).all(|pair| pair[0] < pair[1]),
+            "not oldest first: {rendered:?}"
+        );
+        assert!(tail.len() <= terminal.history_len());
+    }
+
+    /// The whole point of not going through `feed`: a restore must place cells, never interpret
+    /// bytes. Anything the parser would have acted on has to be inert by construction.
+    #[test]
+    fn restoring_history_places_cells_without_producing_events() {
+        let mut terminal = Terminal::new(4, 20, 200);
+        let cells = "restored"
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect::<Vec<_>>();
+        terminal.restore_history(vec![(cells, false)]);
+
+        assert_eq!(terminal.history_len(), 1);
+        let restored = terminal
+            .viewport_line(-1)
+            .unwrap()
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>();
+        assert_eq!(restored.trim_end(), "restored");
+        assert_eq!(terminal.line_wrapped(-1), Some(false));
+    }
+
+    /// The security claim, stated as a test: a persisted line carrying sequences the parser acts on
+    /// must come back as inert text. Routing `restore_history` through `feed` fails this.
+    #[test]
+    fn restoring_history_never_acts_on_what_it_restores() {
+        let mut terminal = Terminal::new(4, 40, 200);
+        // A clipboard write, a device-status query, a title change, and a bell — every one an
+        // event `feed` would emit and a restore must not.
+        let hostile = "\u{1b}]52;c;aGVsbG8=\u{7}\u{1b}[5n\u{1b}]0;pwned\u{7}\u{7}text";
+        let cells = hostile
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect::<Vec<_>>();
+        terminal.restore_history(vec![(cells, false)]);
+
+        let restored = terminal
+            .viewport_line(-1)
+            .unwrap()
+            .iter()
+            .map(|cell| cell.ch)
+            .collect::<String>();
+        assert!(
+            restored.contains('\u{1b}') && restored.contains("text"),
+            "the bytes were interpreted rather than stored: {restored:?}"
+        );
+        // Feeding the same bytes is what a naive implementation would do, and it is not inert.
+        let mut compare = Terminal::new(4, 40, 200);
+        let events = compare.feed(hostile.as_bytes());
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::ClipboardStore { .. })),
+            "the fixture no longer exercises a side effect: {events:?}"
+        );
+    }
+
+    #[test]
+    fn restoring_history_replaces_rather_than_appends_and_respects_the_limit() {
+        let mut terminal = Terminal::new(4, 20, 2);
+        terminal.feed(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n");
+        let row = |ch: char| {
+            (
+                vec![Cell {
+                    ch,
+                    ..Cell::default()
+                }],
+                false,
+            )
+        };
+        terminal.restore_history(vec![row('1'), row('2'), row('3')]);
+        // Capped at the limit, and it is the *newest* that survive.
+        assert_eq!(terminal.history_len(), 2);
+        let text = |line: isize| terminal.viewport_line(line).unwrap()[0].ch;
+        assert_eq!((text(-2), text(-1)), ('2', '3'));
     }
 }
 

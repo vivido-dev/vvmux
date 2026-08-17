@@ -68,6 +68,32 @@ while IFS= read -r line; do :; done
             .unwrap()
     }
 
+    fn enable_pane_history(&self) {
+        let original = fs::read_to_string(&self.config).unwrap();
+        fs::write(
+            &self.config,
+            format!("{original}\n[session]\npane_history = true\n"),
+        )
+        .unwrap();
+    }
+
+    /// Start a single pane that scrolls enough output past to reach scrollback.
+    ///
+    /// A pane only pushes lines into history when the screen *scrolls*, so a handful of lines on a
+    /// 23-row grid reaches none. Driven by a layout command rather than by `submit`, because this
+    /// file's fixture shell reads its input and discards it rather than running it.
+    fn start_scrolling(&self, tag: &str) -> Output {
+        // A TOML *literal* string: the command is full of `$` and `\n`, and a basic string would
+        // process the escapes before the shell ever sees them.
+        let layout = self.write_layout(
+            &format!("{tag}.toml"),
+            &format!(
+                "[[tabs]]\n[tabs.layout]\npane = \"noisy\"\ncommand = 'i=1; while [ $i -le 60 ]; do printf \"{tag}-$i\\n\"; i=$((i+1)); done; sleep 300'\n"
+            ),
+        );
+        self.start(&layout)
+    }
+
     fn start_without_layout(&self) -> Output {
         common::vvmux_command(self.runtime.path())
             .args(["--config"])
@@ -815,4 +841,139 @@ fn shape(fixture: &Fixture) -> Vec<String> {
         .collect::<Vec<_>>();
     shape.sort();
     shape
+}
+
+/// Opt-in pane history brings back what was on a pane's screen, as scrollback rather than as a
+/// screen: the viewport belongs to the shell that just started.
+#[test]
+fn opt_in_pane_history_restores_scrollback_without_replaying_it() {
+    let fixture = Fixture::new("history");
+    fixture.enable_pane_history();
+    assert_success(&fixture.start_scrolling("HIST"));
+    fixture.wait_text(1, "HIST-60");
+
+    let before = history_size(&fixture, 1);
+    assert!(before > 0, "nothing reached scrollback to persist");
+    let history = PathBuf::from(
+        json(fixture.msg(&["snapshot"]))["path"]
+            .as_str()
+            .unwrap()
+            .replace("snapshot-", "history-"),
+    );
+    fixture.kill();
+    assert!(history.exists(), "no history at {}", history.display());
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&history).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "pane output is whatever scrolled past, including secrets"
+    );
+
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    assert_eq!(
+        history_size(&fixture, 1),
+        before,
+        "the restored pane did not get its scrollback back"
+    );
+    // `HIST-1` is a line that genuinely scrolled off before the restart, so it is the one that has
+    // to come back. The trailing lines never left the viewport and so were never in scrollback —
+    // history holds what scrolled past, not what was on screen.
+    //
+    // More rows than the screen holds, so the read reaches past the viewport into the restored
+    // scrollback rather than reporting the fresh shell's blank grid.
+    let recent = text(fixture.msg(&[
+        "get-text",
+        "--pane-id",
+        "1",
+        "--source",
+        "recent",
+        "--rows",
+        "80",
+    ]));
+    assert!(
+        recent.contains("HIST-1\n"),
+        "restored history is not in scrollback: {recent:?}"
+    );
+    // Restored into scrollback, not onto the screen: the fresh shell's own output owns the
+    // viewport, and the old lines sit above it.
+    let visible = text(fixture.msg(&["get-text", "--pane-id", "1"]));
+    assert!(
+        !visible.contains("HIST-1"),
+        "restored history was painted onto the live screen: {visible:?}"
+    );
+    assert!(
+        visible.contains("READY pane=1"),
+        "the restored pane is not a live shell: {visible:?}"
+    );
+}
+
+/// Off by default, because pane output is whatever scrolled past.
+#[test]
+fn pane_history_is_off_unless_asked_for() {
+    let fixture = Fixture::new("nohistory");
+    assert_success(&fixture.start_scrolling("SECRET"));
+    fixture.wait_text(1, "SECRET-60");
+    assert!(history_size(&fixture, 1) > 0);
+    let history = PathBuf::from(
+        json(fixture.msg(&["snapshot"]))["path"]
+            .as_str()
+            .unwrap()
+            .replace("snapshot-", "history-"),
+    );
+    fixture.kill();
+    assert!(
+        !history.exists(),
+        "pane output was written to {} without being asked for",
+        history.display()
+    );
+
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    assert_eq!(history_size(&fixture, 1), 0, "scrollback came back anyway");
+}
+
+/// Turning it off has to take the data with it. Output alone never marks the shape dirty, so
+/// waiting for the next ordinary write would keep the file indefinitely on a session that only
+/// scrolls.
+#[test]
+fn turning_pane_history_off_discards_what_was_written() {
+    let fixture = Fixture::new("histoff");
+    fixture.enable_pane_history();
+    assert_success(&fixture.start_scrolling("GONE"));
+    fixture.wait_text(1, "GONE-60");
+    let history = PathBuf::from(
+        json(fixture.msg(&["snapshot"]))["path"]
+            .as_str()
+            .unwrap()
+            .replace("snapshot-", "history-"),
+    );
+    fixture.kill();
+    assert!(history.exists());
+
+    let config = fs::read_to_string(&fixture.config).unwrap();
+    fs::write(
+        &fixture.config,
+        config.replace("pane_history = true", "pane_history = false"),
+    )
+    .unwrap();
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    assert!(
+        !history.exists(),
+        "opting out left pane output at {}",
+        history.display()
+    );
+    assert_eq!(history_size(&fixture, 1), 0);
+}
+
+fn history_size(fixture: &Fixture, pane: u64) -> u64 {
+    json(fixture.msg(&["inspect", "--pane-id", &pane.to_string()]))["pane"]["history_size"]
+        .as_u64()
+        .unwrap()
+}
+
+fn text(output: Output) -> String {
+    assert_success(&output);
+    String::from_utf8(output.stdout).unwrap()
 }

@@ -35,12 +35,19 @@ pub struct Session {
     /// lost the thing it exists to provide. Turning it off also discards any snapshot already on
     /// disk, so opting out leaves nothing behind.
     pub auto_snapshot: bool,
+    /// Also persist what was on each pane's screen, and replay it into the restored pane.
+    ///
+    /// Off by default, and that is a privacy decision rather than a performance one: pane output is
+    /// whatever scrolled past, which includes tokens, keys, and command output. Enabling it writes
+    /// that to disk in an owner-only file. Requires `auto_snapshot`.
+    pub pane_history: bool,
 }
 
 impl Default for Session {
     fn default() -> Self {
         Self {
             auto_snapshot: true,
+            pane_history: false,
         }
     }
 }

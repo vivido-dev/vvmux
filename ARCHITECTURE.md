@@ -93,6 +93,16 @@ keyed by the pane slots that lowering assigns, and both are produced by a single
 two orderings cannot drift. Pane IDs are assigned in layout-tree order and are therefore not stable
 across a restart; agent names are the durable target.
 
+Persisted pane history is a second, opt-in document beside the shape snapshot, keyed by the same
+pane slots and written in the same pass so the two always describe one generation. It is stored as
+styled runs — text plus a deduplicated style table — and never as a byte stream, because restoring it
+must not re-run it: `Terminal::feed` turns bytes into events, and a persisted line can contain a
+clipboard write, a device query, a graphics packet, or a media anchor. `Terminal::restore_history`
+places cells directly and returns no events, so the parser never sees a byte that came from a file.
+Hyperlinks, graphics placements, anchors, cursor position, and modes are dropped rather than
+restored. Restored lines enter scrollback, never the viewport, which belongs to the newly spawned
+program.
+
 A snapshot is untrusted input. It is bounded before it is allocated, its schema is read before its
 body, and anything unusable starts a fresh session rather than failing to start one. It is owner-only
 and lives outside the config directory, because it records working directories and native agent

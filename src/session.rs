@@ -45,7 +45,8 @@ use crate::search::{
     find_next, find_on_line, row_text_with_columns,
 };
 use crate::session_state::{
-    FloatExtras, PaneAgentExtras, PaneExtras, SessionSnapshot, SnapshotExtras, TabExtras,
+    FloatExtras, HistoryColor, HistoryRow, HistoryRun, HistoryStyle, PaneAgentExtras, PaneExtras,
+    PaneHistory, SessionHistory, SessionSnapshot, SnapshotExtras, TabExtras, TabHistory,
 };
 
 const EVENT_QUEUE: usize = 1024;
@@ -74,6 +75,26 @@ const MAX_PENDING_ACTOR_WORK: usize = 256;
 /// Long enough that dragging a split or opening several panes is one write, short enough that a
 /// crash loses a few seconds of shape rather than a session.
 const SNAPSHOT_DEBOUNCE: Duration = Duration::from_secs(5);
+/// Scrollback lines one pane contributes to a persisted history.
+const HISTORY_MAX_ROWS: usize = 2000;
+/// Bytes one pane contributes, whatever its line count.
+const HISTORY_MAX_PANE_BYTES: usize = 256 * 1024;
+/// Text bytes a whole session's history may capture, whatever its pane count.
+///
+/// Below `session_state::MAX_HISTORY_BYTES`, which bounds the serialized file: this counts text,
+/// and the file additionally carries JSON structure, so the two must not be equal or a maximal
+/// capture would be refused by its own writer.
+const HISTORY_MAX_SESSION_BYTES: usize = 4 * 1024 * 1024;
+
+/// What one capture walk produces: the state a layout file cannot describe, and the slot-to-pane
+/// mapping that only the walk itself knows.
+#[derive(Default)]
+struct SnapshotCapture {
+    extras: SnapshotExtras,
+    /// Per captured tab, the pane holding each slot. Never persisted — pane IDs do not survive a
+    /// restart, which is exactly why the persisted form is keyed by slot.
+    slots: Vec<Vec<PaneId>>,
+}
 /// How long to wait before retrying a capture that found a write already in flight.
 const SNAPSHOT_WRITE_RETRY: Duration = Duration::from_millis(250);
 /// Delayed writes outstanding across the session.
@@ -1497,6 +1518,8 @@ pub struct SessionOptions {
     /// Separate from `layout` because the two come from different places: a plan may equally have
     /// come from `--layout` or `startup.toml`, and only a snapshot carries extras.
     pub restore: Option<SnapshotExtras>,
+    /// What was on each restored pane's screen, when that is persisted and enabled.
+    pub history: Option<SessionHistory>,
     /// Where to persist this session's shape, or `None` to persist nothing.
     pub snapshot_paths: Option<crate::runtime::SnapshotPaths>,
 }
@@ -1509,6 +1532,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         vivid_endpoint,
         layout,
         restore,
+        history,
         snapshot_paths,
     } = options;
     let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE);
@@ -1692,7 +1716,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         client_ipc: None,
     };
     match layout {
-        Some(layout) => actor.apply_layout_plan(layout, restore.as_ref())?,
+        Some(layout) => actor.apply_layout_plan(layout, restore.as_ref(), history.as_ref())?,
         None => actor.new_tab()?,
     }
     let actor_terminated = terminated.clone();
@@ -8474,8 +8498,16 @@ impl SessionActor {
         if self.config.session.auto_snapshot {
             if self.snapshot_paths.is_none() {
                 self.snapshot_paths = crate::runtime::SnapshotPaths::for_session(&self.name).ok();
-                self.mark_snapshot_dirty();
             }
+            // Turning pane history off has to remove what is already written, not merely stop
+            // adding to it, and it must not wait for a shape change that may never come.
+            if !self.config.session.pane_history
+                && let Some(paths) = self.snapshot_paths.clone()
+                && let Err(error) = crate::session_state::clear(&paths.history)
+            {
+                eprintln!("vvmux: could not discard pane history: {error}");
+            }
+            self.mark_snapshot_dirty();
             return;
         }
         let Some(paths) = self.snapshot_paths.take() else {
@@ -8483,8 +8515,10 @@ impl SessionActor {
         };
         self.snapshot_dirty = false;
         self.snapshot_due = None;
-        if let Err(error) = crate::session_state::clear(&paths.snapshot) {
-            eprintln!("vvmux: could not discard the session snapshot: {error}");
+        for path in [&paths.snapshot, &paths.history] {
+            if let Err(error) = crate::session_state::clear(path) {
+                eprintln!("vvmux: could not discard {}: {error}", path.display());
+            }
         }
     }
 
@@ -8516,19 +8550,22 @@ impl SessionActor {
             self.snapshot_dirty = false;
             return;
         };
-        let Some(snapshot) = self.capture_session_snapshot() else {
+        let Some((snapshot, history)) = self.capture_session_snapshot() else {
             // A session with nothing saveable in it — every pane a plugin pane, say — has no shape
             // worth recording. Leave any previous snapshot alone rather than blanking it.
             self.snapshot_dirty = false;
             return;
         };
+        let keep_history = self.config.session.pane_history;
         self.snapshot_dirty = false;
         self.snapshot_writing = true;
         let sender = self.sender.clone();
         let spawn = std::thread::Builder::new()
             .name("vvmux-session-snapshot".into())
             .spawn(move || {
-                let result = crate::session_state::save_snapshot(&paths.snapshot, &snapshot);
+                // Both files in one pass, so shape and history always describe the same generation.
+                let result = crate::session_state::save_snapshot(&paths.snapshot, &snapshot)
+                    .and_then(|()| write_history(&paths.history, keep_history, &history));
                 let _ = sender.send(ActorEvent::SnapshotWritten {
                     result: result.map_err(|error| error.to_string()),
                 });
@@ -8540,10 +8577,47 @@ impl SessionActor {
     }
 
     /// The live session as a persistable snapshot, or `None` when it has no saveable shape.
-    fn capture_session_snapshot(&self) -> Option<SessionSnapshot> {
-        let mut extras = SnapshotExtras::default();
-        let layout = self.capture_layout_with_extras(Some(&mut extras)).ok()?;
-        Some(SessionSnapshot::new(layout, extras))
+    fn capture_session_snapshot(&self) -> Option<(SessionSnapshot, SessionHistory)> {
+        let mut capture = SnapshotCapture::default();
+        let layout = self.capture_layout_with_extras(Some(&mut capture)).ok()?;
+        let history = if self.config.session.pane_history {
+            self.capture_session_history(&capture)
+        } else {
+            SessionHistory::default()
+        };
+        Some((SessionSnapshot::new(layout, capture.extras), history))
+    }
+
+    /// Every pane's scrollback, keyed by the same slots the shape snapshot uses.
+    ///
+    /// Driven by the capture's own slot map rather than by a second walk, so history can never
+    /// describe a pane the shape does not.
+    fn capture_session_history(&self, capture: &SnapshotCapture) -> SessionHistory {
+        let mut remaining = HISTORY_MAX_SESSION_BYTES;
+        let tabs = capture
+            .slots
+            .iter()
+            .map(|slots| TabHistory {
+                panes: slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, pane_id)| {
+                        let history = self.capture_pane_history(slot, *pane_id)?;
+                        // Spent in slot order, so a session of many panes keeps whole panes rather
+                        // than a fragment of each.
+                        let cost: usize = history
+                            .rows
+                            .iter()
+                            .flat_map(|row| row.runs.iter())
+                            .map(|run| run.text.len().saturating_add(8))
+                            .sum();
+                        remaining = remaining.checked_sub(cost.max(1))?;
+                        Some(history)
+                    })
+                    .collect(),
+            })
+            .collect();
+        SessionHistory::new(tabs)
     }
 
     /// Write the current shape before the session goes away, without a worker to wait on.
@@ -8554,10 +8628,14 @@ impl SessionActor {
         let Some(paths) = self.snapshot_paths.clone() else {
             return;
         };
-        let Some(snapshot) = self.capture_session_snapshot() else {
+        let Some((snapshot, history)) = self.capture_session_snapshot() else {
             return;
         };
-        if let Err(error) = crate::session_state::save_snapshot(&paths.snapshot, &snapshot) {
+        let result =
+            crate::session_state::save_snapshot(&paths.snapshot, &snapshot).and_then(|()| {
+                write_history(&paths.history, self.config.session.pane_history, &history)
+            });
+        if let Err(error) = result {
             eprintln!("vvmux: could not write the session snapshot: {error}");
         }
     }
@@ -8947,6 +9025,7 @@ impl SessionActor {
         &mut self,
         plan: LayoutPlan,
         extras: Option<&SnapshotExtras>,
+        history: Option<&SessionHistory>,
     ) -> io::Result<()> {
         let area = self.content_area();
         let mut restored_active = None;
@@ -8954,6 +9033,7 @@ impl SessionActor {
             // Keyed by the plan's tab index, which is the index the capture walk emitted, not the
             // index this tab ends up at — a tab whose panes all failed to spawn is skipped below.
             let tab_extras = extras.and_then(|extras| extras.tabs.get(plan_index));
+            let tab_history = history.and_then(|history| history.tabs.get(plan_index));
             let tab_id = self.next_tab_id;
             self.next_tab_id = self.next_tab_id.wrapping_add(1);
 
@@ -9052,6 +9132,27 @@ impl SessionActor {
             if extras.is_some_and(|extras| extras.active_tab == plan_index) {
                 restored_active = Some(self.tabs.len());
             }
+            if let Some(tab_history) = tab_history {
+                for pane_history in &tab_history.panes {
+                    let Some(pane_id) = slot_ids.get(pane_history.slot).copied() else {
+                        continue;
+                    };
+                    if failed.contains(&pane_id) {
+                        continue;
+                    }
+                    let rows = pane_history
+                        .rows
+                        .iter()
+                        .map(|row| (history_cells(row, &pane_history.styles), row.wrapped))
+                        .collect::<Vec<_>>();
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        // Into scrollback, never onto the screen: the viewport belongs to the shell
+                        // that just started, and painting over it would leave a dead screen with a
+                        // live prompt on top of it.
+                        pane.terminal.restore_history(rows);
+                    }
+                }
+            }
             self.tabs.push(Tab {
                 id: tab_id,
                 name: planned.name,
@@ -9090,7 +9191,7 @@ impl SessionActor {
     /// exactly the kind of thing that would drift.
     fn capture_layout_with_extras(
         &self,
-        mut extras: Option<&mut SnapshotExtras>,
+        mut extras: Option<&mut SnapshotCapture>,
     ) -> io::Result<LayoutFile> {
         let area = self.content_area();
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -9131,11 +9232,16 @@ impl SessionActor {
                 // Skipped here and skipped in the extras below, so the two stay index-aligned.
                 continue;
             }
-            if let Some(extras) = extras.as_deref_mut() {
+            if let Some(capture) = extras.as_deref_mut() {
                 if tab_index == self.active_tab {
-                    extras.active_tab = extras.tabs.len();
+                    capture.extras.active_tab = capture.extras.tabs.len();
                 }
-                extras.tabs.push(TabExtras {
+                // The slot-to-pane mapping is only knowable here, and only for as long as this walk
+                // runs: slots are positions in `labels`, and nothing persisted records a pane ID.
+                capture
+                    .slots
+                    .push(labels.iter().map(|(pane_id, _)| *pane_id).collect());
+                capture.extras.tabs.push(TabExtras {
                     zoomed: tab.zoomed.and_then(|zoomed| {
                         labels.iter().position(|(pane_id, _)| *pane_id == zoomed)
                     }),
@@ -9174,6 +9280,81 @@ impl SessionActor {
             ));
         }
         Ok(LayoutFile::from_tabs(tabs))
+    }
+
+    /// One pane's scrollback, bounded and stripped to text and style.
+    ///
+    /// Bounded twice on purpose: by lines, so a pane that scrolled a gigabyte contributes what a
+    /// person would scroll back through, and by bytes, so a pane of very wide lines cannot reach the
+    /// same total. herdr serializes the entire scrollback of every pane with no cap at all; that is
+    /// the one part of its persistence not worth copying.
+    fn capture_pane_history(&self, slot: usize, pane_id: PaneId) -> Option<PaneHistory> {
+        let pane = self.panes.get(&pane_id)?;
+        let available = pane.terminal.history_len();
+        let rows = pane.terminal.history_tail(HISTORY_MAX_ROWS);
+        let mut styles: Vec<HistoryStyle> = Vec::new();
+        let mut style_ids: HashMap<HistoryStyle, usize> = HashMap::new();
+        let mut captured = Vec::new();
+        let mut bytes = 0_usize;
+        // Newest first, so the byte budget drops the oldest lines rather than the ones a person is
+        // most likely to want.
+        for (cells, wrapped) in rows.iter().rev() {
+            let mut runs: Vec<HistoryRun> = Vec::new();
+            for cell in cells.iter() {
+                if cell.wide_continuation || cell.leading_wide_spacer {
+                    continue;
+                }
+                let style = history_style(cell);
+                let next = *style_ids.entry(style.clone()).or_insert_with(|| {
+                    styles.push(style);
+                    styles.len() - 1
+                });
+                let text = if cell.tab_width.is_some() {
+                    "\t".to_owned()
+                } else {
+                    let mut text = cell.ch.to_string();
+                    text.push_str(&cell.combining);
+                    text
+                };
+                match runs.last_mut() {
+                    Some(run) if run.style == next => run.text.push_str(&text),
+                    _ => runs.push(HistoryRun { style: next, text }),
+                }
+            }
+            // Trailing blanks are most of a terminal line and carry nothing.
+            while runs
+                .last()
+                .is_some_and(|run| run.text.trim_end_matches(' ').is_empty())
+            {
+                runs.pop();
+            }
+            if let Some(run) = runs.last_mut() {
+                let trimmed = run.text.trim_end_matches(' ').len();
+                run.text.truncate(trimmed);
+            }
+            bytes = bytes.saturating_add(
+                runs.iter()
+                    .map(|run| run.text.len().saturating_add(8))
+                    .sum::<usize>(),
+            );
+            if bytes > HISTORY_MAX_PANE_BYTES {
+                break;
+            }
+            captured.push(HistoryRow {
+                wrapped: *wrapped,
+                runs,
+            });
+        }
+        captured.reverse();
+        if captured.iter().all(|row| row.runs.is_empty()) {
+            return None;
+        }
+        Some(PaneHistory {
+            slot,
+            truncated: captured.len() < available,
+            styles,
+            rows: captured,
+        })
     }
 
     /// What a snapshot records about one pane beyond its place in the layout.
@@ -9665,7 +9846,8 @@ impl SessionActor {
         }
 
         let status_changed = next.general.status_visible != self.config.general.status_visible;
-        let snapshot_changed = next.session.auto_snapshot != self.config.session.auto_snapshot;
+        let snapshot_changed = next.session.auto_snapshot != self.config.session.auto_snapshot
+            || next.session.pane_history != self.config.session.pane_history;
         self.config = next;
         self.config_path = Some(path);
 
@@ -11922,6 +12104,96 @@ fn terminal_mode_names(modes: TerminalModes) -> Vec<&'static str> {
         names.push("cursor_visible");
     }
     names
+}
+
+/// A cell's appearance, without anything that would act if it came back.
+///
+/// Notably absent: the hyperlink. It round-trips fine, but restoring it would make a URL from a
+/// previous session clickable in this one, and the URI came from whatever was running in that pane.
+/// Write or remove the pane-history file, following the setting.
+///
+/// Removed rather than left alone when the setting is off: it holds whatever scrolled past, so
+/// turning the setting off has to take the data with it, not merely stop adding to it.
+fn write_history(path: &Path, enabled: bool, history: &SessionHistory) -> io::Result<()> {
+    if enabled {
+        crate::session_state::save_history(path, history)
+    } else {
+        crate::session_state::clear(path)
+    }
+}
+
+fn history_style(cell: &Cell) -> HistoryStyle {
+    HistoryStyle {
+        fg: history_color(cell.foreground),
+        bg: history_color(cell.background),
+        bold: cell.bold,
+        dim: cell.dim,
+        italic: cell.italic,
+        underline: match cell.underline_style {
+            UnderlineStyle::None => 0,
+            UnderlineStyle::Single => 1,
+            UnderlineStyle::Double => 2,
+            UnderlineStyle::Curl => 3,
+            UnderlineStyle::Dotted => 4,
+            UnderlineStyle::Dashed => 5,
+        },
+        blink: cell.blink,
+        inverse: cell.inverse,
+        hidden: cell.hidden,
+        strikeout: cell.strikeout,
+    }
+}
+
+fn history_color(color: TerminalColor) -> Option<HistoryColor> {
+    match color {
+        TerminalColor::Default => None,
+        TerminalColor::Indexed(index) => Some(HistoryColor::Indexed(index)),
+        TerminalColor::Rgb(red, green, blue) => Some(HistoryColor::Rgb(red, green, blue)),
+    }
+}
+
+/// Rebuild the cells of one restored line.
+fn history_cells(row: &HistoryRow, styles: &[HistoryStyle]) -> Vec<Cell> {
+    let mut cells = Vec::new();
+    for run in &row.runs {
+        let style = styles.get(run.style);
+        for ch in run.text.chars() {
+            let mut cell = Cell {
+                ch,
+                ..Cell::default()
+            };
+            if let Some(style) = style {
+                cell.foreground = restored_color(style.fg);
+                cell.background = restored_color(style.bg);
+                cell.bold = style.bold;
+                cell.dim = style.dim;
+                cell.italic = style.italic;
+                cell.underline_style = match style.underline {
+                    1 => UnderlineStyle::Single,
+                    2 => UnderlineStyle::Double,
+                    3 => UnderlineStyle::Curl,
+                    4 => UnderlineStyle::Dotted,
+                    5 => UnderlineStyle::Dashed,
+                    _ => UnderlineStyle::None,
+                };
+                cell.underline = cell.underline_style != UnderlineStyle::None;
+                cell.blink = style.blink;
+                cell.inverse = style.inverse;
+                cell.hidden = style.hidden;
+                cell.strikeout = style.strikeout;
+            }
+            cells.push(cell);
+        }
+    }
+    cells
+}
+
+fn restored_color(color: Option<HistoryColor>) -> TerminalColor {
+    match color {
+        None => TerminalColor::Default,
+        Some(HistoryColor::Indexed(index)) => TerminalColor::Indexed(index),
+        Some(HistoryColor::Rgb(red, green, blue)) => TerminalColor::Rgb(red, green, blue),
+    }
 }
 
 fn style_json(style: &StyleKey) -> serde_json::Value {

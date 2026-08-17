@@ -125,6 +125,14 @@ min_interval_ms = 2000
 # Commands are not recorded, so a restored pane is a plain shell in its saved directory.
 auto_snapshot = true
 
+# Also persist what was on each pane's screen and restore it as scrollback. Off by default, and that
+# is a privacy decision rather than a performance one: pane output is whatever scrolled past, which
+# includes tokens, keys, and command output. Enabling it writes that to an owner-only file. Text and
+# style only -- hyperlinks, graphics, and anchors are dropped -- and restored lines are placed
+# directly rather than replayed through the terminal parser, so nothing acts a second time. Turning
+# it off discards the file.
+pane_history = false
+
 [plugins]
 # Live global kill switch. Disabling stops runtimes and the registry watcher for this session.
 # It also disables bundled and installed agent detection. Toggle individual bundled providers with
