@@ -91,6 +91,7 @@ list-tabs
 select-tab --tab-id ID [--wait outer|rendered] [--timeout DURATION]
 diagnose [--pane-id ID|--all-panes] [--trace-limit N]
 report-agent --agent claude|codex|opencode|hermes --state idle|working|blocked --source ID --sequence N [--message TEXT] [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
+report-agent-session --agent claude|codex|hermes --source ID --sequence N [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
 report-metadata --source ID --sequence N [--token NAME=VALUE]... [--ttl-ms MS] [--display-agent TEXT] [--state-label STATUS=TEXT]... [--title TEXT] [--pane-id ID]
 clear-agent-report --source ID --sequence N [--pane-id ID]
 agent-explain [--pane-id ID]
@@ -376,19 +377,27 @@ Rules run by descending priority and support `idle`, `working`, `blocked`, and s
 disable the current provider before enabling a replacement with the same ID. Manifests are bounded
 to 16 agents and 64 rules per agent, and the live catalog is bounded to 64 agents.
 
-OpenCode can report lifecycle events directly through the managed optional plugin:
+Managed integrations can report native session identity, while OpenCode additionally reports its
+full lifecycle state:
 
 ```sh
 vvmux integration install opencode
-vvmux integration status opencode
+vvmux integration install claude
+vvmux integration install codex
+vvmux integration install hermes
+vvmux integration status
 vvmux integration uninstall opencode
 ```
 
-The installer owns only `~/.config/opencode/plugins/vvmux-agent-state.js`, refuses to replace or
-remove a file without the vvmux ownership marker, and enables the bundled OpenCode provider.
-Uninstalling the adapter leaves the provider's chosen enable state unchanged. Claude Code and
-Codex need no installation; Hermes can be enabled for passive detection with the plugin command
-above.
+The installer refuses to replace or remove files without a vvmux ownership/version marker and
+enables the matching bundled provider. Claude uses `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex uses
+`CODEX_HOME` or `~/.codex`, and Hermes uses `HERMES_HOME` or `~/.hermes`; each directory must
+already exist. Claude and Codex shell hooks require `python3`. Claude's `settings.json` is parsed
+and rewritten as JSON, so comments are not retained; an unparsable file is refused unchanged.
+Codex keeps `[features] hooks = true` after uninstall, matching Codex's global feature semantics.
+Hermes plugin files are installed safely, but its YAML is not edited without a YAML dependency:
+the command prints the exact `plugins.enabled` stanza that must be added manually. Uninstalling an
+adapter leaves the bundled provider's chosen enable state unchanged.
 
 ## Startup layouts
 

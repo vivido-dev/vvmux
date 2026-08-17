@@ -1,0 +1,5 @@
+# VVMUX_INTEGRATION_ID=hermes
+# VVMUX_INTEGRATION_VERSION=1
+name: vvmux-agent-state
+version: "1.0"
+description: Report Hermes session identity to vvmux panes

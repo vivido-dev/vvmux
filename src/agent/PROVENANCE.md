@@ -51,3 +51,8 @@ Later features adapted from the same HerdR commit, recorded as they land:
   adapted from `src/server/alt_screen_read.rs` and `src/terminal/history_read.rs`. vvmux drives the
   phases on its existing session-actor deadlines and writes through its bounded PTY input queue;
   it additionally encodes synthetic coordinates in pixels when the application enabled DEC 1016.
+- **Lifecycle hook assets** (`integration/claude.*`, `integration/codex.sh`, and
+  `integration/hermes_plugin.*`) — the stdin JSON transport, subagent exclusion, Codex inherited
+  session check, Hermes interactive-platform filter, and bounded best-effort subprocess calls are
+  adapted from `src/integration/assets/{claude,codex,hermes}`. vvmux routes them through its
+  owner-only `msg report-agent-session` method instead of HerdR's socket protocol.
