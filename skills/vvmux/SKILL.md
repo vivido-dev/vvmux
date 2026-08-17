@@ -18,6 +18,9 @@ Use this release-matched workflow:
 5. Follow `trace-media --after SEQUENCE --follow` with complete owner filters during recovery.
 6. On failure, capture `diagnose --all-panes --trace-limit 512`; create a metadata-only
    `vvmux debug-bundle` unless the user explicitly authorizes pane grid/text or log content.
+7. When a pane's reported agent state looks wrong, use `agent-explain --pane-id ID` before
+   changing anything: it names the rule that decided and shows every rule's evidence. `diagnose`
+   covers infrastructure, not classification.
 
 Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
 needed. It proves the bytes reached the PTY writer, not that the child application consumed them.

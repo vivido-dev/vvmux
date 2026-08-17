@@ -2900,6 +2900,41 @@ impl SessionActor {
                     ),
                 }
             }
+            AutomationMethod::AgentExplain => {
+                let pane_id = pane_id.unwrap();
+                let Some(pane) = self.panes.get(&pane_id) else {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new("pane_not_found", "pane no longer exists"),
+                    );
+                    return;
+                };
+                let Some(explanation) =
+                    pane.agent
+                        .explain(&self.agent_catalog, &pane.terminal, Instant::now())
+                else {
+                    // An empty success would read as "explained: nothing", when the real answer is
+                    // that classification never ran for this pane.
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "agent_not_detected",
+                            "pane has no detected or reported agent",
+                        ),
+                    );
+                    return;
+                };
+                match serde_json::to_value(explanation) {
+                    Ok(value) => self.reply_automation(
+                        target,
+                        serde_json::json!({"pane_id": pane_id, "explain": value}),
+                    ),
+                    Err(error) => self.reply_automation_error(
+                        target,
+                        AutomationError::new("serialization_failed", error.to_string()),
+                    ),
+                }
+            }
             AutomationMethod::Inspect => {
                 let pane_id = pane_id.unwrap();
                 // The one surface that names a single pane on the owner-only socket, so the only
@@ -9541,7 +9576,7 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
             "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit", "wait_media",
             "wait_media_track",
             "trace_media", "reload_config", "run", "action", "report_agent", "clear_agent_report",
-            "report_metadata", "save_layout"
+            "report_metadata", "agent_explain", "save_layout"
         ],
         "limits": automation_limits(),
         "completion_waits": {

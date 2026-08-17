@@ -93,6 +93,7 @@ diagnose [--pane-id ID|--all-panes] [--trace-limit N]
 report-agent --agent claude|codex|opencode|hermes --state idle|working|blocked --source ID --sequence N [--message TEXT] [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
 report-metadata --source ID --sequence N [--token NAME=VALUE]... [--ttl-ms MS] [--display-agent TEXT] [--state-label STATUS=TEXT]... [--title TEXT] [--pane-id ID]
 clear-agent-report --source ID --sequence N [--pane-id ID]
+agent-explain [--pane-id ID]
 inspect [--pane-id ID]
 inspect-media [--pane-id ID]
 split vertical|horizontal [--pane-id ID]
@@ -224,6 +225,21 @@ priority = 500
 region = "whole_recent"
 contains = ["esc to interrupt"]
 ```
+
+`agent-explain` answers why a pane shows the state it shows. It replays the live detection
+snapshot through the active manifest and reports the rule that decided, every rule that was
+evaluated with its region and evidence, and the reason when none matched — `rule_matched`,
+`state_preserved`, `no_rule_matched`, `startup_grace`, or `reported`. It is read-only and is the
+tool to reach for when writing rules for a new provider.
+
+```sh
+vvmux msg agent-explain --pane-id 2 | jq '.explain | {decision, matched_rule}'
+vvmux msg agent-explain --pane-id 2 | jq '.explain.rules[] | select(.matched)'
+```
+
+Rules are evaluated even while a report holds authority, so a hook that disagrees with the screen
+is visible rather than hidden; `decision` says which one won. A pane with no detected or reported
+agent returns `agent_not_detected` rather than an empty result.
 
 Rules run by descending priority and support `idle`, `working`, `blocked`, and state-preserving
 `unknown`, the screen/OSC regions used by the bundled providers, and nested `contains`, `regex`,

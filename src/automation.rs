@@ -286,6 +286,15 @@ pub enum MsgCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Explain why one pane shows the agent state it shows.
+    ///
+    /// Replays the live detection snapshot through the active manifest and reports which rule
+    /// decided, with per-rule evidence. Use it when a pane's state looks wrong, or when writing
+    /// rules for a new agent provider.
+    AgentExplain {
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Inspect one pane.
     Inspect(PaneTarget),
     /// Inspect sanitized Vivid media state owned by one pane.
@@ -790,6 +799,9 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             false,
             Output::Json,
         ),
+        MsgCommand::AgentExplain { pane_id } => {
+            (AutomationMethod::AgentExplain, pane_id, true, Output::Json)
+        }
         MsgCommand::Inspect(target) => (
             AutomationMethod::Inspect,
             target.pane_id,

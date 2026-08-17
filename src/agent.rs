@@ -38,6 +38,10 @@ pub const MAX_DISPLAY_AGENT_BYTES: usize = 64;
 pub const MAX_AGENT_TITLE_BYTES: usize = 128;
 /// Matches the automation timeout ceiling, so a TTL cannot outlive what a caller can wait for.
 pub const MAX_METADATA_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// Bottom-buffer text agent classification runs against.
+const MAX_DETECTION_BYTES: usize = 64 * 1024;
+/// Region excerpt returned per rule by `agent-explain`.
+const MAX_REGION_PREVIEW_BYTES: usize = 256;
 const IDLE_CONFIRMATIONS: u8 = 3;
 const IDLE_CONFIRMATION_LIMIT: Duration = Duration::from_millis(700);
 const IDLE_CONFIRMATION_RECHECK: Duration = Duration::from_millis(100);
@@ -688,15 +692,7 @@ impl AgentRuntime {
             self.commit(state, AgentSource::Report, visible);
             return;
         }
-        let rows = terminal.rows();
-        let mut screen = terminal.latest_text(rows);
-        if screen.len() > 64 * 1024 {
-            let mut start = screen.len() - 64 * 1024;
-            while !screen.is_char_boundary(start) {
-                start += 1;
-            }
-            screen = screen[start..].to_owned();
-        }
+        let screen = detection_snapshot(terminal);
         let Some(candidate) = detect_candidate(
             catalog,
             &identity.id,
@@ -727,6 +723,68 @@ impl AgentRuntime {
         }
         self.pending_idle = None;
         self.commit(candidate.state, AgentSource::Screen, visible);
+    }
+
+    /// Replay classification for this pane and report what decided its state.
+    ///
+    /// Rules are evaluated and returned even while a report holds authority: "the hook says idle
+    /// but the screen says blocked" is the disagreement most worth seeing, and `decision` says
+    /// which one won.
+    pub fn explain(
+        &self,
+        catalog: &AgentCatalog,
+        terminal: &Terminal,
+        now: Instant,
+    ) -> Option<AgentExplanation> {
+        let identity = self.identity.as_ref()?;
+        let snapshot = self.snapshot()?;
+        let screen = detection_snapshot(terminal);
+        let definition = catalog.definitions.get(&identity.id);
+        let rules = definition.map_or_else(Vec::new, |definition| {
+            definition.manifest.explain(
+                &screen,
+                terminal.agent_osc_title(),
+                terminal.agent_osc_progress(),
+            )
+        });
+        let startup_grace_active =
+            now.saturating_duration_since(self.identified_at) < STARTUP_GRACE;
+        let decided = rules.iter().find(|rule| rule.decided);
+        let decision = if self.report.is_some() {
+            "reported"
+        } else if startup_grace_active {
+            "startup_grace"
+        } else {
+            match decided {
+                Some(rule) if rule.skip_state_update => "state_preserved",
+                Some(_) => "rule_matched",
+                None => "no_rule_matched",
+            }
+        };
+        Some(AgentExplanation {
+            agent: identity.id.clone(),
+            label: identity.name.clone(),
+            provider: identity.provider.clone(),
+            fingerprint: identity.fingerprint.clone(),
+            effective_state: snapshot.state,
+            effective_status: snapshot.status,
+            source: snapshot.source,
+            report: self.report.as_ref().map(|report| ReportExplanation {
+                source: report.source.clone(),
+                sequence: report.sequence,
+                state: report.state,
+                message: report.message.clone(),
+            }),
+            decision,
+            matched_rule: decided.map(|rule| rule.id.clone()),
+            startup_grace_active,
+            pending_idle_confirmations: self.pending_idle.map_or(0, |(_, count)| count),
+            osc_title: terminal.agent_osc_title().to_owned(),
+            osc_progress: terminal.agent_osc_progress().to_owned(),
+            detection_bytes: screen.len(),
+            detection_rows: terminal.rows(),
+            rules,
+        })
     }
 
     pub fn mark_seen(&mut self) {
@@ -901,6 +959,9 @@ struct CompiledManifest {
 
 #[derive(Debug, Clone)]
 struct CompiledRule {
+    /// Kept so a classification report can name the rule the author wrote, rather than an index
+    /// that shifts whenever the manifest gains a rule.
+    id: String,
     state: AgentRuleState,
     priority: u16,
     region: String,
@@ -917,6 +978,113 @@ struct CompiledGate {
     all: Vec<CompiledGate>,
     any: Vec<CompiledGate>,
     not_gate: Vec<CompiledGate>,
+}
+
+/// Why one pane's effective agent state is what it is, with the evidence behind it.
+///
+/// Read-only: a diagnostic must not perturb what it measures, so nothing here advances the idle
+/// confirmation counter or commits a state.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentExplanation {
+    pub agent: AgentId,
+    pub label: String,
+    pub provider: String,
+    pub fingerprint: String,
+    pub effective_state: AgentState,
+    pub effective_status: AgentStatus,
+    pub source: AgentSource,
+    pub report: Option<ReportExplanation>,
+    /// `reported`, `startup_grace`, `state_preserved`, `rule_matched`, or `no_rule_matched`.
+    pub decision: &'static str,
+    pub matched_rule: Option<String>,
+    pub startup_grace_active: bool,
+    pub pending_idle_confirmations: u8,
+    pub osc_title: String,
+    pub osc_progress: String,
+    pub detection_bytes: usize,
+    pub detection_rows: usize,
+    pub rules: Vec<RuleExplanation>,
+}
+
+/// The held report, when one has authority.
+///
+/// Deliberately excludes the native session reference: this is a classification diagnostic, and
+/// that value is disclosed only by a single-pane inspect. See [`AgentSessionRef`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportExplanation {
+    pub source: String,
+    pub sequence: u64,
+    pub state: AgentState,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleExplanation {
+    pub id: String,
+    pub state: &'static str,
+    pub priority: u16,
+    pub region: String,
+    pub matched: bool,
+    /// Whether classification stopped here. At most one rule is `decided`.
+    pub decided: bool,
+    pub visible_idle: bool,
+    pub skip_state_update: bool,
+    pub region_bytes: usize,
+    pub region_preview: String,
+    /// Normalized at compile time to lowercase, which is how the gate compares them.
+    pub contains: Vec<String>,
+    pub regex: Vec<String>,
+    pub line_regex: Vec<String>,
+    pub all_count: usize,
+    pub any_count: usize,
+    pub not_count: usize,
+}
+
+fn rule_state_label(state: AgentRuleState) -> &'static str {
+    match state {
+        AgentRuleState::Idle => "idle",
+        AgentRuleState::Working => "working",
+        AgentRuleState::Blocked => "blocked",
+        AgentRuleState::Unknown => "unknown",
+    }
+}
+
+/// The tail of the region a rule looked at, bounded and safe to print.
+///
+/// The tail rather than the head: every region a manifest can name is anchored at the bottom of
+/// the buffer, so the newest text is what decided the match.
+fn region_preview(text: &str) -> String {
+    let mut start = text.len().saturating_sub(MAX_REGION_PREVIEW_BYTES);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..]
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+/// The exact text agent classification runs against.
+///
+/// Shared by [`AgentRuntime::evaluate_terminal`] and [`AgentRuntime::explain`] on purpose: an
+/// explanation built from a separately-derived snapshot could disagree with the classifier it
+/// claims to describe, which is worse than no explanation at all.
+fn detection_snapshot(terminal: &Terminal) -> String {
+    let mut screen = terminal.latest_text(terminal.rows());
+    if screen.len() > MAX_DETECTION_BYTES {
+        let mut start = screen.len() - MAX_DETECTION_BYTES;
+        while !screen.is_char_boundary(start) {
+            start += 1;
+        }
+        screen = screen[start..].to_owned();
+    }
+    screen
 }
 
 fn agent_rule_state(state: AgentRuleState) -> Option<AgentState> {
@@ -941,6 +1109,7 @@ impl CompiledManifest {
             .clone()
             .into_iter()
             .map(|rule| CompiledRule {
+                id: rule.id,
                 state: rule.state,
                 priority: rule.priority,
                 region: rule.region,
@@ -951,6 +1120,52 @@ impl CompiledManifest {
             .collect::<Vec<_>>();
         rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
         Self { rules }
+    }
+
+    /// Evaluate every rule and record its evidence.
+    ///
+    /// Unlike [`Self::detect`] this does not stop at the first match: a rule shadowed by a
+    /// higher-priority one is exactly what a manifest author needs to see. The rule `detect` would
+    /// have stopped at is flagged `decided`.
+    fn explain(&self, screen: &str, title: &str, progress: &str) -> Vec<RuleExplanation> {
+        let mut decided = false;
+        self.rules
+            .iter()
+            .map(|rule| {
+                let text = rule_region(screen, title, progress, &rule.region);
+                let matched = rule.gate.matches(text);
+                let explanation = RuleExplanation {
+                    id: rule.id.clone(),
+                    state: rule_state_label(rule.state),
+                    priority: rule.priority,
+                    region: rule.region.clone(),
+                    matched,
+                    decided: matched && !decided,
+                    visible_idle: rule.visible_idle,
+                    skip_state_update: rule.skip_state_update,
+                    region_bytes: text.len(),
+                    region_preview: region_preview(text),
+                    contains: rule.gate.contains.clone(),
+                    regex: rule
+                        .gate
+                        .regex
+                        .iter()
+                        .map(|pattern| pattern.as_str().to_owned())
+                        .collect(),
+                    line_regex: rule
+                        .gate
+                        .line_regex
+                        .iter()
+                        .map(|pattern| pattern.as_str().to_owned())
+                        .collect(),
+                    all_count: rule.gate.all.len(),
+                    any_count: rule.gate.any.len(),
+                    not_count: rule.gate.not_gate.len(),
+                };
+                decided |= matched;
+                explanation
+            })
+            .collect()
     }
 
     fn detect(&self, screen: &str, title: &str, progress: &str) -> Option<DetectionCandidate> {
@@ -2344,6 +2559,221 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         assert_eq!(runtime.metadata().tokens().count(), 1);
         assert!(runtime.observe_process(Some(71), Some(identity(&catalog, "codex"))));
         assert!(runtime.metadata().is_empty());
+    }
+
+    /// A terminal holding exactly `screen`, so explain and detection see the same bytes.
+    fn terminal_showing(screen: &str) -> Terminal {
+        let mut terminal = Terminal::new(24, 80, 100);
+        terminal.feed(screen.replace('\n', "\r\n").as_bytes());
+        terminal
+    }
+
+    fn explained(runtime: &AgentRuntime, catalog: &AgentCatalog, screen: &str) -> AgentExplanation {
+        runtime
+            .explain(catalog, &terminal_showing(screen), Instant::now())
+            .unwrap()
+    }
+
+    fn detected_runtime(catalog: &AgentCatalog, agent: &str) -> AgentRuntime {
+        let mut runtime = AgentRuntime::new();
+        runtime.identity = Some(identity(catalog, agent));
+        // Past the startup grace, so classification is what decides rather than the grace window.
+        runtime.identified_at = Instant::now() - STARTUP_GRACE;
+        runtime
+    }
+
+    #[test]
+    fn explain_names_the_rule_detection_actually_used() {
+        let catalog = catalog();
+        // Every screen here is one the detection tests already pin, so a divergence between
+        // `explain` and `detect` fails rather than being explained away.
+        for (agent, screen, expected) in [
+            (
+                "codex",
+                "Allow command? esc to interrupt",
+                AgentState::Blocked,
+            ),
+            ("opencode", "■■■■", AgentState::Working),
+            (
+                "hermes",
+                "Dangerous command — enter to confirm",
+                AgentState::Blocked,
+            ),
+        ] {
+            let runtime = detected_runtime(&catalog, agent);
+            let terminal = terminal_showing(screen);
+            let explanation = runtime
+                .explain(&catalog, &terminal, Instant::now())
+                .unwrap();
+            // Pin the reported input to the snapshot classification uses. Both call
+            // `detection_snapshot`; this fails if `explain` ever grows its own derivation.
+            assert_eq!(
+                explanation.detection_bytes,
+                detection_snapshot(&terminal).len(),
+                "{agent}"
+            );
+            let decided = explanation
+                .rules
+                .iter()
+                .find(|rule| rule.decided)
+                .unwrap_or_else(|| panic!("{agent}: no rule decided"));
+
+            assert_eq!(explanation.decision, "rule_matched", "{agent}");
+            assert_eq!(
+                explanation.matched_rule.as_deref(),
+                Some(decided.id.as_str())
+            );
+            let expected_label = match expected {
+                AgentState::Idle => "idle",
+                AgentState::Working => "working",
+                AgentState::Blocked => "blocked",
+            };
+            assert_eq!(decided.state, expected_label, "{agent}");
+            assert!(decided.matched);
+            // Exactly one rule may claim the decision.
+            assert_eq!(
+                explanation.rules.iter().filter(|rule| rule.decided).count(),
+                1,
+                "{agent}"
+            );
+            // Shadowed rules are still reported, which is the point of evaluating all of them.
+            assert!(explanation.rules.len() > 1, "{agent}");
+            assert_eq!(
+                detect_state(&catalog, &id(agent), screen, "", ""),
+                expected,
+                "{agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_credits_the_highest_priority_rule_when_several_match() {
+        let catalog = catalog();
+        let runtime = detected_runtime(&catalog, "codex");
+        // Matches codex's `live_strong_blocker` (priority 900, "allow command?") and its
+        // `weak_blocker` (priority 600, "[y/n]"). Both say blocked, so only the credited rule ID
+        // distinguishes first-match-wins from last-match-wins.
+        let explanation = explained(&runtime, &catalog, "Allow command? [y/n]");
+
+        assert!(explanation.rules.iter().filter(|rule| rule.matched).count() >= 2);
+        assert_eq!(
+            explanation.matched_rule.as_deref(),
+            Some("live_strong_blocker")
+        );
+        assert_eq!(
+            explanation.rules.iter().filter(|rule| rule.decided).count(),
+            1
+        );
+        // The shadowed rule is still reported, flagged as matching but not deciding.
+        let shadowed = explanation
+            .rules
+            .iter()
+            .find(|rule| rule.id == "weak_blocker")
+            .unwrap();
+        assert!(shadowed.matched);
+        assert!(!shadowed.decided);
+    }
+
+    #[test]
+    fn explain_reports_why_no_rule_decided() {
+        let catalog = catalog();
+        let runtime = detected_runtime(&catalog, "codex");
+        let explanation = explained(&runtime, &catalog, "ordinary shell output");
+        assert_eq!(explanation.decision, "no_rule_matched");
+        assert!(explanation.matched_rule.is_none());
+        assert!(explanation.rules.iter().all(|rule| !rule.decided));
+
+        // A rule that preserves the previous state is a decision, and a distinct one.
+        let claude = detected_runtime(&catalog, "claude");
+        let preserved = explained(
+            &claude,
+            &catalog,
+            "showing detailed transcript\nctrl+o to toggle\n? for shortcuts",
+        );
+        assert_eq!(preserved.decision, "state_preserved");
+        assert!(
+            preserved
+                .rules
+                .iter()
+                .find(|rule| rule.decided)
+                .unwrap()
+                .skip_state_update
+        );
+    }
+
+    #[test]
+    fn explain_shows_a_report_overriding_a_disagreeing_screen() {
+        let catalog = catalog();
+        let mut runtime = detected_runtime(&catalog, "codex");
+        runtime
+            .report(
+                AgentReport {
+                    identity: identity(&catalog, "codex"),
+                    state: AgentState::Idle,
+                    source: "codex-hook".into(),
+                    sequence: 1,
+                    message: Some("finished".into()),
+                    session: None,
+                },
+                false,
+            )
+            .unwrap();
+
+        let explanation = explained(&runtime, &catalog, "Allow command? esc to interrupt");
+        assert_eq!(explanation.decision, "reported");
+        assert_eq!(explanation.source, AgentSource::Report);
+        let report = explanation.report.as_ref().unwrap();
+        assert_eq!(report.source, "codex-hook");
+        assert_eq!(report.message.as_deref(), Some("finished"));
+        // The screen still says blocked; surfacing that disagreement is the whole point.
+        assert_eq!(
+            explanation
+                .rules
+                .iter()
+                .find(|rule| rule.decided)
+                .unwrap()
+                .state,
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn explain_is_read_only_and_bounds_its_evidence() {
+        let catalog = catalog();
+        let mut runtime = detected_runtime(&catalog, "codex");
+        runtime.state = AgentState::Working;
+        let terminal = terminal_showing(&format!("noise {}", "x".repeat(4096)));
+
+        let before = runtime.snapshot();
+        let explanation = runtime
+            .explain(&catalog, &terminal, Instant::now())
+            .unwrap();
+        // A diagnostic must not advance the idle-confirmation machinery it is describing.
+        assert_eq!(runtime.snapshot(), before);
+        assert_eq!(runtime.pending_idle, None);
+        assert_eq!(explanation.pending_idle_confirmations, 0);
+
+        for rule in &explanation.rules {
+            assert!(rule.region_preview.len() <= MAX_REGION_PREVIEW_BYTES);
+            assert!(!rule.region_preview.chars().any(char::is_control));
+        }
+
+        // No identity means classification never ran, which is distinct from "nothing matched".
+        assert!(
+            AgentRuntime::new()
+                .explain(&catalog, &terminal, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn explain_reports_the_startup_grace_window() {
+        let catalog = catalog();
+        let mut runtime = AgentRuntime::new();
+        runtime.identity = Some(identity(&catalog, "codex"));
+        let explanation = explained(&runtime, &catalog, "Allow command? esc to interrupt");
+        assert!(explanation.startup_grace_active);
+        assert_eq!(explanation.decision, "startup_grace");
     }
 
     #[test]

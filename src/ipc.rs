@@ -122,6 +122,8 @@ pub enum AutomationMethod {
         state_labels: Vec<(crate::agent::AgentStatus, Option<String>)>,
         title: Option<Option<String>>,
     },
+    /// Replay agent classification for one pane and report which rule decided its state.
+    AgentExplain,
     Inspect,
     InspectMedia,
     TraceMedia {

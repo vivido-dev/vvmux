@@ -626,6 +626,42 @@ done
     assert!(!missing_metadata_pane.status.success());
     assert!(String::from_utf8_lossy(&missing_metadata_pane.stderr).contains("requires --pane-id"));
 
+    // agent-explain answers "why does this pane show that state", naming the rule that decided.
+    // Pane 2 still holds the working report from sequence 20.
+    let explained = json(command(
+        &runtime,
+        &name,
+        &["agent-explain", "--pane-id", "2"],
+    ));
+    assert_eq!(explained["pane_id"], 2);
+    let explain = &explained["explain"];
+    assert_eq!(explain["agent"], "codex");
+    assert_eq!(explain["decision"], "reported");
+    assert_eq!(explain["report"]["source"], "integration-test");
+    // A report holds authority, but the screen rules are still evaluated and returned so a
+    // disagreement between hook and screen is visible.
+    let rules = explain["rules"].as_array().unwrap();
+    assert!(rules.len() > 1);
+    assert!(rules.iter().all(|rule| rule["id"].is_string()));
+    assert!(
+        rules
+            .iter()
+            .all(|rule| rule["region_preview"].as_str().unwrap().len() <= 256)
+    );
+    // Classification input is reported, and it is the bottom-buffer snapshot, not the viewport.
+    assert!(explain["detection_bytes"].as_u64().unwrap() > 0);
+    // The native session reference is a classification-irrelevant capability; explain omits it.
+    assert!(
+        !serde_json::to_string(&explained)
+            .unwrap()
+            .contains("agent_session")
+    );
+
+    // A pane with no agent gets a named error rather than an empty success.
+    let unexplained = command(&runtime, &name, &["agent-explain", "--pane-id", "3"]);
+    assert!(!unexplained.status.success());
+    assert!(String::from_utf8_lossy(&unexplained.stderr).contains("agent_not_detected"));
+
     let missing_target = common::vvmux_command(&runtime)
         .args([
             "msg",
