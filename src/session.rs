@@ -529,6 +529,12 @@ struct Pane {
     /// it deliberately does not follow the shell's later `cd`.
     spawn_cwd: PathBuf,
     agent: AgentRuntime,
+    /// The agent snapshot this pane has already accounted for.
+    ///
+    /// Agent state is mutated from several unrelated causes, so the live snapshot alone cannot
+    /// say whether a transition is new. `sync_agent_status` compares against this and stores the
+    /// result, making a transition observable exactly once whatever produced it.
+    agent_published: Option<AgentSnapshot>,
     copy: Option<CopyState>,
     mouse_selection: Option<MouseSelection>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
@@ -2790,8 +2796,7 @@ impl SessionActor {
                     });
                 match result {
                     Ok(()) => {
-                        self.session_sequence = self.session_sequence.wrapping_add(1);
-                        self.schedule_render();
+                        self.sync_agent_status();
                         let agent = self.panes[&pane_id].agent.snapshot().map(agent_json);
                         self.reply_automation(
                             target,
@@ -2814,8 +2819,6 @@ impl SessionActor {
                 match result {
                     Ok(()) => {
                         self.evaluate_agent_states();
-                        self.session_sequence = self.session_sequence.wrapping_add(1);
-                        self.schedule_render();
                         let agent = self.panes[&pane_id].agent.snapshot().map(agent_json);
                         self.reply_automation(
                             target,
@@ -4747,22 +4750,44 @@ impl SessionActor {
             HashSet::new()
         };
         let now = Instant::now();
-        let mut changed = false;
         for pane in self.panes.values_mut() {
-            let before = pane.agent.snapshot();
             pane.agent.evaluate_terminal(
                 &self.agent_catalog,
                 &pane.terminal,
                 visible.contains(&pane.id),
                 now,
             );
-            changed |= before != pane.agent.snapshot();
         }
-        if changed {
-            self.session_sequence = self.session_sequence.wrapping_add(1);
-            if self.agent_navigator.is_some() {
-                self.schedule_render();
+        self.sync_agent_status();
+    }
+
+    /// Reconcile every pane's published agent snapshot with its live one.
+    ///
+    /// Agent state changes for six unrelated reasons: screen/OSC classification, an authoritative
+    /// report, a report release, a foreground process change, catalog reconciliation, and the
+    /// navigator acknowledging a finished agent. Each of those routes through here, so a
+    /// transition is sequenced and observed exactly once no matter which one produced it, and a
+    /// mutation that leaves the snapshot unchanged costs nothing.
+    ///
+    /// Consumers that react to a transition — lifecycle events, state waiters, notifications —
+    /// belong in the loop below rather than at the six call sites.
+    fn sync_agent_status(&mut self) {
+        let mut changed = false;
+        for pane in self.panes.values_mut() {
+            let current = pane.agent.snapshot();
+            if pane.agent_published == current {
+                continue;
             }
+            pane.agent_published = current;
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        self.session_sequence = self.session_sequence.wrapping_add(1);
+        // Agent state is drawn only by the navigator popup; the status row does not carry it.
+        if self.agent_navigator.is_some() {
+            self.schedule_render();
         }
     }
 
@@ -6234,6 +6259,9 @@ impl SessionActor {
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             pane.agent.mark_seen();
         }
+        // Acknowledging a finished agent turns `done` back into `idle`, which is a status
+        // transition like any other and must be sequenced, not just repainted.
+        self.sync_agent_status();
         if let Err(error) = self.automation_focus(pane_id) {
             self.status(&error.message);
         }
@@ -7430,6 +7458,7 @@ impl SessionActor {
                 child_pid,
                 spawn_cwd: cwd,
                 agent: AgentRuntime::new(),
+                agent_published: None,
                 copy: None,
                 mouse_selection: None,
                 vivid_metrics: None,

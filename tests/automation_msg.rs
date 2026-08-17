@@ -315,6 +315,65 @@ done
         ],
     ));
 
+    // Every agent mutation routes through one choke point, so a report that leaves the pane's
+    // effective snapshot unchanged is not a transition and must not advance the session sequence.
+    // Two consecutive inspects first establish that the session is otherwise quiet, so a failure
+    // below points at agent sequencing rather than at unrelated session traffic.
+    let sequence_of = |arguments: &[&str]| -> u64 {
+        json(command(&runtime, &name, arguments))["session_sequence"]
+            .as_u64()
+            .unwrap()
+    };
+    let quiet = sequence_of(&["inspect", "--pane-id", "2"]);
+    assert_eq!(quiet, sequence_of(&["inspect", "--pane-id", "2"]));
+
+    let report = |state: &str, sequence: &str| {
+        assert_success(&command(
+            &runtime,
+            &name,
+            &[
+                "report-agent",
+                "--agent",
+                "codex",
+                "--state",
+                state,
+                "--source",
+                "integration-test",
+                "--sequence",
+                sequence,
+                "--pane-id",
+                "2",
+            ],
+        ));
+    };
+
+    report("working", "4");
+    let after_transition = sequence_of(&["inspect", "--pane-id", "2"]);
+    assert!(after_transition > quiet);
+
+    report("working", "5");
+    assert_eq!(
+        after_transition,
+        sequence_of(&["inspect", "--pane-id", "2"])
+    );
+
+    report("blocked", "6");
+    assert!(sequence_of(&["inspect", "--pane-id", "2"]) > after_transition);
+
+    assert_success(&command(
+        &runtime,
+        &name,
+        &[
+            "clear-agent-report",
+            "--source",
+            "integration-test",
+            "--sequence",
+            "7",
+            "--pane-id",
+            "2",
+        ],
+    ));
+
     let missing_target = common::vvmux_command(&runtime)
         .args([
             "msg",
