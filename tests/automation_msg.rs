@@ -470,18 +470,34 @@ done
         ));
     };
 
+    // The per-pane lifecycle counter answers the same question scoped to one agent, and it is
+    // what a submit-and-settle caller baselines against: it must move on exactly the transitions
+    // the session sequence moves on, and on nothing else.
+    let change_sequence_of = |pane: &str| -> u64 {
+        json(command(&runtime, &name, &["inspect", "--pane-id", pane]))["pane"]["agent"]
+            ["change_sequence"]
+            .as_u64()
+            .unwrap()
+    };
+
     report("working", "14");
     let after_transition = sequence_of(&["inspect", "--pane-id", "2"]);
     assert!(after_transition > quiet);
+    let changes = change_sequence_of("2");
+    assert!(changes >= 1);
 
     report("working", "15");
     assert_eq!(
         after_transition,
         sequence_of(&["inspect", "--pane-id", "2"])
     );
+    // A fresh report that leaves the effective state alone is not a lifecycle change. This is the
+    // assertion that separates a counter of transitions from a counter of anything that happened.
+    assert_eq!(change_sequence_of("2"), changes);
 
     report("blocked", "16");
     assert!(sequence_of(&["inspect", "--pane-id", "2"]) > after_transition);
+    assert_eq!(change_sequence_of("2"), changes + 1);
 
     assert_success(&command(
         &runtime,
@@ -1213,6 +1229,17 @@ fn a_detected_agent_reaches_blocked_from_its_screen_alone() {
     assert_eq!(blocked["agent"]["kind"], "codex");
     // Nothing reported this: the state came from the screen.
     assert_eq!(blocked["agent"]["source"], "screen");
+
+    // The lifecycle counter also moves for a transition nobody reported — it counts what the pane
+    // published, whichever path produced it. (That it does *not* move without a transition is
+    // asserted in the report-driven test, where the no-op case can be produced exactly.)
+    let inspected = json(command(&runtime, &name, &["inspect", "--pane-id", &pane]));
+    assert!(
+        inspected["pane"]["agent"]["change_sequence"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
 
     // The classification is explainable, and the rule that decided is the manifest's own.
     let explained = json(command(

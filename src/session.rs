@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
@@ -65,6 +66,12 @@ const INPUT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_AUTOMATION_REQUESTS_PER_CLIENT: usize = 64;
 const MAX_AUTOMATION_WAITERS: usize = 256;
 const MAX_PENDING_ACTOR_WORK: usize = 256;
+/// Delayed writes outstanding across the session.
+///
+/// One prompt schedules one Enter, so this is far above any real load; it exists so a caller
+/// looping on prompts cannot grow the heap without bound.
+#[allow(dead_code)]
+const MAX_DELAYED_INPUTS: usize = 256;
 const MAX_PENDING_MEDIA_PROJECTIONS: usize = 64;
 /// Frames allowed outstanding before rendering pauses for the client to catch up.
 ///
@@ -207,6 +214,69 @@ pub enum ActorEvent {
     PluginsChanged,
     /// Foreground process identity changes discovered by the bounded agent worker.
     AgentProcesses(Vec<ProcessUpdate>),
+    /// A one-shot foreground probe finished for a parked automation request.
+    ///
+    /// Distinct from `AgentProcesses`, which reports the detector's periodic view: this answers a
+    /// specific request that must not act on a cached identity.
+    // Constructed once `agent-start` and `agent-prompt` park requests on a probe.
+    #[allow(dead_code)]
+    AgentProbeComplete {
+        reply: AutomationReplyTarget,
+        pane_id: PaneId,
+        probe: AgentProbe,
+        job: ForegroundProbe,
+    },
+}
+
+/// Bytes queued to reach a pane's PTY at `due`.
+///
+/// Full-screen agents read a bracketed paste and its submitting Enter as one event when they
+/// arrive together, swallowing the Enter into the pasted text. Separating them in time is what
+/// makes the prompt actually submit, so the delay is a feature of the input, not a retry.
+struct DelayedInput {
+    due: Instant,
+    /// Breaks ties so equal deadlines drain in enqueue order; `Instant` has no such guarantee and
+    /// a heap is free to reorder equal keys.
+    sequence: u64,
+    pane_id: PaneId,
+    bytes: Vec<u8>,
+}
+
+impl PartialEq for DelayedInput {
+    fn eq(&self, other: &Self) -> bool {
+        (self.due, self.sequence) == (other.due, other.sequence)
+    }
+}
+
+impl Eq for DelayedInput {}
+
+impl Ord for DelayedInput {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.due, self.sequence).cmp(&(other.due, other.sequence))
+    }
+}
+
+impl PartialOrd for DelayedInput {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// What a parked request asked the foreground probe to decide.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum AgentProbe {
+    /// Whether the pane is an available shell, for a caller about to type a command line into it.
+    ShellAvailable,
+    /// Whether `agent` is still the pane's foreground process, for a caller about to prompt it.
+    HostsAgent { agent: crate::agent::AgentId },
+}
+
+/// One foreground probe's result: the agent the job resolves to, plus the raw job behind it.
+#[derive(Debug, Clone)]
+pub struct ForegroundProbe {
+    pub identity: Option<crate::agent::AgentIdentity>,
+    pub processes: Vec<crate::agent_drive::ForegroundProcess>,
 }
 
 #[derive(Clone)]
@@ -539,6 +609,12 @@ struct Pane {
     /// say whether a transition is new. `sync_agent_status` compares against this and stores the
     /// result, making a transition observable exactly once whatever produced it.
     agent_published: Option<AgentSnapshot>,
+    /// Count of published agent lifecycle transitions on this pane.
+    ///
+    /// A caller that submits work and then asks "did anything happen?" needs a number that moves
+    /// only on lifecycle change. `screen_sequence` cannot answer: a spinner or a clock redraws
+    /// constantly without the agent's state meaning anything different.
+    agent_change_seq: u64,
     copy: Option<CopyState>,
     mouse_selection: Option<MouseSelection>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
@@ -1305,6 +1381,10 @@ struct SessionActor {
     last_plugin_focus: Option<(bool, Option<u64>, Option<PaneId>)>,
     last_plugin_media_revision: u64,
     automation_waiters: Vec<AutomationWaiter>,
+    /// Input scheduled to reach a pane later, earliest first.
+    delayed_inputs: BinaryHeap<Reverse<DelayedInput>>,
+    #[allow(dead_code)]
+    next_delayed_input: u64,
     exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
     vivid: VirtualVivid,
@@ -1508,6 +1588,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         last_plugin_focus: None,
         last_plugin_media_revision: 0,
         automation_waiters: Vec::new(),
+        delayed_inputs: BinaryHeap::new(),
+        next_delayed_input: 0,
         exit_tombstones: VecDeque::new(),
         shutdown: shutdown.clone(),
         vivid,
@@ -1556,6 +1638,7 @@ impl SessionActor {
             timeout = timeout.min(self.next_agent_evaluation_delay());
             timeout = timeout.min(self.next_notice_deadline());
             timeout = timeout.min(self.next_sync_flush_delay());
+            timeout = timeout.min(self.next_delayed_input_deadline());
             // Give ready media low-latency service, but force a general-queue turn after a bounded
             // batch. A bounded channel is not a bounded drain when its producer can refill it.
             if self.drain_media(&media_receiver) {
@@ -1571,6 +1654,7 @@ impl SessionActor {
                     self.drain_media(&media_receiver);
                     self.sync_pending_media_projection();
                     self.expire_status_notice();
+                    self.flush_delayed_inputs();
                     if self.pending_render && render_at <= Instant::now() {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -1587,6 +1671,7 @@ impl SessionActor {
                     self.drain_media(&media_receiver);
                     self.sync_pending_media_projection();
                     self.expire_status_notice();
+                    self.flush_delayed_inputs();
                     if self.pending_render {
                         self.render();
                         render_at = Instant::now() + interval;
@@ -1933,6 +2018,15 @@ impl SessionActor {
                     }
                 }
                 self.evaluate_agent_states();
+            }
+            ActorEvent::AgentProbeComplete {
+                reply,
+                pane_id,
+                probe,
+                job,
+            } => {
+                self.complete_pending_actor_work(&reply);
+                self.resume_agent_probe(reply, pane_id, probe, job);
             }
         }
         // Attachment, pane focus, tab switching, pane teardown, and a program enabling the mode
@@ -4285,6 +4379,149 @@ impl SessionActor {
         }
     }
 
+    /// Park a request on a fresh scan of a pane's foreground job.
+    ///
+    /// Reading the process table means `/proc`, `sysctl`, or a process snapshot — bounded, but not
+    /// bounded by anything this session controls, so it happens on a worker and returns as
+    /// `ActorEvent::AgentProbeComplete`. The alternative, reusing the detector's cache, is wrong
+    /// for the callers that need this: between two detector polls a shell can start a command, and
+    /// deciding it is safe to type from a stale answer types into that command instead.
+    #[allow(dead_code)]
+    fn probe_agent_foreground(
+        &mut self,
+        target: AutomationReplyTarget,
+        pane_id: PaneId,
+        probe: AgentProbe,
+    ) {
+        let Some(pane) = self.panes.get(&pane_id) else {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("pane_not_found", "pane no longer exists"),
+            );
+            return;
+        };
+        let child_pid = pane.child_pid;
+        let group = pane.control.foreground_process_group_id();
+        if !self.register_pending_actor_work(&target) {
+            self.reply_automation_error(
+                target,
+                AutomationError::new("limit_exceeded", "session pending-work quota is exhausted"),
+            );
+            return;
+        }
+        let catalog = Arc::clone(&self.agent_catalog);
+        let sender = self.sender.clone();
+        let completion_target = target.clone();
+        let spawn = std::thread::Builder::new()
+            .name(format!("vvmux-agent-probe-{pane_id}"))
+            .spawn(move || {
+                let (identity, processes) =
+                    crate::agent::foreground_job(&catalog, child_pid, group);
+                let _ = sender.send(ActorEvent::AgentProbeComplete {
+                    reply: completion_target,
+                    pane_id,
+                    probe,
+                    job: ForegroundProbe {
+                        identity,
+                        processes,
+                    },
+                });
+            });
+        if let Err(error) = spawn {
+            self.complete_pending_actor_work(&target);
+            self.reply_automation_error(
+                target,
+                AutomationError::new("unsupported", error.to_string()),
+            );
+        }
+    }
+
+    /// Resume a request parked on `probe_agent_foreground`.
+    ///
+    /// The pane is re-resolved here rather than trusted from before the probe: it can close while
+    /// the worker scans, and answering about a pane that no longer exists is worse than saying so.
+    fn resume_agent_probe(
+        &mut self,
+        reply: AutomationReplyTarget,
+        pane_id: PaneId,
+        probe: AgentProbe,
+        job: ForegroundProbe,
+    ) {
+        let Some(pane) = self.panes.get(&pane_id) else {
+            self.reply_automation_error(
+                reply,
+                AutomationError::new("pane_not_found", "pane no longer exists"),
+            );
+            return;
+        };
+        let child_pid = pane.child_pid;
+        let group = pane.control.foreground_process_group_id();
+        match probe {
+            AgentProbe::ShellAvailable => {
+                let shell =
+                    crate::agent_drive::available_pane_shell(child_pid, group, &job.processes);
+                self.resolve_shell_available_probe(reply, pane_id, shell);
+            }
+            AgentProbe::HostsAgent { agent } => {
+                let hosts = job
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.id == agent);
+                self.resolve_hosts_agent_probe(reply, pane_id, agent, hosts);
+            }
+        }
+    }
+
+    /// Answer a shell-availability probe.
+    ///
+    /// Task 0 lands the probe path with no caller; `agent-start` attaches its launch here.
+    fn resolve_shell_available_probe(
+        &mut self,
+        reply: AutomationReplyTarget,
+        pane_id: PaneId,
+        shell: Option<String>,
+    ) {
+        match shell {
+            Some(shell) => self.reply_automation(
+                reply,
+                serde_json::json!({ "pane_id": pane_id, "shell": shell }),
+            ),
+            None => self.reply_automation_error(
+                reply,
+                AutomationError::new(
+                    "agent_pane_busy",
+                    "pane is not an available shell: its foreground is running something else",
+                ),
+            ),
+        }
+    }
+
+    /// Answer a still-hosting probe.
+    ///
+    /// Task 0 lands the probe path with no caller; `agent-prompt` attaches its submit here.
+    fn resolve_hosts_agent_probe(
+        &mut self,
+        reply: AutomationReplyTarget,
+        pane_id: PaneId,
+        agent: crate::agent::AgentId,
+        hosts: bool,
+    ) {
+        if hosts {
+            self.reply_automation(
+                reply,
+                serde_json::json!({ "pane_id": pane_id, "agent": agent }),
+            );
+        } else {
+            self.reply_automation_error(
+                reply,
+                AutomationError::new(
+                    "agent_not_ready",
+                    format!("{agent} is no longer the pane foreground process"),
+                ),
+            );
+        }
+    }
+
     /// Admit work that may block outside the single-writer session actor.
     ///
     /// The actor performs ordered validation and admission, records a bounded completion key, and
@@ -4367,6 +4604,9 @@ impl SessionActor {
             "plugin": plugin,
             "agent": pane.agent.snapshot().map(|snapshot| {
                 let mut agent = agent_json(snapshot);
+                // The transition counter travels with the state it counts, so a caller can read a
+                // baseline and a status in one call and know they describe the same moment.
+                agent["change_sequence"] = pane.agent_change_seq.into();
                 // Omitted rather than emitted empty: most panes never carry metadata, and a bulk
                 // listing should not pay four empty containers per pane to say so.
                 if !pane.agent.metadata().is_empty() {
@@ -5039,6 +5279,7 @@ impl SessionActor {
                 continue;
             }
             let previous = std::mem::replace(&mut pane.agent_published, current.clone());
+            pane.agent_change_seq = pane.agent_change_seq.saturating_add(1);
             transitions.push((pane.id, previous, current));
         }
         if transitions.is_empty() {
@@ -5660,11 +5901,6 @@ impl SessionActor {
                 if mouse.kind == MouseKind::Move {
                     button |= 32;
                 }
-                let terminator = if mouse.kind == MouseKind::Release {
-                    'm'
-                } else {
-                    'M'
-                };
                 let (x, y) = application_mouse_coordinates(
                     mouse,
                     pixels,
@@ -5672,7 +5908,12 @@ impl SessionActor {
                     display,
                     modes.sgr_pixels,
                 );
-                translated = Some(format!("\x1b[<{button};{x};{y}{terminator}"));
+                translated = Some(crate::agent_drive::encode_sgr_mouse(
+                    button,
+                    x,
+                    y,
+                    mouse.kind != MouseKind::Release,
+                ));
             } else if mouse.kind == MouseKind::Wheel {
                 copy_view_render = true;
                 let previous_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
@@ -7176,6 +7417,52 @@ impl SessionActor {
             .unwrap_or(Duration::MAX)
     }
 
+    /// Queue `bytes` to reach a pane after `delay`.
+    ///
+    /// The caller has already replied or parked; nothing here reports success, because a delayed
+    /// write has no request left to fail. Delivery is best effort by design: the pane can close,
+    /// and a queue full of a slow reader's input must not become actor backpressure.
+    #[allow(dead_code)]
+    fn queue_delayed_input(&mut self, pane_id: PaneId, bytes: Vec<u8>, delay: Duration) {
+        if bytes.is_empty() || self.delayed_inputs.len() >= MAX_DELAYED_INPUTS {
+            return;
+        }
+        let sequence = self.next_delayed_input;
+        self.next_delayed_input = self.next_delayed_input.saturating_add(1);
+        self.delayed_inputs.push(Reverse(DelayedInput {
+            due: Instant::now() + delay,
+            sequence,
+            pane_id,
+            bytes,
+        }));
+    }
+
+    /// Deliver every delayed input whose moment has arrived.
+    fn flush_delayed_inputs(&mut self) {
+        let now = Instant::now();
+        while self
+            .delayed_inputs
+            .peek()
+            .is_some_and(|Reverse(input)| input.due <= now)
+        {
+            let Some(Reverse(input)) = self.delayed_inputs.pop() else {
+                break;
+            };
+            // A pane that closed between queueing and now simply drops its input; the request that
+            // scheduled this has already been answered.
+            if let Some(pane) = self.panes.get(&input.pane_id) {
+                let _ = pane.input.send(&input.bytes);
+            }
+        }
+    }
+
+    fn next_delayed_input_deadline(&self) -> Duration {
+        self.delayed_inputs
+            .peek()
+            .map(|Reverse(input)| input.due.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::MAX)
+    }
+
     fn close_pane_confirmation_input(&mut self, bytes: &[u8]) {
         for byte in bytes {
             match byte {
@@ -7838,6 +8125,7 @@ impl SessionActor {
                 spawn_cwd: cwd,
                 agent: AgentRuntime::new(),
                 agent_published: None,
+                agent_change_seq: 0,
                 copy: None,
                 mouse_selection: None,
                 vivid_metrics: None,
@@ -11719,6 +12007,31 @@ fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn delayed(due: Instant, sequence: u64) -> DelayedInput {
+        DelayedInput {
+            due,
+            sequence,
+            pane_id: 1,
+            bytes: vec![b'\r'],
+        }
+    }
+
+    #[test]
+    fn delayed_input_drains_by_deadline_then_enqueue_order() {
+        let base = Instant::now();
+        let mut heap = BinaryHeap::new();
+        // Pushed out of order, and with a tie on the deadline.
+        heap.push(Reverse(delayed(base + Duration::from_millis(300), 2)));
+        heap.push(Reverse(delayed(base + Duration::from_millis(100), 0)));
+        heap.push(Reverse(delayed(base + Duration::from_millis(300), 1)));
+
+        let order = std::iter::from_fn(|| heap.pop().map(|Reverse(input)| input.sequence))
+            .collect::<Vec<_>>();
+        // Earliest deadline first; equal deadlines keep the order they were queued in, which a
+        // bare `Instant` key would leave to the heap to decide.
+        assert_eq!(order, [0, 1, 2]);
+    }
 
     #[test]
     fn only_states_worth_interrupting_for_notify() {

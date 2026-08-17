@@ -1478,8 +1478,50 @@ fn identify_foreground_agent(
         .find_map(|process| catalog.identify(&process))
 }
 
+/// Probe a pane's foreground job once, for a caller that needs a fresh answer rather than the
+/// detector's cached one.
+///
+/// The detector polls on an interval and reports only changes, which is right for reporting state
+/// but wrong for deciding whether it is safe to type into a pane: between two polls a shell can
+/// start a command, and acting on the stale answer would type a command line into whatever that
+/// command is. Both the agent identity and the raw job come back, so one probe answers "is this an
+/// available shell" and "is the expected agent still in front" without a second scan.
+///
+/// This walks `/proc`, `sysctl`, or a process snapshot, so it must never be called on the session
+/// actor — see `SessionActor::probe_agent_foreground`.
+// Reached once `agent-start` and `agent-prompt` land; the probe path that calls it is already
+// wired through the actor.
+#[allow(dead_code)]
+pub fn foreground_job(
+    catalog: &AgentCatalog,
+    child_pid: u32,
+    group: Option<u32>,
+) -> (
+    Option<AgentIdentity>,
+    Vec<crate::agent_drive::ForegroundProcess>,
+) {
+    let processes = foreground_processes(child_pid, group);
+    let identity = processes
+        .iter()
+        .find_map(|process| catalog.identify(process));
+    let job = processes
+        .into_iter()
+        .map(|process| crate::agent_drive::ForegroundProcess {
+            pid: process.pid,
+            name: process.name,
+        })
+        .collect();
+    (identity, job)
+}
+
 #[derive(Debug)]
 struct ProcessInfo {
+    /// Zero when the platform's scan does not report one; a caller comparing against a pane's
+    /// child PID must treat that as "not the child" rather than a match.
+    ///
+    /// Read only through `foreground_job`, which the agent-drive features consume.
+    #[allow(dead_code)]
+    pid: u32,
     name: String,
     argv: Vec<String>,
 }
@@ -1694,7 +1736,7 @@ fn foreground_processes(_child_pid: u32, group: Option<u32>) -> Vec<ProcessInfo>
             .filter(|part| !part.is_empty())
             .map(|part| String::from_utf8_lossy(part).into_owned())
             .collect();
-        processes.push(ProcessInfo { name, argv });
+        processes.push(ProcessInfo { pid, name, argv });
     }
     processes
 }
@@ -1723,6 +1765,7 @@ fn foreground_processes(_child_pid: u32, group: Option<u32>) -> Vec<ProcessInfo>
         .filter_map(|pid| u32::try_from(pid).ok())
         .filter_map(|pid| {
             macos_argv(pid).map(|argv| ProcessInfo {
+                pid,
                 name: argv.first().cloned().unwrap_or_default(),
                 argv,
             })
@@ -1828,6 +1871,7 @@ fn foreground_processes(child_pid: u32, _group: Option<u32>) -> Vec<ProcessInfo>
             .unwrap_or_else(|| vec![name.clone()]);
         if pid == child_pid {
             root = Some(ProcessInfo {
+                pid,
                 name: name.clone(),
                 argv: argv.clone(),
             });
@@ -1839,7 +1883,7 @@ fn foreground_processes(child_pid: u32, _group: Option<u32>) -> Vec<ProcessInfo>
     while let Some(parent) = queue.pop_front() {
         for (pid, name, argv) in children.remove(&parent).unwrap_or_default() {
             queue.push_back(pid);
-            output.push(ProcessInfo { argv, name });
+            output.push(ProcessInfo { pid, argv, name });
         }
     }
     output
@@ -2060,6 +2104,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         let catalog = catalog();
         assert_eq!(
             catalog.identify(&ProcessInfo {
+                pid: 0,
                 name: "node".into(),
                 argv: vec!["node".into(), "/x/@anthropic-ai/claude-code/cli.js".into()]
             }),
@@ -2067,6 +2112,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         );
         assert_eq!(
             catalog.identify(&ProcessInfo {
+                pid: 0,
                 name: "python".into(),
                 argv: vec!["python".into(), "hermes_agent.py".into()]
             }),
@@ -2074,6 +2120,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         );
         assert_eq!(
             catalog.identify(&ProcessInfo {
+                pid: 0,
                 name: "bash".into(),
                 argv: vec!["bash".into(), "-lc".into(), "exec codex --full-auto".into()]
             }),
@@ -2081,6 +2128,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         );
         assert_eq!(
             catalog.identify(&ProcessInfo {
+                pid: 0,
                 name: "powershell.exe".into(),
                 argv: vec![
                     "powershell.exe".into(),
@@ -2095,6 +2143,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         );
         assert_eq!(
             catalog.identify(&ProcessInfo {
+                pid: 0,
                 name: "node".into(),
                 argv: vec![
                     "node".into(),
@@ -2116,10 +2165,12 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         let catalog = custom_catalog();
         for process in [
             ProcessInfo {
+                pid: 0,
                 name: "/usr/local/bin/openclaw".into(),
                 argv: vec!["/usr/local/bin/openclaw".into()],
             },
             ProcessInfo {
+                pid: 0,
                 name: "node".into(),
                 argv: vec!["node".into(), "/opt/@openclaw/cli/main.js".into()],
             },
