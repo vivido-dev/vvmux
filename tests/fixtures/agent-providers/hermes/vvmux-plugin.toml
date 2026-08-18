@@ -1,11 +1,11 @@
 manifest_version = 2
 
 [plugin]
-id = "dev.vivido.agent.hermes"
+id = "com.example.agent.hermes"
 name = "Hermes Agent Support"
-version = "2026.7.24"
+version = "2026.8.17"
 min_vvmux_version = "0.4.0"
-description = "Bundled passive state detection for Hermes"
+description = "Test fixture: passive state detection for Hermes"
 platforms = ["linux", "macos", "windows"]
 permissions = []
 

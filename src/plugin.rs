@@ -14,8 +14,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use vvmux_plugin_api::{
     Activation, ErrorCode, Event, EventHook, FrameError, Hello, HostCallResult, Invocation,
-    InvocationContext, LoadedManifest, Manifest, NativeMessage, NativeReply, PROTOCOL_VERSION,
-    Permission, PluginError, RuntimeKind, read_frame, write_frame,
+    InvocationContext, LoadedManifest, NativeMessage, NativeReply, PROTOCOL_VERSION, Permission,
+    PluginError, RuntimeKind, read_frame, write_frame,
 };
 
 const REGISTRY_SCHEMA: u16 = 2;
@@ -47,7 +47,7 @@ pub enum PluginCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Install a local directory or HTTPS Git repository.
+    /// Install by name (`NAME`, `OWNER/NAME`), HTTPS Git URL, or local path.
     Install {
         source: String,
         #[arg(long = "ref")]
@@ -65,6 +65,8 @@ pub enum PluginCommand {
     },
     /// Remove a plugin installation.
     Uninstall { id: String },
+    /// Install or repair a plugin's declared agent lifecycle adapters.
+    Integrate { id: String },
     /// Enable an installed plugin.
     Enable { id: String },
     /// Disable an installed plugin.
@@ -164,7 +166,12 @@ struct Registry {
     generation: u64,
     #[serde(default)]
     plugins: BTreeMap<String, RegistryEntry>,
-    #[serde(default)]
+    /// Retired: agent providers are ordinary installed packages.
+    ///
+    /// Still declared, and still read, because the registry is `deny_unknown_fields` and a user
+    /// upgrading from a build that wrote this key would otherwise find an unloadable registry.
+    /// Never written back, so the key disappears the first time anything commits.
+    #[serde(default, skip_serializing)]
     builtin_enabled: BTreeMap<String, bool>,
 }
 
@@ -276,15 +283,13 @@ pub fn run(command: PluginCommand) -> io::Result<()> {
             source,
             git_ref,
             yes,
-        } => {
-            if source.starts_with("https://") {
-                install_git(&paths, &source, git_ref.as_deref(), yes)
-            } else {
-                install_local(&paths, Path::new(&source), false, yes, None, None)
-            }
-        }
+        } => match resolve_source(&source)? {
+            ResolvedSource::Git(url) => install_git(&paths, &url, git_ref.as_deref(), yes),
+            ResolvedSource::Local(path) => install_local(&paths, &path, false, yes, None, None),
+        },
         PluginCommand::Update { id, git_ref, yes } => update(&paths, &id, git_ref.as_deref(), yes),
         PluginCommand::Uninstall { id } => uninstall(&paths, &id),
+        PluginCommand::Integrate { id } => integrate(&paths, &id),
         PluginCommand::Enable { id } => set_enabled(&paths, &id, true),
         PluginCommand::Disable { id } => set_enabled(&paths, &id, false),
         PluginCommand::List { json } => list(&paths, json),
@@ -298,11 +303,6 @@ pub fn run(command: PluginCommand) -> io::Result<()> {
         PluginCommand::Events { target, after } => events(&target, after),
         PluginCommand::Resolve { frozen } => resolve(&paths, frozen),
     }
-}
-
-pub(crate) fn enable_builtin(id: &str) -> io::Result<()> {
-    let paths = PluginPaths::new()?;
-    set_enabled(&paths, id, true)
 }
 
 impl PluginPaths {
@@ -347,80 +347,11 @@ pub(crate) fn load_registry_candidate() -> io::Result<RegistryCandidate> {
     registry_candidate(&registry)
 }
 
-struct BuiltinPlugin {
-    id: &'static str,
-    source: &'static str,
-    default_enabled: bool,
-    manifest_source: &'static str,
-}
-
-const BUILTIN_PLUGINS: &[BuiltinPlugin] = &[
-    BuiltinPlugin {
-        id: "dev.vivido.agent.claude",
-        source: "builtin://vvmux/agent-claude",
-        default_enabled: true,
-        manifest_source: include_str!("../builtin-plugins/agent-claude/vvmux-plugin.toml"),
-    },
-    BuiltinPlugin {
-        id: "dev.vivido.agent.codex",
-        source: "builtin://vvmux/agent-codex",
-        default_enabled: true,
-        manifest_source: include_str!("../builtin-plugins/agent-codex/vvmux-plugin.toml"),
-    },
-    BuiltinPlugin {
-        id: "dev.vivido.agent.opencode",
-        source: "builtin://vvmux/agent-opencode",
-        default_enabled: false,
-        manifest_source: include_str!("../builtin-plugins/agent-opencode/vvmux-plugin.toml"),
-    },
-    BuiltinPlugin {
-        id: "dev.vivido.agent.hermes",
-        source: "builtin://vvmux/agent-hermes",
-        default_enabled: false,
-        manifest_source: include_str!("../builtin-plugins/agent-hermes/vvmux-plugin.toml"),
-    },
-];
-
-fn builtin_manifest(plugin: &BuiltinPlugin) -> io::Result<Manifest> {
-    let manifest: Manifest = toml::from_str(plugin.manifest_source)
-        .map_err(|error| invalid(format!("invalid bundled plugin `{}`: {error}", plugin.id)))?;
-    manifest
-        .validate()
-        .map_err(|error| invalid(format!("invalid bundled plugin `{}`: {error}", plugin.id)))?;
-    Ok(manifest)
-}
-
-fn builtin_enabled(registry: &Registry, plugin: &BuiltinPlugin) -> bool {
-    registry
-        .builtin_enabled
-        .get(plugin.id)
-        .copied()
-        .unwrap_or(plugin.default_enabled)
-}
-
-fn builtin_by_id(id: &str) -> Option<&'static BuiltinPlugin> {
-    BUILTIN_PLUGINS.iter().find(|plugin| plugin.id == id)
-}
-
 fn registry_candidate(registry: &Registry) -> io::Result<RegistryCandidate> {
     let mut plugins = BTreeMap::new();
     let mut catalog = BTreeMap::new();
     let mut failed = BTreeMap::new();
     let mut agent_sources = Vec::new();
-    for builtin in BUILTIN_PLUGINS {
-        if !builtin_enabled(registry, builtin) {
-            continue;
-        }
-        let manifest = builtin_manifest(builtin)?;
-        let digest = hex(&Sha256::digest(builtin.manifest_source.as_bytes()));
-        agent_sources.extend(manifest.agents.into_iter().map(|definition| {
-            crate::agent::AgentCatalogSource {
-                provider: builtin.id.into(),
-                fingerprint: digest.clone(),
-                definition,
-            }
-        }));
-    }
     for entry in registry.plugins.values() {
         if !entry.enabled {
             plugins.insert(
@@ -1241,10 +1172,7 @@ fn commit_registry_with_reload(
     mut reload: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let current = load_registry(paths)?;
-    if current.generation != previous.generation
-        || current.plugins != previous.plugins
-        || current.builtin_enabled != previous.builtin_enabled
-    {
+    if current.generation != previous.generation || current.plugins != previous.plugins {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "plugin registry changed concurrently; retry the operation",
@@ -1336,19 +1264,19 @@ fn install_local(
     let previous_registry = load_registry(paths)?;
     let loaded = load_package(&source)?;
     ensure_current_platform(&loaded)?;
+    ensure_supported_version(&loaded)?;
     let id = loaded.manifest.plugin.id.clone();
-    if builtin_by_id(&id).is_some() {
-        return Err(invalid(format!(
-            "plugin ID `{id}` is reserved for a bundled plugin"
-        )));
-    }
+    let recorded = recorded_source.unwrap_or_else(|| source.to_string_lossy().into_owned());
+    // Before the network and before any prompt: a package claiming a first-party ID has to come
+    // from the first-party organization, or be a linked working copy the user pointed at by hand.
+    ensure_reserved_id_policy(&id, &recorded, linked)?;
     let mut pending = BTreeMap::new();
     pending.insert(
         id.clone(),
         PendingPackage {
             id: id.clone(),
             source_dir: source.clone(),
-            source: recorded_source.unwrap_or_else(|| source.to_string_lossy().into_owned()),
+            source: recorded.clone(),
             commit: recorded_commit,
             linked,
             approved_manifest: digest_file(&source.join("vvmux-plugin.toml"))?,
@@ -1398,7 +1326,156 @@ fn install_local(
         "{} plugin {id}",
         if linked { "linked" } else { "installed" }
     );
+    // After the commit, because the package has to exist before its adapters point at it, and
+    // never fatal: the package is installed either way, and a hand-edited agent config file must
+    // not undo a commit that already succeeded.
+    for package in pending.values() {
+        let root = match package.linked {
+            true => package.source_dir.clone(),
+            false => match load_registry(paths)?.plugins.get(&package.id) {
+                Some(entry) => entry.root.clone(),
+                None => continue,
+            },
+        };
+        apply_integrations(&package.id, &root);
+    }
     Ok(())
+}
+
+/// Install or repair every adapter a package declares, reporting rather than failing.
+fn apply_integrations(id: &str, root: &Path) {
+    let loaded = match load_package(root) {
+        Ok(loaded) if loaded.manifest.integrations.is_empty() => return,
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("warning: {id}: could not read its integrations: {error}");
+            return;
+        }
+    };
+    let home = match home_dir() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("warning: {id}: could not apply its integrations: {error}");
+            return;
+        }
+    };
+    for adapter in crate::plugin_integration::adapters(&loaded.manifest, root, &home) {
+        if !adapter.config_dir().is_dir() {
+            let hint = adapter
+                .config_dir_env()
+                .map_or_else(String::new, |name| format!(", or set {name}"));
+            println!(
+                "integration {}: skipped — {} does not exist. Create it{hint}, then run `vvmux plugin integrate {id}`.",
+                adapter.id(),
+                adapter.config_dir().display()
+            );
+            continue;
+        }
+        match adapter.install() {
+            Ok(paths) => {
+                println!("integration {}: installed", adapter.id());
+                for path in paths {
+                    println!("  {}", path.display());
+                }
+                if let Some(notice) = adapter.notice() {
+                    println!("{notice}");
+                }
+            }
+            Err(error) => eprintln!(
+                "warning: integration {} failed: {error}; repair with `vvmux plugin integrate {id}`",
+                adapter.id()
+            ),
+        }
+    }
+}
+
+/// Remove every adapter a package installed, before its tree goes away.
+fn remove_integrations(root: &Path) {
+    let (Ok(home), Ok(loaded)) = (home_dir(), load_package(root)) else {
+        return;
+    };
+    for adapter in crate::plugin_integration::adapters(&loaded.manifest, root, &home) {
+        match adapter.uninstall() {
+            Ok(paths) if paths.is_empty() => {}
+            Ok(paths) => {
+                println!("integration {}: removed", adapter.id());
+                for path in paths {
+                    println!("  {}", path.display());
+                }
+            }
+            Err(error) => eprintln!(
+                "warning: integration {} was left in place: {error}",
+                adapter.id()
+            ),
+        }
+    }
+}
+
+fn integrate(paths: &PluginPaths, id: &str) -> io::Result<()> {
+    let registry = load_registry(paths)?;
+    let entry = registry.plugins.get(id).ok_or_else(|| not_found(id))?;
+    let loaded = load_package(&entry.root)?;
+    if loaded.manifest.integrations.is_empty() {
+        return Err(invalid(format!("plugin `{id}` declares no integrations")));
+    }
+    apply_integrations(id, &entry.root);
+    Ok(())
+}
+
+/// Per-integration status for `list --json`, `inspect --json`, and `doctor --json`.
+fn integration_report(root: &Path) -> Value {
+    let (Ok(home), Ok(loaded)) = (home_dir(), load_package(root)) else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        crate::plugin_integration::adapters(&loaded.manifest, root, &home)
+            .into_iter()
+            .map(|adapter| {
+                serde_json::json!({
+                    "id": adapter.id(),
+                    "version": adapter.version(),
+                    "config_dir": adapter.config_dir(),
+                    "status": adapter
+                        .status()
+                        .map_or_else(|error| error.to_string(), |status| status.to_string()),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn print_integration_status(root: &Path, indent: &str) {
+    let (Ok(home), Ok(loaded)) = (home_dir(), load_package(root)) else {
+        return;
+    };
+    for adapter in crate::plugin_integration::adapters(&loaded.manifest, root, &home) {
+        println!(
+            "{indent}integration: {} v{} — {} ({})",
+            adapter.id(),
+            adapter.version(),
+            adapter
+                .status()
+                .map_or_else(|error| error.to_string(), |status| status.to_string()),
+            adapter.config_dir().display()
+        );
+        for target in adapter.registration_targets() {
+            println!("{indent}  registers: {target}");
+        }
+    }
+}
+
+/// The user's home directory, resolved once here so the engine takes it as a parameter.
+fn home_dir() -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    let value = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    #[cfg(not(windows))]
+    let value = std::env::var_os("HOME");
+    value.map(PathBuf::from).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not determine the user home directory",
+        )
+    })
 }
 
 struct PendingPackage {
@@ -1408,6 +1485,112 @@ struct PendingPackage {
     commit: Option<String>,
     linked: bool,
     approved_manifest: String,
+}
+
+/// Where a `vvmux plugin install` argument actually points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedSource {
+    Git(String),
+    Local(PathBuf),
+}
+
+/// The first-party plugin organization, and the only source a reserved ID may come from.
+const FIRST_PARTY_PREFIX: &str = "https://github.com/vivido-dev/";
+/// Plugin IDs only a first-party package may claim.
+const RESERVED_ID_PREFIX: &str = "dev.vivido.";
+
+/// Turn what the user typed into a repository URL or a local directory.
+///
+/// A bare name is the common case and resolves to the first-party organization; `owner/repo`
+/// names anyone else's. Anything that looks like a path — absolute, or explicitly `./` or `../` —
+/// stays local, so a name is never ambiguous with a directory that happens to sit beside the
+/// user's shell. This is the one seam a future package index replaces: it maps a name to a
+/// source and nothing else.
+fn resolve_source(source: &str) -> io::Result<ResolvedSource> {
+    if source.is_empty() {
+        return Err(invalid("plugin source must not be empty"));
+    }
+    if source.starts_with("https://") {
+        return Ok(ResolvedSource::Git(source.to_owned()));
+    }
+    let path = Path::new(source);
+    if path.is_absolute()
+        || source.starts_with("./")
+        || source.starts_with("../")
+        || source.starts_with(".\\")
+        || source.starts_with("..\\")
+    {
+        return Ok(ResolvedSource::Local(path.to_path_buf()));
+    }
+    // Everything else is a shorthand name. Refusing the other URL forms by name gives a better
+    // error than letting them fail as a nonexistent one- or two-segment repository.
+    if source.starts_with("http://") {
+        return Err(invalid("plugin sources must use HTTPS"));
+    }
+    if source.contains("://") || source.contains(':') {
+        return Err(invalid(format!(
+            "unsupported plugin source `{source}`; use a name, owner/name, an https:// URL, or a ./path"
+        )));
+    }
+    let segments = source.split('/').collect::<Vec<_>>();
+    if segments
+        .iter()
+        .any(|segment| !valid_source_segment(segment))
+    {
+        return Err(invalid(format!("invalid plugin name `{source}`")));
+    }
+    match segments.as_slice() {
+        [name] => Ok(ResolvedSource::Git(format!("{FIRST_PARTY_PREFIX}{name}"))),
+        [owner, repository] => Ok(ResolvedSource::Git(format!(
+            "https://github.com/{owner}/{repository}"
+        ))),
+        // vvmux clones whole repositories, so a deeper path would name something it cannot install.
+        _ => Err(invalid(format!(
+            "plugin name `{source}` has too many segments; use NAME or OWNER/NAME"
+        ))),
+    }
+}
+
+fn valid_source_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= 100
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// A first-party plugin ID may only be claimed by a first-party package.
+///
+/// The ID is what the agent catalog, the registry, and every `vvmux plugin` command address a
+/// provider by, so letting an arbitrary repository publish `dev.vivido.agent.claude` would let it
+/// take over an identity users already trust. A linked working copy is exempt because the user
+/// named a directory on their own machine, which is how the first-party packages are developed.
+fn ensure_reserved_id_policy(id: &str, source: &str, linked: bool) -> io::Result<()> {
+    if !id.starts_with(RESERVED_ID_PREFIX) || linked || source.starts_with(FIRST_PARTY_PREFIX) {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "plugin ID `{id}` is reserved: `{RESERVED_ID_PREFIX}*` may only be installed from {FIRST_PARTY_PREFIX}"
+    )))
+}
+
+/// Refuse a package that declares it needs a newer vvmux than this one.
+///
+/// Parsed but unenforced until now, which meant a manifest using a table an older binary does not
+/// know would fail as an unknown field rather than as the version mismatch it is.
+fn ensure_supported_version(loaded: &LoadedManifest) -> io::Result<()> {
+    let running = semver::Version::parse(env!("CARGO_PKG_VERSION")).map_err(io::Error::other)?;
+    let required = &loaded.manifest.plugin.min_vvmux_version;
+    if *required <= running {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "plugin `{}` requires vvmux {required} or newer; this is {running}",
+            loaded.manifest.plugin.id
+        )))
+    }
 }
 
 fn ensure_current_platform(loaded: &LoadedManifest) -> io::Result<()> {
@@ -1461,10 +1644,14 @@ fn collect_dependency_sources(
         .ok_or_else(|| invalid(format!("dependency_failed: package `{id}` is unavailable")))?;
     let loaded = load_package(root)?;
     ensure_current_platform(&loaded)?;
+    ensure_supported_version(&loaded)?;
     for dependency in &loaded.manifest.dependencies {
         if visiting.contains(&dependency.id) {
             return Err(invalid(format!("dependency cycle at `{}`", dependency.id)));
         }
+        // Before the clone, so a manifest cannot make vvmux fetch a repository by claiming an ID
+        // it is not entitled to.
+        ensure_reserved_id_policy(&dependency.id, &dependency.source, false)?;
         let constraint = constraints
             .entry(dependency.id.clone())
             .or_insert_with(|| (dependency.source.clone(), Vec::new()));
@@ -1520,6 +1707,7 @@ fn collect_dependency_sources(
                 )));
             }
             ensure_current_platform(&dependency_package)?;
+            ensure_supported_version(&dependency_package)?;
             pending.insert(
                 dependency.id.clone(),
                 PendingPackage {
@@ -1761,9 +1949,6 @@ fn install_git(
 }
 
 fn update(paths: &PluginPaths, id: &str, git_ref: Option<&str>, yes: bool) -> io::Result<()> {
-    if builtin_by_id(id).is_some() {
-        return Err(invalid("bundled plugins are updated with the vvmux binary"));
-    }
     let registry = load_registry(paths)?;
     let entry = registry
         .plugins
@@ -1785,14 +1970,13 @@ fn update(paths: &PluginPaths, id: &str, git_ref: Option<&str>, yes: bool) -> io
 }
 
 fn uninstall(paths: &PluginPaths, id: &str) -> io::Result<()> {
-    if builtin_by_id(id).is_some() {
-        return Err(invalid(
-            "bundled plugins cannot be uninstalled; disable them instead",
-        ));
-    }
     let previous = load_registry(paths)?;
     let mut registry = previous.clone();
     let entry = registry.plugins.remove(id).ok_or_else(|| not_found(id))?;
+    // Adapters are removed while the package is still on disk, because their declaration lives in
+    // its manifest. A file the user hand-edited is reported and left alone rather than blocking
+    // the uninstall: refusing here would strand a package nothing can remove.
+    remove_integrations(&entry.root);
     commit_registry(paths, &previous, &mut registry)?;
     if !entry.linked && entry.root.exists() {
         remove_known_tree(&paths.packages, &entry.root)?;
@@ -1804,12 +1988,8 @@ fn uninstall(paths: &PluginPaths, id: &str) -> io::Result<()> {
 fn set_enabled(paths: &PluginPaths, id: &str, enabled: bool) -> io::Result<()> {
     let previous = load_registry(paths)?;
     let mut registry = previous.clone();
-    if builtin_by_id(id).is_some() {
-        registry.builtin_enabled.insert(id.to_owned(), enabled);
-    } else {
-        let entry = registry.plugins.get_mut(id).ok_or_else(|| not_found(id))?;
-        entry.enabled = enabled;
-    }
+    let entry = registry.plugins.get_mut(id).ok_or_else(|| not_found(id))?;
+    entry.enabled = enabled;
     validate_registry_for_install(&registry)?;
     commit_registry(paths, &previous, &mut registry)?;
     println!(
@@ -1822,42 +2002,19 @@ fn set_enabled(paths: &PluginPaths, id: &str, enabled: bool) -> io::Result<()> {
 fn list(paths: &PluginPaths, json: bool) -> io::Result<()> {
     let registry = load_registry(paths)?;
     if json {
-        let mut values = BUILTIN_PLUGINS
-            .iter()
-            .map(|plugin| {
-                let manifest = builtin_manifest(plugin)?;
-                Ok(serde_json::json!({
-                    "id": plugin.id,
-                    "version": manifest.plugin.version,
-                    "source": plugin.source,
-                    "enabled": builtin_enabled(&registry, plugin),
-                    "builtin": true,
-                    "runtime_tier": "builtin_data",
-                }))
+        let values = registry
+            .plugins
+            .values()
+            .map(|entry| {
+                let mut value = serde_json::to_value(entry).unwrap_or(Value::Null);
+                if let Value::Object(object) = &mut value {
+                    object.insert("integrations".into(), integration_report(&entry.root));
+                }
+                value
             })
-            .collect::<io::Result<Vec<_>>>()?;
-        values.extend(registry.plugins.values().map(|entry| {
-            let mut value = serde_json::to_value(entry).unwrap_or(Value::Null);
-            if let Value::Object(object) = &mut value {
-                object.insert("builtin".into(), Value::Bool(false));
-            }
-            value
-        }));
+            .collect::<Vec<_>>();
         print_json(&values)
     } else {
-        for plugin in BUILTIN_PLUGINS {
-            let manifest = builtin_manifest(plugin)?;
-            println!(
-                "{}\t{}\t{}\tbuiltin_data",
-                plugin.id,
-                manifest.plugin.version,
-                if builtin_enabled(&registry, plugin) {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
-        }
         for entry in registry.plugins.values() {
             println!(
                 "{}\t{}\t{}\t{}",
@@ -1866,6 +2023,7 @@ fn list(paths: &PluginPaths, json: bool) -> io::Result<()> {
                 if entry.enabled { "enabled" } else { "disabled" },
                 entry.runtime_tier
             );
+            print_integration_status(&entry.root, "  ");
         }
         Ok(())
     }
@@ -1873,41 +2031,6 @@ fn list(paths: &PluginPaths, json: bool) -> io::Result<()> {
 
 fn inspect(paths: &PluginPaths, id: &str, json: bool) -> io::Result<()> {
     let registry = load_registry(paths)?;
-    if let Some(plugin) = builtin_by_id(id) {
-        let manifest = builtin_manifest(plugin)?;
-        let value = serde_json::json!({
-            "registry": {
-                "id": plugin.id,
-                "source": plugin.source,
-                "enabled": builtin_enabled(&registry, plugin),
-                "builtin": true,
-                "runtime_tier": "builtin_data",
-            },
-            "manifest": manifest,
-            "warnings": [],
-            "trust": "bundled declarative data; no executable runtime",
-        });
-        if json {
-            return print_json(&value);
-        }
-        println!(
-            "{} {} (builtin_data)",
-            plugin.id, value["manifest"]["plugin"]["version"]
-        );
-        println!("source: {}", plugin.source);
-        for agent in &value["manifest"]["agents"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-        {
-            println!(
-                "agent: {} — {}",
-                agent["id"].as_str().unwrap_or_default(),
-                agent["name"].as_str().unwrap_or_default()
-            );
-        }
-        return Ok(());
-    }
     let entry = registry.plugins.get(id).ok_or_else(|| not_found(id))?;
     let loaded = load_package(&entry.root)?;
     let value = serde_json::json!({
@@ -1915,6 +2038,7 @@ fn inspect(paths: &PluginPaths, id: &str, json: bool) -> io::Result<()> {
         "manifest": loaded.manifest,
         "warnings": loaded.warnings,
         "trust": trust_text(&loaded),
+        "integrations": integration_report(&entry.root),
     });
     if json {
         print_json(&value)
@@ -1940,6 +2064,7 @@ fn inspect(paths: &PluginPaths, id: &str, json: bool) -> io::Result<()> {
         for agent in &loaded.manifest.agents {
             println!("agent: {} — {}", agent.id, agent.name);
         }
+        print_integration_status(&entry.root, "");
         for warning in loaded.warnings {
             println!("warning: {warning}");
         }
@@ -1950,13 +2075,6 @@ fn inspect(paths: &PluginPaths, id: &str, json: bool) -> io::Result<()> {
 fn doctor(paths: &PluginPaths, json: bool) -> io::Result<()> {
     let registry = load_registry(paths)?;
     let mut reports = Vec::new();
-    for plugin in BUILTIN_PLUGINS {
-        let result = builtin_manifest(plugin);
-        reports.push(match result {
-            Ok(_) => serde_json::json!({"id": plugin.id, "ok": true, "warnings": [], "builtin": true}),
-            Err(error) => serde_json::json!({"id": plugin.id, "ok": false, "error": error.to_string(), "builtin": true}),
-        });
-    }
     for entry in registry.plugins.values() {
         let result = load_package(&entry.root).and_then(|loaded| {
             if loaded.manifest.plugin.id != entry.id {
@@ -1968,9 +2086,12 @@ fn doctor(paths: &PluginPaths, json: bool) -> io::Result<()> {
             }
         });
         match result {
-            Ok(warnings) => {
-                reports.push(serde_json::json!({"id": entry.id, "ok": true, "warnings": warnings}))
-            }
+            Ok(warnings) => reports.push(serde_json::json!({
+                "id": entry.id,
+                "ok": true,
+                "warnings": warnings,
+                "integrations": integration_report(&entry.root),
+            })),
             Err(error) => reports
                 .push(serde_json::json!({"id": entry.id, "ok": false, "error": error.to_string()})),
         }
@@ -2002,11 +2123,6 @@ fn doctor(paths: &PluginPaths, json: bool) -> io::Result<()> {
 }
 
 fn permissions(paths: &PluginPaths, id: &str) -> io::Result<()> {
-    if builtin_by_id(id).is_some() {
-        println!("runtime: builtin_data");
-        println!("permissions: none");
-        return Ok(());
-    }
     let registry = load_registry(paths)?;
     let entry = registry.plugins.get(id).ok_or_else(|| not_found(id))?;
     println!("runtime: {}", entry.runtime_tier);
@@ -3118,6 +3234,43 @@ fn preview(loaded: &LoadedManifest, source: &str) {
             agent.id, agent.name, agent.process.executables, agent.process.argv_contains
         );
     }
+    for integration in &loaded.manifest.integrations {
+        println!(
+            "integration: {} v{} — {}{}",
+            integration.id,
+            integration.version,
+            integration.config_dir.display(),
+            integration
+                .config_dir_env
+                .as_ref()
+                .map_or_else(String::new, |name| format!(" (or ${name})"))
+        );
+        for file in &integration.files {
+            println!("  file: {}", file.dest.display());
+        }
+        for registration in &integration.registrations {
+            match registration {
+                vvmux_plugin_api::IntegrationRegistration::JsonHook {
+                    file,
+                    event,
+                    command_file,
+                    ..
+                } => println!(
+                    "  registers: {} ({event} -> {})",
+                    file.display(),
+                    command_file.display()
+                ),
+                vvmux_plugin_api::IntegrationRegistration::TomlFlag {
+                    file, section, key, ..
+                } => println!("  registers: {} ([{section}] {key})", file.display()),
+            }
+        }
+    }
+    if !loaded.manifest.integrations.is_empty() {
+        println!(
+            "warning: this plugin writes integration files into agent config directories under your home directory"
+        );
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -3730,7 +3883,7 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-fn current_platform() -> &'static str {
+pub(crate) fn current_platform() -> &'static str {
     if cfg!(target_os = "macos") {
         "macos"
     } else if cfg!(windows) {
@@ -3756,7 +3909,7 @@ fn hex(bytes: &[u8]) -> String {
     result
 }
 
-fn invalid(message: impl Into<String>) -> io::Error {
+pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
@@ -3879,62 +4032,65 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
         );
     }
 
+    /// With no packages installed there are no agents, and that has to be an empty catalog
+    /// rather than an error: a fresh vvmux ships no providers at all now.
     #[test]
-    fn bundled_agent_defaults_and_global_id_conflicts_are_enforced() {
-        let defaults = Registry::default();
-        let candidate = registry_candidate(&defaults).unwrap();
-        let descriptions = candidate.agent_catalog.describe();
-        assert_eq!(
-            descriptions
-                .iter()
-                .map(|agent| agent["id"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["claude", "codex"]
-        );
+    fn a_registry_with_no_packages_compiles_an_empty_agent_catalog() {
+        let candidate = registry_candidate(&Registry::default()).unwrap();
+        assert!(candidate.agent_catalog.describe().is_empty());
+        assert!(candidate.plugins.is_empty());
+        assert!(crate::agent::AgentCatalog::compile(Vec::new()).is_ok());
+    }
 
+    /// Agent IDs are global, so two installed providers claiming `codex` is a registry-level
+    /// conflict rather than a last-one-wins race.
+    #[test]
+    fn two_packages_may_not_claim_the_same_agent_id() {
         let directory = tempfile::tempdir().unwrap();
-        let package = directory.path().join("custom");
-        write_agent_package(&package, "com.example.codex", "codex");
         let mut registry = Registry::default();
-        registry.plugins.insert(
-            "com.example.codex".into(),
-            RegistryEntry {
-                id: "com.example.codex".into(),
-                version: "1.0.0".into(),
-                root: package.clone(),
-                source: package.display().to_string(),
-                commit: None,
-                digest: digest_tree(&package, true).unwrap(),
-                manifest_digest: digest_file(&package.join("vvmux-plugin.toml")).unwrap(),
-                enabled: true,
-                linked: true,
-                runtime_tier: "declarative".into(),
-                permissions: Vec::new(),
-            },
-        );
+        for id in ["com.example.codex", "com.other.codex"] {
+            let package = directory.path().join(id);
+            write_agent_package(&package, id, "codex");
+            registry.plugins.insert(
+                id.into(),
+                RegistryEntry {
+                    id: id.into(),
+                    version: "1.0.0".into(),
+                    root: package.clone(),
+                    source: package.display().to_string(),
+                    commit: None,
+                    digest: digest_tree(&package, true).unwrap(),
+                    manifest_digest: digest_file(&package.join("vvmux-plugin.toml")).unwrap(),
+                    enabled: true,
+                    linked: true,
+                    runtime_tier: "workflow".into(),
+                    permissions: Vec::new(),
+                },
+            );
+        }
         assert!(
             registry_candidate(&registry)
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate")
         );
-        registry
-            .builtin_enabled
-            .insert("dev.vivido.agent.codex".into(), false);
-        let candidate = registry_candidate(&registry).unwrap();
+        registry.plugins.get_mut("com.other.codex").unwrap().enabled = false;
         assert_eq!(
-            candidate
+            registry_candidate(&registry)
+                .unwrap()
                 .agent_catalog
                 .describe()
-                .iter()
-                .find(|agent| agent["id"] == "codex")
-                .unwrap()["provider"],
-            "com.example.codex"
+                .len(),
+            1
         );
     }
 
+    /// A registry written by a build that still tracked bundled providers must keep loading.
+    ///
+    /// The struct is `deny_unknown_fields`, so the retired key stays declared; it is never written
+    /// back, which is how it disappears on the next commit.
     #[test]
-    fn schema_one_registry_loads_as_schema_two_with_builtin_defaults() {
+    fn a_registry_holding_the_retired_builtin_key_still_loads_and_stops_writing_it() {
         let directory = tempfile::tempdir().unwrap();
         let paths = PluginPaths {
             root: directory.path().into(),
@@ -3944,55 +4100,124 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
         };
         fs::write(
             &paths.registry,
-            br#"{"schema":1,"generation":7,"plugins":{}}"#,
+            br#"{"schema":1,"generation":7,"plugins":{},"builtin_enabled":{"dev.vivido.agent.claude":false}}"#,
         )
         .unwrap();
-        let registry = load_registry(&paths).unwrap();
+        let mut registry = load_registry(&paths).unwrap();
         assert_eq!(registry.schema, 2);
-        assert!(registry.builtin_enabled.is_empty());
+        assert_eq!(registry.builtin_enabled.len(), 1);
+        assert!(registry_candidate(&registry).unwrap().plugins.is_empty());
+
+        save_registry(&paths, &mut registry).unwrap();
+        let written = fs::read_to_string(&paths.registry).unwrap();
+        assert!(!written.contains("builtin_enabled"));
+        assert!(load_registry(&paths).unwrap().builtin_enabled.is_empty());
+
+        // And a registry that never had the key loads exactly the same way.
+        fs::write(
+            &paths.registry,
+            br#"{"schema":1,"generation":1,"plugins":{}}"#,
+        )
+        .unwrap();
+        assert!(load_registry(&paths).unwrap().builtin_enabled.is_empty());
+    }
+
+    /// One table, because the whole point of the resolver is that a user can predict what a
+    /// short name will clone before they run it.
+    #[test]
+    fn install_sources_resolve_by_shape_and_refuse_everything_ambiguous() {
+        for (input, expected) in [
+            (
+                "hermes",
+                ResolvedSource::Git("https://github.com/vivido-dev/hermes".into()),
+            ),
+            (
+                "someguy/hermes-dashboard",
+                ResolvedSource::Git("https://github.com/someguy/hermes-dashboard".into()),
+            ),
+            (
+                "https://example.invalid/x.git",
+                ResolvedSource::Git("https://example.invalid/x.git".into()),
+            ),
+            ("./local", ResolvedSource::Local("./local".into())),
+            ("../local", ResolvedSource::Local("../local".into())),
+            ("/abs/local", ResolvedSource::Local("/abs/local".into())),
+        ] {
+            assert_eq!(resolve_source(input).unwrap(), expected, "{input}");
+        }
+        #[cfg(windows)]
         assert_eq!(
-            registry_candidate(&registry)
-                .unwrap()
-                .agent_catalog
-                .describe()
-                .len(),
-            2
+            resolve_source(r"C:\packages\hermes").unwrap(),
+            ResolvedSource::Local(r"C:\packages\hermes".into())
         );
+        for refused in [
+            "",
+            "a/b/c",
+            "git@github.com:owner/repo.git",
+            "http://example.invalid/x",
+            "ssh://example.invalid/x",
+            ".",
+            "..",
+            "own er/repo",
+            "owner/re;po",
+        ] {
+            assert!(resolve_source(refused).is_err(), "{refused} should refuse");
+        }
+    }
+
+    /// A first-party ID is an identity, not a name: only the first-party organization, or a
+    /// working copy the user pointed at themselves, may publish one.
+    #[test]
+    fn reserved_ids_are_bound_to_the_first_party_organization() {
+        for (id, source, linked, allowed) in [
+            (
+                "dev.vivido.agent.hermes",
+                "https://github.com/vivido-dev/hermes",
+                false,
+                true,
+            ),
+            (
+                "dev.vivido.agent.hermes",
+                "https://github.com/someguy/hermes",
+                false,
+                false,
+            ),
+            ("dev.vivido.agent.hermes", "/home/user/hermes", false, false),
+            ("dev.vivido.agent.hermes", "/home/user/hermes", true, true),
+            // A prefix that merely starts the same way is not the reserved namespace.
+            (
+                "dev.vividoworks.thing",
+                "https://github.com/x/y",
+                false,
+                true,
+            ),
+            ("dev.base", "/home/user/base", false, true),
+        ] {
+            assert_eq!(
+                ensure_reserved_id_policy(id, source, linked).is_ok(),
+                allowed,
+                "{id} from {source} (linked={linked})"
+            );
+        }
     }
 
     #[test]
-    fn bundled_provider_enablement_persists_through_the_existing_plugin_commands() {
+    fn a_package_may_require_a_newer_vvmux_than_this_one() {
         let directory = tempfile::tempdir().unwrap();
-        let paths = PluginPaths {
-            root: directory.path().into(),
-            registry: directory.path().join("registry.json"),
-            packages: directory.path().join("packages"),
-            lock: directory.path().join("vvmux-plugin.lock"),
-        };
-        set_enabled(&paths, "dev.vivido.agent.claude", false).unwrap();
-        let disabled = load_registry(&paths).unwrap();
-        assert_eq!(
-            disabled.builtin_enabled.get("dev.vivido.agent.claude"),
-            Some(&false)
-        );
-        assert!(
-            registry_candidate(&disabled)
-                .unwrap()
-                .agent_catalog
-                .describe()
-                .iter()
-                .all(|agent| agent["id"] != "claude")
-        );
+        let package = directory.path().join("future");
+        write_test_package(&package);
+        let manifest = fs::read_to_string(package.join("vvmux-plugin.toml"))
+            .unwrap()
+            .replace(
+                r#"min_vvmux_version = "0.4.0""#,
+                r#"min_vvmux_version = "99.0.0""#,
+            );
+        fs::write(package.join("vvmux-plugin.toml"), manifest).unwrap();
+        let error = ensure_supported_version(&load_package(&package).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("99.0.0"), "{error}");
 
-        set_enabled(&paths, "dev.vivido.agent.claude", true).unwrap();
-        assert!(
-            registry_candidate(&load_registry(&paths).unwrap())
-                .unwrap()
-                .agent_catalog
-                .describe()
-                .iter()
-                .any(|agent| agent["id"] == "claude")
-        );
+        write_test_package(&package);
+        ensure_supported_version(&load_package(&package).unwrap()).unwrap();
     }
 
     #[test]

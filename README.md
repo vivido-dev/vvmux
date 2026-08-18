@@ -90,8 +90,8 @@ session-inspect
 list-tabs
 select-tab --tab-id ID [--wait outer|rendered] [--timeout DURATION]
 diagnose [--pane-id ID|--all-panes] [--trace-limit N]
-report-agent --agent claude|codex|opencode|hermes --state idle|working|blocked --source ID --sequence N [--message TEXT] [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
-report-agent-session --agent claude|codex|hermes --source ID --sequence N [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
+report-agent --agent AGENT --state idle|working|blocked --source ID --sequence N [--message TEXT] [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
+report-agent-session --agent AGENT --source ID --sequence N [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
 report-metadata --source ID --sequence N [--token NAME=VALUE]... [--ttl-ms MS] [--display-agent TEXT] [--state-label STATUS=TEXT]... [--title TEXT] [--pane-id ID]
 clear-agent-report --source ID --sequence N [--pane-id ID]
 snapshot
@@ -220,15 +220,22 @@ labels; an over-limit patch is refused whole rather than applied in part. Becaus
 display-only, they deliberately do not appear in the agent state that `wait` and event subscribers
 observe — a progress counter must not read as a stream of lifecycle transitions.
 
-Agent detection is plugin-provided. vvmux bundles four immutable data-only providers: Claude Code
-and Codex are enabled by default, while OpenCode and Hermes are disabled by default. They use the
-ordinary plugin controls and appear in `vvmux plugin list`:
+Agent detection is plugin-provided, and vvmux ships no providers of its own: a fresh install
+detects nothing until you install the package for the agent you use. The first-party packages are
+one bare name each, resolved to `github.com/vivido-dev/<name>`:
 
 ```sh
+vvmux plugin install claude          # or codex, opencode, hermes
+vvmux plugin list
 vvmux plugin disable dev.vivido.agent.claude
-vvmux plugin enable dev.vivido.agent.opencode
 vvmux plugin inspect dev.vivido.agent.codex
 ```
+
+`vvmux plugin install` takes four forms: a bare name (first-party), `owner/name` (anyone else's
+GitHub repository), a full `https://` URL, and a local path — which must be absolute or start with
+`./` or `../`, so a name is never ambiguous with a directory. A package's `[[dependencies]]` are
+cloned and installed with it. Plugin IDs beginning `dev.vivido.` may only be installed from
+`https://github.com/vivido-dev/`, or linked from a local working copy with `vvmux plugin link`.
 
 Third-party plugins use `manifest_version = 2` and may declare one or more passive agents without
 an executable runtime or permissions. Executable names are normalized and matched exactly;
@@ -388,8 +395,9 @@ stopping a session does not lose the last few seconds of shape.
 #### Resuming agents
 
 An agent pane restores as a plain shell, and then reopens the conversation it had. If the agent's
-integration reported a session identity (`report-agent --agent-session-id`, which the bundled
-integrations do), vvmux types that agent's own resume command at the restored pane's shell:
+integration reported a session identity (`report-agent --agent-session-id`, which the first-party
+provider packages' integrations do), vvmux types that agent's own resume command at the restored
+pane's shell:
 
 | Agent | Command |
 |---|---|
@@ -544,35 +552,48 @@ is visible rather than hidden; `decision` says which one won. A pane with no det
 agent returns `agent_not_detected` rather than an empty result.
 
 Rules run by descending priority and support `idle`, `working`, `blocked`, and state-preserving
-`unknown`, the screen/OSC regions used by the bundled providers, and nested `contains`, `regex`,
+`unknown`, the screen/OSC regions used by the first-party providers, and nested `contains`, `regex`,
 `line_regex`, `all`, `any`, and `not` gates. Agent IDs are globally unique among enabled plugins;
 disable the current provider before enabling a replacement with the same ID. Manifests are bounded
 to 16 agents and 64 rules per agent, and the live catalog is bounded to 64 agents.
 
-Managed integrations can report native session identity, while OpenCode additionally reports its
-full lifecycle state:
+### Lifecycle integrations
+
+Screen rules classify what a pane looks like. An agent's own lifecycle hook is what reports native
+session identity — the thing a resume is rebuilt from — and, for OpenCode, its full lifecycle
+state. Those hooks are declared by the provider package and installed with it:
 
 ```sh
-vvmux integration install opencode
-vvmux integration install claude
-vvmux integration install codex
-vvmux integration install hermes
-vvmux integration status
-vvmux integration uninstall opencode
+vvmux plugin install opencode        # installs the package and its integration
+vvmux plugin integrate dev.vivido.agent.opencode   # re-run or repair
+vvmux plugin list                    # shows each integration and whether it is current
+vvmux plugin uninstall dev.vivido.agent.opencode   # removes hooks, then the package
 ```
 
-The installer refuses to replace or remove files without a vvmux ownership/version marker and
-enables the matching bundled provider. Claude uses `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex uses
-`CODEX_HOME` or `~/.codex`, and Hermes uses `HERMES_HOME` or `~/.hermes`; each directory must
-already exist. Claude and Codex shell hooks require `python3`. Claude's `settings.json` is parsed
-and rewritten as JSON, so comments are not retained; an unparsable file is refused unchanged.
-Codex keeps `[features] hooks = true` after uninstall, matching Codex's global feature semantics.
-Hermes plugin files are installed safely, but its YAML is not edited without a YAML dependency:
-the command prints the exact `plugins.enabled` stanza that must be added manually. Uninstalling an
-adapter leaves the bundled provider's chosen enable state unchanged. OpenCode uses its JavaScript
-plugin and reports lifecycle plus native session identity; Claude installs settings-driven start
-and stop hooks; Codex installs a shell hook; Hermes installs Python plugin files but requires the
-printed manual YAML enablement step.
+An integration is manifest data, not vvmux code: `[[integrations]]` names the agent's config
+directory, the files to place in it, and the registrations that make the agent run them. A package
+declaring one must hold the `integration.write` permission, which appears in the install preview
+and forces fresh confirmation if an update adds it. See `official-plugins/README.md` for the
+authoring contract.
+
+What the engine guarantees:
+
+- Every managed file carries `VVMUX_INTEGRATION_ID` and `VVMUX_INTEGRATION_VERSION` in its first
+  lines, and a file without the matching id is never replaced or removed — so a hook you wrote
+  yourself is safe, and is reported rather than clobbered.
+- A missing agent config directory is a skip with a hint, not a failure; create it (or set the
+  agent's own override) and run `vvmux plugin integrate`. Claude uses `CLAUDE_CONFIG_DIR` or
+  `~/.claude`, Codex `CODEX_HOME` or `~/.codex`, Hermes `HERMES_HOME` or `~/.hermes`, and OpenCode
+  `~/.config/opencode`.
+- JSON edits preserve every foreign hook; an unparsable config file refuses the whole install
+  unchanged. Claude's `settings.json` is reparsed and rewritten as JSON, so comments are not
+  retained.
+- Codex keeps `[features] hooks = true` after uninstall, matching Codex's global feature semantics.
+- Hermes plugin files install safely, but its YAML is not edited: the install prints the exact
+  `plugins.enabled` stanza to add by hand.
+- Claude and Codex shell hooks require `python3`.
+- An integration failure never fails the package install, and a hand-edited file never blocks an
+  uninstall.
 
 ## Startup layouts
 

@@ -56,8 +56,9 @@ Use this release-matched workflow:
 
 15. After a restart, an agent pane reopens its own conversation when a client attaches — check
    `inspect`'s `pending_resume` before concluding a pane is a bare shell, and do not launch a second
-   agent into it. A resume needs the agent's integration installed (`vvmux integration install`),
-   because the session identity it uses comes from that integration and only from it.
+   agent into it. A resume needs the agent's provider plugin installed with its integration
+   (`vvmux plugin install claude`), because the session identity it uses comes from that
+   integration and only from it.
 
 Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
 needed. It proves the bytes reached the PTY writer, not that the child application consumed them.
@@ -77,6 +78,15 @@ surface a human or script uses:
 ```sh
 vvmux plugin invoke PLUGIN_ID/ACTION --target SESSION --input @input.json
 ```
+
+Installing is name-based: `vvmux plugin install NAME` resolves a bare name to the first-party
+`github.com/vivido-dev` organization and `OWNER/NAME` to that GitHub repository; a full `https://`
+URL and a local path (absolute, or `./`-prefixed) also work, and declared dependencies install with
+it. Never install a plugin on the user's behalf without asking — it is code and, if the package
+declares `integration.write`, it also writes hook files into the user's agent config directories.
+Agent providers and their lifecycle integrations are ordinary packages: a session with no provider
+installed detects no agents, which is a missing package rather than a fault. `vvmux plugin list`
+shows each integration's status; `vvmux plugin integrate PLUGIN_ID` repairs one.
 
 Manifest-declared native PTY panes are separate from actions. Inspect the package declaration and
 open an exact pane entrypoint only in the intended live session:

@@ -15,8 +15,10 @@ HerdR is licensed under Apache License 2.0. The adapted implementation uses vvmu
 session actor, terminal emulator, IPC, and rendering abstractions rather than retaining HerdR's
 UI or server architecture.
 
-The adapted first-party rules are now shipped as the four data-only plugin manifests under
-`builtin-plugins/`; user agent providers use the same public manifest schema.
+The adapted first-party rules ship as installable plugin packages under the repository's
+`official-plugins/` directory, not inside this binary; user agent providers use the same public
+manifest schema. Those packages also carry the lifecycle hook assets, whose provenance is recorded
+in `official-plugins/PROVENANCE.md`.
 
 ## Per-feature adaptations
 
@@ -84,13 +86,3 @@ Later features adapted from the same HerdR commit, recorded as they land:
   it additionally encodes synthetic coordinates in pixels when the application enabled DEC 1016
   and freezes each admitted snapshot rather than sharing mutable harvest state across concurrent
   reads.
-- **Lifecycle hook assets** (`integration/claude_hook.py`, `integration/claude_settings.json`,
-  `integration/codex.sh`, `integration/hermes_plugin.py`, and
-  `integration/hermes_plugin.yaml`) — each asset preserves its HerdR copyright notice. The stdin
-  JSON transport, subagent exclusion, Codex inherited-session check, Hermes interactive-platform
-  filter, and bounded best-effort subprocess calls are adapted from
-  `src/integration/assets/{claude,codex,hermes}`. vvmux routes them through its owner-only
-  `msg report-agent-session` method instead of HerdR's socket protocol. Its installer uses a
-  strict JSON editor for Claude settings, which deliberately drops JSONC comments rather than
-  attempting a lossy comment-preserving rewrite, and leaves Hermes YAML enablement manual when no
-  YAML dependency is available.

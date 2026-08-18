@@ -612,3 +612,39 @@ pub fn vvmux_command(runtime: &std::path::Path) -> std::process::Command {
     command.env("HOME", runtime);
     command
 }
+
+/// Install the fixture agent providers into an isolated config directory.
+///
+/// vvmux ships no agent providers of its own any more — they are ordinary installed packages —
+/// so a test that reports or detects an agent has to install one first. These fixtures are copies
+/// of the first-party packages with `com.example.` IDs, which is what keeps a local install from
+/// hitting the reserved-ID policy.
+#[allow(dead_code)]
+pub fn install_agent_providers(runtime: &std::path::Path, providers: &[&str]) {
+    // These tests point `XDG_RUNTIME_DIR` and `XDG_CONFIG_HOME` at one directory, so installing
+    // before any session exists is what first creates `<runtime>/vvmux`. It has to be owner-only
+    // from the start, or the reload that follows the install refuses to scan it.
+    let directory = runtime.join("vvmux");
+    std::fs::create_dir_all(&directory).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for provider in providers {
+        let package = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/agent-providers")
+            .join(provider);
+        let output = vvmux_command(runtime)
+            .args(["plugin", "install"])
+            .arg(&package)
+            .arg("--yes")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "installing the {provider} provider failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

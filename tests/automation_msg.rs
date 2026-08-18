@@ -34,6 +34,7 @@ fn pane_automation_drives_and_observes_only_the_selected_pane() {
         .unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let runtime = directory.path().to_path_buf();
+    common::install_agent_providers(&runtime, &["codex"]);
     let shell = directory.path().join("fixture-shell");
     fs::write(
         &shell,
@@ -245,7 +246,7 @@ done
     assert_eq!(reported["pane_id"], 2);
     assert_eq!(reported["agent"]["kind"], "codex");
     assert_eq!(reported["agent"]["label"], "Codex");
-    assert_eq!(reported["agent"]["provider"], "dev.vivido.agent.codex");
+    assert_eq!(reported["agent"]["provider"], "com.example.agent.codex");
     assert_eq!(reported["agent"]["state"], "working");
     assert_eq!(reported["agent"]["status"], "working");
     assert_eq!(reported["agent"]["source"], "report");
@@ -1146,7 +1147,7 @@ done
 /// The rest of the agent coverage drives state through `report-agent`, which bypasses process
 /// discovery and manifest evaluation entirely. This exercises the path an unhooked agent actually
 /// takes — foreground process → catalog identity → screen rule → published transition — by running
-/// an executable literally named `codex`, which is how the bundled provider identifies it.
+/// an executable literally named `codex`, which is how the codex provider identifies it.
 #[test]
 fn a_detected_agent_reaches_blocked_from_its_screen_alone() {
     let directory = tempfile::Builder::new()
@@ -1155,6 +1156,7 @@ fn a_detected_agent_reaches_blocked_from_its_screen_alone() {
         .unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let runtime = directory.path().to_path_buf();
+    common::install_agent_providers(&runtime, &["codex"]);
 
     // A real shell, unlike the scripted fixture the other test uses: `msg run` hands its command
     // to the shell with `-c`, and this test needs that `exec` to actually happen.
@@ -1361,6 +1363,7 @@ fn agent_start_launches_into_a_shell_pane_and_refuses_everything_else() {
         .unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let runtime = directory.path().to_path_buf();
+    common::install_agent_providers(&runtime, &["codex"]);
 
     // `agent-start` types a bare command name and lets the shell resolve it, so the fixture has to
     // be reachable through PATH rather than by path — which is also what proves the launch really
@@ -1490,6 +1493,7 @@ fn agent_start_refuses_a_pane_whose_foreground_is_not_its_shell() {
         .unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let runtime = directory.path().to_path_buf();
+    common::install_agent_providers(&runtime, &["codex"]);
 
     let config = directory.path().join("vvmux.toml");
     fs::write(
@@ -1543,6 +1547,7 @@ fn an_agent_alias_targets_its_pane_and_belongs_to_the_agent_that_earned_it() {
         .unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let runtime = directory.path().to_path_buf();
+    common::install_agent_providers(&runtime, &["claude", "codex"]);
     let shell = directory.path().join("fixture-shell");
     fs::write(
         &shell,

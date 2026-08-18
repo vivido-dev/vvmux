@@ -252,12 +252,26 @@ typed `SessionCommand`/`CallerContext` authorization before serving `session.ins
 `pane.get_text`, or `pane.input`. Native code remains trusted because it can bypass this broker as
 the same OS user.
 
-The same validated registry snapshot compiles a bounded agent catalog from bundled and installed
-manifest-version-2 providers. The supervisor publishes the immutable catalog and its generation to
-the actor, which shares it with the process detector and uses it for screen/OSC evaluation. Catalog
-replacement invalidates process caches and clears only reports whose provider identity or manifest
-fingerprint disappeared. Claude and Codex are default-enabled bundled data providers; OpenCode and
-Hermes default off. The global plugin kill switch also removes this catalog.
+The same validated registry snapshot compiles a bounded agent catalog from installed
+manifest-version-2 providers. vvmux embeds none of its own: an empty registry compiles an empty
+catalog, and every provider — including the first-party ones — is an ordinary installed package.
+The supervisor publishes the immutable catalog and its generation to the actor, which shares it
+with the process detector and uses it for screen/OSC evaluation. Catalog replacement invalidates
+process caches and clears only reports whose provider identity or manifest fingerprint
+disappeared. The global plugin kill switch also removes this catalog.
+
+Agent lifecycle adapters are the same data. A manifest's `[[integrations]]` declares an agent's
+config directory (with the environment override the agent itself honors), the files to place
+there, and the registrations — a JSON hook merge or a TOML boolean flag — that make the agent run
+them. One generic engine performs exactly those edits, and it runs in the CLI process only: it
+writes into `$HOME` behind the ordinary install approval, and the session actor has no part in it
+and gains no capability for it. Ownership is two markers in each managed file's first lines, so a
+path holding anything else is refused rather than replaced, writes are atomic replaces of
+owner-only temporaries, and each JSON file is rewritten once with foreign entries preserved. An
+absent config directory is a skip; an adapter failure is reported and never rolls back a package
+commit, and a foreign file never blocks a package removal. The `integration.write` permission
+gates the whole table and flows through the existing approval delta, so a package that gains an
+adapter in an update has to be confirmed again.
 
 Manifest PTY panes are resolved by the supervisor, then lowered as exact-argv `pane.create` commands
 through the same actor service. The actor attaches complete session/plugin-instance/package

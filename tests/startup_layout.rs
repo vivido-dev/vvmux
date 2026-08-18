@@ -55,6 +55,15 @@ while IFS= read -r line; do :; done
         }
     }
 
+    /// vvmux ships no agent providers of its own, so a test that reports or resumes an agent has
+    /// to install one first. The catalog still reaches the session by registry event, which is why
+    /// `msg_when_agents_ready` stays.
+    fn with_agents(label: &str) -> Self {
+        let fixture = Self::new(label);
+        common::install_agent_providers(fixture.runtime.path(), &["codex"]);
+        fixture
+    }
+
     fn write_layout(&self, name: &str, source: &str) -> PathBuf {
         let path = self.runtime.path().join(name);
         fs::write(&path, source).unwrap();
@@ -1082,7 +1091,7 @@ fn text(output: Output) -> String {
 /// is looking.
 #[test]
 fn a_restored_agent_pane_resumes_its_conversation_when_a_client_attaches() {
-    let fixture = Fixture::new("resume");
+    let fixture = Fixture::with_agents("resume");
     fixture.use_executing_shell();
     // An executable named `codex` that records how it was invoked, then holds the pane while
     // painting a marker the codex rules classify. It forks nothing: a fixture that spawned a child
@@ -1159,7 +1168,7 @@ fn a_restored_agent_pane_resumes_its_conversation_when_a_client_attaches() {
 /// Anything else restores as the plain shell it already is.
 #[test]
 fn a_session_reported_by_a_foreign_source_is_not_resumed() {
-    let fixture = Fixture::new("foreign");
+    let fixture = Fixture::with_agents("foreign");
     assert_success(&fixture.start_without_layout());
     fixture.wait_text(1, "READY pane=1");
     assert_success(&fixture.msg_when_agents_ready(&[
@@ -1192,7 +1201,7 @@ fn a_session_reported_by_a_foreign_source_is_not_resumed() {
 /// Opting out has to mean no agent processes are started, whatever the snapshot says.
 #[test]
 fn resume_can_be_turned_off() {
-    let fixture = Fixture::new("noresume");
+    let fixture = Fixture::with_agents("noresume");
     fixture.append_config("[session]\nresume_agents = false");
     assert_success(&fixture.start_without_layout());
     fixture.wait_text(1, "READY pane=1");
@@ -1226,7 +1235,7 @@ fn resume_can_be_turned_off() {
 /// while a pane beside it, with no agent, still does.
 #[test]
 fn a_resuming_pane_gets_no_history_replay_but_its_neighbour_does() {
-    let fixture = Fixture::new("resumehist");
+    let fixture = Fixture::with_agents("resumehist");
     fixture.use_executing_shell();
     fixture.enable_pane_history();
     let bin = fixture.runtime.path().join("bin");

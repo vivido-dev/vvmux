@@ -2264,22 +2264,25 @@ mod tests {
     use super::*;
 
     fn catalog() -> AgentCatalog {
+        // Fixture copies of the first-party provider packages, inside this crate: the packages
+        // themselves live in a sibling directory that becomes its own repository, and an
+        // `include_str!` reaching across that boundary would stop compiling the day it does.
         let manifests = [
             (
-                "dev.vivido.agent.claude",
-                include_str!("../builtin-plugins/agent-claude/vvmux-plugin.toml"),
+                "com.example.agent.claude",
+                include_str!("../tests/fixtures/agent-providers/claude/vvmux-plugin.toml"),
             ),
             (
-                "dev.vivido.agent.codex",
-                include_str!("../builtin-plugins/agent-codex/vvmux-plugin.toml"),
+                "com.example.agent.codex",
+                include_str!("../tests/fixtures/agent-providers/codex/vvmux-plugin.toml"),
             ),
             (
-                "dev.vivido.agent.opencode",
-                include_str!("../builtin-plugins/agent-opencode/vvmux-plugin.toml"),
+                "com.example.agent.opencode",
+                include_str!("../tests/fixtures/agent-providers/opencode/vvmux-plugin.toml"),
             ),
             (
-                "dev.vivido.agent.hermes",
-                include_str!("../builtin-plugins/agent-hermes/vvmux-plugin.toml"),
+                "com.example.agent.hermes",
+                include_str!("../tests/fixtures/agent-providers/hermes/vvmux-plugin.toml"),
             ),
         ];
         AgentCatalog::compile(

@@ -142,7 +142,8 @@ resume_agents = true
 
 [plugins]
 # Live global kill switch. Disabling stops runtimes and the registry watcher for this session.
-# It also disables bundled and installed agent detection. Toggle individual bundled providers with
+# It also disables agent detection, which is supplied entirely by installed provider plugins.
+# Install one with `vvmux plugin install claude`, and toggle it with
 # `vvmux plugin enable|disable dev.vivido.agent.NAME`.
 enabled = true
 

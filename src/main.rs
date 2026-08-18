@@ -9,7 +9,6 @@ mod config;
 mod config_watch;
 #[cfg(feature = "server-capability")]
 mod gateway;
-mod integration;
 mod ipc;
 mod layout;
 mod layout_file;
@@ -20,6 +19,7 @@ mod notify;
 mod platform;
 mod plugin;
 mod plugin_component;
+mod plugin_integration;
 mod plugin_supervisor;
 mod region;
 mod runtime;
@@ -120,11 +120,6 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         command: plugin::PluginCommand,
-    },
-    /// Manage optional AI-agent lifecycle integrations.
-    Integration {
-        #[command(subcommand)]
-        command: integration::IntegrationCommand,
     },
     /// Run the authenticated loopback VVWS/1 session gateway, or connect mode
     /// (`--connect`) which opens no listener and serves through a VVTUN/1 tunnel.
@@ -293,7 +288,6 @@ fn run(cli: Cli) -> io::Result<()> {
             command,
         }) => automation::run(target.as_deref(), alias, *command),
         Some(Command::Plugin { command }) => plugin::run(command),
-        Some(Command::Integration { command }) => integration::run(command),
         #[cfg(feature = "server-capability")]
         Some(Command::Serve {
             listen,

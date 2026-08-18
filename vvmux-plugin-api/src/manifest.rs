@@ -20,6 +20,15 @@ pub const MAX_AGENT_ARGV_MARKERS: usize = 16;
 pub const MAX_AGENT_RULES: usize = 64;
 pub const MAX_AGENT_GATE_DEPTH: usize = 8;
 pub const MAX_AGENT_MATCHER_BYTES: usize = 4 * 1024;
+pub const MAX_INTEGRATIONS_PER_PLUGIN: usize = 4;
+pub const MAX_INTEGRATION_FILES: usize = 8;
+pub const MAX_INTEGRATION_REGISTRATIONS: usize = 8;
+pub const MAX_INTEGRATION_FILE_BYTES: u64 = 1024 * 1024;
+/// Segments allowed in a home-relative `config_dir` or a config-relative `dest`.
+pub const MAX_INTEGRATION_PATH_SEGMENTS: usize = 4;
+pub const MAX_INTEGRATION_NOTICE_BYTES: usize = 512;
+pub const MAX_INTEGRATION_ARGS: usize = 8;
+pub const MAX_INTEGRATION_ARG_BYTES: usize = 128;
 
 #[derive(Debug)]
 pub enum ManifestError {
@@ -75,6 +84,8 @@ pub struct Manifest {
     pub workflows: Vec<Workflow>,
     #[serde(default)]
     pub agents: Vec<Agent>,
+    #[serde(default)]
+    pub integrations: Vec<Integration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -117,6 +128,13 @@ pub enum Permission {
     ClipboardWrite,
     #[serde(rename = "media.produce")]
     MediaProduce,
+    /// Write this plugin's declared lifecycle-adapter files into an agent's own config directory.
+    ///
+    /// Last in declaration order so the derived `Ord` keeps it last wherever permissions are
+    /// listed, and deliberately absent from the session broker's enforceable set: it is an
+    /// install-time authority over `$HOME`, not something a running plugin can exercise.
+    #[serde(rename = "integration.write")]
+    IntegrationWrite,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -235,6 +253,77 @@ pub struct Dependency {
     pub id: String,
     pub version: VersionReq,
     pub source: String,
+}
+
+/// A lifecycle adapter this plugin installs into an agent's own configuration directory.
+///
+/// Declarative rather than code: the vvmux side is one generic engine, so a provider package adds
+/// support for a new agent by describing where its files go and how that agent's configuration
+/// registers them, without a vvmux release.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Integration {
+    /// Ownership marker written into every managed file as `VVMUX_INTEGRATION_ID=<id>`.
+    ///
+    /// One id owns one config directory: the engine refuses to replace or remove a file whose
+    /// first lines do not carry this marker, which is what keeps a hand-written hook of the user's
+    /// own safe from an install.
+    pub id: String,
+    /// Bumped whenever the managed files change, and matched against
+    /// `VVMUX_INTEGRATION_VERSION=<version>` to report an installed adapter as outdated.
+    pub version: u32,
+    /// Home-relative directory the agent reads its own configuration from.
+    pub config_dir: PathBuf,
+    /// Environment variable that relocates `config_dir` when the user has set one.
+    #[serde(default)]
+    pub config_dir_env: Option<String>,
+    /// Printed after a successful install, for an agent whose enablement vvmux cannot perform.
+    #[serde(default)]
+    pub notice: Option<String>,
+    #[serde(default)]
+    pub files: Vec<IntegrationFile>,
+    #[serde(default)]
+    pub registrations: Vec<IntegrationRegistration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationFile {
+    /// Package-relative file to copy.
+    pub source: PathBuf,
+    /// Destination relative to the resolved config directory.
+    pub dest: PathBuf,
+    /// Platforms this file belongs on; empty means every platform.
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    #[serde(default)]
+    pub executable: bool,
+}
+
+/// One edit to an agent's own configuration file that makes a managed file take effect.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum IntegrationRegistration {
+    /// Merge a command hook into a JSON configuration file, preserving every foreign entry.
+    JsonHook {
+        /// Config-relative JSON file to edit.
+        file: PathBuf,
+        event: String,
+        #[serde(default)]
+        matcher: Option<String>,
+        /// The `dest` of a declared file, run as the hook command.
+        command_file: PathBuf,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    /// Set one boolean key in a TOML table, leaving every other line untouched.
+    TomlFlag {
+        /// Config-relative TOML file to edit.
+        file: PathBuf,
+        section: String,
+        key: String,
+        value: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -452,6 +541,24 @@ impl LoadedManifest {
                 ));
             }
         }
+        // Integration payloads are read straight out of the package and written into the user's
+        // home directory, so they get the same symlink/escape guard and a size bound before the
+        // engine ever opens one.
+        for file in manifest
+            .integrations
+            .iter()
+            .flat_map(|integration| &integration.files)
+        {
+            validate_relative_path(&file.source, "integration file source")?;
+            let resolved = root.join(&file.source);
+            ensure_package_file(root, &resolved, &file.source)?;
+            if fs::metadata(&resolved)?.len() > MAX_INTEGRATION_FILE_BYTES {
+                return Err(ManifestError::Invalid(format!(
+                    "integration file `{}` exceeds 1 MiB",
+                    file.source.display()
+                )));
+            }
+        }
 
         let mut schemas = BTreeMap::new();
         for path in manifest
@@ -552,6 +659,9 @@ impl Manifest {
         if self.manifest_version == 1 && !self.agents.is_empty() {
             return invalid("agent definitions require manifest_version = 2");
         }
+        if self.manifest_version == 1 && !self.integrations.is_empty() {
+            return invalid("integration definitions require manifest_version = 2");
+        }
         validate_plugin_id(&self.plugin.id)?;
         if self.plugin.name.is_empty() || self.plugin.name.len() > 128 {
             return invalid("plugin name must contain 1 through 128 bytes");
@@ -647,8 +757,199 @@ impl Manifest {
         }
         validate_workflows(&self.workflows, &aliases, &action_ids)?;
         validate_agents(&self.agents)?;
+        validate_integrations(&self.integrations, &self.plugin.permissions)?;
         Ok(())
     }
+}
+
+fn validate_integrations(
+    integrations: &[Integration],
+    permissions: &[Permission],
+) -> Result<(), ManifestError> {
+    if integrations.len() > MAX_INTEGRATIONS_PER_PLUGIN {
+        return invalid(format!(
+            "plugin exceeds {MAX_INTEGRATIONS_PER_PLUGIN} integrations"
+        ));
+    }
+    // The engine writes into the user's own home directory, which no other manifest table does, so
+    // the permission is the thing that puts it in front of the install prompt as an added
+    // permission rather than as an unannounced side effect of a package update.
+    if !integrations.is_empty() && !permissions.contains(&Permission::IntegrationWrite) {
+        return invalid("integrations require the `integration.write` permission");
+    }
+    let mut ids = BTreeSet::new();
+    for integration in integrations {
+        validate_local_id(&integration.id, "integration")?;
+        if !ids.insert(integration.id.as_str()) {
+            return invalid(format!("duplicate integration id `{}`", integration.id));
+        }
+        if integration.version == 0 {
+            return invalid(format!(
+                "integration `{}` version must be at least 1",
+                integration.id
+            ));
+        }
+        validate_integration_path(&integration.config_dir, "config_dir", &integration.id)?;
+        if let Some(name) = &integration.config_dir_env
+            && !valid_environment_name(name)
+        {
+            return invalid(format!(
+                "integration `{}` config_dir_env must be an uppercase environment variable name",
+                integration.id
+            ));
+        }
+        if let Some(notice) = &integration.notice
+            && (notice.is_empty()
+                || notice.len() > MAX_INTEGRATION_NOTICE_BYTES
+                || notice
+                    .chars()
+                    .any(|character| character.is_control() && character != '\n'))
+        {
+            return invalid(format!(
+                "integration `{}` notice must contain 1 through {MAX_INTEGRATION_NOTICE_BYTES} printable bytes",
+                integration.id
+            ));
+        }
+        if integration.files.len() > MAX_INTEGRATION_FILES {
+            return invalid(format!(
+                "integration `{}` exceeds {MAX_INTEGRATION_FILES} files",
+                integration.id
+            ));
+        }
+        let mut destinations = BTreeSet::new();
+        for file in &integration.files {
+            validate_relative_path(&file.source, "integration file source")?;
+            validate_integration_path(&file.dest, "file dest", &integration.id)?;
+            if !destinations.insert(file.dest.as_path()) {
+                return invalid(format!(
+                    "integration `{}` declares `{}` twice",
+                    integration.id,
+                    file.dest.display()
+                ));
+            }
+            validate_platforms(&file.platforms, &integration.id)?;
+        }
+        if integration.registrations.len() > MAX_INTEGRATION_REGISTRATIONS {
+            return invalid(format!(
+                "integration `{}` exceeds {MAX_INTEGRATION_REGISTRATIONS} registrations",
+                integration.id
+            ));
+        }
+        for registration in &integration.registrations {
+            match registration {
+                IntegrationRegistration::JsonHook {
+                    file,
+                    event,
+                    matcher,
+                    command_file,
+                    args,
+                } => {
+                    validate_integration_path(file, "registration file", &integration.id)?;
+                    validate_integration_word(event, "event", &integration.id)?;
+                    if let Some(matcher) = matcher {
+                        validate_integration_short_text(matcher, "matcher", &integration.id)?;
+                    }
+                    // A registration may only name a file this same integration owns: the hook
+                    // command is a path that will be executed, and pointing it at anything else
+                    // would let a manifest register a command it never declared.
+                    if !destinations.contains(command_file.as_path()) {
+                        return invalid(format!(
+                            "integration `{}` registers undeclared command file `{}`",
+                            integration.id,
+                            command_file.display()
+                        ));
+                    }
+                    if args.len() > MAX_INTEGRATION_ARGS {
+                        return invalid(format!(
+                            "integration `{}` registration exceeds {MAX_INTEGRATION_ARGS} arguments",
+                            integration.id
+                        ));
+                    }
+                    for argument in args {
+                        validate_integration_word(argument, "argument", &integration.id)?;
+                    }
+                }
+                IntegrationRegistration::TomlFlag {
+                    file,
+                    section,
+                    key,
+                    value: _,
+                } => {
+                    validate_integration_path(file, "registration file", &integration.id)?;
+                    validate_integration_word(section, "section", &integration.id)?;
+                    validate_integration_word(key, "key", &integration.id)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A bounded, relative, escape-free path with no more than four segments.
+///
+/// Both kinds this checks are resolved against a directory the user owns — `$HOME` for a
+/// `config_dir`, the agent's config directory for a `dest` — so an absolute path or a `..`
+/// component would let a manifest choose a destination outside the tree the install is about.
+fn validate_integration_path(path: &Path, what: &str, id: &str) -> Result<(), ManifestError> {
+    validate_relative_path(path, &format!("integration `{id}` {what}"))?;
+    let segments = path.components().count();
+    if segments == 0 || segments > MAX_INTEGRATION_PATH_SEGMENTS {
+        return invalid(format!(
+            "integration `{id}` {what} must contain 1 through {MAX_INTEGRATION_PATH_SEGMENTS} segments"
+        ));
+    }
+    Ok(())
+}
+
+/// One shell-safe word: a hook argument is appended to a command line unquoted.
+fn validate_integration_word(value: &str, what: &str, id: &str) -> Result<(), ManifestError> {
+    if value.is_empty()
+        || value.len() > MAX_INTEGRATION_ARG_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'='))
+    {
+        return invalid(format!(
+            "integration `{id}` has an invalid {what} `{value}`"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_integration_short_text(value: &str, what: &str, id: &str) -> Result<(), ManifestError> {
+    if value.is_empty()
+        || value.len() > MAX_INTEGRATION_ARG_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return invalid(format!("integration `{id}` has an invalid {what}"));
+    }
+    Ok(())
+}
+
+fn validate_platforms(platforms: &[String], id: &str) -> Result<(), ManifestError> {
+    let mut unique = BTreeSet::new();
+    for platform in platforms {
+        if !matches!(platform.as_str(), "linux" | "macos" | "windows")
+            || !unique.insert(platform.as_str())
+        {
+            return invalid(format!(
+                "integration `{id}` has an invalid platform `{platform}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_environment_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_uppercase() || *byte == b'_')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn validate_agents(agents: &[Agent]) -> Result<(), ManifestError> {
@@ -1283,6 +1584,7 @@ mod tests {
             dependencies: Vec::new(),
             workflows: Vec::new(),
             agents: Vec::new(),
+            integrations: Vec::new(),
         }
     }
 
@@ -1644,5 +1946,321 @@ command = ["python", "dashboard.py"]
         manifest.validate().unwrap();
         assert!(manifest.panes[0].hold_on_exit);
         assert!(!manifest.panes[0].accept_sync_input);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    const HEADER: &str = r#"manifest_version = 2
+[plugin]
+id = "dev.vivido.agent.demo"
+name = "Demo"
+version = "1.0.0"
+min_vvmux_version = "0.4.0"
+description = "d"
+platforms = ["linux", "macos", "windows"]
+permissions = ["integration.write"]
+"#;
+
+    fn parse(body: &str) -> Result<Manifest, ManifestError> {
+        let manifest: Manifest = toml::from_str(&format!("{HEADER}{body}"))?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// The four shapes the first-party provider packages actually declare.
+    ///
+    /// Claude registers one hook per platform because its command differs between a POSIX shell
+    /// script and a PowerShell one; the file each names carries the platform filter that decides
+    /// which of the two is live.
+    #[test]
+    fn accepts_every_first_party_integration_shape() {
+        let claude = parse(
+            r#"
+[[integrations]]
+id = "claude"
+version = 1
+config_dir = ".claude"
+config_dir_env = "CLAUDE_CONFIG_DIR"
+[[integrations.files]]
+source = "integration/claude.sh"
+dest = "hooks/vvmux-agent-state.sh"
+platforms = ["linux", "macos"]
+executable = true
+[[integrations.files]]
+source = "integration/claude.ps1"
+dest = "hooks/vvmux-agent-state.ps1"
+platforms = ["windows"]
+[[integrations.registrations]]
+kind = "json-hook"
+file = "settings.json"
+event = "SessionStart"
+matcher = "*"
+command_file = "hooks/vvmux-agent-state.sh"
+args = ["session"]
+[[integrations.registrations]]
+kind = "json-hook"
+file = "settings.json"
+event = "SessionStart"
+matcher = "*"
+command_file = "hooks/vvmux-agent-state.ps1"
+args = ["session"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(claude.integrations[0].files.len(), 2);
+        assert_eq!(
+            claude.integrations[0].config_dir_env.as_deref(),
+            Some("CLAUDE_CONFIG_DIR")
+        );
+
+        let codex = parse(
+            r#"
+[[integrations]]
+id = "codex"
+version = 1
+config_dir = ".codex"
+config_dir_env = "CODEX_HOME"
+[[integrations.files]]
+source = "integration/codex.sh"
+dest = "vvmux-agent-state.sh"
+executable = true
+[[integrations.registrations]]
+kind = "json-hook"
+file = "hooks.json"
+event = "SessionStart"
+command_file = "vvmux-agent-state.sh"
+args = ["session"]
+[[integrations.registrations]]
+kind = "toml-flag"
+file = "config.toml"
+section = "features"
+key = "hooks"
+value = true
+"#,
+        )
+        .unwrap();
+        assert!(codex.integrations[0].files[0].platforms.is_empty());
+        assert!(matches!(
+            codex.integrations[0].registrations[1],
+            IntegrationRegistration::TomlFlag { value: true, .. }
+        ));
+
+        // No registrations at all: OpenCode discovers plugin files by directory.
+        let opencode = parse(
+            r#"
+[[integrations]]
+id = "opencode"
+version = 2
+config_dir = ".config/opencode"
+[[integrations.files]]
+source = "integration/opencode.js"
+dest = "plugins/vvmux-agent-state.js"
+"#,
+        )
+        .unwrap();
+        assert!(opencode.integrations[0].registrations.is_empty());
+        assert!(opencode.integrations[0].config_dir_env.is_none());
+
+        let hermes = parse(
+            r#"
+[[integrations]]
+id = "hermes"
+version = 1
+config_dir = ".hermes"
+config_dir_env = "HERMES_HOME"
+notice = "manual enable required"
+[[integrations.files]]
+source = "integration/hermes_plugin.yaml"
+dest = "plugins/vvmux-agent-state/plugin.yaml"
+[[integrations.files]]
+source = "integration/hermes_plugin.py"
+dest = "plugins/vvmux-agent-state/__init__.py"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hermes.integrations[0].notice.as_deref(),
+            Some("manual enable required")
+        );
+    }
+
+    const MINIMAL: &str = r#"
+[[integrations]]
+id = "demo"
+version = 1
+config_dir = ".demo"
+[[integrations.files]]
+source = "integration/demo.sh"
+dest = "hooks/demo.sh"
+"#;
+
+    #[test]
+    fn refuses_shapes_that_would_escape_the_declared_package_or_config_directory() {
+        parse(MINIMAL).unwrap();
+
+        // manifest_version 1 predates the table, so an old binary that ignored it would silently
+        // install nothing rather than refusing.
+        let version_one =
+            format!("{HEADER}{MINIMAL}").replace("manifest_version = 2", "manifest_version = 1");
+        let manifest: Manifest = toml::from_str(&version_one).unwrap();
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("manifest_version = 2")
+        );
+
+        let unpermitted = format!("{HEADER}{MINIMAL}")
+            .replace(r#"permissions = ["integration.write"]"#, "permissions = []");
+        let manifest: Manifest = toml::from_str(&unpermitted).unwrap();
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("integration.write")
+        );
+
+        for (bad, expected) in [
+            (
+                MINIMAL.replace(r#"config_dir = ".demo""#, r#"config_dir = "/etc""#),
+                "config_dir",
+            ),
+            (
+                MINIMAL.replace(r#"config_dir = ".demo""#, r#"config_dir = "../demo""#),
+                "config_dir",
+            ),
+            (
+                MINIMAL.replace(r#"config_dir = ".demo""#, r#"config_dir = "a/b/c/d/e""#),
+                "segments",
+            ),
+            (
+                MINIMAL.replace(r#"dest = "hooks/demo.sh""#, r#"dest = "../demo.sh""#),
+                "dest",
+            ),
+            (
+                MINIMAL.replace(
+                    r#"source = "integration/demo.sh""#,
+                    r#"source = "/abs/demo.sh""#,
+                ),
+                "source",
+            ),
+            (format!("{MINIMAL}platforms = [\"solaris\"]\n"), "platform"),
+            (
+                format!("{MINIMAL}{}", MINIMAL.trim_start_matches('\n')),
+                "duplicate integration id",
+            ),
+        ] {
+            let manifest: Manifest = toml::from_str(&format!("{HEADER}{bad}")).unwrap();
+            let error = manifest.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_registrations_that_name_something_the_manifest_never_declared() {
+        let undeclared = format!(
+            "{MINIMAL}{}",
+            r#"[[integrations.registrations]]
+kind = "json-hook"
+file = "settings.json"
+event = "SessionStart"
+command_file = "hooks/other.sh"
+"#
+        );
+        let manifest: Manifest = toml::from_str(&format!("{HEADER}{undeclared}")).unwrap();
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("undeclared command file")
+        );
+
+        let unknown_kind = format!(
+            "{MINIMAL}{}",
+            r#"[[integrations.registrations]]
+kind = "yaml-merge"
+file = "config.yaml"
+"#
+        );
+        assert!(toml::from_str::<Manifest>(&format!("{HEADER}{unknown_kind}")).is_err());
+
+        // An argument is appended to a command line unquoted, so a word with a space in it would
+        // become two arguments rather than one.
+        let unquotable = format!(
+            "{MINIMAL}{}",
+            r#"[[integrations.registrations]]
+kind = "json-hook"
+file = "settings.json"
+event = "SessionStart"
+command_file = "hooks/demo.sh"
+args = ["session; rm -rf /"]
+"#
+        );
+        let manifest: Manifest = toml::from_str(&format!("{HEADER}{unquotable}")).unwrap();
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid argument")
+        );
+    }
+
+    #[test]
+    fn loading_a_package_bounds_and_confines_every_declared_integration_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("integration")).unwrap();
+        fs::write(root.join("vvmux-plugin.toml"), format!("{HEADER}{MINIMAL}")).unwrap();
+        fs::write(
+            root.join("integration/demo.sh"),
+            "# VVMUX_INTEGRATION_ID=demo\n",
+        )
+        .unwrap();
+        let loaded = LoadedManifest::load(root).unwrap();
+        assert_eq!(loaded.manifest.integrations[0].files.len(), 1);
+
+        // A symlink is how a package would otherwise reach a file it does not contain.
+        #[cfg(unix)]
+        {
+            fs::remove_file(root.join("integration/demo.sh")).unwrap();
+            std::os::unix::fs::symlink("/etc/hostname", root.join("integration/demo.sh")).unwrap();
+            assert!(
+                LoadedManifest::load(root)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("symlink")
+            );
+        }
+
+        fs::remove_file(root.join("integration/demo.sh")).unwrap();
+        fs::write(
+            root.join("integration/demo.sh"),
+            [b'x'; MAX_INTEGRATION_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(
+            LoadedManifest::load(root)
+                .unwrap_err()
+                .to_string()
+                .contains("1 MiB")
+        );
+    }
+
+    /// Sorted last so the install prompt's permission list keeps a stable, reviewable order.
+    #[test]
+    fn integration_write_sorts_after_every_runtime_permission() {
+        let mut permissions = [Permission::IntegrationWrite, Permission::SessionRead];
+        permissions.sort();
+        assert_eq!(permissions.last(), Some(&Permission::IntegrationWrite));
     }
 }
