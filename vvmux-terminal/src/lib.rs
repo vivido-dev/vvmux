@@ -407,6 +407,7 @@ pub enum TerminalEvent {
         marker: String,
         row: usize,
         column: usize,
+        alternate: bool,
     },
     KittyGraphics(KittyGraphicsCommand),
     /// The grid scrolled. `lines` is signed (up positive, down negative); `top`/`bottom` bound the
@@ -418,8 +419,12 @@ pub enum TerminalEvent {
         top: usize,
         bottom: usize,
         pushed_to_history: bool,
+        alternate: bool,
     },
     Clear {
+        alternate: bool,
+    },
+    ScreenSwap {
         alternate: bool,
     },
     /// A pane asked to write the user's clipboard (OSC 52 store). Already decoded and bounded.
@@ -708,6 +713,7 @@ impl Terminal {
                         marker,
                         row: self.cursor_row,
                         column: self.cursor_col,
+                        alternate: self.alternate_screen,
                     });
                 }
             }
@@ -938,12 +944,14 @@ impl Terminal {
             .unwrap_or(KeyboardModes::NO_MODE)
             .bits();
         self.alternate_screen = !self.alternate_screen;
+        self.events.push(TerminalEvent::ScreenSwap {
+            alternate: self.alternate_screen,
+        });
         self.damage();
     }
 
-    /// Blank the active screen without announcing `TerminalEvent::Clear`. Media anchors belong to
-    /// the pane rather than to one screen, so reporting a clear while switching screens would drop
-    /// anchors the primary screen still owns.
+    /// Blank the active screen without announcing `TerminalEvent::Clear`. A screen switch changes
+    /// which anchors are visible but does not constitute an explicit clear of either anchor set.
     fn clear_active_grid(&mut self) {
         self.grid = blank_grid(self.rows, self.cols);
         self.grid_wrapped.fill(false);
@@ -984,6 +992,7 @@ impl Terminal {
                 top: self.scroll_top,
                 bottom: self.scroll_bottom,
                 pushed_to_history,
+                alternate: self.alternate_screen,
             });
             self.damage();
         }
@@ -1004,6 +1013,7 @@ impl Terminal {
                 top: self.scroll_top,
                 bottom: self.scroll_bottom,
                 pushed_to_history: false,
+                alternate: self.alternate_screen,
             });
             self.damage();
         }
@@ -2436,6 +2446,7 @@ mod tests {
                             .into(),
                     row: 0,
                     column: 0,
+                    alternate: false,
                 })
             );
             assert!(terminal.cells().iter().flatten().all(|cell| cell.ch == ' '));
@@ -2605,6 +2616,7 @@ mod tests {
             top: 0,
             bottom: 3,
             pushed_to_history: true,
+            alternate: false,
         }));
         assert_eq!(terminal.history_len(), 1);
 
@@ -2617,6 +2629,7 @@ mod tests {
             top: 1,
             bottom: 3,
             pushed_to_history: false,
+            alternate: false,
         }));
         assert_eq!(region.history_len(), 0);
 
@@ -2629,6 +2642,7 @@ mod tests {
             top: 0,
             bottom: 3,
             pushed_to_history: false,
+            alternate: true,
         }));
         assert_eq!(alt.history_len(), 0);
 
@@ -2640,6 +2654,7 @@ mod tests {
             top: 0,
             bottom: 3,
             pushed_to_history: false,
+            alternate: false,
         }));
     }
 
@@ -2982,8 +2997,9 @@ mod tests {
             !events
                 .iter()
                 .any(|event| matches!(event, TerminalEvent::Clear { .. })),
-            "anchors belong to the pane, so a screen switch must not report a clear"
+            "a screen switch must not report an explicit clear"
         );
+        assert!(events.contains(&TerminalEvent::ScreenSwap { alternate: true }));
 
         let events = terminal.feed(b"\x1b[2J");
         assert!(
@@ -2991,6 +3007,8 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, TerminalEvent::Clear { alternate: true }))
         );
+        let events = terminal.feed(b"\x1b[?1049l");
+        assert!(events.contains(&TerminalEvent::ScreenSwap { alternate: false }));
     }
 
     #[test]

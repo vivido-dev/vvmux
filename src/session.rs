@@ -2277,6 +2277,7 @@ impl SessionActor {
                         marker,
                         row,
                         column,
+                        alternate,
                     } => {
                         // The authenticated marker is consumed here. Media ownership is
                         // connected by the virtual-presenter module, never forwarded into
@@ -2284,18 +2285,20 @@ impl SessionActor {
                         // the marker was consumed: the live cursor has already moved on
                         // when ConPTY batches repositioning output behind the marker.
                         self.vivid
-                            .observe_marker(pane_id, &marker, row as i32, column);
+                            .observe_marker(pane_id, &marker, row as i32, column, alternate);
                     }
                     TerminalEvent::KittyGraphics(command) => kitty_commands.push(command),
-                    TerminalEvent::GridScroll { lines, .. } => {
-                        self.vivid.scroll_anchors(pane_id, lines);
+                    TerminalEvent::GridScroll {
+                        lines, alternate, ..
+                    } => {
+                        self.vivid.scroll_anchors(pane_id, lines, alternate);
                     }
-                    TerminalEvent::Clear { alternate: false } => {
-                        self.vivid.clear_anchors(pane_id);
+                    TerminalEvent::Clear { alternate } => {
+                        self.vivid.clear_anchors(pane_id, alternate);
                     }
-                    // vvmux anchors are pane-owned, so alternate-screen output cannot destroy an
-                    // image retained on the pane's primary screen.
-                    TerminalEvent::Clear { alternate: true } => {}
+                    TerminalEvent::ScreenSwap { alternate } => {
+                        self.vivid.set_alternate_screen(pane_id, alternate);
+                    }
                     // Deferred: honoring these needs the session's policy and focus state, which
                     // cannot be read while a pane is mutably borrowed.
                     TerminalEvent::ClipboardStore { selection, text } => {
@@ -13399,6 +13402,7 @@ fn pane_mouse_selection_after_output(
                 top,
                 bottom,
                 pushed_to_history,
+                ..
             } => {
                 if pushed_to_history {
                     selection.start = shift_mouse_selection_cell(selection.start, lines);
