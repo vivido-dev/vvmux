@@ -6,8 +6,7 @@
 //! the PTY a zero dimension, and a refused resize closed the pane and killed its program. The
 //! panes disappeared for good: growing the window back could not restore what had been reaped.
 
-#[allow(dead_code)]
-mod common;
+use crate::common;
 
 use std::fs;
 use std::io::Read;

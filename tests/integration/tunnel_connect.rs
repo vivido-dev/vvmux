@@ -6,7 +6,7 @@
 //! real VVWS session through a tunnel leg, ticket rejection, tunnel loss, and
 //! session survival.
 
-mod common;
+use crate::common;
 
 use std::io::Write as _;
 use std::process::Stdio;

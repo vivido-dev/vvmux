@@ -8,8 +8,7 @@
 //! never asked for the mode echoed `^[[O`. Focus now reaches only a pane whose program enabled
 //! focus reporting, and only when that pane's own focus changed.
 
-#[allow(dead_code)]
-mod common;
+use crate::common;
 
 use std::fs;
 use std::io::Read;

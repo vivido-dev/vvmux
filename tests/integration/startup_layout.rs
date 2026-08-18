@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
-#[allow(dead_code)]
-mod common;
+use crate::common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

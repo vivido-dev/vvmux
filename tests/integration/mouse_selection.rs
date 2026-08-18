@@ -9,8 +9,7 @@
 //! highlight itself survives subsequent pane output by watching the inverse-video SGR travel
 //! through the client's render stream while a background printer keeps scrolling the grid.
 
-#[allow(dead_code)]
-mod common;
+use crate::common;
 
 use std::fs;
 use std::io::Read;

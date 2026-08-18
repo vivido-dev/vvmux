@@ -254,6 +254,10 @@ impl DaemonLauncher {
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
                 }
+                // A descriptor inherited by accident is held for the daemon's whole life, so
+                // drop everything the server was not given on purpose before the startup channel
+                // is made inheritable.
+                close_stray_descriptors(writer_descriptor);
                 // The startup channel is the one descriptor that must survive exec. Its reading end
                 // stays close-on-exec, so the launcher sees EOF the moment the server exits.
                 clear_close_on_exec(writer_descriptor)
@@ -320,6 +324,50 @@ fn relocate_above_standard_descriptors(descriptor: OwnedFd) -> io::Result<OwnedF
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(relocated) })
+}
+
+/// Close every descriptor a detached session server was not deliberately handed.
+///
+/// The daemon outlives the launcher that forked it, so a descriptor it inherits by accident stays
+/// open for the session's whole life. That is not hypothetical: on platforms without an atomic
+/// `pipe2`, `Command` opens its capture pipes and marks them close-on-exec in two steps, so a
+/// launch running concurrently in another thread can fork with an unrelated pipe still
+/// inheritable. The daemon would then hold that pipe's writing end forever and the thread waiting
+/// on `Command::output` would never see EOF. Standard descriptors are already the null redirection
+/// `Command` applied before this runs, and `keep` is the startup channel.
+///
+/// Async-signal-safe: only `close`, `close_range`, and `getrlimit` run, as required between `fork`
+/// and `exec`. Failures are ignored — a descriptor that cannot be closed must not stop the server
+/// from starting.
+fn close_stray_descriptors(keep: RawFd) {
+    let first = libc::STDERR_FILENO + 1;
+    #[cfg(target_os = "linux")]
+    {
+        // Two ranges, because the startup channel sits somewhere in the middle.
+        let close_range = |low: RawFd, high: RawFd| -> bool {
+            low > high
+                || unsafe { libc::syscall(libc::SYS_close_range, low as u32, high as u32, 0) } == 0
+        };
+        if close_range(first, keep - 1) && close_range(keep + 1, RawFd::MAX) {
+            return;
+        }
+    }
+    // No `close_range`: an open descriptor is always below the soft descriptor limit, so that is a
+    // real upper bound. Cap it anyway, because the limit may be effectively unlimited.
+    const SCAN_LIMIT: RawFd = 64 * 1024;
+    let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+    let bound = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        RawFd::try_from(limit.rlim_cur)
+            .unwrap_or(SCAN_LIMIT)
+            .min(SCAN_LIMIT)
+    } else {
+        SCAN_LIMIT
+    };
+    for descriptor in first..bound {
+        if descriptor != keep {
+            unsafe { libc::close(descriptor) };
+        }
+    }
 }
 
 /// Async-signal-safe: only `fcntl` runs, as required between `fork` and `exec`.
