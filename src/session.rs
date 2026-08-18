@@ -2254,7 +2254,7 @@ impl SessionActor {
                 .filter(|event| {
                     matches!(
                         event,
-                        TerminalEvent::GridScroll { .. } | TerminalEvent::Clear
+                        TerminalEvent::GridScroll { .. } | TerminalEvent::Clear { .. }
                     )
                 })
                 .cloned()
@@ -2290,7 +2290,12 @@ impl SessionActor {
                     TerminalEvent::GridScroll { lines, .. } => {
                         self.vivid.scroll_anchors(pane_id, lines);
                     }
-                    TerminalEvent::Clear => self.vivid.clear_anchors(pane_id),
+                    TerminalEvent::Clear { alternate: false } => {
+                        self.vivid.clear_anchors(pane_id);
+                    }
+                    // vvmux anchors are pane-owned, so alternate-screen output cannot destroy an
+                    // image retained on the pane's primary screen.
+                    TerminalEvent::Clear { alternate: true } => {}
                     // Deferred: honoring these needs the session's policy and focus state, which
                     // cannot be read while a pane is mutably borrowed.
                     TerminalEvent::ClipboardStore { selection, text } => {
@@ -13407,7 +13412,7 @@ fn pane_mouse_selection_after_output(
                     return None;
                 }
             }
-            TerminalEvent::Clear => return None,
+            TerminalEvent::Clear { .. } => return None,
             _ => {}
         }
     }
@@ -14822,7 +14827,12 @@ mod tests {
         };
 
         assert_eq!(
-            pane_mouse_selection_after_output(Some(selection), &[TerminalEvent::Clear], false, 10),
+            pane_mouse_selection_after_output(
+                Some(selection),
+                &[TerminalEvent::Clear { alternate: false }],
+                false,
+                10,
+            ),
             None
         );
 

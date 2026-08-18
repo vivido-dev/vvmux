@@ -419,7 +419,9 @@ pub enum TerminalEvent {
         bottom: usize,
         pushed_to_history: bool,
     },
-    Clear,
+    Clear {
+        alternate: bool,
+    },
     /// A pane asked to write the user's clipboard (OSC 52 store). Already decoded and bounded.
     ClipboardStore {
         selection: u8,
@@ -1251,7 +1253,9 @@ impl Handler for Terminal {
             ClearMode::All => {
                 self.grid = blank_grid(self.rows, self.cols);
                 self.grid_wrapped.fill(false);
-                self.events.push(TerminalEvent::Clear);
+                self.events.push(TerminalEvent::Clear {
+                    alternate: self.alternate_screen,
+                });
                 self.damage();
             }
             ClearMode::Saved => {
@@ -1266,7 +1270,9 @@ impl Handler for Terminal {
                     .flatten()
                     .all(|cell| cell.ch == ' ' && cell.combining.is_empty())
                 {
-                    self.events.push(TerminalEvent::Clear);
+                    self.events.push(TerminalEvent::Clear {
+                        alternate: self.alternate_screen,
+                    });
                 }
             }
         }
@@ -1358,7 +1364,7 @@ impl Handler for Terminal {
         };
         self.keyboard_mode_stack.clear();
         self.inactive_keyboard_mode_stack.clear();
-        self.events.push(TerminalEvent::Clear);
+        self.events.push(TerminalEvent::Clear { alternate: false });
         self.damage();
     }
 
@@ -2570,14 +2576,22 @@ mod tests {
         terminal.feed(b"one\r\ntwo\r\nthree\r\nfour");
         // ConPTY cls: home, erase-line on every row, then ED 3. No ED 2 is sent.
         let events = terminal.feed(b"\x1b[H\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[3J");
-        assert!(events.contains(&TerminalEvent::Clear));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::Clear { alternate: false }))
+        );
         assert_eq!(terminal.history_len(), 0);
 
         // A bare scrollback purge with visible viewport content is not a clear.
         let mut populated = Terminal::new(3, 10, 10);
         populated.feed(b"one\r\ntwo\r\nthree\r\nfour");
         let events = populated.feed(b"\x1b[3J");
-        assert!(!events.contains(&TerminalEvent::Clear));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::Clear { .. }))
+        );
     }
 
     #[test]
@@ -2965,8 +2979,17 @@ mod tests {
         let events = terminal.feed(b"\x1b[?1049h");
         assert_eq!(terminal.extract_rows(0, 1), "");
         assert!(
-            !events.contains(&TerminalEvent::Clear),
+            !events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::Clear { .. })),
             "anchors belong to the pane, so a screen switch must not report a clear"
+        );
+
+        let events = terminal.feed(b"\x1b[2J");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::Clear { alternate: true }))
         );
     }
 
