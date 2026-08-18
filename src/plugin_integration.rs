@@ -135,11 +135,14 @@ impl<'a> Adapter<'a> {
             .collect()
     }
 
-    /// The declared registration targets, resolved, for inspection.
+    /// The registration targets that are live on this platform, resolved, for inspection.
+    ///
+    /// Platform-filtered rather than as-declared: a package that carries a hook per interpreter
+    /// declares one registration for each, and listing both would report an edit this machine
+    /// never makes.
     pub(crate) fn registration_targets(&self) -> Vec<String> {
-        self.integration
-            .registrations
-            .iter()
+        self.platform_registrations()
+            .into_iter()
             .map(|registration| match registration {
                 IntegrationRegistration::JsonHook { file, event, .. } => {
                     format!("{} ({event} hook)", self.config.join(file).display())
