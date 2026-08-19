@@ -10664,6 +10664,7 @@ impl SessionActor {
                     &source.descriptor,
                     source.raster_delta_operation_limit,
                 ),
+                decoder_reset_serial: source.decoder_reset_serial,
                 live: source.live,
                 active: source.active,
                 audio_gain: source.audio_gain.map(|gain| gain.raw()),

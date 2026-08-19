@@ -1547,7 +1547,11 @@ fn recreated_source_keys(
                 || previous
                     .iter()
                     .find(|old| old.key == source.key)
-                    .is_none_or(|old| old.kind != source.kind || old.live != source.live)
+                    .is_none_or(|old| {
+                        old.kind != source.kind
+                            || old.decoder_reset_serial != source.decoder_reset_serial
+                            || old.live != source.live
+                    })
         })
         .map(|source| source.key)
         .collect::<HashSet<_>>();
@@ -1586,6 +1590,7 @@ fn compare_projection(
             current_sources.iter().any(|current| {
                 previous.key == current.key
                     && previous.kind == current.kind
+                    && previous.decoder_reset_serial == current.decoder_reset_serial
                     && previous.live == current.live
             })
         });
@@ -1739,7 +1744,11 @@ fn recreated_playing_video_sources(
                 && previous
                     .iter()
                     .find(|old| old.key == source.key)
-                    .is_none_or(|old| old.kind != source.kind || old.live != source.live)
+                    .is_none_or(|old| {
+                        old.kind != source.kind
+                            || old.decoder_reset_serial != source.decoder_reset_serial
+                            || old.live != source.live
+                    })
         })
         .map(|source| source.key)
         .collect()
@@ -2436,6 +2445,7 @@ mod tests {
             track: 7,
         };
         let source = BridgeSource {
+            decoder_reset_serial: 1,
             key,
             kind: BridgeSourceKind::Video {
                 codec_string: None,
@@ -2976,6 +2986,7 @@ mod tests {
             track: 7,
         };
         let source = BridgeSource {
+            decoder_reset_serial: 1,
             key,
             kind: BridgeSourceKind::Raster {
                 width: 2,
@@ -3108,6 +3119,7 @@ mod tests {
             track: 7,
         };
         let source = BridgeSource {
+            decoder_reset_serial: 1,
             key,
             kind: BridgeSourceKind::Raster {
                 width: 2,
@@ -3320,6 +3332,7 @@ mod tests {
     #[cfg(unix)]
     fn page_source(key: BridgeSourceKey) -> BridgeSource {
         BridgeSource {
+            decoder_reset_serial: 1,
             key,
             kind: BridgeSourceKind::Raster {
                 width: PAGE_WIDTH,
@@ -3580,6 +3593,7 @@ mod tests {
             track: 8,
         };
         let video_source = BridgeSource {
+            decoder_reset_serial: 1,
             key: video_key,
             kind: BridgeSourceKind::Video {
                 codec_string: None,
@@ -3619,6 +3633,7 @@ mod tests {
             },
         };
         let audio_source = BridgeSource {
+            decoder_reset_serial: 1,
             key,
             kind: BridgeSourceKind::Audio {
                 codec_string: None,
@@ -4167,6 +4182,7 @@ mod tests {
                 start_policy: 1,
             };
             let video_source = |playing, play_request| BridgeSource {
+                decoder_reset_serial: 1,
                 key: video_key,
                 kind: BridgeSourceKind::Video {
                     codec_string: None,
@@ -4198,6 +4214,7 @@ mod tests {
                 play_request,
             };
             let audio_source = BridgeSource {
+                decoder_reset_serial: 1,
                 key: audio_key,
                 kind: BridgeSourceKind::Audio {
                     codec_string: None,
@@ -4437,6 +4454,7 @@ mod tests {
                 track: 9,
             };
             let image_source = BridgeSource {
+                decoder_reset_serial: 1,
                 key: image_key,
                 kind: BridgeSourceKind::Image {
                     encoding: 1,
@@ -4837,6 +4855,7 @@ mod tests {
             track: 8,
         };
         let video = |playing| BridgeSource {
+            decoder_reset_serial: 1,
             key: video_key,
             kind: crate::ipc::BridgeSourceKind::Video {
                 codec_string: None,
@@ -4876,6 +4895,7 @@ mod tests {
             },
         };
         let audio = BridgeSource {
+            decoder_reset_serial: 1,
             key: audio_key,
             kind: crate::ipc::BridgeSourceKind::Audio {
                 codec_string: None,
@@ -4988,6 +5008,23 @@ mod tests {
             "a replacement outer session recreates every source"
         );
 
+        let mut reset_audio = after.clone();
+        reset_audio
+            .iter_mut()
+            .find(|source| source.key == audio_key)
+            .unwrap()
+            .decoder_reset_serial += 1;
+        assert_eq!(
+            compare_projection(&surfaces, &after, &[], &surfaces, &reset_audio, &[]),
+            ProjectionChange::Sources,
+            "a decoder reset must not be reduced to a playback-only update"
+        );
+        assert_eq!(
+            recreated_source_keys(&after, &reset_audio, false),
+            HashSet::from([audio_key]),
+            "an audio-only reset must preserve unrelated outer tracks"
+        );
+
         let image_key = BridgeSourceKey {
             producer: 3,
             context: 1,
@@ -4996,6 +5033,7 @@ mod tests {
         };
         let mut with_image = after.clone();
         with_image.push(BridgeSource {
+            decoder_reset_serial: 1,
             key: image_key,
             kind: BridgeSourceKind::Image {
                 encoding: 1,
