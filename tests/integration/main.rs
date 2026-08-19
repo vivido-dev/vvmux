@@ -14,6 +14,7 @@ mod automation_msg;
 mod automation_run;
 mod config_reload;
 mod daemon_descriptors;
+mod direct_attach;
 mod gateway_ws;
 mod image_probe;
 mod mouse_selection;

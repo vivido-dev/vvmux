@@ -926,6 +926,13 @@ fn run_manager(inputs: ManagerInputs) {
         generation: registry.generation,
         catalog: registry.agent_catalog.clone(),
     });
+    let (generation, keybindings, link_handlers) =
+        crate::plugin::effective_registrations(registry.generation, &registry.plugins);
+    let _ = actor.send(ActorEvent::PluginRegistrationsApplied {
+        generation,
+        keybindings,
+        link_handlers,
+    });
     let mut workers = HashMap::<String, WorkerHandle>::new();
     let mut active = HashMap::<u64, ActiveJob>::new();
     let mut accounting = JobAccounting::default();
@@ -2741,6 +2748,13 @@ fn apply_registry_candidate(
         });
     }
     registry.failures = candidate.failed;
+    let (generation, keybindings, link_handlers) =
+        crate::plugin::effective_registrations(registry.generation, &registry.plugins);
+    let _ = actor.send(ActorEvent::PluginRegistrationsApplied {
+        generation,
+        keybindings,
+        link_handlers,
+    });
     report
 }
 
@@ -3111,6 +3125,8 @@ mod tests {
             }],
             activation: Activation::OnDemand,
             events: Vec::new(),
+            keybindings: Vec::new(),
+            link_handlers: Vec::new(),
             workflows: Vec::new(),
         };
         let registry = AppliedRegistry {

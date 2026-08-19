@@ -1035,7 +1035,7 @@ async fn handle_session_message(
         }
         // Browser input is already normalized by the web client and does not use the host TTY's
         // Kitty keyboard encoder.
-        ServerMessage::InputMode { .. } => {}
+        ServerMessage::InputMode { .. } | ServerMessage::PluginKeymap { .. } => {}
         // Dropped rather than forwarded: VVWS has no notification record, and a browser tab is not
         // the terminal these escapes are meant for. Browser attach gets no desktop notification.
         ServerMessage::Notify { .. } => {}

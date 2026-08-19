@@ -26,7 +26,8 @@ const MAX_LOG_OUTPUT: usize = 256 * 1024;
 fn known_plugin_event(name: &str) -> bool {
     matches!(
         name,
-        "pane.opened"
+        "session.started"
+            | "pane.opened"
             | "pane.exited"
             | "pane.closed"
             | "pane.screen_changed"
@@ -241,7 +242,51 @@ pub(crate) struct RuntimePlugin {
     pub(crate) panes: Vec<vvmux_plugin_api::Pane>,
     pub(crate) activation: Activation,
     pub(crate) events: Vec<EventHook>,
+    pub(crate) keybindings: Vec<vvmux_plugin_api::Keybinding>,
+    pub(crate) link_handlers: Vec<vvmux_plugin_api::LinkHandler>,
     pub(crate) workflows: Vec<RuntimeWorkflow>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LinkRegistration {
+    pub(crate) pattern: String,
+    pub(crate) action: String,
+}
+
+pub(crate) fn effective_registrations(
+    generation: u64,
+    plugins: &BTreeMap<String, RuntimePlugin>,
+) -> (
+    u64,
+    Vec<crate::ipc::PluginKeybinding>,
+    Vec<LinkRegistration>,
+) {
+    let mut key_candidates = BTreeMap::<u8, Vec<String>>::new();
+    let mut links = Vec::new();
+    for (plugin_id, plugin) in plugins.iter().filter(|(_, plugin)| plugin.enabled) {
+        for binding in &plugin.keybindings {
+            key_candidates
+                .entry(binding.chord.as_bytes()[0])
+                .or_default()
+                .push(format!("{plugin_id}/{}", binding.action));
+        }
+        links.extend(plugin.link_handlers.iter().map(|handler| LinkRegistration {
+            pattern: handler.pattern.clone(),
+            action: format!("{plugin_id}/{}", handler.action),
+        }));
+    }
+    // A chord claimed by multiple plugins is ambiguous, so neither receives it. This remains
+    // deterministic across registry reloads and never lets package ordering grant authority.
+    let keys = key_candidates
+        .into_iter()
+        .filter_map(|(chord, mut actions)| {
+            (actions.len() == 1).then(|| crate::ipc::PluginKeybinding {
+                chord,
+                action: actions.pop().expect("one candidate was checked"),
+            })
+        })
+        .collect();
+    (generation, keys, links)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -368,6 +413,8 @@ fn registry_candidate(registry: &Registry) -> io::Result<RegistryCandidate> {
                     panes: Vec::new(),
                     activation: Activation::OnDemand,
                     events: Vec::new(),
+                    keybindings: Vec::new(),
+                    link_handlers: Vec::new(),
                     workflows: Vec::new(),
                 },
             );
@@ -452,6 +499,8 @@ fn registry_candidate(registry: &Registry) -> io::Result<RegistryCandidate> {
                         .filter(|hook| known_plugin_event(&hook.on))
                         .cloned()
                         .collect(),
+                    keybindings: loaded.manifest.keybindings.clone(),
+                    link_handlers: loaded.manifest.link_handlers.clone(),
                     workflows: Vec::new(),
                 },
                 actions,

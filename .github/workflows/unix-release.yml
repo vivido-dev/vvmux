@@ -1,0 +1,106 @@
+name: Unix release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        required: true
+        default: preview
+        type: choice
+        options: [preview, stable]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unix-release-${{ inputs.channel || 'stable' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binary
+        env:
+          VVMUX_UPDATE_PUBLIC_KEY_HEX: ${{ vars.VVMUX_UPDATE_PUBLIC_KEY_HEX }}
+        run: |
+          test -n "$VVMUX_UPDATE_PUBLIC_KEY_HEX"
+          cargo build --locked --release --target '${{ matrix.target }}'
+      - name: Stage artifact
+        run: cp 'target/${{ matrix.target }}/release/vvmux' 'vvmux-${{ matrix.target }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vvmux-${{ matrix.target }}
+          path: vvmux-${{ matrix.target }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      CHANNEL: ${{ inputs.channel || 'stable' }}
+      UPDATE_SIGNING_KEY_PEM: ${{ secrets.VVMUX_UPDATE_SIGNING_KEY_PEM }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vvmux-*
+          merge-multiple: true
+          path: release-assets
+      - name: Build signed manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n '${{ vars.VVMUX_UPDATE_PUBLIC_KEY_HEX }}'
+          test -n "$UPDATE_SIGNING_KEY_PEM"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "vvmux") | .version')"
+          if [[ "$CHANNEL" == stable ]]; then test "$GITHUB_REF_NAME" = "v${version}"; fi
+          if [[ "$CHANNEL" == preview ]]; then release_tag=preview; else release_tag="$GITHUB_REF_NAME"; fi
+          assets='[]'
+          for path in release-assets/vvmux-*; do
+            target="${path#release-assets/vvmux-}"
+            size="$(stat -c %s "$path")"
+            digest="$(sha256sum "$path" | cut -d ' ' -f 1)"
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/vvmux-${target}"
+            assets="$(jq -c --arg target "$target" --arg url "$url" --arg sha256 "$digest" --argjson size "$size" '. + [{target:$target,url:$url,sha256:$sha256,size:$size}]' <<<"$assets")"
+          done
+          jq -cn --arg channel "$CHANNEL" --arg version "$version" --arg notes_url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${release_tag}" --argjson assets "$assets" \
+            '{schema:1,channel:$channel,version:$version,notes_url:$notes_url,assets:$assets}' > "vvmux-update-${CHANNEL}.json"
+          install -m 600 /dev/null update-signing.pem
+          printf '%s' "$UPDATE_SIGNING_KEY_PEM" > update-signing.pem
+          derived_public="$(openssl pkey -in update-signing.pem -pubout -outform DER | tail -c 32 | xxd -p -c 64)"
+          test "$derived_public" = '${{ vars.VVMUX_UPDATE_PUBLIC_KEY_HEX }}'
+          openssl pkeyutl -sign -rawin -inkey update-signing.pem -in "vvmux-update-${CHANNEL}.json" \
+            | base64 -w0 > "vvmux-update-${CHANNEL}.json.sig"
+          rm update-signing.pem
+      - name: Publish stable release
+        if: env.CHANNEL == 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes release-assets/vvmux-* vvmux-update-stable.json vvmux-update-stable.json.sig
+      - name: Publish rolling preview release
+        if: env.CHANNEL == 'preview'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete preview --cleanup-tag --yes || true
+          gh release create preview --prerelease --title "vvmux preview ${GITHUB_SHA::8}" --notes "Automated preview build from ${GITHUB_SHA}." release-assets/vvmux-* vvmux-update-preview.json vvmux-update-preview.json.sig

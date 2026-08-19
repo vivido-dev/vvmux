@@ -148,7 +148,9 @@ fn release_codepoint(byte: u8) -> u32 {
 pub(crate) struct PrefixParser {
     prefix_byte: u8,
     bindings: HashMap<u8, Action>,
+    plugin_bindings: HashMap<u8, Action>,
     prefix: bool,
+    direct: bool,
     sequence: Vec<u8>,
     escape_sequence: Vec<u8>,
     escape_since: Option<Instant>,
@@ -170,6 +172,14 @@ impl Default for PrefixParser {
 
 impl PrefixParser {
     pub(crate) fn new(prefix_byte: u8, configured: &BTreeMap<String, String>) -> Self {
+        Self::new_with_mode(prefix_byte, configured, false)
+    }
+
+    pub(crate) fn new_with_mode(
+        prefix_byte: u8,
+        configured: &BTreeMap<String, String>,
+        direct: bool,
+    ) -> Self {
         let bindings = configured
             .iter()
             .filter_map(|(chord, action)| {
@@ -182,7 +192,9 @@ impl PrefixParser {
         Self {
             prefix_byte,
             bindings,
+            plugin_bindings: HashMap::new(),
             prefix: false,
+            direct,
             sequence: Vec::new(),
             escape_sequence: Vec::new(),
             escape_since: None,
@@ -207,6 +219,21 @@ impl PrefixParser {
         if flags == 0 {
             self.suppressed_kitty_releases.clear();
         }
+    }
+
+    pub(crate) fn set_plugin_bindings(&mut self, bindings: Vec<crate::ipc::PluginKeybinding>) {
+        self.plugin_bindings = bindings
+            .into_iter()
+            .filter(|binding| {
+                !self.bindings.contains_key(&binding.chord) && !is_core_chord(binding.chord)
+            })
+            .map(|binding| {
+                (
+                    binding.chord,
+                    Action::Plugin(format!("plugin:{}", binding.action)),
+                )
+            })
+            .collect();
     }
 
     /// Release a lone Escape once it can no longer be the start of a mouse report or focus event.
@@ -445,6 +472,17 @@ impl PrefixParser {
             self.prefix = true;
             return;
         }
+        if self.direct {
+            match byte {
+                b'q' => output.push(ParsedInput::Detach),
+                value if value == self.prefix_byte => {
+                    output.push(ParsedInput::Input(literal.to_vec()));
+                }
+                _ => {}
+            }
+            self.prefix = false;
+            return;
+        }
         if let Some(action) = self.bindings.get(&byte).cloned() {
             if matches!(action, Action::BeginClosePaneConfirmation) {
                 self.confirm_close = true;
@@ -490,10 +528,45 @@ impl PrefixParser {
                 self.sequence.push(byte);
                 return;
             }
-            _ => {}
+            _ => {
+                if let Some(action) = self.plugin_bindings.get(&byte).cloned() {
+                    output.push(ParsedInput::Action(action));
+                }
+            }
         }
         self.prefix = false;
     }
+}
+
+fn is_core_chord(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'%' | b'"'
+            | b'c'
+            | b'n'
+            | b'p'
+            | b'h'
+            | b'j'
+            | b'k'
+            | b'l'
+            | b'w'
+            | b','
+            | b'z'
+            | b's'
+            | b'S'
+            | b'f'
+            | b'F'
+            | b'P'
+            | b't'
+            | b'm'
+            | b'r'
+            | b'a'
+            | b'd'
+            | b'['
+            | b']'
+            | b'x'
+            | b'1'..=b'9' | 0x1b
+    )
 }
 
 pub(crate) fn parse_configured_action(action: &str) -> Option<Action> {
@@ -630,6 +703,8 @@ fn parse_sgr_mouse(sequence: &[u8]) -> Option<MouseEvent> {
         y,
         kind,
         shift: raw & 4 != 0,
+        alt: raw & 8 != 0,
+        ctrl: raw & 16 != 0,
     })
 }
 
@@ -692,6 +767,8 @@ mod tests {
                     y: 6,
                     kind: MouseKind::Wheel,
                     shift: false,
+                    alt: false,
+                    ctrl: false,
                 },
                 MouseCoordinates::Cells
             )]
@@ -987,5 +1064,48 @@ mod tests {
             }]
         );
         assert!(forward.is_empty());
+    }
+
+    #[test]
+    fn direct_attachment_keeps_only_literal_prefix_and_detach() {
+        let mut parser = PrefixParser::new_with_mode(0x02, &BTreeMap::new(), true);
+        assert_eq!(
+            parser.feed(b"ordinary"),
+            [ParsedInput::Input(b"ordinary".to_vec())]
+        );
+        assert!(parser.feed(b"\x02z").is_empty());
+        assert_eq!(parser.feed(b"\x02\x02"), [ParsedInput::Input(vec![0x02])]);
+        assert_eq!(parser.feed(b"\x02q"), [ParsedInput::Detach]);
+    }
+
+    #[test]
+    fn plugin_bindings_fill_only_unclaimed_prefix_chords() {
+        let configured = BTreeMap::from([("u".into(), "new-tab".into())]);
+        let mut parser = PrefixParser::new(0x02, &configured);
+        parser.set_plugin_bindings(vec![
+            crate::ipc::PluginKeybinding {
+                chord: b'u',
+                action: "dev.example/open".into(),
+            },
+            crate::ipc::PluginKeybinding {
+                chord: b'z',
+                action: "dev.example/open".into(),
+            },
+            crate::ipc::PluginKeybinding {
+                chord: b'v',
+                action: "dev.example/open".into(),
+            },
+        ]);
+        assert_eq!(parser.feed(b"\x02u"), [ParsedInput::Action(Action::NewTab)]);
+        assert_eq!(
+            parser.feed(b"\x02z"),
+            [ParsedInput::Action(Action::ToggleZoom)]
+        );
+        assert_eq!(
+            parser.feed(b"\x02v"),
+            [ParsedInput::Action(Action::Plugin(
+                "plugin:dev.example/open".into()
+            ))]
+        );
     }
 }

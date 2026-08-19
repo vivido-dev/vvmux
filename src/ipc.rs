@@ -33,7 +33,7 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 23;
+pub const VERSION: u16 = 24;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -76,7 +76,7 @@ struct MediaChunk {
 const AUTOMATION_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 const AUTOMATION_CHUNK_BYTES: usize = 512 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct AutomationRequest {
     pub id: u64,
     pub pane_id: Option<u64>,
@@ -91,7 +91,7 @@ pub struct AutomationRequest {
     pub method: AutomationMethod,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AutomationMethod {
     Capabilities,
@@ -302,7 +302,7 @@ pub enum NotifyKind {
 }
 
 /// Narrows an event stream. An empty filter accepts everything.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct EventFilter {
     pub names: Vec<String>,
     pub pane_id: Option<u64>,
@@ -328,7 +328,9 @@ impl EventFilter {
 }
 
 /// Which terminal text a pane read returns.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
 pub enum TextSource {
@@ -342,14 +344,14 @@ pub enum TextSource {
     Detection,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationCompletion {
     Outer,
     Rendered,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct MediaTrackIdentity {
     pub producer_id: u64,
     pub context_id: u64,
@@ -357,7 +359,7 @@ pub struct MediaTrackIdentity {
     pub track_id: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaTrackWaitCondition {
     Visible,
@@ -372,7 +374,7 @@ pub enum MediaTrackWaitCondition {
     QueueDrained,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PluginMethod {
     Invoke {
@@ -416,7 +418,7 @@ pub enum PluginEventEnvelope {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct AutomationError {
     pub code: String,
     pub message: String,
@@ -431,7 +433,7 @@ impl AutomationError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct AutomationResponse {
     pub id: u64,
     pub ok: bool,
@@ -485,14 +487,14 @@ impl ChannelKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub enum Axis {
     Vertical,
     Horizontal,
 }
 
 /// Where a `run` pane goes.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub enum RunPlacement {
     /// Split the target pane, as `msg split` would.
     Split { axis: Axis },
@@ -502,7 +504,7 @@ pub enum RunPlacement {
     Tab,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub enum Direction {
     Left,
     Right,
@@ -510,7 +512,7 @@ pub enum Direction {
     Down,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub enum Action {
     Split(Axis),
     Focus(Direction),
@@ -575,12 +577,15 @@ pub struct MouseEvent {
     pub y: u16,
     pub kind: MouseKind,
     pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClientMessage {
     Attach {
         replace: bool,
+        target: AttachmentTarget,
         display: DisplayMetrics,
         vivid: bool,
         /// The directly hosting terminal speaks the Kitty graphics protocol.
@@ -669,6 +674,18 @@ pub enum ClientMessage {
     PixelMouse(MouseEvent),
 }
 
+/// Which session projection a foreground controller owns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttachmentTarget {
+    /// The ordinary tab/pane multiplexer UI.
+    Session,
+    /// One pane rendered over the complete host terminal.
+    Pane { pane_id: u64 },
+    /// Resolve one live agent alias atomically when attachment is admitted.
+    Agent { alias: crate::agent::AgentAlias },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServerMessage {
     Attached {
@@ -695,6 +712,12 @@ pub enum ServerMessage {
     },
     Clipboard(String),
     Status(String),
+    /// Effective plugin prefix bindings for this registry generation. The client owns prefix
+    /// parsing and applies these only where neither user configuration nor a core chord wins.
+    PluginKeymap {
+        generation: u64,
+        bindings: Vec<PluginKeybinding>,
+    },
     MediaSnapshot {
         revision: u64,
         surfaces: Vec<BridgeSurface>,
@@ -741,6 +764,13 @@ pub enum ServerMessage {
         keyboard_flags: u8,
         sgr_pixels: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginKeybinding {
+    pub chord: u8,
+    /// Canonical `PLUGIN/ACTION` reference.
+    pub action: String,
 }
 
 pub struct RecordReader {
@@ -1184,6 +1214,23 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_targets_are_explicit_and_round_trip() {
+        for target in [
+            AttachmentTarget::Session,
+            AttachmentTarget::Pane { pane_id: 42 },
+            AttachmentTarget::Agent {
+                alias: "reviewer".parse().unwrap(),
+            },
+        ] {
+            let bytes = serde_json::to_vec(&target).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<AttachmentTarget>(&bytes).unwrap(),
+                target
+            );
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SharedBytes(Arc<Mutex<Vec<u8>>>);

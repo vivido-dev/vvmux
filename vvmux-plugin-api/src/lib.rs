@@ -9,9 +9,11 @@ mod protocol;
 pub use manifest::{
     Action, Activation, Agent, AgentGate, AgentProcess, AgentRule, AgentRuleState,
     ComponentPreopen, Dependency, EventHook, Integration, IntegrationFile, IntegrationRegistration,
-    LoadedManifest, MAX_AGENT_RESUME_ARGS, MAX_INTEGRATION_FILE_BYTES, Manifest, ManifestError,
-    Pane, Permission, Placement, Plugin, RESUME_ID_PLACEHOLDER, RESUME_PATH_PLACEHOLDER, Runtime,
-    RuntimeKind, SchemaDocument, Workflow, WorkflowStep, validate_schema_instance,
+    Keybinding, LinkHandler, LoadedManifest, MAX_AGENT_RESUME_ARGS, MAX_INTEGRATION_FILE_BYTES,
+    MAX_KEYBINDINGS_PER_PLUGIN, MAX_LINK_HANDLERS_PER_PLUGIN, MAX_LINK_PATTERN_BYTES, Manifest,
+    ManifestError, Pane, Permission, Placement, Plugin, RESUME_ID_PLACEHOLDER,
+    RESUME_PATH_PLACEHOLDER, Runtime, RuntimeKind, SchemaDocument, Workflow, WorkflowStep,
+    validate_schema_instance,
 };
 pub use protocol::{
     ErrorCode, Event, FrameError, Hello, HostCall, HostCallResult, Invocation, InvocationContext,

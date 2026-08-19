@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use jsonschema::{Draft, Validator};
+use regex::Regex;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +30,9 @@ pub const MAX_INTEGRATION_PATH_SEGMENTS: usize = 4;
 pub const MAX_INTEGRATION_NOTICE_BYTES: usize = 512;
 pub const MAX_INTEGRATION_ARGS: usize = 8;
 pub const MAX_INTEGRATION_ARG_BYTES: usize = 128;
+pub const MAX_KEYBINDINGS_PER_PLUGIN: usize = 16;
+pub const MAX_LINK_HANDLERS_PER_PLUGIN: usize = 16;
+pub const MAX_LINK_PATTERN_BYTES: usize = 512;
 
 #[derive(Debug)]
 pub enum ManifestError {
@@ -76,6 +80,10 @@ pub struct Manifest {
     pub actions: Vec<Action>,
     #[serde(default)]
     pub events: Vec<EventHook>,
+    #[serde(default)]
+    pub keybindings: Vec<Keybinding>,
+    #[serde(default)]
+    pub link_handlers: Vec<LinkHandler>,
     #[serde(default)]
     pub panes: Vec<Pane>,
     #[serde(default)]
@@ -215,6 +223,25 @@ pub struct EventHook {
     pub include_self: bool,
     #[serde(default = "default_event_timeout")]
     pub timeout_ms: u64,
+}
+
+/// A client-side prefix chord that invokes one action from this package.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Keybinding {
+    /// One printable ASCII byte following the configured vvmux prefix.
+    pub chord: String,
+    /// A local action id declared by this manifest.
+    pub action: String,
+}
+
+/// A Ctrl-click route from an OSC 8 URL to one action from this package.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinkHandler {
+    pub pattern: String,
+    /// A local action id declared by this manifest.
+    pub action: String,
 }
 
 fn default_event_timeout() -> u64 {
@@ -612,6 +639,7 @@ impl LoadedManifest {
         }
 
         let known_events = [
+            "session.started",
             "pane.opened",
             "pane.exited",
             "pane.closed",
@@ -661,6 +689,11 @@ impl Manifest {
         }
         if self.manifest_version == 1 && !self.integrations.is_empty() {
             return invalid("integration definitions require manifest_version = 2");
+        }
+        if self.manifest_version == 1
+            && (!self.keybindings.is_empty() || !self.link_handlers.is_empty())
+        {
+            return invalid("keybinding and link handler definitions require manifest_version = 2");
         }
         validate_plugin_id(&self.plugin.id)?;
         if self.plugin.name.is_empty() || self.plugin.name.len() > 128 {
@@ -752,6 +785,8 @@ impl Manifest {
             .iter()
             .map(|action| action.id.as_str())
             .collect::<BTreeSet<_>>();
+        validate_keybindings(&self.keybindings, &action_ids)?;
+        validate_link_handlers(&self.link_handlers, &action_ids)?;
         if self.workflows.len() > MAX_WORKFLOWS {
             return invalid("plugin exceeds 128 workflows");
         }
@@ -760,6 +795,69 @@ impl Manifest {
         validate_integrations(&self.integrations, &self.plugin.permissions)?;
         Ok(())
     }
+}
+
+fn validate_keybindings(
+    keybindings: &[Keybinding],
+    action_ids: &BTreeSet<&str>,
+) -> Result<(), ManifestError> {
+    if keybindings.len() > MAX_KEYBINDINGS_PER_PLUGIN {
+        return invalid("plugin exceeds 16 keybindings");
+    }
+    let mut chords = BTreeSet::new();
+    for binding in keybindings {
+        let bytes = binding.chord.as_bytes();
+        if bytes.len() != 1 || !(0x20..=0x7e).contains(&bytes[0]) {
+            return invalid("plugin keybinding chord must be one printable ASCII byte");
+        }
+        if !chords.insert(binding.chord.as_str()) {
+            return invalid(format!(
+                "duplicate plugin keybinding chord `{}`",
+                binding.chord
+            ));
+        }
+        if !action_ids.contains(binding.action.as_str()) {
+            return invalid(format!(
+                "plugin keybinding `{}` references unknown action `{}`",
+                binding.chord, binding.action
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_link_handlers(
+    handlers: &[LinkHandler],
+    action_ids: &BTreeSet<&str>,
+) -> Result<(), ManifestError> {
+    if handlers.len() > MAX_LINK_HANDLERS_PER_PLUGIN {
+        return invalid("plugin exceeds 16 link handlers");
+    }
+    let mut patterns = BTreeSet::new();
+    for handler in handlers {
+        if handler.pattern.is_empty() || handler.pattern.len() > MAX_LINK_PATTERN_BYTES {
+            return invalid("plugin link handler pattern must contain 1 through 512 bytes");
+        }
+        if !patterns.insert(handler.pattern.as_str()) {
+            return invalid(format!(
+                "duplicate plugin link handler pattern `{}`",
+                handler.pattern
+            ));
+        }
+        Regex::new(&handler.pattern).map_err(|error| {
+            ManifestError::Invalid(format!(
+                "plugin link handler pattern `{}` is invalid: {error}",
+                handler.pattern
+            ))
+        })?;
+        if !action_ids.contains(handler.action.as_str()) {
+            return invalid(format!(
+                "plugin link handler references unknown action `{}`",
+                handler.action
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_integrations(
@@ -1580,6 +1678,8 @@ mod tests {
                 timeout_ms: 1000,
             }],
             events: Vec::new(),
+            keybindings: Vec::new(),
+            link_handlers: Vec::new(),
             panes: Vec::new(),
             dependencies: Vec::new(),
             workflows: Vec::new(),
@@ -1946,6 +2046,39 @@ command = ["python", "dashboard.py"]
         manifest.validate().unwrap();
         assert!(manifest.panes[0].hold_on_exit);
         assert!(!manifest.panes[0].accept_sync_input);
+    }
+
+    #[test]
+    fn manifest_two_validates_bounded_action_registrations() {
+        let mut manifest = valid_manifest();
+        manifest.manifest_version = 2;
+        manifest.keybindings = vec![Keybinding {
+            chord: "v".into(),
+            action: "read".into(),
+        }];
+        manifest.link_handlers = vec![LinkHandler {
+            pattern: r"^https://github\.com/".into(),
+            action: "read".into(),
+        }];
+        manifest.validate().unwrap();
+
+        manifest.link_handlers[0].pattern = "[".into();
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid")
+        );
+        manifest.link_handlers[0].pattern = "valid".into();
+        manifest.keybindings[0].action = "missing".into();
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("unknown action")
+        );
     }
 }
 

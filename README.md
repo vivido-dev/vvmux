@@ -41,20 +41,25 @@ and `VIVID_ANCHOR_TRANSPORT=conpty`. Remote Unix applications may still need the
 ```text
 vvmux                              attach/create `default`
 vvmux new [-s NAME] [-d]           create a session
-vvmux attach [-t NAME] [--replace] attach exactly by name
+vvmux attach [-t NAME] [--pane-id ID|--alias NAME] [--replace]
 vvmux list [--json]                list live owner sessions
 vvmux doctor -t NAME --json        check registry, IPC, bridge, and queue health
 vvmux debug-bundle -t NAME ...     write an atomic diagnostic ZIP
 vvmux kill-session -t NAME         terminate a session and its process groups
 vvmux msg [-t NAME] COMMAND        automate or inspect one pane directly
 vvmux plugin COMMAND               install, inspect, and invoke typed plugins
+vvmux api schema --json            emit the automation JSON Schema
+vvmux channel set stable|preview   select the Unix update stream
+vvmux update [--check]             verify/install a signed Unix release
 vvmux token create [--rotate]      create/rotate the VVWS bearer token
 vvmux serve [OPTIONS]              run the loopback VVWS/1 session gateway
 vvmux --config PATH ...            use an explicit strict TOML config
 ```
 
 Only one client can be attached to a session. `--replace` sends a clean detach to the old client
-before the new client is admitted.
+before the new client is admitted. `--pane-id` and `--alias` attach that pane directly over the
+whole terminal: input and resize affect only it, the session chrome and ordinary prefix actions
+are absent, and `Ctrl+b q` returns to the shell.
 
 ## Pane automation
 
@@ -236,6 +241,8 @@ GitHub repository), a full `https://` URL, and a local path — which must be ab
 `./` or `../`, so a name is never ambiguous with a directory. A package's `[[dependencies]]` are
 cloned and installed with it. Plugin IDs beginning `dev.vivido.` may only be installed from
 `https://github.com/vivido-dev/`, or linked from a local working copy with `vvmux plugin link`.
+The discovery index at [vivido.dev/vvmux/plugins](https://vivido.dev/vvmux/plugins) lists indexed
+packages, while installation still fetches source directly and shows the local trust preview.
 
 Third-party plugins use `manifest_version = 2` and may declare one or more passive agents without
 an executable runtime or permissions. Executable names are normalized and matched exactly;
@@ -273,6 +280,27 @@ priority = 500
 region = "whole_recent"
 contains = ["esc to interrupt"]
 ```
+
+Manifest v2 may also register up to 16 unused prefix chords and 16 Ctrl-click OSC 8 URL routes.
+The referenced action must be declared by the same package. User-configured chords win over core
+chords, core chords win over plugin chords, and a chord claimed by two plugins is disabled.
+
+```toml
+[[keybindings]]
+chord = "v"
+action = "open-issue"
+
+[[link_handlers]]
+pattern = '^https://github\.com/[^/]+/[^/]+/issues/[0-9]+$'
+action = "open-issue"
+
+[[events]]
+on = "session.started"
+command = ["./restore-state"]
+```
+
+`session.started` is published once after snapshot/layout restoration. Like every executable event
+hook, failure is isolated to the plugin worker and does not stop the session.
 
 When a background agent blocks or finishes, the attached client raises a desktop notification, so
 you do not have to watch every pane. `[notifications]` controls it:
@@ -1004,7 +1032,7 @@ full-duplex outer control, linked A/V projection, bounded scrollback search, tab
 input, optional bulk-media endpoint discovery, and validated Kitty/Ghostty graphics passthrough for
 Unicode virtual placements.
 
-Intentionally absent: a plugin marketplace, a bundled web UI, direct non-loopback/TLS serving,
+Intentionally absent: an in-terminal marketplace, a bundled web UI, direct non-loopback/TLS serving,
 arbitrary action sockets, stacked panes, pane-class conversion, multi-pane selection, scrollback
 editing, source transcoding, mirrored multi-client sessions, WinPTY, MSI/service installs,
 and machine-wide PATH changes. `run` and a layout `command` take one shell command line, passed to
@@ -1049,6 +1077,19 @@ artifacts use immutable content-addressed package directories: existing calls dr
 artifact, disabled or removed plugins cancel their jobs, and old runtimes fully stop before package
 cleanup or update acknowledgement. `vvmux msg --target SESSION reload-plugins` forces validation
 and reports the generation plus applied, deferred, and failed plugin IDs.
+
+## Updates and API schema
+
+Linux and macOS builds can select `stable` (the default) or `preview`, check for a release, and
+replace the current user-owned executable. The updater accepts only HTTPS, bounds every download,
+verifies the release manifest with the public key compiled into the binary, then checks the signed
+size and SHA-256 before an atomic same-directory replacement. It never sends credentials and does
+not restart live session daemons. Windows remains managed by the Vivido Suite installer.
+
+Official release automation requires the repository variable `VVMUX_UPDATE_PUBLIC_KEY_HEX` and
+the matching secret `VVMUX_UPDATE_SIGNING_KEY_PEM`; local builds intentionally carry a fail-closed
+development key. `vvmux api schema --json` emits a deterministic Draft 2020-12 document tagged with
+the exact VVMX version for client/tooling discovery.
 
 ## Windows troubleshooting
 

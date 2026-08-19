@@ -52,6 +52,7 @@ impl SessionAdapter {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .send(&ClientMessage::Attach {
                     replace: takeover,
+                    target: crate::ipc::AttachmentTarget::Session,
                     display,
                     vivid,
                     kitty_graphics: false,

@@ -114,6 +114,7 @@ pub fn attach(
     name: &str,
     replace: bool,
     create: bool,
+    target: crate::ipc::AttachmentTarget,
     config_path: Option<&Path>,
 ) -> io::Result<()> {
     let client_config = crate::config::Config::load(config_path)?;
@@ -145,6 +146,7 @@ pub fn attach(
         &mut reader,
         &writer,
         replace,
+        target.clone(),
         display,
         vivid,
         kitty_graphics,
@@ -159,6 +161,7 @@ pub fn attach(
     // through this bounded channel; edit keys are parsed only while a confirmed mode is active.
     let (mode_sender, mode_receiver) = mpsc::sync_channel::<(u64, bool)>(8);
     let (input_mode_sender, input_mode_receiver) = mpsc::sync_channel::<(u8, MouseCoordinates)>(8);
+    let (plugin_keymap_sender, plugin_keymap_receiver) = mpsc::sync_channel(8);
     let output = terminal.output()?;
     let output = Arc::new(Mutex::new(output));
     let output_thread = TerminalOutput::spawn(output, writer.clone())?;
@@ -274,6 +277,9 @@ pub fn attach(
                     }
                     ServerMessage::Status(status) => {
                         write_title(&output_thread, &format!("vvmux: {status}"));
+                    }
+                    ServerMessage::PluginKeymap { bindings, .. } => {
+                        let _ = plugin_keymap_sender.send(bindings);
                     }
                     ServerMessage::MediaSnapshot {
                         revision,
@@ -431,9 +437,11 @@ pub fn attach(
         signal_thread: Some(signal_thread),
     };
 
-    let mut parser = PrefixParser::new(
+    let direct = !matches!(target, crate::ipc::AttachmentTarget::Session);
+    let mut parser = PrefixParser::new_with_mode(
         crate::config::parse_control_chord(&client_config.general.prefix).unwrap_or(0x02),
         &client_config.keys.prefix,
+        direct,
     );
     #[cfg(not(windows))]
     let mut last_display = display;
@@ -464,6 +472,9 @@ pub fn attach(
             while let Ok((flags, coordinates)) = input_mode_receiver.try_recv() {
                 parser.set_keyboard_flags(flags);
                 parser.set_mouse_coordinates(coordinates);
+            }
+            while let Ok(bindings) = plugin_keymap_receiver.try_recv() {
+                parser.set_plugin_bindings(bindings);
             }
             let mut bytes = [0_u8; 4096];
             // A held bare Escape has to reach the pane on its own timescale, not on the idle poll
@@ -572,6 +583,7 @@ fn request_attachment(
     reader: &mut crate::ipc::RecordReader,
     writer: &SharedWriter,
     replace: bool,
+    target: crate::ipc::AttachmentTarget,
     display: crate::ipc::DisplayMetrics,
     vivid: bool,
     kitty_graphics: bool,
@@ -580,6 +592,7 @@ fn request_attachment(
         writer,
         &ClientMessage::Attach {
             replace,
+            target,
             display,
             vivid,
             kitty_graphics,
@@ -2330,6 +2343,7 @@ mod tests {
             &mut reader,
             &writer,
             false,
+            crate::ipc::AttachmentTarget::Session,
             crate::ipc::DisplayMetrics {
                 columns: 80,
                 rows: 24,
@@ -2550,6 +2564,8 @@ mod tests {
                     y: 6,
                     kind: MouseKind::Wheel,
                     shift: true,
+                    alt: false,
+                    ctrl: false,
                 },
                 MouseCoordinates::Cells
             )]

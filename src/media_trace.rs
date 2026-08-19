@@ -9,7 +9,9 @@ pub const MAX_MEDIA_TRACE_EVENTS: usize = 4096;
 pub const MAX_MEDIA_TRACE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_MEDIA_TRACE_QUERY_EVENTS: u16 = 512;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
 pub enum MediaTraceCategory {
@@ -167,7 +169,9 @@ pub struct MediaTraceEvent {
     pub kind: MediaTraceKind,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema,
+)]
 pub struct MediaTraceFilter {
     pub producer_id: Option<u64>,
     pub context_id: Option<u64>,

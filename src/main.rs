@@ -1,6 +1,7 @@
 mod agent;
 mod agent_drive;
 mod alt_read;
+mod api;
 mod automation;
 mod bridge;
 mod client;
@@ -29,6 +30,7 @@ mod server;
 mod session;
 mod session_state;
 mod theme;
+mod update;
 
 use std::fs;
 use std::io::{self, Write};
@@ -54,6 +56,22 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Emit machine-readable public API contracts.
+    Api {
+        #[command(subcommand)]
+        command: api::ApiCommand,
+    },
+    /// Check for or install a signed vvmux release (Linux and macOS).
+    Update {
+        /// Report the selected release without replacing the executable.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Select the release stream used by `vvmux update`.
+    Channel {
+        #[command(subcommand)]
+        command: update::ChannelCommand,
+    },
     /// Create a new session.
     New {
         #[arg(short = 's', long = "session", default_value = "default")]
@@ -68,6 +86,12 @@ enum Command {
     Attach {
         #[arg(short = 't', long = "target", default_value = "default")]
         target: String,
+        /// Attach directly to one pane instead of the complete session UI.
+        #[arg(long, conflicts_with = "alias")]
+        pane_id: Option<u64>,
+        /// Attach directly to the pane whose live agent owns this alias.
+        #[arg(long, conflicts_with = "pane_id")]
+        alias: Option<crate::agent::AgentAlias>,
         #[arg(long)]
         replace: bool,
     },
@@ -250,7 +274,13 @@ fn run(cli: Cli) -> io::Result<()> {
         return Ok(());
     }
     match cli.command.map(|command| *command) {
-        None => client::attach("default", false, true, cli.config.as_deref()),
+        None => client::attach(
+            "default",
+            false,
+            true,
+            ipc::AttachmentTarget::Session,
+            cli.config.as_deref(),
+        ),
         Some(Command::New {
             session,
             detached,
@@ -262,12 +292,29 @@ fn run(cli: Cli) -> io::Result<()> {
                 println!("created vvmux session {session}");
                 Ok(())
             } else {
-                client::attach(&session, false, false, cli.config.as_deref())
+                client::attach(
+                    &session,
+                    false,
+                    false,
+                    ipc::AttachmentTarget::Session,
+                    cli.config.as_deref(),
+                )
             }
         }
-        Some(Command::Attach { target, replace }) => {
+        Some(Command::Attach {
+            target,
+            pane_id,
+            alias,
+            replace,
+        }) => {
             runtime::validate_session_name(&target)?;
-            client::attach(&target, replace, false, cli.config.as_deref())
+            let attachment = match (pane_id, alias) {
+                (Some(pane_id), None) => ipc::AttachmentTarget::Pane { pane_id },
+                (None, Some(alias)) => ipc::AttachmentTarget::Agent { alias },
+                (None, None) => ipc::AttachmentTarget::Session,
+                (Some(_), Some(_)) => unreachable!("clap rejects conflicting attachment targets"),
+            };
+            client::attach(&target, replace, false, attachment, cli.config.as_deref())
         }
         Some(Command::List { json }) => list_sessions(json),
         Some(Command::Doctor { target, json }) => doctor(&target, json),
@@ -288,6 +335,9 @@ fn run(cli: Cli) -> io::Result<()> {
             command,
         }) => automation::run(target.as_deref(), alias, *command),
         Some(Command::Plugin { command }) => plugin::run(command),
+        Some(Command::Api { command }) => api::run(command),
+        Some(Command::Update { check }) => update::run(check),
+        Some(Command::Channel { command }) => update::channel(command),
         #[cfg(feature = "server-capability")]
         Some(Command::Serve {
             listen,
@@ -666,6 +716,26 @@ mod tests {
 
     #[test]
     fn parses_pane_automation_commands_and_enforces_cli_bounds() {
+        assert!(Cli::try_parse_from(["vvmux", "attach", "-t", "work", "--pane-id", "7"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["vvmux", "attach", "-t", "work", "--alias", "reviewer"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vvmux",
+                "attach",
+                "-t",
+                "work",
+                "--pane-id",
+                "7",
+                "--alias",
+                "reviewer"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["vvmux", "api", "schema", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["vvmux", "channel", "set", "preview"]).is_ok());
+        assert!(Cli::try_parse_from(["vvmux", "update", "--check"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "vvmux",

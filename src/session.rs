@@ -22,12 +22,12 @@ use crate::agent::{
 };
 use crate::config::{Config, OpenMode};
 use crate::ipc::{
-    Action, AutomationCompletion, AutomationError, AutomationMethod, AutomationRequest,
-    AutomationResponse, Axis, BridgeClipRect, BridgeNode, BridgePlayRequest, BridgeSource,
-    BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey,
-    ClientMessage, Direction, DisplayMetrics, FloatingEditCommand, FloatingEditKind,
-    MediaTrackIdentity, MediaTrackWaitCondition, MouseEvent, MouseKind, PluginEventEnvelope,
-    ServerMessage, SharedWriter, TextSource,
+    Action, AttachmentTarget, AutomationCompletion, AutomationError, AutomationMethod,
+    AutomationRequest, AutomationResponse, Axis, BridgeClipRect, BridgeNode, BridgePlayRequest,
+    BridgeSource, BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface,
+    BridgeSurfaceKey, ClientMessage, Direction, DisplayMetrics, FloatingEditCommand,
+    FloatingEditKind, MediaTrackIdentity, MediaTrackWaitCondition, MouseEvent, MouseKind,
+    PluginEventEnvelope, ServerMessage, SharedWriter, TextSource,
 };
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
@@ -248,6 +248,11 @@ pub enum ActorEvent {
     AgentCatalogApplied {
         generation: u64,
         catalog: Arc<crate::agent::AgentCatalog>,
+    },
+    PluginRegistrationsApplied {
+        generation: u64,
+        keybindings: Vec<crate::ipc::PluginKeybinding>,
+        link_handlers: Vec<crate::plugin::LinkRegistration>,
     },
     PluginLifecycle {
         name: String,
@@ -514,11 +519,18 @@ struct AttachedClient {
     id: u64,
     writer: SharedWriter,
     display: DisplayMetrics,
+    view: AttachmentView,
     acknowledged_frame: u64,
     vivid: bool,
     kitty_graphics: bool,
     rendered_session_sequence: u64,
     frame_sequences: VecDeque<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentView {
+    Session,
+    Pane(PaneId),
 }
 
 #[derive(Default)]
@@ -890,6 +902,19 @@ struct MouseSelection {
 struct HoveredLink {
     pane: PaneId,
     link: TerminalHyperlink,
+}
+
+struct CompiledLinkRegistration {
+    regex: regex::Regex,
+    action: String,
+}
+
+struct PluginLinkPress {
+    pane: PaneId,
+    content: Rect,
+    cell: (isize, usize),
+    uri: String,
+    action: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1486,6 +1511,10 @@ struct SessionActor {
     status_notice: Option<StatusNotice>,
     agent_catalog: Arc<crate::agent::AgentCatalog>,
     agent_catalog_generation: u64,
+    plugin_registration_generation: u64,
+    plugin_keybindings: Vec<crate::ipc::PluginKeybinding>,
+    plugin_link_handlers: Vec<CompiledLinkRegistration>,
+    plugin_link_press: Option<PluginLinkPress>,
     /// Per-pane notification floor. Bounded by the pane set, and pruned with it.
     last_notified: HashMap<PaneId, Instant>,
     next_float_mode: u64,
@@ -1713,6 +1742,10 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         status_notice: None,
         agent_catalog: Arc::new(crate::agent::AgentCatalog::default()),
         agent_catalog_generation: 0,
+        plugin_registration_generation: 0,
+        plugin_keybindings: Vec::new(),
+        plugin_link_handlers: Vec::new(),
+        plugin_link_press: None,
         last_notified: HashMap::new(),
         next_float_mode: 0,
         session_sequence: 1,
@@ -1744,9 +1777,18 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         bridge_metrics: crate::metrics::BridgeMetrics::default(),
         client_ipc: None,
     };
+    let restored_session = restore.is_some();
     match layout {
         Some(layout) => actor.apply_layout_plan(layout, restore.as_ref(), history.as_ref())?,
         None => actor.new_tab()?,
+    }
+    if actor.plugin_supervisor.is_some() {
+        actor.publish_plugin_event(
+            "session.started",
+            serde_json::json!({"restored": restored_session}),
+            None,
+            None,
+        );
     }
     let actor_terminated = terminated.clone();
     std::thread::Builder::new()
@@ -2161,6 +2203,30 @@ impl SessionActor {
                     self.evaluate_agent_states();
                 }
             }
+            ActorEvent::PluginRegistrationsApplied {
+                generation,
+                keybindings,
+                link_handlers,
+            } => {
+                if self.plugin_supervisor.is_some()
+                    && generation >= self.plugin_registration_generation
+                {
+                    self.plugin_registration_generation = generation;
+                    self.plugin_keybindings = keybindings;
+                    self.plugin_link_handlers = link_handlers
+                        .into_iter()
+                        .filter_map(|handler| {
+                            regex::Regex::new(&handler.pattern).ok().map(|regex| {
+                                CompiledLinkRegistration {
+                                    regex,
+                                    action: handler.action,
+                                }
+                            })
+                        })
+                        .collect();
+                    self.send_plugin_keymap();
+                }
+            }
             ActorEvent::PluginLifecycle {
                 name,
                 payload,
@@ -2453,10 +2519,34 @@ impl SessionActor {
         match message {
             ClientMessage::Attach {
                 replace,
+                target,
                 display,
                 vivid,
                 kitty_graphics,
             } => {
+                let view = match target {
+                    AttachmentTarget::Session => AttachmentView::Session,
+                    AttachmentTarget::Pane { pane_id } => {
+                        if !self.panes.contains_key(&pane_id) {
+                            return crate::ipc::send(
+                                &writer,
+                                &ServerMessage::Error(format!("pane {pane_id} does not exist")),
+                            );
+                        }
+                        AttachmentView::Pane(pane_id)
+                    }
+                    AttachmentTarget::Agent { alias } => {
+                        let Some(pane_id) = self.pane_with_agent_alias(&alias) else {
+                            return crate::ipc::send(
+                                &writer,
+                                &ServerMessage::Error(format!(
+                                    "no live agent owns alias `{alias}`"
+                                )),
+                            );
+                        };
+                        AttachmentView::Pane(pane_id)
+                    }
+                };
                 if let Some(old) = &self.attached {
                     if !replace {
                         return crate::ipc::send(
@@ -2481,7 +2571,10 @@ impl SessionActor {
                 self.vivid.deactivate_bridge();
                 self.pending_media_projections.clear();
                 self.clear_kitty_graphics();
-                let display = normalized_display(display, self.config.general.status_visible);
+                let display = normalized_display(
+                    display,
+                    matches!(view, AttachmentView::Session) && self.config.general.status_visible,
+                );
                 self.last_display = display;
                 self.client_ipc = Some(
                     writer
@@ -2503,6 +2596,7 @@ impl SessionActor {
                     id,
                     writer: writer.clone(),
                     display,
+                    view,
                     // This client never received the session's historical frames. Start its
                     // flow-control window at the current frame so the forced full repaint below
                     // becomes its first outstanding frame instead of being suppressed as stale.
@@ -2517,9 +2611,15 @@ impl SessionActor {
                 self.last_projection_warning = None;
                 // Detached tabs retain their rectangles. Clamp them against the attaching host
                 // before publishing the first text or media projection.
-                let area = self.content_area();
-                for tab in &mut self.tabs {
-                    tab.floating.clamp_all(area);
+                if matches!(view, AttachmentView::Session) {
+                    let area = self.content_area();
+                    for tab in &mut self.tabs {
+                        tab.floating.clamp_all(area);
+                    }
+                } else if let AttachmentView::Pane(pane_id) = view
+                    && let Some(pane) = self.panes.get_mut(&pane_id)
+                {
+                    pane.copy = None;
                 }
                 crate::ipc::send(
                     &writer,
@@ -2528,6 +2628,7 @@ impl SessionActor {
                         text_only: !vivid,
                     },
                 )?;
+                self.send_plugin_keymap();
                 self.last_screen = None;
                 #[cfg(windows)]
                 {
@@ -2544,7 +2645,7 @@ impl SessionActor {
                 // After the resize, never before: an agent reads its terminal size as it starts,
                 // and one launched against the placeholder geometry would lay itself out for a
                 // window that does not exist. This is also why a resume waits for an attach at all.
-                self.fire_pending_resumes();
+                self.fire_pending_resumes(self.direct_pane());
                 self.sync_media(true);
                 self.schedule_render();
             }
@@ -2576,7 +2677,14 @@ impl SessionActor {
             }
             ClientMessage::Resize(display) => {
                 if self.client_is(id) {
-                    let display = normalized_display(display, self.config.general.status_visible);
+                    let session_view = self
+                        .attached
+                        .as_ref()
+                        .is_some_and(|client| matches!(client.view, AttachmentView::Session));
+                    let display = normalized_display(
+                        display,
+                        session_view && self.config.general.status_visible,
+                    );
                     // A client may re-send its display without changing it: browser presenters
                     // report every dimension probe, not only real resizes. Relaying a phantom
                     // resize would bump `layout_revision`, so `should_sync_media` would rebuild
@@ -2595,18 +2703,26 @@ impl SessionActor {
                             client.display = display;
                             self.last_display = client.display;
                         }
-                        // Deterministic host-resize clamp: size before position, per float.
-                        let area = self.content_area();
-                        for tab in &mut self.tabs {
-                            tab.floating.clamp_all(area);
+                        if session_view {
+                            // Deterministic host-resize clamp: size before position, per float.
+                            let area = self.content_area();
+                            for tab in &mut self.tabs {
+                                tab.floating.clamp_all(area);
+                            }
                         }
                         self.force_full = true;
-                        self.relayout();
+                        if session_view {
+                            self.relayout();
+                        } else {
+                            self.resize_all();
+                            self.sync_media(true);
+                            self.schedule_render();
+                        }
                     }
                 }
             }
             ClientMessage::Action(action) => {
-                if self.client_is(id) {
+                if self.client_is(id) && self.direct_pane().is_none() {
                     self.action(action);
                 }
             }
@@ -3994,6 +4110,51 @@ impl SessionActor {
 
     fn client_is(&self, id: u64) -> bool {
         self.attached.as_ref().is_some_and(|client| client.id == id)
+    }
+
+    fn send_plugin_keymap(&self) {
+        let Some(client) = &self.attached else {
+            return;
+        };
+        let _ = crate::ipc::send(
+            &client.writer,
+            &ServerMessage::PluginKeymap {
+                generation: self.plugin_registration_generation,
+                bindings: self.plugin_keybindings.clone(),
+            },
+        );
+    }
+
+    fn direct_pane(&self) -> Option<PaneId> {
+        match self.attached.as_ref().map(|client| client.view) {
+            Some(AttachmentView::Pane(pane_id)) => Some(pane_id),
+            Some(AttachmentView::Session) | None => None,
+        }
+    }
+
+    fn attached_focus_pane(&self) -> Option<PaneId> {
+        self.direct_pane()
+            .or_else(|| self.active_tab().map(|tab| tab.focused))
+    }
+
+    fn attached_projections(&self, area: Rect) -> Vec<PaneProjection> {
+        if let Some(pane_id) = self.direct_pane() {
+            return self
+                .panes
+                .contains_key(&pane_id)
+                .then_some(PaneProjection {
+                    pane_id,
+                    outer: area,
+                    content: area,
+                    layer: PaneLayer::Tiled,
+                    focused: true,
+                })
+                .into_iter()
+                .collect();
+        }
+        self.active_tab()
+            .map(|tab| visible_projections(tab, area))
+            .unwrap_or_default()
     }
 
     /// The pane holding the agent named `alias`, if one does.
@@ -5474,10 +5635,7 @@ impl SessionActor {
                 tiled_geometry.map_or(Rect::default(), |(_, rect)| rect),
             )
         };
-        let visible = tab_index == self.active_tab
-            && visible_projections(tab, area)
-                .iter()
-                .any(|projection| projection.pane_id == pane_id);
+        let visible = self.pane_is_visibly_present(pane_id);
         let cursor = pane.terminal.cursor();
         let plugin = match &pane.role {
             PaneRole::Core => None,
@@ -5498,7 +5656,7 @@ impl SessionActor {
             "tab_id": tab.id,
             "tab_name": tab.name,
             "active_tab": tab_index == self.active_tab,
-            "focused": tab.focused == pane_id,
+            "focused": self.attached_focus_pane() == Some(pane_id),
             "visible": visible,
             "layer": layer,
             "zoomed": tab.zoomed == Some(pane_id),
@@ -6339,14 +6497,10 @@ impl SessionActor {
     fn evaluate_agent_states(&mut self) {
         let visible = if self.attached.is_some() && self.client_focused {
             let area = self.content_area();
-            self.active_tab()
-                .map(|tab| {
-                    visible_projections(tab, area)
-                        .into_iter()
-                        .map(|projection| projection.pane_id)
-                        .collect::<HashSet<_>>()
-                })
-                .unwrap_or_default()
+            self.attached_projections(area)
+                .into_iter()
+                .map(|projection| projection.pane_id)
+                .collect::<HashSet<_>>()
         } else {
             HashSet::new()
         };
@@ -6489,6 +6643,14 @@ impl SessionActor {
     }
 
     fn input(&mut self, bytes: Vec<u8>) {
+        if let Some(pane_id) = self.direct_pane() {
+            let failure = self
+                .panes
+                .get_mut(&pane_id)
+                .and_then(|pane| queue_pane_input(pane, &bytes));
+            self.report_input_failure(pane_id, failure);
+            return;
+        }
         if self.agent_navigator.is_some() {
             self.agent_navigator_input(&key_presses(&bytes));
             return;
@@ -6830,6 +6992,9 @@ impl SessionActor {
         if self.tab_rename.is_some() || self.close_pane_confirmation.is_some() {
             return;
         }
+        if self.handle_plugin_link_mouse(mouse) {
+            return;
+        }
         if self.mouse_selection_drag.is_some() {
             match mouse.kind {
                 MouseKind::Move if mouse.button == 0 => {
@@ -6845,6 +7010,10 @@ impl SessionActor {
                     self.mouse_click_tracker = None;
                 }
             }
+        }
+        if let Some(pane_id) = self.direct_pane() {
+            self.direct_mouse(pane_id, mouse, pixels, display);
+            return;
         }
         if self.pointer_drag.is_some() {
             match mouse.kind {
@@ -7008,6 +7177,12 @@ impl SessionActor {
                 if mouse.kind == MouseKind::Move {
                     button |= 32;
                 }
+                if mouse.alt {
+                    button |= 8;
+                }
+                if mouse.ctrl {
+                    button |= 16;
+                }
                 let (x, y) = application_mouse_coordinates(
                     mouse,
                     pixels,
@@ -7068,6 +7243,82 @@ impl SessionActor {
         let display_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
         let cell = mouse_selection_cell(content, x, y, display_offset)?;
         self.link_at_cell(pane_id, cell)
+    }
+
+    /// Capture a Ctrl-left click on an OSC 8 URL for a declarative plugin handler. Capture wins
+    /// over application mouse mode deliberately: Ctrl is the explicit user opt-in to reroute the
+    /// click, while an ordinary click remains byte-for-byte application input or local selection.
+    fn handle_plugin_link_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if let Some(press) = self.plugin_link_press.take() {
+            match mouse.kind {
+                MouseKind::Move if mouse.button == 0 => {
+                    if mouse_selection_cell(press.content, mouse.x, mouse.y, 0) == Some(press.cell)
+                    {
+                        self.plugin_link_press = Some(press);
+                    }
+                    return true;
+                }
+                MouseKind::Release if mouse.button == 0 => {
+                    let unchanged = mouse_selection_cell(press.content, mouse.x, mouse.y, 0)
+                        == Some(press.cell)
+                        && self
+                            .link_at_cell(press.pane, press.cell)
+                            .is_some_and(|link| link.uri == press.uri);
+                    if unchanged {
+                        self.invoke_plugin_action(
+                            press.action,
+                            serde_json::json!({"uri": press.uri}),
+                        );
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if mouse.kind != MouseKind::Press
+            || mouse.button != 0
+            || !mouse.ctrl
+            || self.plugin_link_handlers.is_empty()
+        {
+            return false;
+        }
+        let area = self.content_area();
+        let Some(projection) = self
+            .attached_projections(area)
+            .into_iter()
+            .rev()
+            .find(|projection| projection.content.contains(mouse.x, mouse.y))
+        else {
+            return false;
+        };
+        let Some(cell) = mouse_selection_cell(projection.content, mouse.x, mouse.y, 0) else {
+            return false;
+        };
+        let Some(link) = self.link_at_cell(projection.pane_id, cell) else {
+            return false;
+        };
+        let actions = self
+            .plugin_link_handlers
+            .iter()
+            .filter(|handler| handler.regex.is_match(&link.uri))
+            .take(2)
+            .map(|handler| handler.action.clone())
+            .collect::<Vec<_>>();
+        let [action] = actions.as_slice() else {
+            if actions.len() > 1 {
+                self.status("plugin link click is ambiguous; matching handlers were not invoked");
+                return true;
+            }
+            return false;
+        };
+        self.plugin_link_press = Some(PluginLinkPress {
+            pane: projection.pane_id,
+            content: projection.content,
+            cell,
+            uri: link.uri,
+            action: action.clone(),
+        });
+        true
     }
 
     /// Open a clicked link on the host vvmux itself runs on.
@@ -7177,6 +7428,12 @@ impl SessionActor {
         if mouse.kind == MouseKind::Move {
             button |= 32;
         }
+        if mouse.alt {
+            button |= 8;
+        }
+        if mouse.ctrl {
+            button |= 16;
+        }
         let terminator = if mouse.kind == MouseKind::Release {
             'm'
         } else {
@@ -7188,6 +7445,101 @@ impl SessionActor {
             pane_id,
             format!("\x1b[<{button};{x};{y}{terminator}").as_bytes(),
         );
+    }
+
+    fn direct_mouse(
+        &mut self,
+        pane_id: PaneId,
+        mouse: MouseEvent,
+        pixels: Option<(u16, u16)>,
+        display: DisplayMetrics,
+    ) {
+        let content = self.content_area();
+        if !content.contains(mouse.x, mouse.y) {
+            self.set_hovered_link(None);
+            return;
+        }
+        let Some(modes) = self.panes.get(&pane_id).map(|pane| pane.terminal.modes()) else {
+            return;
+        };
+        let application_mouse = !mouse.shift
+            && (modes.mouse_clicks || (mouse.kind == MouseKind::Move && modes.mouse_motion));
+        if mouse.kind == MouseKind::Move {
+            let hovered = (!application_mouse && self.config.hyperlinks.enabled)
+                .then(|| self.link_at(pane_id, content, mouse.x, mouse.y))
+                .flatten()
+                .map(|link| HoveredLink {
+                    pane: pane_id,
+                    link,
+                });
+            self.set_hovered_link(hovered);
+        }
+        if starts_mouse_selection(mouse, false, modes) {
+            self.begin_mouse_selection(pane_id, content, mouse);
+            return;
+        }
+        if application_mouse {
+            let mut button = u16::from(mouse.button);
+            if mouse.kind == MouseKind::Wheel {
+                button |= 64;
+            }
+            if mouse.kind == MouseKind::Move {
+                button |= 32;
+            }
+            if mouse.alt {
+                button |= 8;
+            }
+            if mouse.ctrl {
+                button |= 16;
+            }
+            let (x, y) =
+                application_mouse_coordinates(mouse, pixels, content, display, modes.sgr_pixels);
+            self.send_pane_input(
+                pane_id,
+                crate::agent_drive::encode_sgr_mouse(
+                    button,
+                    x,
+                    y,
+                    mouse.kind != MouseKind::Release,
+                )
+                .as_bytes(),
+            );
+        } else if mouse.kind == MouseKind::Wheel {
+            let previous_offset = self
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| pane.copy.as_ref())
+                .map_or(0, |copy| copy.offset);
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                let copy = pane.copy.get_or_insert(CopyState {
+                    offset: 0,
+                    row: 0,
+                    column: 0,
+                    selection_start: None,
+                    search: None,
+                    matches: Vec::new(),
+                    current: None,
+                });
+                if mouse.button == 0 {
+                    copy.offset = (copy.offset + 3).min(pane.terminal.history_len());
+                } else {
+                    copy.offset = copy.offset.saturating_sub(3);
+                    if copy.offset == 0 {
+                        pane.copy = None;
+                    }
+                }
+            }
+            let current_offset = self
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| pane.copy.as_ref())
+                .map_or(0, |copy| copy.offset);
+            if previous_offset != current_offset {
+                self.projection_changed();
+            } else {
+                self.schedule_render();
+            }
+        }
     }
 
     fn update_pointer_drag(&mut self, mouse: MouseEvent) {
@@ -7475,11 +7827,16 @@ impl SessionActor {
             self.status("invalid plugin action reference");
             return;
         }
+        self.invoke_plugin_action(invocation, serde_json::json!({}));
+    }
+
+    fn invoke_plugin_action(&mut self, invocation: String, input: serde_json::Value) {
         let Some(supervisor) = self.plugin_supervisor.clone() else {
             self.status("plugin action rejected: plugins are disabled in this session");
             return;
         };
-        if let Err(error) = supervisor.invoke_notice(invocation, serde_json::json!({}), reference) {
+        let notice = format!("plugin:{invocation}");
+        if let Err(error) = supervisor.invoke_notice(invocation, input, notice) {
             self.status(&format!("plugin action rejected: {}", error.message));
         }
     }
@@ -9483,14 +9840,16 @@ impl SessionActor {
     /// One attempt each, success or failure: a pane whose shell is busy, or whose write fails, is
     /// left as the working shell it already is rather than retried into an unclear state. Nothing is
     /// waiting on a reply, so a failure is reported to nobody and costs only the resume.
-    fn fire_pending_resumes(&mut self) {
+    fn fire_pending_resumes(&mut self, only: Option<PaneId>) {
         if !self.config.session.resume_agents {
             return;
         }
         let armed = self
             .panes
             .iter()
-            .filter(|(_, pane)| pane.pending_resume.is_some())
+            .filter(|(pane_id, pane)| {
+                pane.pending_resume.is_some() && only.is_none_or(|only| **pane_id == only)
+            })
             .map(|(pane_id, _)| *pane_id)
             .collect::<Vec<_>>();
         for pane_id in armed {
@@ -9844,6 +10203,22 @@ impl SessionActor {
     }
 
     fn close_pane(&mut self, pane_id: PaneId) {
+        if self.direct_pane() == Some(pane_id) {
+            if let Some(client) = &self.attached {
+                let _ = crate::ipc::send(
+                    &client.writer,
+                    &ServerMessage::Detached {
+                        reason: format!("directly attached pane {pane_id} closed"),
+                    },
+                );
+            }
+            self.attached = None;
+            self.clear_kitty_graphics();
+            self.reported_input_mode = None;
+            self.last_screen = None;
+            self.pending_media_projections.clear();
+            self.vivid.deactivate_bridge();
+        }
         if let Some(pending) = self.alt_reads.remove(&pane_id) {
             self.reply_automation_error(
                 pending.reply,
@@ -9995,6 +10370,11 @@ impl SessionActor {
         for (_, subscription) in self.plugin_event_subscriptions.drain() {
             subscription.cancel.cancel();
         }
+        self.plugin_registration_generation = 0;
+        self.plugin_keybindings.clear();
+        self.plugin_link_handlers.clear();
+        self.plugin_link_press = None;
+        self.send_plugin_keymap();
     }
 
     /// Re-read the config file and adopt what can be adopted without disturbing live state.
@@ -10161,67 +10541,73 @@ impl SessionActor {
         let display = self.layout_display();
         let mut resize_failures = Vec::new();
         let mut resized_panes = 0_u64;
-        for tab in &self.tabs {
-            // Hidden ordinary floats keep consuming PTY output but are not resized while
-            // hidden; a re-shown float is resized here on the next relayout if its content
-            // dimensions changed.
-            for projection in visible_projections(tab, area) {
-                if let Some(pane) = self.panes.get_mut(&projection.pane_id) {
-                    let content = projection.content;
-                    // A pane squeezed to nothing still has a live program behind it, and neither
-                    // a terminal grid nor a PTY has a zero dimension. Such a pane keeps a single
-                    // cell so the window can shrink past its frame and grow back with the pane
-                    // and its program intact.
-                    let columns = content.width.max(1);
-                    let rows = content.height.max(1);
-                    let metrics = (
+        let projections = if self.direct_pane().is_some() {
+            self.attached_projections(area)
+        } else {
+            self.tabs
+                .iter()
+                .flat_map(|tab| visible_projections(tab, area))
+                .collect()
+        };
+        // Hidden ordinary floats keep consuming PTY output but are not resized while
+        // hidden; a re-shown float is resized here on the next relayout if its content
+        // dimensions changed.
+        for projection in projections {
+            if let Some(pane) = self.panes.get_mut(&projection.pane_id) {
+                let content = projection.content;
+                // A pane squeezed to nothing still has a live program behind it, and neither
+                // a terminal grid nor a PTY has a zero dimension. Such a pane keeps a single
+                // cell so the window can shrink past its frame and grow back with the pane
+                // and its program intact.
+                let columns = content.width.max(1);
+                let rows = content.height.max(1);
+                let metrics = (
+                    content.width,
+                    content.height,
+                    display.cell_width,
+                    display.cell_height,
+                );
+                let dimensions_changed = pane.terminal.rows() != rows as usize
+                    || pane.terminal.cols() != columns as usize;
+                let metrics_changed = pane.vivid_metrics != Some(metrics);
+                if dimensions_changed {
+                    pane.terminal.resize(rows as usize, columns as usize);
+                    pane.screen_sequence = pane.screen_sequence.wrapping_add(1);
+                    pane.last_screen_change = Instant::now();
+                    pane.screen_changes.push_back(ScreenChange {
+                        sequence: pane.screen_sequence,
+                        rows: None,
+                    });
+                    while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
+                        pane.screen_changes.pop_front();
+                    }
+                    resized_panes = resized_panes.wrapping_add(1);
+                }
+                if dimensions_changed || metrics_changed {
+                    let pixel_width = u32::from(columns)
+                        .checked_mul(u32::from(display.cell_width))
+                        .and_then(|value| u16::try_from(value).ok())
+                        .unwrap_or(0);
+                    let pixel_height = u32::from(rows)
+                        .checked_mul(u32::from(display.cell_height))
+                        .and_then(|value| u16::try_from(value).ok())
+                        .unwrap_or(0);
+                    if pane
+                        .control
+                        .resize_with_pixels(columns, rows, pixel_width, pixel_height)
+                        .is_err()
+                    {
+                        resize_failures.push(projection.pane_id);
+                    }
+                }
+                if metrics_changed {
+                    self.vivid.update_metrics(
+                        projection.pane_id,
                         content.width,
                         content.height,
-                        display.cell_width,
-                        display.cell_height,
+                        (display.cell_width, display.cell_height),
                     );
-                    let dimensions_changed = pane.terminal.rows() != rows as usize
-                        || pane.terminal.cols() != columns as usize;
-                    let metrics_changed = pane.vivid_metrics != Some(metrics);
-                    if dimensions_changed {
-                        pane.terminal.resize(rows as usize, columns as usize);
-                        pane.screen_sequence = pane.screen_sequence.wrapping_add(1);
-                        pane.last_screen_change = Instant::now();
-                        pane.screen_changes.push_back(ScreenChange {
-                            sequence: pane.screen_sequence,
-                            rows: None,
-                        });
-                        while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
-                            pane.screen_changes.pop_front();
-                        }
-                        resized_panes = resized_panes.wrapping_add(1);
-                    }
-                    if dimensions_changed || metrics_changed {
-                        let pixel_width = u32::from(columns)
-                            .checked_mul(u32::from(display.cell_width))
-                            .and_then(|value| u16::try_from(value).ok())
-                            .unwrap_or(0);
-                        let pixel_height = u32::from(rows)
-                            .checked_mul(u32::from(display.cell_height))
-                            .and_then(|value| u16::try_from(value).ok())
-                            .unwrap_or(0);
-                        if pane
-                            .control
-                            .resize_with_pixels(columns, rows, pixel_width, pixel_height)
-                            .is_err()
-                        {
-                            resize_failures.push(projection.pane_id);
-                        }
-                    }
-                    if metrics_changed {
-                        self.vivid.update_metrics(
-                            projection.pane_id,
-                            content.width,
-                            content.height,
-                            (display.cell_width, display.cell_height),
-                        );
-                        pane.vivid_metrics = Some(metrics);
-                    }
+                    pane.vivid_metrics = Some(metrics);
                 }
             }
         }
@@ -10253,19 +10639,21 @@ impl SessionActor {
         };
         let theme = self.config.resolved_theme();
         let display = client.display;
+        let session_view = matches!(client.view, AttachmentView::Session);
         let writer = client.writer.clone();
         let kitty_graphics = client.kitty_graphics;
         #[cfg(windows)]
         let focused_bracketed_paste = self
-            .active_tab()
-            .and_then(|tab| self.panes.get(&tab.focused))
+            .attached_focus_pane()
+            .and_then(|pane_id| self.panes.get(&pane_id))
             .is_some_and(|pane| pane.terminal.modes().bracketed_paste);
         let mut screen = ScreenBuffer::new(display.columns, display.rows);
         let area = self.content_area();
-        if let Some(tab) = self.active_tab() {
+        let projections = self.attached_projections(area);
+        if !projections.is_empty() {
             // Composition follows the ordered projection list; later projections overwrite
             // earlier frames and cells, and the status row is drawn last.
-            let projections = visible_projections(tab, area);
+            let sync_input = session_view && self.active_tab().is_some_and(|tab| tab.sync_input);
             let mut cursor: Option<((u16, u16), usize)> = None;
             for (index, projection) in projections.iter().enumerate() {
                 let Some(pane) = self.panes.get(&projection.pane_id) else {
@@ -10283,7 +10671,7 @@ impl SessionActor {
                     .and_then(|copy| copy.search.as_ref())
                     .filter(|search| !search.query.is_empty())
                     .map_or_else(String::new, |search| format!(" [search: {}]", search.query));
-                let sync_suffix = if tab.sync_input { " [sync]" } else { "" };
+                let sync_suffix = if sync_input { " [sync]" } else { "" };
                 let pin_suffix = if projection.layer == PaneLayer::Pinned {
                     " [pin]"
                 } else {
@@ -10292,13 +10680,15 @@ impl SessionActor {
                 // A held pane outlives its process; say so, or it looks like a live shell that
                 // has stopped responding.
                 let exit_suffix = pane.exit_status.map(|_| " [exited]").unwrap_or("");
-                screen.draw_frame(
-                    projection.outer,
-                    &format!(
-                        " {title}{copy_suffix}{search_suffix}{sync_suffix}{pin_suffix}{exit_suffix} "
-                    ),
-                    theme.frame(active),
-                );
+                if session_view {
+                    screen.draw_frame(
+                        projection.outer,
+                        &format!(
+                            " {title}{copy_suffix}{search_suffix}{sync_suffix}{pin_suffix}{exit_suffix} "
+                        ),
+                        theme.frame(active),
+                    );
+                }
                 let content = projection.content;
                 let offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
                 screen.draw_terminal(content, &pane.terminal, offset);
@@ -10404,12 +10794,12 @@ impl SessionActor {
                     .then_some((x, y))
             });
         }
-        if self.agent_navigator.is_some() {
+        if session_view && self.agent_navigator.is_some() {
             self.draw_agent_navigator(&mut screen, theme);
-        } else if self.tab_navigator.is_some() {
+        } else if session_view && self.tab_navigator.is_some() {
             self.draw_tab_navigator(&mut screen, theme);
         }
-        if self.config.general.status_visible && screen.rows > 0 {
+        if session_view && self.config.general.status_visible && screen.rows > 0 {
             let rename_prompt = self.tab_rename.as_ref().and_then(|rename| {
                 self.tabs
                     .iter()
@@ -10591,12 +10981,19 @@ impl SessionActor {
             return;
         }
         let writer = client.writer.clone();
-        let Some((projections, pane_priority)) = self.active_tab().map(|tab| {
-            let projections = visible_projections(tab, self.content_area());
-            let priority = projection_pane_priority(tab, &projections);
-            (projections, priority)
-        }) else {
+        let projections = self.attached_projections(self.content_area());
+        if projections.is_empty() {
             return;
+        }
+        let pane_priority = if self.direct_pane().is_some() {
+            projections
+                .iter()
+                .map(|projection| projection.pane_id)
+                .collect()
+        } else {
+            self.active_tab()
+                .map(|tab| projection_pane_priority(tab, &projections))
+                .unwrap_or_default()
         };
         let area = self.content_area();
         let panes = projections
@@ -11034,13 +11431,18 @@ impl SessionActor {
 
     fn content_area(&self) -> Rect {
         let display = self.layout_display();
+        let status_visible = self
+            .attached
+            .as_ref()
+            .is_none_or(|client| matches!(client.view, AttachmentView::Session))
+            && self.config.general.status_visible;
         Rect {
             x: 0,
             y: 0,
             width: display.columns.max(1),
             height: display
                 .rows
-                .saturating_sub(u16::from(self.config.general.status_visible))
+                .saturating_sub(u16::from(status_visible))
                 .max(1),
         }
     }
@@ -11058,11 +11460,9 @@ impl SessionActor {
             return false;
         }
         let area = self.content_area();
-        self.active_tab().is_some_and(|tab| {
-            visible_projections(tab, area)
-                .iter()
-                .any(|projection| projection.pane_id == pane_id)
-        })
+        self.attached_projections(area)
+            .iter()
+            .any(|projection| projection.pane_id == pane_id)
     }
 
     fn status(&self, message: &str) {
@@ -11091,7 +11491,7 @@ impl SessionActor {
         let focused = self
             .attached
             .is_some()
-            .then(|| self.active_tab().map(|tab| tab.focused))
+            .then(|| self.attached_focus_pane())
             .flatten()
             .filter(|_| self.client_focused);
         let mut failures = Vec::new();
@@ -11143,8 +11543,8 @@ impl SessionActor {
     /// coordinates while the physical presenter continues sending legacy keys and cell positions.
     fn sync_client_input_mode(&mut self) {
         let (keyboard_flags, sgr_pixels) = self
-            .active_tab()
-            .and_then(|tab| self.panes.get(&tab.focused))
+            .attached_focus_pane()
+            .and_then(|pane_id| self.panes.get(&pane_id))
             .map_or((0, false), |pane| {
                 let modes = pane.terminal.modes();
                 (modes.keyboard_flags, modes.sgr_pixels)
@@ -11421,6 +11821,16 @@ impl SessionActor {
     }
 
     fn paste(&mut self) {
+        if let Some(pane_id) = self.direct_pane() {
+            let sanitized = sanitize_bracketed_paste(&self.copy_buffer);
+            let bytes = self.paste_payload_for(pane_id, &sanitized);
+            let failure = self
+                .panes
+                .get_mut(&pane_id)
+                .and_then(|pane| queue_pane_input(pane, &bytes));
+            self.report_input_failure(pane_id, failure);
+            return;
+        }
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -14604,6 +15014,8 @@ mod tests {
             y: 4,
             kind: MouseKind::Press,
             shift: false,
+            alt: false,
+            ctrl: false,
         };
         let mut modes = TerminalModes::default();
         assert!(starts_mouse_selection(press, false, modes));
@@ -14612,6 +15024,8 @@ mod tests {
         assert!(starts_mouse_selection(
             MouseEvent {
                 shift: true,
+                alt: false,
+                ctrl: false,
                 ..press
             },
             false,
@@ -14946,6 +15360,8 @@ mod tests {
             y: 130,
             kind: MouseKind::Press,
             shift: false,
+            alt: false,
+            ctrl: false,
         };
         let cell_mouse = pixel_mouse_to_cells(pixel_mouse, display);
         assert_eq!((cell_mouse.x, cell_mouse.y), (15, 6));

@@ -52,7 +52,7 @@ const FULL_PROCESS_RECHECK: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const MAX_PROCESS_ARGV_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema)]
 pub struct AgentId(String);
 
 impl AgentId {
@@ -115,7 +115,7 @@ impl<'de> Deserialize<'de> for AgentId {
 /// An alias is typed on a command line and compared against pane IDs, so it must never be mistaken
 /// for a number, a flag, or a differently-cased spelling of another alias. Ported from herdr's
 /// `valid_agent_name` (`src/app/agents.rs`); see `agent/PROVENANCE.md`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema)]
 pub struct AgentAlias(String);
 
 impl AgentAlias {
@@ -170,7 +170,9 @@ impl<'de> Deserialize<'de> for AgentAlias {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
 pub enum AgentState {
@@ -191,6 +193,7 @@ pub enum AgentState {
     Deserialize,
     clap::ValueEnum,
     Hash,
+    schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "snake_case")]

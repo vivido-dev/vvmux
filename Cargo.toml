@@ -34,6 +34,7 @@ regex = { version = "1", default-features = false, features = [
   "unicode-case",
   "unicode-perl",
 ] }
+schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -44,7 +45,7 @@ ed25519-dalek = { version = "3", features = [
   "signature",
   "digest",
   "zeroize",
-], optional = true }
+] }
 httpdate = { version = "1", optional = true }
 rpassword = { version = "7", optional = true }
 tokio-tungstenite = { version = "0.30", features = [
@@ -67,7 +68,7 @@ vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
 zeroize = { version = "1.9", features = ["serde"] }
-vvmux-plugin-api = { version = "0.4", path = "vvmux-plugin-api" }
+vvmux-plugin-api = { version = "0.5", path = "vvmux-plugin-api" }
 # 38.0.4 was the original design pin but now has applicable RustSec sandbox/WASI advisories.
 # 36.0.13 is the fully patched maintenance line that still supports this workspace's Rust 1.88.
 wasmtime = { version = "47", default-features = false, features = [
@@ -82,7 +83,6 @@ wasmtime-wasi = { version = "47", default-features = false }
 default = ["server-capability"]
 server-capability = [
   "dep:axum",
-  "dep:ed25519-dalek",
   "dep:futures-util",
   "dep:httpdate",
   "dep:rpassword",
@@ -99,6 +99,7 @@ libc = "0.2"
 signal-hook = { version = "0.4", default-features = false, features = [
   "iterator",
 ] }
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
