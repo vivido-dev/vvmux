@@ -41,7 +41,7 @@ and `VIVID_ANCHOR_TRANSPORT=conpty`. Remote Unix applications may still need the
 ```text
 vvmux                              attach/create `default`
 vvmux new [-s NAME] [-d]           create a session
-vvmux attach [-t NAME] [--pane-id ID|--alias NAME] [--replace]
+vvmux attach [-d|--replace] [-t NAME] [--pane-id ID|--alias NAME]
 vvmux list [--json]                list live owner sessions
 vvmux doctor -t NAME --json        check registry, IPC, bridge, and queue health
 vvmux debug-bundle -t NAME ...     write an atomic diagnostic ZIP
@@ -56,10 +56,11 @@ vvmux serve [OPTIONS]              run the loopback VVWS/1 session gateway
 vvmux --config PATH ...            use an explicit strict TOML config
 ```
 
-Only one client can be attached to a session. `--replace` sends a clean detach to the old client
-before the new client is admitted. `--pane-id` and `--alias` attach that pane directly over the
-whole terminal: input and resize affect only it, the session chrome and ordinary prefix actions
-are absent, and `Ctrl+b q` returns to the shell.
+Only one client can be attached to a session. `-d` (or `--replace`) sends a clean detach to the old
+client before the new client is admitted. With no `-t`, `vvmux attach -d` replaces the client on
+the `default` session. `--pane-id` and `--alias` attach that pane directly over the whole terminal:
+input and resize affect only it, the session chrome and ordinary prefix actions are absent, and
+`Ctrl+b q` returns to the shell.
 
 ## Pane automation
 

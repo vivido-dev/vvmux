@@ -92,7 +92,8 @@ enum Command {
         /// Attach directly to the pane whose live agent owns this alias.
         #[arg(long, conflicts_with = "pane_id")]
         alias: Option<crate::agent::AgentAlias>,
-        #[arg(long)]
+        /// Detach the current client before attaching.
+        #[arg(short = 'd', long)]
         replace: bool,
     },
     /// List live sessions owned by this user.
@@ -713,6 +714,59 @@ fn crc32(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_detach_other_flag_defaults_to_default_session() {
+        let cli = Cli::try_parse_from(["vvmux", "attach", "-d"]).unwrap();
+        let Some(command) = cli.command else {
+            panic!("attach command was not parsed");
+        };
+        let Command::Attach {
+            target,
+            pane_id,
+            alias,
+            replace,
+        } = *command
+        else {
+            panic!("parsed command was not attach");
+        };
+        assert_eq!(target, "default");
+        assert_eq!(pane_id, None);
+        assert_eq!(alias, None);
+        assert!(replace);
+    }
+
+    #[test]
+    fn attach_detach_other_flag_accepts_an_explicit_target() {
+        let cli = Cli::try_parse_from(["vvmux", "attach", "-d", "-t", "work"]).unwrap();
+        let Some(command) = cli.command else {
+            panic!("attach command was not parsed");
+        };
+        let Command::Attach {
+            target, replace, ..
+        } = *command
+        else {
+            panic!("parsed command was not attach");
+        };
+        assert_eq!(target, "work");
+        assert!(replace);
+    }
+
+    #[test]
+    fn attach_without_detach_other_keeps_replacement_disabled() {
+        let cli = Cli::try_parse_from(["vvmux", "attach"]).unwrap();
+        let Some(command) = cli.command else {
+            panic!("attach command was not parsed");
+        };
+        let Command::Attach {
+            target, replace, ..
+        } = *command
+        else {
+            panic!("parsed command was not attach");
+        };
+        assert_eq!(target, "default");
+        assert!(!replace);
+    }
 
     #[test]
     fn parses_pane_automation_commands_and_enforces_cli_bounds() {
