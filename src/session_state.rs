@@ -42,7 +42,7 @@ use crate::layout_file::LayoutFile;
 /// `deny_unknown_fields` — [`LayoutFile`] does — gains a field. Adding a new optional field to the
 /// extras below needs no bump, because they are all `#[serde(default)]` and tolerate absence in both
 /// directions.
-pub const SNAPSHOT_SCHEMA: u16 = 1;
+pub const SNAPSHOT_SCHEMA: u16 = 2;
 
 /// Ceiling for a shape snapshot.
 ///

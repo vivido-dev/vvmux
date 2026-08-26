@@ -30,7 +30,8 @@ use crate::ipc::{
     PluginEventEnvelope, ServerMessage, SharedWriter, TabSelector, TextSource,
 };
 use crate::layout::{
-    EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
+    EdgeMask, FloatOrigin, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode,
+    directional_focus,
 };
 use crate::layout_file::{
     LayoutFile, LayoutFloat, LayoutNode, LayoutPlan, LayoutTab, MAX_LAYOUT_PANES, MAX_LAYOUT_TABS,
@@ -1416,6 +1417,7 @@ enum PointerDrag {
         pane: PaneId,
         start: (u16, u16),
         original: Rect,
+        origin: Option<FloatOrigin>,
     },
     Resize {
         tab_id: u64,
@@ -1423,6 +1425,7 @@ enum PointerDrag {
         edges: EdgeMask,
         start: (u16, u16),
         original: Rect,
+        origin: Option<FloatOrigin>,
     },
 }
 
@@ -1443,6 +1446,7 @@ struct FloatModal {
     pane: PaneId,
     kind: FloatingEditKind,
     original: Rect,
+    origin: Option<FloatOrigin>,
 }
 
 #[derive(Debug, Default)]
@@ -2732,12 +2736,13 @@ impl SessionActor {
                 self.reported_input_mode = None;
                 self.fragment_assignments.clear();
                 self.last_projection_warning = None;
-                // Detached tabs retain their rectangles. Clamp them against the attaching host
-                // before publishing the first text or media projection.
+                // Detached tabs were laid out against the placeholder host, so floats authored
+                // by percentages re-proportion onto the attaching host — and any float keeps
+                // fitting — before the first text or media projection is published.
                 if matches!(view, AttachmentView::Session) {
                     let area = self.content_area();
                     for tab in &mut self.tabs {
-                        tab.floating.clamp_all(area);
+                        tab.floating.reproportion(area);
                     }
                 } else if let AttachmentView::Pane(pane_id) = view
                     && let Some(pane) = self.panes.get_mut(&pane_id)
@@ -2827,10 +2832,11 @@ impl SessionActor {
                             self.last_display = client.display;
                         }
                         if session_view {
-                            // Deterministic host-resize clamp: size before position, per float.
+                            // Deterministic host-resize behavior: origin-ful floats re-proportion
+                            // to their percents, the rest clamp size before position, per float.
                             let area = self.content_area();
                             for tab in &mut self.tabs {
-                                tab.floating.clamp_all(area);
+                                tab.floating.reproportion(area);
                             }
                         }
                         self.force_full = true;
@@ -5017,14 +5023,10 @@ impl SessionActor {
                 self.spawn_pane(new_pane_id, tab_id, &spec)
                     .map_err(|error| AutomationError::new("spawn_failed", error.to_string()))?;
                 let area = self.content_area();
-                let width_percent = self.config.floating.default_width_percent;
-                let height_percent = self.config.floating.default_height_percent;
-                self.tabs[tab_index].floating.insert(
-                    new_pane_id,
-                    area,
-                    width_percent,
-                    height_percent,
-                );
+                let origin = self.default_float_origin();
+                self.tabs[tab_index]
+                    .floating
+                    .insert(new_pane_id, area, origin);
                 tab_id
             }
             crate::ipc::RunPlacement::Tab => {
@@ -6035,6 +6037,8 @@ impl SessionActor {
                 ..rect
             };
             self.tabs[tab_index].floating.set_rect(pane_id, next, area);
+            // An exactly sized float is a caller's decision: it stops re-proportioning.
+            self.tabs[tab_index].floating.clear_origin(pane_id);
         } else {
             for (requested, axis, name) in [
                 (columns, Axis::Vertical, "columns"),
@@ -6149,13 +6153,8 @@ impl SessionActor {
                         ));
                     }
                     self.tabs[from_index].tree = remaining;
-                    let percent = (
-                        self.config.floating.default_width_percent,
-                        self.config.floating.default_height_percent,
-                    );
-                    self.tabs[from_index]
-                        .floating
-                        .insert(pane_id, area, percent.0, percent.1);
+                    let origin = self.default_float_origin();
+                    self.tabs[from_index].floating.insert(pane_id, area, origin);
                 }
                 (crate::ipc::PaneLayerRequest::Tiled, true) => {
                     self.tabs[from_index].floating.remove(pane_id);
@@ -6242,13 +6241,8 @@ impl SessionActor {
         area: Rect,
     ) -> Result<(), AutomationError> {
         if floating {
-            let percent = (
-                self.config.floating.default_width_percent,
-                self.config.floating.default_height_percent,
-            );
-            self.tabs[tab_index]
-                .floating
-                .insert(pane_id, area, percent.0, percent.1);
+            let origin = self.default_float_origin();
+            self.tabs[tab_index].floating.insert(pane_id, area, origin);
             return Ok(());
         }
         let tree = match self.tabs[tab_index].tree.take() {
@@ -9258,12 +9252,19 @@ impl SessionActor {
                     self.config.floating.border_drag_margin,
                 )
             {
+                let origin = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .and_then(|tab| tab.floating.get(pane_id))
+                    .and_then(|float| float.origin);
                 self.pointer_drag = Some(match target {
                     FloatPointerTarget::Move => PointerDrag::Move {
                         tab_id,
                         pane: pane_id,
                         start: (mouse.x, mouse.y),
                         original: rect,
+                        origin,
                     },
                     FloatPointerTarget::Resize(edges) => PointerDrag::Resize {
                         tab_id,
@@ -9271,6 +9272,7 @@ impl SessionActor {
                         edges,
                         start: (mouse.x, mouse.y),
                         original: rect,
+                        origin,
                     },
                 });
                 self.schedule_render();
@@ -9767,6 +9769,10 @@ impl SessionActor {
                 let changed = self
                     .active_tab_mut()
                     .is_some_and(|tab| tab.floating.move_from(*pane, *original, dx, dy, area));
+                // A dragged float is where the user put it: stop re-proportioning it.
+                if changed && let Some(tab) = self.active_tab_mut() {
+                    tab.floating.clear_origin(*pane);
+                }
                 (changed, true)
             }
             PointerDrag::Resize {
@@ -9782,6 +9788,9 @@ impl SessionActor {
                     tab.floating
                         .resize_from(*pane, *original, *edges, dx, dy, area)
                 });
+                if changed && let Some(tab) = self.active_tab_mut() {
+                    tab.floating.clear_origin(*pane);
+                }
                 (changed, true)
             }
         };
@@ -9821,18 +9830,30 @@ impl SessionActor {
                 tab_id,
                 pane,
                 original,
+                origin,
                 ..
             }
             | PointerDrag::Resize {
                 tab_id,
                 pane,
                 original,
+                origin,
                 ..
             } => self
                 .tabs
                 .iter_mut()
                 .find(|tab| tab.id == tab_id)
-                .is_some_and(|tab| tab.floating.set_rect(pane, original, area)),
+                .is_some_and(|tab| {
+                    let rect_changed = tab.floating.set_rect(pane, original, area);
+                    // A cancelled edit is as if it never happened: the birth geometry the
+                    // drag cleared comes back with the rectangle.
+                    let origin_changed = tab
+                        .floating
+                        .get(pane)
+                        .is_some_and(|float| float.origin != origin);
+                    tab.floating.restore_origin(pane, origin);
+                    rect_changed || origin_changed
+                }),
         };
         if changed {
             self.force_full = true;
@@ -11293,7 +11314,7 @@ impl SessionActor {
             self.status("only floating panes can be moved or resized");
             return;
         };
-        let (pane, original) = (float.pane_id, float.rect);
+        let (pane, original, origin) = (float.pane_id, float.rect, float.origin);
         let Some(next_mode) = self.next_float_mode.checked_add(1) else {
             self.status("floating edit mode ID space exhausted");
             return;
@@ -11305,6 +11326,7 @@ impl SessionActor {
             pane,
             kind,
             original,
+            origin,
         });
         if let Some(client) = &self.attached {
             let _ = crate::ipc::send(
@@ -11318,8 +11340,9 @@ impl SessionActor {
         }
     }
 
-    /// End the active float-edit mode. `restore` puts the captured entry rectangle back
-    /// (re-clamped against the current area); commit and destroyed-pane paths pass `false`.
+    /// End the active float-edit mode. `restore` puts the captured entry rectangle and birth
+    /// geometry back (re-clamped against the current area); commit and destroyed-pane paths pass
+    /// `false`.
     fn end_float_mode(&mut self, restore: bool) {
         let Some(modal) = self.float_modal.take() else {
             return;
@@ -11330,7 +11353,17 @@ impl SessionActor {
                 .tabs
                 .iter_mut()
                 .find(|tab| tab.floating.contains(modal.pane))
-                .is_some_and(|tab| tab.floating.set_rect(modal.pane, modal.original, area));
+                .is_some_and(|tab| {
+                    let rect_changed = tab.floating.set_rect(modal.pane, modal.original, area);
+                    // A cancelled edit is as if it never happened: the birth geometry the
+                    // steps cleared comes back with the rectangle.
+                    let origin_changed = tab
+                        .floating
+                        .get(modal.pane)
+                        .is_some_and(|float| float.origin != modal.origin);
+                    tab.floating.restore_origin(modal.pane, modal.origin);
+                    rect_changed || origin_changed
+                });
             if changed {
                 self.force_full = true;
                 self.relayout();
@@ -11390,6 +11423,10 @@ impl SessionActor {
                     ),
                 });
                 if changed {
+                    // Stepping fixes the float: it stops re-proportioning on host changes.
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.floating.clear_origin(pane);
+                    }
                     self.force_full = true;
                     self.relayout();
                 }
@@ -11494,11 +11531,9 @@ impl SessionActor {
         }
         self.next_pane_id += 1;
         let area = self.content_area();
-        let width_percent = self.config.floating.default_width_percent;
-        let height_percent = self.config.floating.default_height_percent;
+        let origin = self.default_float_origin();
         if let Some(tab) = self.active_tab_mut() {
-            tab.floating
-                .insert(pane_id, area, width_percent, height_percent);
+            tab.floating.insert(pane_id, area, origin);
             tab.set_focus(pane_id);
         }
         self.force_full = true;
@@ -11633,50 +11668,33 @@ impl SessionActor {
             }
 
             let mut floating = FloatingLayer::default();
-            for (index, planned_float) in planned.floating.iter().enumerate() {
+            for planned_float in &planned.floating {
                 let pane_id = slot_ids[planned_float.slot];
                 if failed.contains(&pane_id) {
                     continue;
                 }
-                floating.insert(
-                    pane_id,
-                    area,
-                    planned_float.width_percent,
-                    planned_float.height_percent,
-                );
-                floating.set_pinned(pane_id, planned_float.pinned);
-                // A snapshot knows where the float actually sat; a hand-written layout does not, so
-                // it falls back to cascading each float clear of the one before it.
+                // A snapshot knows where the float actually sat; a hand-written layout knows its
+                // optional percent edge; neither means centered with the layer's cascade.
                 let restored = tab_extras.and_then(|tab| {
                     tab.floats
                         .iter()
                         .find(|float| float.slot == planned_float.slot)
                 });
-                if let Some(restored) = restored {
-                    if let Some(rect) = floating.get(pane_id).map(|float| float.rect) {
-                        floating.set_rect(
-                            pane_id,
-                            Rect {
-                                x: percent_of(restored.x_percent, area.width),
-                                y: percent_of(restored.y_percent, area.height),
-                                ..rect
-                            },
-                            area,
-                        );
-                    }
-                } else if index != 0
-                    && let Some(rect) = floating.get(pane_id).map(|float| float.rect)
-                {
-                    floating.set_rect(
-                        pane_id,
-                        Rect {
-                            x: rect.x.saturating_add((index as u16).saturating_mul(2)),
-                            y: rect.y.saturating_add(index as u16),
-                            ..rect
-                        },
-                        area,
-                    );
-                }
+                floating.insert(
+                    pane_id,
+                    area,
+                    FloatOrigin {
+                        width_percent: planned_float.width_percent,
+                        height_percent: planned_float.height_percent,
+                        x_percent: restored
+                            .map(|float| float.x_percent)
+                            .or(planned_float.x_percent),
+                        y_percent: restored
+                            .map(|float| float.y_percent)
+                            .or(planned_float.y_percent),
+                    },
+                );
+                floating.set_pinned(pane_id, planned_float.pinned);
             }
 
             if tree.is_none() && floating.is_empty() {
@@ -11798,20 +11816,35 @@ impl SessionActor {
                     continue;
                 };
                 let label = format!("p{}", labels.len() + 1);
+                // A float that still carries its birth geometry is recorded exactly as it was
+                // born: the origin percents are the truth, while measuring the rectangle can
+                // only reproduce them through placeholder-area rounding. A float a user placed
+                // by hand is measured, as before.
+                let origin = float.origin;
                 float_extras.push(FloatExtras {
                     slot: labels.len(),
                     // A layout file records a float's size but not where it sat, because a
                     // hand-written layout should not have to place windows. A snapshot describes a
                     // session that existed, so it records both.
-                    x_percent: saved_position_percent(float.rect.x, area.width),
-                    y_percent: saved_position_percent(float.rect.y, area.height),
+                    x_percent: origin
+                        .and_then(|origin| origin.x_percent)
+                        .unwrap_or_else(|| saved_position_percent(float.rect.x, area.width)),
+                    y_percent: origin
+                        .and_then(|origin| origin.y_percent)
+                        .unwrap_or_else(|| saved_position_percent(float.rect.y, area.height)),
                 });
                 labels.push((float.pane_id, label.clone()));
                 floating.push(LayoutFloat::new(
                     label,
                     saved_cwd(&pane.spawn_cwd, home.as_deref()),
-                    saved_percent(float.rect.width, area.width),
-                    saved_percent(float.rect.height, area.height),
+                    origin.map_or_else(
+                        || saved_percent(float.rect.width, area.width),
+                        |origin| origin.width_percent,
+                    ),
+                    origin.map_or_else(
+                        || saved_percent(float.rect.height, area.height),
+                        |origin| origin.height_percent,
+                    ),
                     float.pinned,
                     !pane.transparent,
                 ));
@@ -12720,6 +12753,10 @@ impl SessionActor {
             self.last_display = normalized_display(self.last_display, status_visible);
             if let Some(client) = &mut self.attached {
                 client.display = normalized_display(client.display, status_visible);
+            }
+            let area = self.content_area();
+            for tab in &mut self.tabs {
+                tab.floating.reproportion(area);
             }
             self.force_full = true;
             // One relayout for the whole change: it resizes every PTY and schedules the render.
@@ -13681,6 +13718,15 @@ impl SessionActor {
                 .saturating_sub(u16::from(status_visible))
                 .max(1),
         }
+    }
+
+    /// Birth geometry for a float created at runtime: the configured default size, which then
+    /// re-proportions across host changes until the user moves or resizes the pane.
+    fn default_float_origin(&self) -> FloatOrigin {
+        FloatOrigin::sized(
+            self.config.floating.default_width_percent,
+            self.config.floating.default_height_percent,
+        )
     }
 
     fn active_tab(&self) -> Option<&Tab> {
@@ -15748,17 +15794,14 @@ fn saved_sizes(first: u32, second: u32) -> Vec<u32> {
 /// Where a float sat, as a percentage of the host area.
 ///
 /// Unlike [`saved_percent`], which describes an extent and so has a 10% floor, a position of zero is
-/// an ordinary answer: a float flush against the left edge is where the user put it.
+/// an ordinary answer: a float flush against the left edge is where the user put it. Its inverse
+/// lives in [`crate::layout`] as `percent_of`: restoring a recorded position into a live area is
+/// the same percent-to-cells math float placement uses.
 fn saved_position_percent(offset: u16, available: u16) -> u16 {
     if available == 0 {
         return 0;
     }
     ((u32::from(offset) * 100) / u32::from(available)).min(100) as u16
-}
-
-/// The inverse of [`saved_position_percent`], for restoring a recorded position into a live area.
-fn percent_of(percent: u16, available: u16) -> u16 {
-    ((u32::from(percent) * u32::from(available)) / 100).min(u32::from(u16::MAX)) as u16
 }
 
 fn saved_percent(extent: u16, available: u16) -> u16 {
@@ -17873,8 +17916,8 @@ mod tests {
         let mut tree = TiledNode::leaf(1);
         tree.split(1, 2, crate::ipc::Axis::Vertical, area).unwrap();
         let mut floating = FloatingLayer::default();
-        floating.insert(10, area, 60, 60);
-        floating.insert(11, area, 40, 40);
+        floating.insert(10, area, FloatOrigin::sized(60, 60));
+        floating.insert(11, area, FloatOrigin::sized(40, 40));
         floating.set_pinned(11, true);
         Tab {
             id: 1,
@@ -18161,8 +18204,7 @@ mod tests {
                 width: 80,
                 height: 23,
             },
-            40,
-            40,
+            FloatOrigin::sized(40, 40),
         );
         tab.set_focus(10);
         assert_eq!(

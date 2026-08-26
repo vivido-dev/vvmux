@@ -383,6 +383,45 @@ pinned = true
     fixture.wait_text(2, "FLOAT second");
 }
 
+/// A detached start lays floats out against the 80x24 placeholder host, because no client has
+/// attached yet. Their birth percentages must re-proportion onto the real host at attach — and
+/// the optional position percents must place the top-left edge — instead of keeping the
+/// placeholder's 56-column idea of `width_percent = 70` forever.
+#[test]
+fn startup_float_reproportions_to_the_attached_display() {
+    let fixture = Fixture::new("float-size");
+    let layout = fixture.write_layout(
+        "float-size.toml",
+        r#"
+[[tabs]]
+[[tabs.floating]]
+pane = "sized"
+command = "printf 'FLOAT sized\n'; sleep 30"
+width_percent = 70
+height_percent = 70
+x_percent = 10
+y_percent = 20
+"#,
+    );
+    assert_success(&fixture.start(&layout));
+
+    // Detached, everything is measured against the placeholder 80x23 content area.
+    let geometry = fixture.panes()[0]["geometry"].clone();
+    assert_eq!(geometry["width"], 56, "{geometry}");
+    assert_eq!(geometry["height"], 16, "{geometry}");
+    assert_eq!(geometry["x"], 8, "{geometry}");
+    assert_eq!(geometry["y"], 4, "{geometry}");
+
+    // A 120x40 client attaches: the same percents now describe 120x39 of content.
+    fixture.attach_briefly(2);
+    let geometry = fixture.panes()[0]["geometry"].clone();
+    assert_eq!(geometry["width"], 84, "{geometry}");
+    assert_eq!(geometry["height"], 27, "{geometry}");
+    assert_eq!(geometry["x"], 12, "{geometry}");
+    assert_eq!(geometry["y"], 7, "{geometry}");
+    fixture.wait_text(1, "FLOAT sized");
+}
+
 #[test]
 fn partial_failure_is_owner_scoped_and_the_other_session_keeps_updating() {
     let owner_b = Fixture::new("owner-b");

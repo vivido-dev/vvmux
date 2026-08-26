@@ -884,6 +884,8 @@ focus = "shell"
   pane = "notes"
   width_percent = 50
   height_percent = 60
+  x_percent = 5
+  y_percent = 10
   pinned = true
 ```
 
@@ -894,6 +896,13 @@ Floating-only tabs are valid. `command` is one shell command line passed to `she
 accepts `~/`, and `hold = true` preserves command output after exit. If one pane cannot spawn, its
 leaf is removed and its siblings keep their exact owner-scoped layout; a layout where every pane
 fails falls back to one shell tab.
+
+A floating pane's `width_percent`/`height_percent` (10–100) size it against the tab content area.
+The optional `x_percent`/`y_percent` (0–100) fix its top-left edge instead of centering it; a
+float without them is centered with a small cascade offset from the one before it. A session
+starts detached against a placeholder host, so these percentages are re-proportioned onto the
+real host when a client attaches, and again on every host resize — until the float is moved or
+resized by hand, which fixes its geometry.
 
 `Ctrl-b s` writes the live layout back out in this format. The status row prompts for a target,
 prefilled with `startup.toml`; Enter accepts it, Escape cancels, and a bare name becomes
@@ -1133,7 +1142,8 @@ or read the buffer behind your back, and the later of a pane store and a mouse s
 
 Strict floating defaults live under `[floating]`: `default_width_percent` and
 `default_height_percent` accept 10–100, and `border_drag_margin` accepts 1–4. New floats are centered
-at 60% by 60% by default, with a minimum 4-by-2 content area plus frame.
+at 60% by 60% by default, with a minimum 4-by-2 content area plus frame, and keep re-proportioning
+to those percentages as the host resizes until moved or resized by hand.
 
 ## Configuration reload
 

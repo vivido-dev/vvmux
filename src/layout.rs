@@ -207,11 +207,37 @@ pub struct EdgeMask {
     pub bottom: bool,
 }
 
+/// Percent-based birth geometry of a float: the size it was created at and, optionally, where
+/// its left/top edge sits as a percent of the content area. Until a user edit clears it, the
+/// float is re-proportioned from these percents whenever the host area changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloatOrigin {
+    pub width_percent: u16,
+    pub height_percent: u16,
+    pub x_percent: Option<u16>,
+    pub y_percent: Option<u16>,
+}
+
+impl FloatOrigin {
+    /// Size-only origin: centered placement with the layer's cascade offset.
+    pub fn sized(width_percent: u16, height_percent: u16) -> Self {
+        Self {
+            width_percent,
+            height_percent,
+            x_percent: None,
+            y_percent: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FloatingPane {
     pub pane_id: PaneId,
     /// Frame-inclusive rectangle in composed grid cells.
     pub rect: Rect,
+    /// Geometry this float is re-proportioned from while the host area changes, absent once a
+    /// user edit has fixed the rectangle.
+    pub origin: Option<FloatOrigin>,
     pub pinned: bool,
 }
 
@@ -270,17 +296,19 @@ impl FloatingLayer {
         self.visible().last().map(|pane| pane.pane_id)
     }
 
-    /// Add a new ordinary float at the top of the ordinary class, centered per the configured
-    /// percentages. Creating a float also shows the ordinary layer so the new pane can be
-    /// focused.
-    pub fn insert(&mut self, pane_id: PaneId, area: Rect, width_percent: u16, height_percent: u16) {
-        let rect = default_rect(area, width_percent, height_percent);
+    /// Add a new ordinary float at the top of the ordinary class, placed per its origin
+    /// percents: sized against the area, positioned at its percent edge or centered with the
+    /// cascade offset of its layer position. Creating a float also shows the ordinary layer so
+    /// the new pane can be focused.
+    pub fn insert(&mut self, pane_id: PaneId, area: Rect, origin: FloatOrigin) {
         let top_of_ordinary = self.first_pinned_index();
+        let rect = origin_rect(area, origin, top_of_ordinary as u16);
         self.panes.insert(
             top_of_ordinary,
             FloatingPane {
                 pane_id,
                 rect,
+                origin: Some(origin),
                 pinned: false,
             },
         );
@@ -378,13 +406,38 @@ impl FloatingLayer {
         self.update_rect(pane, area, |_| rect)
     }
 
-    /// Deterministic host-resize behavior: every float keeps its size and position where they
-    /// still fit, clamping width and height before x and y so shrinking the host cannot strand
-    /// a float outside the visible area.
-    pub fn clamp_all(&mut self, area: Rect) {
-        for float in &mut self.panes {
-            float.rect = clamp_rect(float.rect, area);
+    /// Re-derive every float against a changed host area. A float that still carries its origin
+    /// is placed exactly as at birth — size percents, position percents or centered with the
+    /// cascade offset of its layer order — so percentages authored against any host hold on
+    /// every other one. A float a user moved or resized keeps its rectangle, clamped width and
+    /// height before x and y so shrinking the host cannot strand it outside the visible area.
+    pub fn reproportion(&mut self, area: Rect) {
+        for (index, float) in self.panes.iter_mut().enumerate() {
+            float.rect = match float.origin {
+                Some(origin) => clamp_rect(origin_rect(area, origin, index as u16), area),
+                None => clamp_rect(float.rect, area),
+            };
         }
+    }
+
+    /// Fix a float's geometry: it stops re-proportioning on host changes. Returns whether the
+    /// pane was found.
+    pub fn clear_origin(&mut self, pane: PaneId) -> bool {
+        let Some(float) = self.panes.iter_mut().find(|float| float.pane_id == pane) else {
+            return false;
+        };
+        float.origin = None;
+        true
+    }
+
+    /// Put a captured origin back, for cancel paths that also restore the rectangle. Returns
+    /// whether the pane was found.
+    pub fn restore_origin(&mut self, pane: PaneId, origin: Option<FloatOrigin>) -> bool {
+        let Some(float) = self.panes.iter_mut().find(|float| float.pane_id == pane) else {
+            return false;
+        };
+        float.origin = origin;
+        true
     }
 
     fn update_rect(&mut self, pane: PaneId, area: Rect, apply: impl FnOnce(Rect) -> Rect) -> bool {
@@ -405,22 +458,38 @@ impl FloatingLayer {
     }
 }
 
-/// Centered default placement: rounded integer percentages of the tab content area, clamped to
-/// the minimum and the area, with any odd leftover cell assigned to the right/bottom.
-fn default_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
-    let width = ((u32::from(area.width) * u32::from(width_percent) + 50) / 100) as u16;
-    let height = ((u32::from(area.height) * u32::from(height_percent) + 50) / 100) as u16;
+/// Placement from an origin: size is a rounded percent of the tab content area with any odd
+/// leftover cell assigned to the right/bottom; position is either the origin's percent edge or
+/// the centered position offset by the cascade, which keeps unpositioned floats clear of each
+/// other. The result is clamped to the minimum and the area.
+fn origin_rect(area: Rect, origin: FloatOrigin, cascade: u16) -> Rect {
+    let width = ((u32::from(area.width) * u32::from(origin.width_percent) + 50) / 100) as u16;
+    let height = ((u32::from(area.height) * u32::from(origin.height_percent) + 50) / 100) as u16;
+    let centered_x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let centered_y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height) / 2);
     clamp_rect(
         Rect {
-            x: area.x.saturating_add(area.width.saturating_sub(width) / 2),
-            y: area
-                .y
-                .saturating_add(area.height.saturating_sub(height) / 2),
+            x: origin.x_percent.map_or_else(
+                || centered_x.saturating_add(cascade.saturating_mul(2)),
+                |percent| area.x.saturating_add(percent_of(percent, area.width)),
+            ),
+            y: origin.y_percent.map_or_else(
+                || centered_y.saturating_add(cascade),
+                |percent| area.y.saturating_add(percent_of(percent, area.height)),
+            ),
             width,
             height,
         },
         area,
     )
+}
+
+/// A percent of `available` cells, floored. Unlike the size percents, which round to preserve
+/// area, a position percent must not overshoot its edge on any host.
+pub(crate) fn percent_of(percent: u16, available: u16) -> u16 {
+    ((u32::from(percent) * u32::from(available)) / 100).min(u32::from(u16::MAX)) as u16
 }
 
 fn offset_coordinate(value: u16, delta: i32) -> u16 {
@@ -1227,7 +1296,7 @@ mod tests {
     #[test]
     fn default_float_is_centered_and_clamped() {
         let mut layer = FloatingLayer::default();
-        layer.insert(1, area(), 60, 60);
+        layer.insert(1, area(), FloatOrigin::sized(60, 60));
         let rect = layer.get(1).unwrap().rect;
         assert_eq!((rect.width, rect.height), (48, 14));
         assert_eq!((rect.x, rect.y), (16, 4));
@@ -1238,7 +1307,7 @@ mod tests {
             width: 7,
             height: 4,
         };
-        layer.insert(2, tiny, 60, 60);
+        layer.insert(2, tiny, FloatOrigin::sized(60, 60));
         let rect = layer.get(2).unwrap().rect;
         assert_eq!(
             (rect.width, rect.height),
@@ -1248,10 +1317,177 @@ mod tests {
     }
 
     #[test]
+    fn positioned_origin_places_edges_by_percent() {
+        let mut layer = FloatingLayer::default();
+        let origin = FloatOrigin {
+            width_percent: 50,
+            height_percent: 40,
+            x_percent: Some(10),
+            y_percent: Some(20),
+        };
+        layer.insert(1, area(), origin);
+        assert_eq!(
+            layer.get(1).unwrap().rect,
+            Rect {
+                x: 8,
+                y: 4,
+                width: 40,
+                height: 9
+            }
+        );
+        assert_floating_invariants(&layer, area());
+
+        let tiny = Rect {
+            x: 2,
+            y: 1,
+            width: 7,
+            height: 4,
+        };
+        layer.insert(2, tiny, origin);
+        let rect = layer.get(2).unwrap().rect;
+        assert_eq!(
+            (rect.width, rect.height),
+            (MIN_FLOAT_WIDTH, MIN_FLOAT_HEIGHT)
+        );
+        assert!(rect.x >= tiny.x && rect.x + rect.width <= tiny.x + tiny.width);
+        assert!(rect.y >= tiny.y && rect.y + rect.height <= tiny.y + tiny.height);
+    }
+
+    #[test]
+    fn reproportion_recomputes_from_origin_until_cleared() {
+        let mut layer = FloatingLayer::default();
+        // Placed against the detached 80x23 placeholder, exactly as a startup layout is.
+        layer.insert(1, area(), FloatOrigin::sized(70, 70));
+        assert_eq!(
+            layer.get(1).unwrap().rect,
+            Rect {
+                x: 12,
+                y: 3,
+                width: 56,
+                height: 16
+            }
+        );
+
+        // The first attach brings a 120x39 host: the same percents must hold against it.
+        let attached = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 39,
+        };
+        layer.reproportion(attached);
+        assert_eq!(
+            layer.get(1).unwrap().rect,
+            Rect {
+                x: 18,
+                y: 6,
+                width: 84,
+                height: 27
+            }
+        );
+
+        // A layer-level set_rect is not a user edit: the origin wins on the next reproportion.
+        assert!(layer.set_rect(
+            1,
+            Rect {
+                x: 60,
+                y: 30,
+                width: 24,
+                height: 6,
+            },
+            attached
+        ));
+        layer.reproportion(attached);
+        assert_eq!(
+            layer.get(1).unwrap().rect,
+            Rect {
+                x: 18,
+                y: 6,
+                width: 84,
+                height: 27
+            },
+            "an origin-ful float snaps back to its percents"
+        );
+
+        // Once the session layer clears the origin, the rectangle is the user's to keep.
+        assert!(layer.clear_origin(1));
+        assert!(layer.set_rect(
+            1,
+            Rect {
+                x: 60,
+                y: 30,
+                width: 24,
+                height: 6,
+            },
+            attached
+        ));
+        layer.reproportion(attached);
+        assert_eq!(
+            layer.get(1).unwrap().rect,
+            Rect {
+                x: 60,
+                y: 30,
+                width: 24,
+                height: 6
+            },
+            "an origin-less float only clamps"
+        );
+        assert_floating_invariants(&layer, attached);
+
+        // A cancelled edit restores a captured origin alongside the rectangle.
+        let captured = FloatOrigin::sized(70, 70);
+        assert!(layer.set_rect(
+            1,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 30,
+                height: 10,
+            },
+            attached
+        ));
+        assert!(layer.restore_origin(1, Some(captured)));
+        layer.reproportion(attached);
+        assert_eq!(
+            layer.get(1).unwrap().rect,
+            Rect {
+                x: 18,
+                y: 6,
+                width: 84,
+                height: 27
+            }
+        );
+    }
+
+    #[test]
+    fn unpositioned_floats_cascade_and_stay_separated() {
+        let mut layer = FloatingLayer::default();
+        layer.insert(1, area(), FloatOrigin::sized(60, 60));
+        layer.insert(2, area(), FloatOrigin::sized(60, 60));
+        let (first, second) = (layer.get(1).unwrap().rect, layer.get(2).unwrap().rect);
+        assert_eq!((second.x, second.y), (first.x + 2, first.y + 1));
+
+        let attached = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 39,
+        };
+        layer.reproportion(attached);
+        let (first, second) = (layer.get(1).unwrap().rect, layer.get(2).unwrap().rect);
+        assert_eq!(
+            (second.x, second.y),
+            (first.x + 2, first.y + 1),
+            "reproportioning must not stack unpositioned floats on one point"
+        );
+        assert_floating_invariants(&layer, attached);
+    }
+
+    #[test]
     fn raise_and_pin_preserve_class_ordering() {
         let mut layer = FloatingLayer::default();
         for pane in 1..=4 {
-            layer.insert(pane, area(), 40, 40);
+            layer.insert(pane, area(), FloatOrigin::sized(40, 40));
         }
         assert_eq!(layer.pane_ids(), [1, 2, 3, 4]);
         assert!(layer.set_pinned(2, true));
@@ -1286,8 +1522,8 @@ mod tests {
     #[test]
     fn hidden_ordinary_floats_keep_state_and_pinned_stay_visible() {
         let mut layer = FloatingLayer::default();
-        layer.insert(1, area(), 40, 40);
-        layer.insert(2, area(), 40, 40);
+        layer.insert(1, area(), FloatOrigin::sized(40, 40));
+        layer.insert(2, area(), FloatOrigin::sized(40, 40));
         layer.set_pinned(2, true);
         let rects = (layer.get(1).unwrap().rect, layer.get(2).unwrap().rect);
 
@@ -1304,7 +1540,7 @@ mod tests {
         );
         assert_eq!(layer.pane_ids(), [1, 2], "hiding mutates no z-order");
 
-        layer.insert(3, area(), 40, 40);
+        layer.insert(3, area(), FloatOrigin::sized(40, 40));
         assert!(
             layer.ordinary_visible,
             "creating a float shows the ordinary layer"
@@ -1319,7 +1555,7 @@ mod tests {
     #[test]
     fn host_resize_clamps_size_before_position() {
         let mut layer = FloatingLayer::default();
-        layer.insert(1, area(), 40, 40);
+        layer.insert(1, area(), FloatOrigin::sized(40, 40));
         layer
             .set_rect(
                 1,
@@ -1333,6 +1569,8 @@ mod tests {
             )
             .then_some(())
             .unwrap();
+        // The session layer fixes a manually placed float: it no longer re-proportions.
+        assert!(layer.clear_origin(1));
 
         // Shrink: the size still fits, so only the position moves.
         let smaller = Rect {
@@ -1341,7 +1579,7 @@ mod tests {
             width: 64,
             height: 18,
         };
-        layer.clamp_all(smaller);
+        layer.reproportion(smaller);
         assert_eq!(
             layer.get(1).unwrap().rect,
             Rect {
@@ -1359,7 +1597,7 @@ mod tests {
             width: 10,
             height: 5,
         };
-        layer.clamp_all(tiny);
+        layer.reproportion(tiny);
         assert_eq!(
             layer.get(1).unwrap().rect,
             Rect {
@@ -1375,7 +1613,7 @@ mod tests {
     #[test]
     fn edge_resize_keeps_unselected_edges_fixed() {
         let mut layer = FloatingLayer::default();
-        layer.insert(1, area(), 40, 40);
+        layer.insert(1, area(), FloatOrigin::sized(40, 40));
         let start = Rect {
             x: 20,
             y: 8,
@@ -1423,7 +1661,7 @@ mod tests {
     #[test]
     fn pointer_geometry_is_always_recomputed_from_the_press_rectangle() {
         let mut layer = FloatingLayer::default();
-        layer.insert(1, area(), 40, 40);
+        layer.insert(1, area(), FloatOrigin::sized(40, 40));
         let original = Rect {
             x: 20,
             y: 8,
@@ -1514,8 +1752,10 @@ mod tests {
                     layer.insert(
                         next_pane,
                         area,
-                        20 + random.below(80) as u16,
-                        20 + random.below(80) as u16,
+                        FloatOrigin::sized(
+                            20 + random.below(80) as u16,
+                            20 + random.below(80) as u16,
+                        ),
                     );
                     next_pane += 1;
                 }
@@ -1556,10 +1796,12 @@ mod tests {
                         height: random.below(45) as u16,
                     };
                     layer.set_rect(pane, rect, area);
+                    // The session layer fixes a float an automation command placed exactly.
+                    layer.clear_origin(pane);
                 }
                 8 => {
                     area = areas[random.below(areas.len() as u64) as usize];
-                    layer.clamp_all(area);
+                    layer.reproportion(area);
                 }
                 _ => {}
             }

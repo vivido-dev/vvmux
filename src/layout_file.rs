@@ -101,6 +101,12 @@ pub struct LayoutFloat {
     hold: bool,
     width_percent: u16,
     height_percent: u16,
+    /// Optional top-left edge as a percent of the content area; absent means centered with the
+    /// cascade offset, so a hand-written layout still does not have to place windows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x_percent: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    y_percent: Option<u16>,
     #[serde(skip_serializing_if = "is_false")]
     pinned: bool,
     /// Named for the non-default state, exactly as on `LayoutNode`.
@@ -121,6 +127,8 @@ impl Default for LayoutFloat {
             hold: false,
             width_percent: 60,
             height_percent: 60,
+            x_percent: None,
+            y_percent: None,
             pinned: false,
             opaque: false,
         }
@@ -173,6 +181,8 @@ pub struct PlannedFloat {
     pub slot: usize,
     pub width_percent: u16,
     pub height_percent: u16,
+    pub x_percent: Option<u16>,
+    pub y_percent: Option<u16>,
     pub pinned: bool,
 }
 
@@ -241,6 +251,16 @@ impl LayoutFile {
                         "tab {tab_number} pane {label:?} float percentages must be between 10 and 100"
                     )));
                 }
+                // Positions are edges, not extents: zero is where a flush float sits, so unlike
+                // the size percents there is no floor.
+                if float.x_percent.is_some_and(|percent| percent > 100)
+                    || float.y_percent.is_some_and(|percent| percent > 100)
+                {
+                    return Err(invalid(format!(
+                        "tab {tab_number} pane {label:?} float position percentages must be \
+                         between 0 and 100"
+                    )));
+                }
                 let slot = spawns.len();
                 spawns.push(spawn(
                     float.command,
@@ -255,6 +275,8 @@ impl LayoutFile {
                     slot,
                     width_percent: float.width_percent,
                     height_percent: float.height_percent,
+                    x_percent: float.x_percent,
+                    y_percent: float.y_percent,
                     pinned: float.pinned,
                 });
             }
@@ -323,6 +345,10 @@ impl LayoutFloat {
             hold: false,
             width_percent,
             height_percent,
+            // Capture never records a position here: a float the session re-proportions keeps
+            // its origin percents exactly, and a user-placed one is measured into `FloatExtras`.
+            x_percent: None,
+            y_percent: None,
             pinned,
             opaque,
         }
@@ -671,6 +697,14 @@ hold = true
                 "[[tabs]]\n[[tabs.floating]]\npane='a'\nwidth_percent=9",
                 "percentages",
             ),
+            (
+                "[[tabs]]\n[[tabs.floating]]\npane='a'\nx_percent=101",
+                "position percentages",
+            ),
+            (
+                "[[tabs]]\n[[tabs.floating]]\npane='a'\ny_percent=150",
+                "position percentages",
+            ),
         ];
         for (source, expected) in cases {
             let error = parse(source).unwrap_err().to_string();
@@ -712,6 +746,24 @@ hold = true
         );
         assert_eq!(tab.floating[0].width_percent, 60);
         assert_eq!(tab.floating[0].height_percent, 60);
+        assert_eq!(tab.floating[0].x_percent, None);
+        assert_eq!(tab.floating[0].y_percent, None);
+    }
+
+    /// Position percents are edges, not extents: zero is a flush float and must load, and the
+    /// percents must survive lowering into the plan that float placement consumes.
+    #[test]
+    fn float_position_percents_lower_into_the_plan() {
+        let plan = parse(
+            "[[tabs]]\n[[tabs.floating]]\npane='a'\nx_percent=0\ny_percent=100\n\
+             [[tabs.floating]]\npane='b'",
+        )
+        .unwrap();
+        let floats = &plan.tabs[0].floating;
+        assert_eq!(floats[0].x_percent, Some(0));
+        assert_eq!(floats[0].y_percent, Some(100));
+        assert_eq!(floats[1].x_percent, None);
+        assert_eq!(floats[1].y_percent, None);
     }
 
     /// The writer and the parser share one schema, so a captured layout must load back with the
@@ -750,6 +802,9 @@ hold = true
         // A capture never replays a command, and the absent-by-default fields stay out of the file.
         assert!(!rendered.contains("command"), "{rendered}");
         assert!(!rendered.contains("hold"), "{rendered}");
+        // Float position rides in the snapshot extras, not the layout, so it stays out too.
+        assert!(!rendered.contains("x_percent"), "{rendered}");
+        assert!(!rendered.contains("y_percent"), "{rendered}");
 
         let plan = parse(&rendered).unwrap();
         assert_eq!(plan.tabs.len(), 2);
