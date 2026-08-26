@@ -278,6 +278,14 @@ impl DaemonLauncher {
 /// markers for the *outer* platform's pseudoconsole while they are talking to this hop's virtual
 /// presenter, whose scanner does not recognize that envelope.
 ///
+/// The `VIVIDO_*` automation identity goes for the same reason, and it is the one an agent is most
+/// likely to act on. `VIVIDO_SOCKET` and `VIVIDO_WINDOW_ID` name the Vivido window that happened to
+/// start this daemon; the daemon outlives it. After a detach and a reattach to a different window
+/// they address the wrong window, and under `vvssh` they address a socket on a machine the pane
+/// cannot reach at all. An agent in a pane running `vivido msg` would then drive somebody else's
+/// terminal, so the stale value must not survive rather than be merely discouraged. The live
+/// identity belongs to whichever client is attached now, and is published by that client.
+///
 /// An outer tmux or screen identity is stale for the same reason: the daemon creates and owns a new
 /// PTY boundary. If `TMUX` or `STY` reaches that PTY, Vivid producers deliberately decline text
 /// anchors because an ordinary multiplexer may consume their APC marker. Under vvmux the marker is
@@ -292,7 +300,15 @@ fn scrub_daemon_environment(
     for (key, _) in environment {
         let key_text = key.to_string_lossy();
         if key_text.starts_with("VIVID_")
-            || matches!(key_text.as_ref(), "TMUX" | "TMUX_PANE" | "STY")
+            || matches!(
+                key_text.as_ref(),
+                "VIVIDO_SOCKET"
+                    | "VIVIDO_WINDOW_ID"
+                    | "VIVIDO_SESSION"
+                    | "TMUX"
+                    | "TMUX_PANE"
+                    | "STY"
+            )
         {
             command.env_remove(&key);
         }

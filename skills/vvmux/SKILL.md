@@ -9,9 +9,12 @@ Use this release-matched workflow:
 
 1. Discover with `vvmux list --json`, then check the selected session with `vvmux doctor --target
    SESSION --json`.
-2. Capability-discover with `vvmux msg --target SESSION capabilities`. Its method and limit lists
-   are authoritative for that release; do not rely on a remembered surface. Capture
-   `session-inspect`, `list-tabs`, and `list-panes`, then use exact stable tab and pane IDs.
+2. Capability-discover with `vvmux msg --target SESSION capabilities`. Its method, limit, error and
+   event lists are authoritative for that release; do not rely on a remembered surface. Read
+   `method_capabilities` when the question is whether something is safe to run: each entry carries a
+   `class` and `mutating`, and only `observe` is non-mutating. Branch on `error_codes` rather than on
+   message text, and filter `subscribe --name` against `event_kinds`. Capture `session-inspect`,
+   `list-tabs`, and `list-panes`, then use exact stable tab and pane IDs.
 3. Capture the relevant screen, session, outer-projection, or trace sequence before acting.
 4. Use `focus` or `select-tab --tab-id ID` with `--wait outer` when media projection is the
    assertion, or `--wait rendered` for the attached terminal frame. Use Vivido `wait frame`
@@ -59,6 +62,11 @@ Use this release-matched workflow:
    agent into it. A resume needs the agent's provider plugin installed with its integration
    (`vvmux plugin install claude`), because the session identity it uses comes from that
    integration and only from it.
+
+A pane never inherits an outer `VIVIDO_SOCKET` or `VIVIDO_WINDOW_ID`: the session server outlives
+the Vivido window that started it, so those are stripped rather than left to address the wrong
+window. Do not reconstruct them. Ask the user which Vivido window is presenting the session when a
+task genuinely needs both tools.
 
 Use `--report` on `typing`, `key`, and `paste` when deterministic PTY-write acknowledgement is
 needed. It proves the bytes reached the PTY writer, not that the child application consumed them.

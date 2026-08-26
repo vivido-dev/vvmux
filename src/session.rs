@@ -1782,14 +1782,16 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         Some(layout) => actor.apply_layout_plan(layout, restore.as_ref(), history.as_ref())?,
         None => actor.new_tab()?,
     }
-    if actor.plugin_supervisor.is_some() {
-        actor.publish_plugin_event(
-            "session.started",
-            serde_json::json!({"restored": restored_session}),
-            None,
-            None,
-        );
-    }
+    // Published whether or not plugins are enabled. `msg subscribe` is an automation surface that
+    // reads the same journal and explicitly does not require the plugin system, and this is the
+    // event a restart-aware agent replays from sequence 0 to learn it is looking at a restored
+    // session rather than a fresh one.
+    actor.publish_plugin_event(
+        "session.started",
+        serde_json::json!({"restored": restored_session}),
+        None,
+        None,
+    );
     let actor_terminated = terminated.clone();
     std::thread::Builder::new()
         .name("vvmux-session".into())
@@ -3102,6 +3104,7 @@ impl SessionActor {
                 Ok(request.pane_id.unwrap())
             } else {
                 self.resolve_automation_pane(
+                    &request.method,
                     request.pane_id,
                     request.agent.as_ref(),
                     request.allow_focused,
@@ -3139,6 +3142,26 @@ impl SessionActor {
                 if let Err(error) = supervisor.capabilities(target.clone()) {
                     self.complete_pending_actor_work(&target);
                     self.reply_automation_error(target, error);
+                }
+            }
+            AutomationMethod::GetConfig => {
+                match serde_json::to_value(&self.config) {
+                    Ok(config) => self.reply_automation(
+                        target,
+                        serde_json::json!({
+                            "path": self
+                                .config_path
+                                .as_ref()
+                                .map(|path| path.display().to_string()),
+                            "config": config,
+                        }),
+                    ),
+                    // The config is plain data with no custom serializers, so this cannot fail in
+                    // practice; reporting it beats an unwrap on the session actor.
+                    Err(error) => self.reply_automation_error(
+                        target,
+                        AutomationError::new("serialization_failed", error.to_string()),
+                    ),
                 }
             }
             AutomationMethod::ReloadConfig => match self.reload_config() {
@@ -4172,6 +4195,7 @@ impl SessionActor {
 
     fn resolve_automation_pane(
         &self,
+        method: &AutomationMethod,
         requested: Option<PaneId>,
         alias: Option<&crate::agent::AgentAlias>,
         allow_focused: bool,
@@ -4203,9 +4227,11 @@ impl SessionActor {
                 .filter(|pane| self.panes.contains_key(pane))
                 .ok_or_else(|| AutomationError::new("no_focused_pane", "no focused vvmux pane"));
         }
+        // Name the method: a caller batching several requests gets one error per request and
+        // otherwise cannot tell which of them was the one missing a target.
         Err(AutomationError::new(
             "invalid_params",
-            "this command requires a pane ID",
+            format!("{} requires a pane ID", method.name()),
         ))
     }
 
@@ -11943,6 +11969,7 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
             | AutomationMethod::Diagnose { .. }
             | AutomationMethod::WaitRendered { .. }
             | AutomationMethod::ReloadConfig
+            | AutomationMethod::GetConfig
             | AutomationMethod::SaveLayout { .. }
             | AutomationMethod::SessionSnapshot
             | AutomationMethod::Plugin(_)
@@ -12333,18 +12360,19 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
     serde_json::json!({
         "protocol": "VVMX",
         "protocol_version": crate::ipc::VERSION,
-        "methods": [
-            "capabilities", "list_panes", "session_inspect", "list_tabs", "select_tab", "diagnose",
-            "inspect", "inspect_media", "split", "focus", "focus_wait", "close_pane",
-            "typing", "key", "paste", "submit_line", "get_text", "get_grid", "search",
-            "set_sync_input", "wait_text",
-            "wait_screen_change", "wait_screen_stable", "wait_rendered", "wait_exit",
-            "wait_agent_state", "wait_media",
-            "wait_media_track",
-            "trace_media", "reload_config", "run", "action", "report_agent", "report_agent_session", "clear_agent_report",
-            "report_metadata", "agent_explain", "agent_rename", "snapshot", "agent_start", "agent_prompt",
-            "agent_send_keys", "agent_read", "subscribe", "save_layout"
-        ],
+        // Both projections of one table. `methods` stays the flat list older callers read;
+        // `method_capabilities` says what each one does, which is what a plan preflight and a
+        // scoped remote token need in order to skip or refuse a mutation.
+        "methods": crate::ipc::METHOD_CAPABILITIES
+            .iter()
+            .map(|capability| capability.name)
+            .collect::<Vec<_>>(),
+        "method_capabilities": crate::ipc::METHOD_CAPABILITIES,
+        // Every code an automation reply can carry, so a caller can branch on the set it knows and
+        // treat the rest as unrecognized rather than guessing from message text.
+        "error_codes": AUTOMATION_ERROR_CODES,
+        // The names `subscribe --name` and a plugin manifest hook may both use.
+        "event_kinds": vvmux_plugin_api::EVENT_KINDS,
         "limits": automation_limits(),
         "completion_waits": {
             "outer": "foreground_bridge_projection_acknowledgement",
@@ -12353,6 +12381,73 @@ pub(crate) fn automation_capabilities(plugin: serde_json::Value) -> serde_json::
         "plugins": plugin,
     })
 }
+
+/// Every `code` an [`AutomationError`] reply can carry.
+///
+/// Advertised so a caller can tell "a failure I know how to handle" from "a failure this release
+/// added", which message text cannot express. Sorted, and covered by a test that scans the crate
+/// for constructed codes so a new one cannot go unadvertised.
+pub(crate) const AUTOMATION_ERROR_CODES: &[&str] = &[
+    "action_not_found",
+    "agent_alias_not_found",
+    "agent_alias_taken",
+    "agent_kind_mismatch",
+    "agent_launch_pending",
+    "agent_not_detected",
+    "agent_not_idle",
+    "agent_not_launchable",
+    "agent_not_ready",
+    "agent_not_running",
+    "agent_pane_busy",
+    "agent_prompt_failed",
+    "agent_prompt_stalled",
+    "agent_start_failed",
+    "agent_start_input_failed",
+    "alt_read_in_progress",
+    "busy",
+    "cancelled",
+    "capability_denied",
+    "dependency_failed",
+    "duplicate_request_id",
+    "empty_agent_prompt",
+    "event_gap",
+    "invalid_agent_argument",
+    "invalid_agent_kind",
+    "invalid_agent_report",
+    "invalid_agent_timeout",
+    "invalid_argument",
+    "invalid_config",
+    "invalid_key",
+    "invalid_params",
+    "invalid_state",
+    "job_not_found",
+    "limit_exceeded",
+    "missing_attachment",
+    "mouse_reporting_disabled",
+    "no_focused_pane",
+    "not_alternate_screen",
+    "output_invalid",
+    "pane_not_found",
+    "pane_required",
+    "plugin_disabled",
+    "plugin_not_found",
+    "protocol_error",
+    "pty_closed",
+    "pty_spawn_failed",
+    "regex_invalid",
+    "runtime_crashed",
+    "runtime_unavailable",
+    "save_failed",
+    "schema_invalid",
+    "scope_denied",
+    "sequence_gap",
+    "serialization_failed",
+    "spawn_failed",
+    "tab_not_found",
+    "timeout",
+    "track_not_found",
+    "unsupported",
+];
 
 fn disabled_plugin_capabilities(session_instance: &str) -> serde_json::Value {
     serde_json::json!({
@@ -16188,6 +16283,134 @@ mod tests {
                 filter: MediaTraceFilter::default(),
             })
             .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod capability_advertisement_tests {
+    use super::{AUTOMATION_ERROR_CODES, automation_capabilities, disabled_plugin_capabilities};
+
+    /// Every `code` this crate actually constructs, read from its own source.
+    ///
+    /// A source scan rather than a curated fixture: the point is to catch a code added in some
+    /// distant handler, and only the source knows about that one.
+    fn constructed_error_codes() -> std::collections::BTreeSet<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_files(&root, &mut files);
+        assert!(!files.is_empty(), "no source files were scanned");
+        let mut codes = std::collections::BTreeSet::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("crate source is readable");
+            // Whitespace between the call and its first argument spans lines in rustfmt output,
+            // so match on the flattened text rather than line by line.
+            let flattened = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            for (marker, offset) in [
+                ("AutomationError::new(", 21),
+                ("AutomationError { code:", 23),
+            ] {
+                let mut rest = flattened.as_str();
+                while let Some(index) = rest.find(marker) {
+                    rest = &rest[index + offset..];
+                    let trimmed = rest.trim_start();
+                    if let Some(quoted) = trimmed.strip_prefix('"')
+                        && let Some(end) = quoted.find('"')
+                        && !quoted[..end].is_empty()
+                        && quoted[..end]
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                    {
+                        codes.insert(quoted[..end].to_owned());
+                    }
+                }
+            }
+        }
+        codes
+    }
+
+    fn collect_rust_files(directory: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory).expect("source directory is readable") {
+            let path = entry.expect("directory entry is readable").path();
+            if path.is_dir() {
+                collect_rust_files(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn every_constructed_error_code_is_advertised() {
+        let missing = constructed_error_codes()
+            .into_iter()
+            .filter(|code| !AUTOMATION_ERROR_CODES.contains(&code.as_str()))
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "these error codes are returned but not advertised: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn advertised_error_codes_are_sorted_and_unique() {
+        let mut sorted = AUTOMATION_ERROR_CODES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.as_slice(), AUTOMATION_ERROR_CODES);
+    }
+
+    /// The handshake a caller reads before deciding what it may run.
+    #[test]
+    fn capabilities_describe_methods_events_and_errors() {
+        let value = automation_capabilities(disabled_plugin_capabilities("test-instance"));
+        assert_eq!(value["protocol"], "VVMX");
+        assert_eq!(value["protocol_version"], crate::ipc::VERSION);
+
+        let methods = value["methods"].as_array().expect("methods is a list");
+        let capabilities = value["method_capabilities"]
+            .as_array()
+            .expect("method_capabilities is a list");
+        assert_eq!(methods.len(), capabilities.len());
+        assert_eq!(methods.len(), crate::ipc::METHOD_CAPABILITIES.len());
+
+        // The two entries the hand-written list got wrong.
+        assert!(methods.iter().any(|name| name == "session_snapshot"));
+        assert!(methods.iter().any(|name| name == "plugin"));
+        assert!(!methods.iter().any(|name| name == "snapshot"));
+
+        // An observation is advertised as safe to run; an input is not.
+        let class_of = |wanted: &str| {
+            capabilities
+                .iter()
+                .find(|entry| entry["name"] == wanted)
+                .map(|entry| (entry["class"].clone(), entry["mutating"].clone()))
+        };
+        assert_eq!(
+            class_of("get_text"),
+            Some((serde_json::json!("observe"), serde_json::json!(false)))
+        );
+        assert_eq!(
+            class_of("typing"),
+            Some((serde_json::json!("input"), serde_json::json!(true)))
+        );
+        assert_eq!(
+            class_of("get_config"),
+            Some((serde_json::json!("observe"), serde_json::json!(false)))
+        );
+
+        assert_eq!(
+            value["error_codes"],
+            serde_json::json!(AUTOMATION_ERROR_CODES)
+        );
+        assert_eq!(
+            value["event_kinds"],
+            serde_json::json!(vvmux_plugin_api::EVENT_KINDS)
+        );
+        // Advertising an event nobody subscribes to would be as misleading as omitting one.
+        assert!(
+            vvmux_plugin_api::EVENT_KINDS.contains(&"session.started"),
+            "the restart-detection event must stay advertised"
         );
     }
 }

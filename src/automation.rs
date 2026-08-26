@@ -192,6 +192,8 @@ pub enum MsgCommand {
     Capabilities,
     /// Re-read the session's config file now, without waiting for the watcher.
     ReloadConfig,
+    /// Print the configuration this session is actually running with.
+    GetConfig,
     /// Revalidate the plugin registry immediately.
     ReloadPlugins,
     /// Apply an ordinary interactive action through the automation service.
@@ -714,7 +716,10 @@ pub fn run(
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "command requires --pane-id, --alias, or a same-session VVMUX_PANE_ID",
+            format!(
+                "{} requires --pane-id, --alias, or a same-session VVMUX_PANE_ID",
+                method.name()
+            ),
         ));
     }
     // `agent-start` needs no case of its own: it needs a pane with no agent in it, an alias only
@@ -885,6 +890,7 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
     let tuple = match command {
         MsgCommand::Capabilities => (AutomationMethod::Capabilities, None, false, Output::Json),
         MsgCommand::ReloadConfig => (AutomationMethod::ReloadConfig, None, false, Output::Json),
+        MsgCommand::GetConfig => (AutomationMethod::GetConfig, None, false, Output::Json),
         MsgCommand::ReloadPlugins => (
             AutomationMethod::Plugin(PluginMethod::Reload),
             None,

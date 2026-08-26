@@ -1438,11 +1438,23 @@ fn daemon_environment_from(
         // they are shell bookkeeping, not variables the daemon should inherit. An outer tmux or
         // screen identity is stale too: this daemon owns the new ConPTY boundary, and preserving
         // those variables makes Vivid producers suppress anchors intended for its presenter.
+        // `VIVIDO_*` is stale in the same way and more dangerous: it names the Vivido window that
+        // started this daemon, which the daemon outlives, so a pane agent running `vivido msg`
+        // would drive a window that is gone or belongs to somebody else. Note `VIVIDO_` does not
+        // match the `VIVID_` prefix above and has to be listed. See `scrub_daemon_environment` in
+        // the Unix launcher for the full reasoning.
         if folded.starts_with("VIVID_")
             || folded.starts_with('=')
             || matches!(
                 folded.as_str(),
-                "SSH_AUTH_SOCK" | "SSH_AGENT_PID" | "TMUX" | "TMUX_PANE" | "STY"
+                "SSH_AUTH_SOCK"
+                    | "SSH_AGENT_PID"
+                    | "VIVIDO_SOCKET"
+                    | "VIVIDO_WINDOW_ID"
+                    | "VIVIDO_SESSION"
+                    | "TMUX"
+                    | "TMUX_PANE"
+                    | "STY"
             )
         {
             continue;

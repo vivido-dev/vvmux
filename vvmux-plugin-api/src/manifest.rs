@@ -69,6 +69,25 @@ impl From<toml::de::Error> for ManifestError {
     }
 }
 
+/// Every event a session publishes, and the only names a manifest hook may subscribe to.
+///
+/// One table, read by manifest validation and advertised verbatim by `capabilities`, so an agent
+/// filtering a subscription and a package declaring a hook are working from the same list.
+pub const EVENT_KINDS: &[&str] = &[
+    "session.started",
+    "pane.opened",
+    "pane.exited",
+    "pane.closed",
+    "pane.screen_changed",
+    "agent.status_changed",
+    "layout.changed",
+    "focus.changed",
+    "config.changed",
+    "media.changed",
+    "plugin.job_completed",
+    "plugin.runtime_crashed",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -638,24 +657,10 @@ impl LoadedManifest {
             );
         }
 
-        let known_events = [
-            "session.started",
-            "pane.opened",
-            "pane.exited",
-            "pane.closed",
-            "pane.screen_changed",
-            "agent.status_changed",
-            "layout.changed",
-            "focus.changed",
-            "config.changed",
-            "media.changed",
-            "plugin.job_completed",
-            "plugin.runtime_crashed",
-        ];
         let warnings = manifest
             .events
             .iter()
-            .filter(|hook| !known_events.contains(&hook.on.as_str()))
+            .filter(|hook| !EVENT_KINDS.contains(&hook.on.as_str()))
             .map(|hook| format!("unknown event `{}` is inactive", hook.on))
             .collect();
         Ok(Self {

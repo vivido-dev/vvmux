@@ -33,7 +33,10 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-pub const VERSION: u16 = 24;
+/// Version 25 adds the typed capability handshake and `get_config`: `capabilities` now describes
+/// every method's class and whether it mutates, so a caller can tell an observation from a mutation
+/// before running one. One bump covers the batch.
+pub const VERSION: u16 = 25;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -257,6 +260,12 @@ pub enum AutomationMethod {
     },
     /// Re-read the session's config file now, instead of waiting for the watcher to notice.
     ReloadConfig,
+    /// Return the effective configuration this session is running with.
+    ///
+    /// The values in force, not the file: a session started before an edit, or one whose reload
+    /// deferred a key, differs from what `vvmux.toml` currently says, and that difference is
+    /// exactly what a caller is asking about.
+    GetConfig,
     /// Open a pane running one shell command.
     Run {
         /// Handed to the shell with `-c`, so pipes and redirection work. Not an argument vector.
@@ -291,6 +300,179 @@ pub enum AutomationMethod {
         condition: MediaTrackWaitCondition,
         timeout_ms: u64,
     },
+}
+
+/// What a method does, so a caller can tell an observation from a mutation before running one.
+///
+/// A class is coarse on purpose. It answers "may this run during a read-only pass, and what kind of
+/// authority does it need", which is what a plan preflight and a scoped remote token each have to
+/// decide without understanding every method.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MethodClass {
+    /// Reads state or blocks until state arrives. Never writes.
+    Observe,
+    /// Writes to a pane's PTY.
+    Input,
+    /// Creates or destroys a pane.
+    Pane,
+    /// Rearranges, selects, or persists what already exists.
+    Layout,
+    /// Changes the session's configuration.
+    Config,
+    /// Claims, names, or drives an agent in a pane.
+    Agent,
+    /// Enters the plugin host, whose own operations carry their own permissions.
+    Plugin,
+}
+
+impl MethodClass {
+    /// Whether a method of this class can change session state.
+    ///
+    /// Derived rather than stored so the two can never disagree: everything that is not an
+    /// observation mutates something.
+    pub const fn mutating(self) -> bool {
+        !matches!(self, Self::Observe)
+    }
+}
+
+/// One advertised method: its wire name and what it does.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct MethodCapability {
+    pub name: &'static str,
+    pub class: MethodClass,
+    /// Always `class.mutating()`. Carried explicitly so a caller filtering the list does not have
+    /// to reproduce the class table to answer the only question most of them ask.
+    pub mutating: bool,
+}
+
+const fn capability(name: &'static str, class: MethodClass) -> MethodCapability {
+    MethodCapability {
+        name,
+        class,
+        mutating: class.mutating(),
+    }
+}
+
+/// Every automation method this release serves, in the order `capabilities` advertises them.
+///
+/// The single source of the advertised surface. It is checked against the generated schema in
+/// tests, so an [`AutomationMethod`] variant added without an entry here fails the build rather
+/// than silently becoming an unadvertised method — which is how `session_snapshot` came to be
+/// advertised under a name that was never on the wire.
+pub const METHOD_CAPABILITIES: &[MethodCapability] = {
+    use MethodClass::{Agent, Config, Input, Layout, Observe, Pane, Plugin};
+    &[
+        capability("capabilities", Observe),
+        capability("get_config", Observe),
+        capability("list_panes", Observe),
+        capability("list_tabs", Observe),
+        capability("session_inspect", Observe),
+        capability("session_snapshot", Observe),
+        capability("inspect", Observe),
+        capability("inspect_media", Observe),
+        capability("diagnose", Observe),
+        capability("trace_media", Observe),
+        capability("get_text", Observe),
+        capability("get_grid", Observe),
+        capability("search", Observe),
+        capability("agent_explain", Observe),
+        capability("subscribe", Observe),
+        capability("wait_text", Observe),
+        capability("wait_screen_change", Observe),
+        capability("wait_screen_stable", Observe),
+        capability("wait_rendered", Observe),
+        capability("wait_exit", Observe),
+        capability("wait_agent_state", Observe),
+        capability("wait_media", Observe),
+        capability("wait_media_track", Observe),
+        capability("typing", Input),
+        capability("key", Input),
+        capability("paste", Input),
+        capability("submit_line", Input),
+        capability("agent_send_keys", Input),
+        capability("split", Pane),
+        capability("run", Pane),
+        capability("close_pane", Pane),
+        capability("select_tab", Layout),
+        capability("focus", Layout),
+        capability("focus_wait", Layout),
+        capability("set_sync_input", Layout),
+        capability("save_layout", Layout),
+        capability("action", Layout),
+        capability("reload_config", Config),
+        capability("report_agent", Agent),
+        capability("report_agent_session", Agent),
+        capability("clear_agent_report", Agent),
+        capability("report_metadata", Agent),
+        capability("agent_rename", Agent),
+        capability("agent_start", Agent),
+        capability("agent_prompt", Agent),
+        // Observation in intent, but it scrolls the agent's viewport to reach the scrollback and
+        // scrolls it back afterward. A read-only pass must skip it.
+        capability("agent_read", Agent),
+        capability("plugin", Plugin),
+    ]
+};
+
+impl AutomationMethod {
+    /// This method's wire tag, matching the `snake_case` name serde encodes.
+    ///
+    /// Exhaustive on purpose: a new variant does not compile until it is named here, and the tests
+    /// then require that name to appear in [`METHOD_CAPABILITIES`].
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Capabilities => "capabilities",
+            Self::ListPanes => "list_panes",
+            Self::SessionInspect => "session_inspect",
+            Self::ListTabs => "list_tabs",
+            Self::SelectTab { .. } => "select_tab",
+            Self::Diagnose { .. } => "diagnose",
+            Self::ReportAgent { .. } => "report_agent",
+            Self::ReportAgentSession { .. } => "report_agent_session",
+            Self::ClearAgentReport { .. } => "clear_agent_report",
+            Self::ReportMetadata { .. } => "report_metadata",
+            Self::AgentExplain => "agent_explain",
+            Self::SessionSnapshot => "session_snapshot",
+            Self::AgentRename { .. } => "agent_rename",
+            Self::AgentStart { .. } => "agent_start",
+            Self::AgentPrompt { .. } => "agent_prompt",
+            Self::AgentSendKeys { .. } => "agent_send_keys",
+            Self::AgentRead { .. } => "agent_read",
+            Self::Inspect => "inspect",
+            Self::InspectMedia => "inspect_media",
+            Self::TraceMedia { .. } => "trace_media",
+            Self::Split { .. } => "split",
+            Self::SaveLayout { .. } => "save_layout",
+            Self::Focus => "focus",
+            Self::FocusWait { .. } => "focus_wait",
+            Self::ClosePane => "close_pane",
+            Self::Typing { .. } => "typing",
+            Self::Key { .. } => "key",
+            Self::Paste { .. } => "paste",
+            Self::SubmitLine { .. } => "submit_line",
+            Self::GetText { .. } => "get_text",
+            Self::GetGrid { .. } => "get_grid",
+            Self::Search { .. } => "search",
+            Self::SetSyncInput { .. } => "set_sync_input",
+            Self::Action(_) => "action",
+            Self::Plugin(_) => "plugin",
+            Self::WaitText { .. } => "wait_text",
+            Self::WaitScreenChange { .. } => "wait_screen_change",
+            Self::WaitScreenStable { .. } => "wait_screen_stable",
+            Self::WaitRendered { .. } => "wait_rendered",
+            Self::ReloadConfig => "reload_config",
+            Self::GetConfig => "get_config",
+            Self::Run { .. } => "run",
+            Self::WaitExit { .. } => "wait_exit",
+            Self::Subscribe { .. } => "subscribe",
+            Self::WaitAgentState { .. } => "wait_agent_state",
+            Self::WaitMedia { .. } => "wait_media",
+            Self::WaitMediaTrack { .. } => "wait_media_track",
+        }
+    }
 }
 
 /// Why a notification fired.
@@ -1636,6 +1818,157 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<AutomationResponse>(&decoded).unwrap(),
             response
+        );
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::{METHOD_CAPABILITIES, MethodCapability, MethodClass};
+
+    fn advertised(name: &str) -> Option<&'static MethodCapability> {
+        METHOD_CAPABILITIES
+            .iter()
+            .find(|capability| capability.name == name)
+    }
+
+    /// Every `method` tag the generated schema knows, which is every `AutomationMethod` variant.
+    fn schema_method_names() -> Vec<String> {
+        let schema = crate::api::schema();
+        let mut names = Vec::new();
+        collect(&schema, &mut names);
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The `method` tag appears as a single-value `const`/`enum` on each variant's object schema.
+    fn collect(value: &serde_json::Value, names: &mut Vec<String>) {
+        if let Some(object) = value.as_object() {
+            if let Some(method) = object.get("properties").and_then(|properties| {
+                properties
+                    .get("method")
+                    .and_then(|method| method.as_object())
+            }) {
+                if let Some(name) = method.get("const").and_then(|name| name.as_str()) {
+                    names.push(name.to_owned());
+                } else if let Some(values) = method.get("enum").and_then(|values| values.as_array())
+                {
+                    names.extend(
+                        values
+                            .iter()
+                            .filter_map(|name| name.as_str())
+                            .map(str::to_owned),
+                    );
+                }
+            }
+            for nested in object.values() {
+                collect(nested, names);
+            }
+        } else if let Some(array) = value.as_array() {
+            for nested in array {
+                collect(nested, names);
+            }
+        }
+    }
+
+    /// The gate that makes the table a source of truth rather than a fourth list to forget.
+    ///
+    /// A new `AutomationMethod` variant changes the schema, so it fails here until it is given a
+    /// class — which is how `session_snapshot` came to be advertised as `snapshot`.
+    #[test]
+    fn every_wire_method_is_advertised_with_a_class() {
+        let mut advertised = METHOD_CAPABILITIES
+            .iter()
+            .map(|capability| capability.name.to_owned())
+            .collect::<Vec<_>>();
+        advertised.sort();
+        let schema = schema_method_names();
+        assert!(
+            !schema.is_empty(),
+            "the schema must expose the method tags this test compares against"
+        );
+        assert_eq!(
+            schema, advertised,
+            "METHOD_CAPABILITIES and the AutomationMethod schema disagree"
+        );
+    }
+
+    #[test]
+    fn advertised_names_are_unique_and_resolvable() {
+        let mut seen = std::collections::BTreeSet::new();
+        for capability in METHOD_CAPABILITIES {
+            assert!(
+                seen.insert(capability.name),
+                "duplicate advertised method {}",
+                capability.name
+            );
+            assert_eq!(
+                advertised(capability.name).map(|found| found.class),
+                Some(capability.class)
+            );
+        }
+        assert!(advertised("no_such_method").is_none());
+    }
+
+    /// `mutating` is a projection of `class`, so the two can never disagree in an advertisement.
+    #[test]
+    fn mutating_agrees_with_class() {
+        for capability in METHOD_CAPABILITIES {
+            assert_eq!(
+                capability.mutating,
+                capability.class.mutating(),
+                "{} advertises the wrong mutating flag",
+                capability.name
+            );
+            assert_eq!(
+                capability.class == MethodClass::Observe,
+                !capability.mutating,
+                "{} is the only class that may be non-mutating",
+                capability.name
+            );
+        }
+    }
+
+    /// The wire tag serde encodes and the tag `name()` reports must be the same string.
+    #[test]
+    fn name_matches_the_serialized_tag() {
+        let samples = [
+            super::AutomationMethod::Capabilities,
+            super::AutomationMethod::GetConfig,
+            super::AutomationMethod::SessionSnapshot,
+            super::AutomationMethod::Inspect,
+            super::AutomationMethod::ClosePane,
+            super::AutomationMethod::Typing {
+                text: "x".into(),
+                report: false,
+            },
+            super::AutomationMethod::Plugin(super::PluginMethod::Reload),
+            super::AutomationMethod::Action(super::Action::NewTab),
+        ];
+        for method in samples {
+            let encoded = serde_json::to_value(&method).unwrap();
+            assert_eq!(
+                encoded["method"].as_str(),
+                Some(method.name()),
+                "name() disagrees with serde for {encoded}"
+            );
+            assert!(
+                advertised(method.name()).is_some(),
+                "{} is on the wire but not advertised",
+                method.name()
+            );
+        }
+    }
+
+    /// `session_snapshot` and `plugin` are the two the hand-written list got wrong.
+    #[test]
+    fn advertises_the_previously_missing_entries() {
+        assert!(advertised("session_snapshot").is_some());
+        assert!(advertised("plugin").is_some());
+        assert!(
+            advertised("snapshot").is_none(),
+            "`snapshot` is the CLI spelling and was never a wire method"
         );
     }
 }

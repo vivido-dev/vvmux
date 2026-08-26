@@ -73,6 +73,25 @@ is resolved from `--pane-id`, then a same-session `VVMUX_PANE_ID`, then the focu
 active tab. `close-pane` deliberately has no focused fallback. Pane shells inherit the exact
 `VVMUX_SESSION`, `VVMUX_TAB_ID`, and `VVMUX_PANE_ID` values for their owner.
 
+A pane does **not** inherit an outer `VIVIDO_SOCKET`, `VIVIDO_WINDOW_ID`, or `VIVIDO_SESSION`. The
+session server outlives the Vivido window that started it, so those name a window that may be gone,
+may now be a different one after a reattach, or — over `vvssh` — may live on another machine
+entirely. They are stripped along with the whole `VIVID_*` namespace and an outer `TMUX`/`STY`
+identity, so a pane agent cannot silently drive somebody else's terminal.
+
+`capabilities` is authoritative for a release and describes the surface rather than just naming it:
+
+```sh
+# Every method, with what it does and whether it changes anything.
+vvmux msg capabilities | jq '.method_capabilities[] | select(.mutating | not) | .name'
+```
+
+Each entry carries a `name`, a `class` (`observe`, `input`, `pane`, `layout`, `config`, `agent`,
+`plugin`), and `mutating`, which is `false` only for `observe`. A read-only pass runs the
+non-mutating set and skips the rest. `capabilities` also lists every `error_codes` value a reply can
+carry and every `event_kinds` name `subscribe --name` accepts, so a caller can tell a failure it
+handles from one this release added, and a real event name from a typo.
+
 ```sh
 export VVMUX_SESSION=agent
 
@@ -90,7 +109,10 @@ Available commands are:
 
 ```text
 capabilities
+get-config
 reload-config
+reload-plugins
+action ACTION [--pane-id ID]
 list-panes
 session-inspect
 list-tabs
@@ -109,6 +131,8 @@ agent-send-keys [--pane-id ID] --key KEY [--key KEY]...
 agent-read [--pane-id ID] [--lines N]
 inspect [--pane-id ID]
 inspect-media [--pane-id ID]
+trace-media [--after SEQ] [--limit N] [--follow] [--producer-id ID --context-id ID --surface-id ID --track-id ID] [--category CATEGORY] [--recovery-only] [--timeout DURATION] [--pane-id ID]
+save-layout [--path NAME|PATH]
 split vertical|horizontal [--pane-id ID]
 run COMMAND [--placement split|float|tab] [--axis vertical|horizontal] [--cwd DIR] [--hold] [--no-focus] [--pane-id ID]
 focus [--pane-id ID] [--wait outer|rendered] [--timeout DURATION]

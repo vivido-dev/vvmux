@@ -10,6 +10,7 @@
 #[allow(dead_code)]
 mod common;
 
+mod automation_contract;
 mod automation_msg;
 mod automation_run;
 mod config_reload;
