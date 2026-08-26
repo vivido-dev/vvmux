@@ -16,15 +16,17 @@ use crate::metrics::{BlockTimer, IpcCounters};
 use crate::platform::{ConnectionCancel, Transport};
 
 pub const MAGIC: &[u8; 4] = b"VVMX";
-/// Version 23 carries agent-name targeting and the session-state surface: a request may address a
-/// pane by the alias its agent was given, and a session's shape is snapshotted and restored across
-/// daemon restarts. One bump covers the batch.
-/// Version 22 carries the agent-runtime drive surface: launching an agent into a shell pane,
-/// prompting it, and reading its alternate-screen transcript. One bump covers the batch, so a
-/// session started by an older binary must be restarted before those methods exist.
-/// Version 19 added the per-pane transparency action. `Action` rides `ClientMessage`, and an
-/// unknown variant name is a decode failure rather than a negotiation, so a new client against a
-/// surviving old server tore the connection down mid-session instead of saying why.
+/// Version 20 is the first number past the last published release (18): the development-only bumps
+/// 19 through 29 never shipped, so their features are folded into 20 rather than renumbered. It
+/// carries the per-pane transparency action; the agent-runtime drive surface of launching an agent
+/// into a shell pane, prompting it, and reading its alternate-screen transcript; agent-name
+/// targeting and the session-state surface that snapshots and restores a session's shape across
+/// daemon restarts; the typed capability handshake and `get_config`; the topology surface of
+/// `layout`/`resolve_pane`, durable pane names, and name-addressable tabs; input, process, and
+/// observation parity (mouse, signals, exact pane resize, a bounded output transcript with
+/// byte-offset waits, idempotent setters, pane movement); request atomicity, where a request may
+/// carry the sequences it expects the session to be at and an idempotency key; and the outer
+/// identity an attached client publishes, with multi-agent leases and session recording.
 /// Version 18 reports recreated retained outer sources so their bodies can be rehydrated.
 /// Version 17 added actor-owned tab-navigation, rename, and close-confirmation actions.
 /// Version 16 was the hard cutover for deterministic automation waits and correlated diagnostics.
@@ -33,21 +35,9 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-/// Version 29 adds the outer identity an attached client publishes, multi-agent leases, and
-/// session recording. One bump covers the batch.
-/// Version 28 adds atomicity: a request may carry the sequences it expects the session to be at
-/// and an idempotency key, so a stale action is refused before it reaches a PTY and a retried one
-/// is not applied twice. One bump covers the batch.
-/// Version 27 adds input, process, and observation parity: mouse, signals, exact pane resize, a
-/// bounded output transcript with byte-offset waits, idempotent setters, and pane movement. One
-/// bump covers the batch.
-/// Version 26 adds the topology surface: `layout` and `resolve_pane` describe and navigate the
-/// split tree, panes carry durable names that survive a restart, and tabs are addressable and
-/// renameable by name. One bump covers the batch.
-/// Version 25 adds the typed capability handshake and `get_config`: `capabilities` now describes
-/// every method's class and whether it mutates, so a caller can tell an observation from a mutation
-/// before running one. One bump covers the batch.
-pub const VERSION: u16 = 29;
+/// A wire change does not raise this constant: the maintainer bumps it manually, so leave it alone
+/// and keep the mixed-version rejection intact.
+pub const VERSION: u16 = 20;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump

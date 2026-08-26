@@ -217,7 +217,7 @@ checked pixel dimensions; Windows accepts the same internal call and continues u
 This is the sole scoped PTY media exception in vvmux and does not change the Vivid wire stack.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 18 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 20 → outer vvmux producer → Vivido
 ```
 
 ## Plugin boundary
