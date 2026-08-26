@@ -105,6 +105,41 @@ upper of the two panes to its right, because that is where focus would go. Read 
 question is really about position on screen, and inspect `split_path` and the rectangles before
 translating a phrase like "the bottom pane" into a target.
 
+`mouse` takes **pane-local** coordinates, so a caller never has to know where a pane sits.
+`--route application` encodes through that pane's own live terminal modes and writes to its PTY,
+which reaches a pane whether or not it is visible, in another tab, or under a zoom — an explicitly
+targeted event is not hit-tested. `--route mux` gives the event to vvmux instead, which is what
+handles copy-mode selection, float drag and resize, and pane focus. Cells are the primary
+coordinate; `--x/--y` pixels need an attached client's cell metrics and are refused without one, and
+pass through exactly under SGR pixel mouse mode. `mouse path` sends one bounded press/move/release
+gesture over 2–1000 points, so a gesture cannot leave a button held down because a separate release
+call failed.
+
+`signal` reaches the pane's **foreground process group**, which typing `Ctrl+C` cannot promise: a
+shell running `cargo test` hands that job the terminal, and a signal aimed at the child would reach
+the shell instead. The reply says which group it went to, so `foreground_job` distinguishes
+interrupting the job from interrupting a shell sitting at its prompt. Windows has no equivalent and
+refuses rather than approximating one.
+
+`transcript` and `wait output` observe the **output stream**, not the screen. Output that a pane
+overwrites — a progress line rewritten by carriage returns, anything that scrolls past between two
+polls — is gone from the grid before `get-text` can see it. Each pane keeps a bounded in-memory
+rolling window with a monotonic byte offset; a request for output that has already scrolled out of
+it reports `dropped_before_offset` rather than silently returning less. This is separate from the
+opt-in on-disk `[session] pane_history` and writes nothing anywhere.
+
+`resize-pane` sets an exact size, unlike `action resize <direction>`, which nudges one step. A
+tiled pane is sized by reweighting the split that decides its span — the deepest ancestor on that
+axis — so a neighbour absorbs the difference and the rest of the layout stays put.
+
+`set-flag` replaces the toggles for automation. A toggle cannot be replayed: running it twice puts
+the flag back, which makes every retry loop wrong. Each setter states the state it wants and reports
+`changed`, so a repeat is a no-op rather than a reversal. The toggles remain as keybindings.
+
+`move-pane` relocates a pane to another tab, swaps it with a neighbour, or moves it between the
+tiled tree and the floating layer. The pane keeps its ID, its name, its agent, and its Vivid media
+ownership; only where it sits changes.
+
 `activate-pane` reveals a pane — selecting its tab and lifting a zoom that hides it — **without**
 moving focus. Visibility is what drives media projection, so "let me see this" and "type here now"
 are separate requests.
@@ -181,6 +216,12 @@ split vertical|horizontal [--pane-id ID]
 run COMMAND [--placement split|float|tab] [--axis vertical|horizontal] [--cwd DIR] [--hold] [--no-focus] [--pane-id ID]
 focus [--pane-id ID] [--wait outer|rendered] [--timeout DURATION]
 close-pane --pane-id ID
+mouse move|click|double-click|down|up|drag|scroll|path (--cell-column N --cell-row N | --x PX --y PX | --relative-x F --relative-y F) [--point COL,ROW]... [--button left|middle|right] [--route application|mux] [--mods Shift,Alt,Ctrl] [--scroll N] [--pane-id ID]
+signal INT|TERM|HUP|QUIT|TSTP|CONT|WINCH|KILL|STOP [--pane-id ID]
+resize-pane [--columns N] [--rows N] [--pane-id ID]
+move-pane (--to-tab ID|--to-tab-name NAME | --swap left|right|up|down | --to-layer tiled|floating) [--pane-id ID]
+set-flag zoom|pinned|transparent|copy-mode|floats-visible|sync-input (--on|--off) [--offset N] [--pane-id ID]
+transcript [--after-offset N] [--max-bytes N] [--base64] [--pane-id ID]
 typing TEXT [--pane-id ID] [--report]
 key KEY [--mods Shift,Alt,Ctrl,Super] [--repeat N] [--pane-id ID] [--report]
 paste TEXT [--pane-id ID] [--report]
@@ -190,6 +231,7 @@ get-grid [--start-line LINE --row-count N | --since-screen SEQ] [--pane-id ID]
 search --pattern TEXT [--regex] [--direction forward|backward] [--start-line LINE --start-column COLUMN] [--limit N] [--pane-id ID]
 sync-input (--on|--off) [--pane-id ID]
 wait text TEXT [--regex] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
+wait output PATTERN [--regex] [--after-offset N] [--timeout DURATION] [--pane-id ID]
 wait screen-change [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait screen-stable [--quiet DURATION] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait rendered --after-session SEQ [--timeout DURATION]

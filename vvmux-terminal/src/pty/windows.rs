@@ -150,6 +150,20 @@ impl PtyControl {
         }
     }
 
+    /// Windows has no POSIX signals and no foreground process group.
+    ///
+    /// A ConPTY pane's children live in a job object, which supports termination but not the
+    /// selective delivery a signal expresses; there is no equivalent of "interrupt the foreground
+    /// job and leave its shell alone". Refused here rather than approximated, because a caller
+    /// asking for `INT` and silently getting a job-wide kill would be worse than being told no.
+    /// `Ctrl+C` is still available as ordinary input through `key`.
+    pub fn signal(&self, _signal: i32) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows panes have no process group to signal",
+        ))
+    }
+
     pub fn terminate(&self) {
         if self.inner.closing.swap(true, Ordering::AcqRel) {
             return;

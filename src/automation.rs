@@ -266,6 +266,96 @@ pub enum MsgCommand {
     },
     /// Reveal a pane without moving focus or stealing the attachment.
     ActivatePane(PaneTarget),
+    /// Send a mouse action to a pane, in pane-local coordinates.
+    Mouse {
+        #[arg(value_enum)]
+        action: crate::ipc::MouseAction,
+        /// Zero-based cell inside the pane's content area.
+        #[arg(long, requires = "cell_row")]
+        cell_column: Option<u16>,
+        #[arg(long, requires = "cell_column")]
+        cell_row: Option<u16>,
+        /// Physical pixels inside the pane's content area. Needs an attached client.
+        #[arg(long, requires = "y", conflicts_with_all = ["cell_column", "relative_x"])]
+        x: Option<u32>,
+        #[arg(long, requires = "x")]
+        y: Option<u32>,
+        /// A fraction of the pane, 0.0 through 1.0.
+        #[arg(long, requires = "relative_y", conflicts_with_all = ["cell_column", "x"])]
+        relative_x: Option<f32>,
+        #[arg(long, requires = "relative_x")]
+        relative_y: Option<f32>,
+        /// Gesture points for `path`, as `COLUMN,ROW` cells. Repeatable, 2 through 1000.
+        #[arg(long = "point", value_parser = parse_mouse_point)]
+        points: Vec<(u16, u16)>,
+        #[arg(long, value_enum, default_value_t = crate::ipc::MouseButton::Left)]
+        button: crate::ipc::MouseButton,
+        #[arg(long, value_enum, default_value_t = crate::ipc::MouseRoute::Application)]
+        route: crate::ipc::MouseRoute,
+        /// Comma-separated modifiers: `Shift`, `Alt`, `Ctrl`.
+        #[arg(long, value_delimiter = ',')]
+        mods: Vec<String>,
+        /// Wheel notches for `scroll`: negative scrolls up, positive down.
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+        scroll: i16,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Read a pane's bounded rolling window of raw output.
+    Transcript {
+        #[arg(long)]
+        after_offset: Option<u64>,
+        /// Return exact bytes, base64-encoded, instead of lossy text.
+        #[arg(long)]
+        base64: bool,
+        #[arg(long)]
+        max_bytes: Option<u32>,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Give one pane an exact size instead of nudging it one step.
+    ResizePane {
+        #[arg(long)]
+        columns: Option<u16>,
+        #[arg(long)]
+        rows: Option<u16>,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Move a pane to another tab, swap it with a neighbour, or change its layer.
+    MovePane {
+        #[arg(long, conflicts_with_all = ["swap", "to_layer"])]
+        to_tab: Option<u64>,
+        #[arg(long, conflicts_with_all = ["swap", "to_layer"])]
+        to_tab_name: Option<String>,
+        #[arg(long, value_enum, conflicts_with = "to_layer")]
+        swap: Option<DirectionArg>,
+        #[arg(long, value_enum)]
+        to_layer: Option<crate::ipc::PaneLayerRequest>,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Set a pane or tab flag outright, instead of flipping it.
+    SetFlag {
+        #[arg(value_enum)]
+        flag: crate::ipc::PaneFlag,
+        #[arg(long, conflicts_with = "off")]
+        on: bool,
+        #[arg(long, conflicts_with = "on")]
+        off: bool,
+        /// Scrollback offset for `copy-mode`.
+        #[arg(long)]
+        offset: Option<usize>,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Deliver a signal to a pane's foreground process group.
+    Signal {
+        #[arg(value_enum)]
+        signal: crate::ipc::SignalName,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Open a tab and report the IDs it was given.
     NewTab {
         #[arg(long)]
@@ -670,6 +760,18 @@ pub enum WaitCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Wait for a pattern in a pane's output stream, which a screen wait can miss.
+    Output {
+        pattern: String,
+        #[arg(long)]
+        regex: bool,
+        #[arg(long)]
+        after_offset: Option<u64>,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Wait for a newer pane screen sequence.
     ScreenChange {
         #[arg(long)]
@@ -979,6 +1081,75 @@ enum Output {
     EventStream,
 }
 
+/// A `COLUMN,ROW` gesture point.
+fn parse_mouse_point(value: &str) -> Result<(u16, u16), String> {
+    let (column, row) = value
+        .split_once(',')
+        .ok_or_else(|| format!("expected COLUMN,ROW, got `{value}`"))?;
+    Ok((
+        column
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid column in `{value}`"))?,
+        row.trim()
+            .parse()
+            .map_err(|_| format!("invalid row in `{value}`"))?,
+    ))
+}
+
+/// Exactly one coordinate form, converted to the wire's pane-local position.
+fn mouse_position(
+    cell_column: Option<u16>,
+    cell_row: Option<u16>,
+    x: Option<u32>,
+    y: Option<u32>,
+    relative_x: Option<f32>,
+    relative_y: Option<f32>,
+) -> io::Result<Option<crate::ipc::MousePosition>> {
+    use crate::ipc::MousePosition;
+    if let (Some(column), Some(row)) = (cell_column, cell_row) {
+        return Ok(Some(MousePosition::Cell { column, row }));
+    }
+    if let (Some(x), Some(y)) = (x, y) {
+        return Ok(Some(MousePosition::Pixel { x, y }));
+    }
+    if let (Some(x), Some(y)) = (relative_x, relative_y) {
+        // Per-mille on the wire; a fraction is what a person types.
+        for value in [x, y] {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "relative coordinates run from 0.0 through 1.0",
+                ));
+            }
+        }
+        return Ok(Some(MousePosition::Relative {
+            x: (x * 1000.0).round() as u16,
+            y: (y * 1000.0).round() as u16,
+        }));
+    }
+    Ok(None)
+}
+
+/// `Shift`, `Alt`, `Ctrl` in any case, as the three flags the wire carries.
+fn mouse_modifiers(mods: &[String]) -> io::Result<(bool, bool, bool)> {
+    let (mut shift, mut alt, mut ctrl) = (false, false, false);
+    for modifier in mods {
+        match modifier.trim().to_ascii_lowercase().as_str() {
+            "shift" => shift = true,
+            "alt" | "meta" => alt = true,
+            "ctrl" | "control" => ctrl = true,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown modifier `{other}`; use Shift, Alt, or Ctrl"),
+                ));
+            }
+        }
+    }
+    Ok((shift, alt, ctrl))
+}
+
 fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u64>, bool, Output)> {
     let tuple = match command {
         MsgCommand::Capabilities => (AutomationMethod::Capabilities, None, false, Output::Json),
@@ -1030,6 +1201,118 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             AutomationMethod::PaneRename { name },
             pane_id,
             false,
+            Output::Json,
+        ),
+        MsgCommand::Mouse {
+            action,
+            cell_column,
+            cell_row,
+            x,
+            y,
+            relative_x,
+            relative_y,
+            points,
+            button,
+            route,
+            mods,
+            scroll,
+            pane_id,
+        } => {
+            let (shift, alt, ctrl) = mouse_modifiers(&mods)?;
+            (
+                AutomationMethod::Mouse {
+                    action,
+                    position: mouse_position(cell_column, cell_row, x, y, relative_x, relative_y)?,
+                    button,
+                    route,
+                    shift,
+                    alt,
+                    ctrl,
+                    scroll,
+                    points: points
+                        .into_iter()
+                        .map(|(column, row)| crate::ipc::MousePosition::Cell { column, row })
+                        .collect(),
+                    duration_ms: None,
+                    wait_rendered: false,
+                    timeout_ms: 30_000,
+                },
+                pane_id,
+                true,
+                Output::Json,
+            )
+        }
+        MsgCommand::Transcript {
+            after_offset,
+            base64,
+            max_bytes,
+            pane_id,
+        } => (
+            AutomationMethod::Transcript {
+                after_offset,
+                base64,
+                max_bytes,
+            },
+            pane_id,
+            true,
+            Output::Json,
+        ),
+        MsgCommand::ResizePane {
+            columns,
+            rows,
+            pane_id,
+        } => (
+            AutomationMethod::ResizePane { columns, rows },
+            pane_id,
+            true,
+            Output::Json,
+        ),
+        MsgCommand::MovePane {
+            to_tab,
+            to_tab_name,
+            swap,
+            to_layer,
+            pane_id,
+        } => (
+            AutomationMethod::MovePane {
+                to_tab: to_tab
+                    .map(TabSelector::Id)
+                    .or_else(|| to_tab_name.map(TabSelector::Name)),
+                swap: swap.map(Into::into),
+                to_layer,
+            },
+            pane_id,
+            true,
+            Output::Json,
+        ),
+        MsgCommand::SetFlag {
+            flag,
+            on,
+            off,
+            offset,
+            pane_id,
+        } => {
+            if on == off {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "set-flag needs exactly one of --on or --off",
+                ));
+            }
+            (
+                AutomationMethod::SetFlag {
+                    flag,
+                    enabled: on,
+                    offset,
+                },
+                pane_id,
+                true,
+                Output::Json,
+            )
+        }
+        MsgCommand::Signal { signal, pane_id } => (
+            AutomationMethod::Signal { signal },
+            pane_id,
+            true,
             Output::Json,
         ),
         MsgCommand::ActivatePane(target) => (
@@ -1531,6 +1814,31 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             )
         }
         MsgCommand::Wait { command } => match command {
+            WaitCommand::Output {
+                pattern,
+                regex,
+                after_offset,
+                timeout,
+                pane_id,
+            } => {
+                if regex && pattern.len() > 8 * 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "regular expression exceeds 8 KiB",
+                    ));
+                }
+                (
+                    AutomationMethod::WaitOutput {
+                        pattern,
+                        regex,
+                        after_offset,
+                        timeout_ms: millis(timeout),
+                    },
+                    pane_id,
+                    true,
+                    Output::Json,
+                )
+            }
             WaitCommand::Text {
                 text,
                 regex,

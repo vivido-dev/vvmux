@@ -576,6 +576,78 @@ impl TiledNode {
         }
     }
 
+    /// Give `pane` exactly `cells` along `axis`, by reweighting the split that decides it.
+    ///
+    /// The deciding split is the *deepest* ancestor of the pane whose axis matches: a shallower
+    /// same-axis split subdivides an area this one is already inside, and a perpendicular split
+    /// does not change the span at all. Weights rather than sizes are what the tree stores, so the
+    /// requested span is converted into the pair of weights that reproduces it at the current area
+    /// and keeps its ratio when the area later changes.
+    ///
+    /// Returns `false` when the pane has no ancestor split on that axis — a lone pane fills its
+    /// tab and cannot be given a different size — and leaves the tree untouched.
+    pub fn set_pane_span(&mut self, pane: PaneId, axis: Axis, cells: u16, area: Rect) -> bool {
+        let mut candidate = self.clone();
+        if !candidate.reweight_deepest(pane, axis, cells, area) {
+            return false;
+        }
+        // A weight the tree accepts can still produce a pane too small to hold a terminal, so the
+        // committed geometry is checked before it replaces the live tree, exactly as `split` does.
+        if candidate.geometry(area).values().any(|rect| {
+            let content = rect.content();
+            content.width < MIN_CONTENT_COLUMNS || content.height < MIN_CONTENT_ROWS
+        }) {
+            return false;
+        }
+        *self = candidate;
+        true
+    }
+
+    fn reweight_deepest(&mut self, pane: PaneId, axis: Axis, cells: u16, area: Rect) -> bool {
+        let Self::Split {
+            axis: split_axis,
+            first,
+            second,
+            first_weight,
+            second_weight,
+        } = self
+        else {
+            return false;
+        };
+        let (first_area, second_area, total) =
+            split_areas(area, *split_axis, *first_weight, *second_weight);
+        let in_first = first.contains(pane);
+        let holds = in_first || second.contains(pane);
+        if !holds {
+            return false;
+        }
+        let child_area = if in_first { first_area } else { second_area };
+        // Deeper first: the closest same-axis ancestor is the one that decides the span.
+        let child = if in_first {
+            first.as_mut()
+        } else {
+            second.as_mut()
+        };
+        if child.reweight_deepest(pane, axis, cells, child_area) {
+            return true;
+        }
+        if *split_axis != axis {
+            return false;
+        }
+        // Weights are relative, so any pair with this ratio works; using the cell counts directly
+        // keeps the split at the requested size and preserves the ratio across later resizes.
+        let requested = cells.clamp(1, total.saturating_sub(1).max(1));
+        let remainder = total.saturating_sub(requested).max(1);
+        let (new_first, new_second) = if in_first {
+            (requested, remainder)
+        } else {
+            (remainder, requested)
+        };
+        *first_weight = u32::from(new_first).max(1);
+        *second_weight = u32::from(new_second).max(1);
+        true
+    }
+
     pub fn geometry(&self, area: Rect) -> BTreeMap<PaneId, Rect> {
         let mut geometry = BTreeMap::new();
         self.place(area, &mut geometry);
@@ -607,6 +679,35 @@ impl TiledNode {
         }
         *self = candidate;
         Ok(())
+    }
+
+    /// Exchange two tiled leaves, leaving the tree's shape and every weight alone.
+    ///
+    /// A swap rather than a remove-and-reinsert: the panes trade places, so the split that held
+    /// each of them keeps its size and the rest of the layout does not shift around the move.
+    /// Returns `false` unless both panes are leaves of this tree.
+    pub fn swap(&mut self, first: PaneId, second: PaneId) -> bool {
+        if first == second || !self.contains(first) || !self.contains(second) {
+            return false;
+        }
+        self.rename_leaf(first, second);
+        true
+    }
+
+    fn rename_leaf(&mut self, first: PaneId, second: PaneId) {
+        match self {
+            Self::Leaf(pane) if *pane == first => *pane = second,
+            Self::Leaf(pane) if *pane == second => *pane = first,
+            Self::Leaf(_) => {}
+            Self::Split {
+                first: left,
+                second: right,
+                ..
+            } => {
+                left.rename_leaf(first, second);
+                right.rename_leaf(first, second);
+            }
+        }
     }
 
     pub fn close(self, pane: PaneId) -> Option<Self> {

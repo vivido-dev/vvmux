@@ -83,6 +83,39 @@ impl PtyControl {
         }
     }
 
+    /// Deliver one signal to the pane's foreground process group.
+    ///
+    /// The foreground group, not the child: a shell running `cargo test` puts that job in its own
+    /// group and hands it the terminal, so signalling the child would reach the shell and leave the
+    /// job running — which is the opposite of what a caller asking to interrupt means. Falls back
+    /// to the pane's own group when nothing has claimed the terminal, so a signal still reaches a
+    /// pane whose shell is sitting at its prompt.
+    ///
+    /// Refused once termination has started: the teardown path owns SIGHUP-then-SIGKILL, and a
+    /// signal racing it would be delivered to a group that is already going away.
+    pub fn signal(&self, signal: i32) -> io::Result<u32> {
+        if self.inner.terminating.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pane is terminating",
+            ));
+        }
+        let group = self
+            .foreground_process_group_id()
+            .and_then(|group| i32::try_from(group).ok())
+            .unwrap_or(self.inner.process_group);
+        if group <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "pane has no process group",
+            ));
+        }
+        if unsafe { libc::kill(-group, signal) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(group as u32)
+    }
+
     pub fn terminate(&self) {
         if self.inner.terminating.swap(true, Ordering::AcqRel) {
             return;

@@ -33,13 +33,16 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
+/// Version 27 adds input, process, and observation parity: mouse, signals, exact pane resize, a
+/// bounded output transcript with byte-offset waits, idempotent setters, and pane movement. One
+/// bump covers the batch.
 /// Version 26 adds the topology surface: `layout` and `resolve_pane` describe and navigate the
 /// split tree, panes carry durable names that survive a restart, and tabs are addressable and
 /// renameable by name. One bump covers the batch.
 /// Version 25 adds the typed capability handshake and `get_config`: `capabilities` now describes
 /// every method's class and whether it mutates, so a caller can tell an observation from a mutation
 /// before running one. One bump covers the batch.
-pub const VERSION: u16 = 26;
+pub const VERSION: u16 = 27;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -102,6 +105,180 @@ pub struct AutomationRequest {
     pub pane_name: Option<crate::layout::PaneName>,
     pub allow_focused: bool,
     pub method: AutomationMethod,
+}
+
+/// What a mouse request does.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum MouseAction {
+    Move,
+    Click,
+    DoubleClick,
+    Down,
+    Up,
+    Drag,
+    Scroll,
+    /// One bounded press, move, release gesture over a list of points.
+    Path,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+impl MouseButton {
+    /// The SGR button code, which is also the wire encoding an application receives.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Left => 0,
+            Self::Middle => 1,
+            Self::Right => 2,
+        }
+    }
+}
+
+/// Who handles a mouse event.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum MouseRoute {
+    /// Encode through the pane's terminal modes and write to its PTY. Works on a hidden pane.
+    Application,
+    /// Give it to vvmux, which is what handles selection, float drag, and pane focus.
+    ///
+    /// Named `mux` rather than Vivido's `ui`: vvmux has no GPU chrome, and what this route reaches
+    /// is the multiplexer's own handling of a pointer.
+    Mux,
+}
+
+/// Where in a pane a mouse action happens.
+///
+/// Exactly one form, always pane-local. Cells are the primary one because vvmux is a text
+/// multiplexer and a pane's rectangle is measured in them; pixels exist for applications under SGR
+/// pixel mouse mode, which want the exact position inside a cell.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MousePosition {
+    Cell {
+        column: u16,
+        row: u16,
+    },
+    /// Physical pixels inside the pane's content area.
+    Pixel {
+        x: u32,
+        y: u32,
+    },
+    /// A fraction of the pane's content area, in per-mille: 0 is the left/top edge, 1000 the
+    /// right/bottom.
+    ///
+    /// Integers rather than a float, so the wire type stays comparable and a position round-trips
+    /// through JSON unchanged. The CLI still takes `0.5` and converts.
+    Relative {
+        x: u16,
+        y: u16,
+    },
+}
+
+/// Which layer a pane should live on.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum PaneLayerRequest {
+    Tiled,
+    Floating,
+}
+
+/// A pane or tab flag an automation caller can set outright.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum PaneFlag {
+    /// Project this pane over its whole tab. Tab-scoped: at most one pane is zoomed.
+    Zoom,
+    /// Keep this floating pane visible while the ordinary float block is hidden.
+    Pinned,
+    /// Paint this pane's own background instead of letting the outer terminal through.
+    Transparent,
+    /// Put this pane in copy mode, optionally at a scrollback offset.
+    CopyMode,
+    /// Show the tab's ordinary (unpinned) floating panes.
+    FloatsVisible,
+    /// Send input typed at any pane in this tab to all of them.
+    SyncInput,
+}
+
+/// A signal a caller may deliver to a pane's foreground process group.
+///
+/// A closed list rather than a raw number: these are the ones a terminal automation caller has a
+/// reason to send, they mean the same thing on every Unix, and a typo cannot become a different
+/// signal.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum, schemars::JsonSchema,
+)]
+#[serde(rename_all = "UPPERCASE")]
+#[clap(rename_all = "UPPER")]
+pub enum SignalName {
+    Int,
+    Term,
+    Hup,
+    Quit,
+    Tstp,
+    Cont,
+    Winch,
+    Kill,
+    Stop,
+}
+
+impl SignalName {
+    #[cfg(unix)]
+    pub fn number(self) -> i32 {
+        match self {
+            Self::Int => libc::SIGINT,
+            Self::Term => libc::SIGTERM,
+            Self::Hup => libc::SIGHUP,
+            Self::Quit => libc::SIGQUIT,
+            Self::Tstp => libc::SIGTSTP,
+            Self::Cont => libc::SIGCONT,
+            Self::Winch => libc::SIGWINCH,
+            Self::Kill => libc::SIGKILL,
+            Self::Stop => libc::SIGSTOP,
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn number(self) -> i32 {
+        0
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Int => "INT",
+            Self::Term => "TERM",
+            Self::Hup => "HUP",
+            Self::Quit => "QUIT",
+            Self::Tstp => "TSTP",
+            Self::Cont => "CONT",
+            Self::Winch => "WINCH",
+            Self::Kill => "KILL",
+            Self::Stop => "STOP",
+        }
+    }
 }
 
 /// Which tab a request means.
@@ -244,6 +421,83 @@ pub enum AutomationMethod {
     /// Close a tab and every pane in it.
     CloseTab {
         tab: TabSelector,
+    },
+    /// Send one mouse action to a pane.
+    ///
+    /// Coordinates are pane-local, so a caller does not have to know where the pane sits in the
+    /// session. `application` encodes through the pane's own live terminal modes and reaches it
+    /// whether or not it is visible; `mux` drives vvmux's own handling — copy-mode selection,
+    /// float drag and resize, focus — through the same path a real mouse takes.
+    Mouse {
+        action: MouseAction,
+        position: Option<MousePosition>,
+        button: MouseButton,
+        route: MouseRoute,
+        shift: bool,
+        alt: bool,
+        ctrl: bool,
+        /// Wheel notches for `scroll`: negative scrolls up, positive down.
+        scroll: i16,
+        /// Points for `path`, as a bounded press/move/release gesture.
+        points: Vec<MousePosition>,
+        /// Pace a `path` over this long, so an application sees motion rather than a teleport.
+        duration_ms: Option<u64>,
+        /// Resolve only once the attached client has acknowledged a newer render.
+        wait_rendered: bool,
+        timeout_ms: u64,
+    },
+    /// Read a pane's bounded rolling window of raw output.
+    ///
+    /// The answer to "what did it print" when the grid has already overwritten it. Reports a gap
+    /// rather than silently returning a shorter answer when the requested offset has scrolled out
+    /// of the retained window.
+    Transcript {
+        after_offset: Option<u64>,
+        /// Return the exact bytes, base64-encoded, instead of lossy text.
+        base64: bool,
+        max_bytes: Option<u32>,
+    },
+    /// Wait for a pattern in a pane's output stream rather than on its screen.
+    ///
+    /// A screen wait can miss text that was overwritten before any snapshot ran; this cannot.
+    WaitOutput {
+        pattern: String,
+        regex: bool,
+        after_offset: Option<u64>,
+        timeout_ms: u64,
+    },
+    /// Give one pane an exact size, rather than nudging it one step.
+    ///
+    /// A tiled pane is sized by reweighting the split that decides its span; a floating pane's
+    /// rectangle is set directly. Minimum pane sizes still apply, and the committed geometry is
+    /// reported rather than assumed.
+    ResizePane {
+        columns: Option<u16>,
+        rows: Option<u16>,
+    },
+    /// Move a pane within the session: to another tab, to a neighbour's place, or between layers.
+    MovePane {
+        to_tab: Option<TabSelector>,
+        /// Swap with the pane one step in this direction, keeping both in place otherwise.
+        swap: Option<Direction>,
+        to_layer: Option<PaneLayerRequest>,
+    },
+    /// Set a pane or tab flag outright, rather than flipping it.
+    ///
+    /// A toggle cannot be retried: replaying one puts the flag back. Every interactive toggle keeps
+    /// its keybinding and gains a setter here, so an automation caller states the state it wants.
+    SetFlag {
+        flag: PaneFlag,
+        enabled: bool,
+        /// Scrollback offset for `copy_mode`, ignored by every other flag.
+        offset: Option<usize>,
+    },
+    /// Deliver one signal to a pane's foreground process group.
+    ///
+    /// Not the same as typing `Ctrl+C`: a signal reaches the job that owns the terminal even when
+    /// it is not reading input, and does not depend on the pane's line discipline.
+    Signal {
+        signal: SignalName,
     },
     Inspect,
     InspectMedia,
@@ -391,6 +645,8 @@ pub enum MethodClass {
     Layout,
     /// Changes the session's configuration.
     Config,
+    /// Acts on a pane's child processes rather than on its terminal.
+    Process,
     /// Claims, names, or drives an agent in a pane.
     Agent,
     /// Enters the plugin host, whose own operations carry their own permissions.
@@ -432,7 +688,7 @@ const fn capability(name: &'static str, class: MethodClass) -> MethodCapability 
 /// than silently becoming an unadvertised method — which is how `session_snapshot` came to be
 /// advertised under a name that was never on the wire.
 pub const METHOD_CAPABILITIES: &[MethodCapability] = {
-    use MethodClass::{Agent, Config, Input, Layout, Observe, Pane, Plugin};
+    use MethodClass::{Agent, Config, Input, Layout, Observe, Pane, Plugin, Process};
     &[
         capability("capabilities", Observe),
         capability("get_config", Observe),
@@ -451,6 +707,8 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         capability("search", Observe),
         capability("agent_explain", Observe),
         capability("subscribe", Observe),
+        capability("transcript", Observe),
+        capability("wait_output", Observe),
         capability("wait_text", Observe),
         capability("wait_screen_change", Observe),
         capability("wait_screen_stable", Observe),
@@ -464,6 +722,7 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         capability("paste", Input),
         capability("submit_line", Input),
         capability("agent_send_keys", Input),
+        capability("mouse", Input),
         capability("split", Pane),
         capability("run", Pane),
         capability("close_pane", Pane),
@@ -473,12 +732,16 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         capability("pane_rename", Layout),
         capability("rename_tab", Layout),
         capability("reset_tab_title", Layout),
+        capability("move_pane", Layout),
+        capability("resize_pane", Layout),
         capability("select_tab", Layout),
+        capability("set_flag", Layout),
         capability("focus", Layout),
         capability("focus_wait", Layout),
         capability("set_sync_input", Layout),
         capability("save_layout", Layout),
         capability("action", Layout),
+        capability("signal", Process),
         capability("reload_config", Config),
         capability("report_agent", Agent),
         capability("report_agent_session", Agent),
@@ -526,6 +789,13 @@ impl AutomationMethod {
             Self::RenameTab { .. } => "rename_tab",
             Self::ResetTabTitle { .. } => "reset_tab_title",
             Self::CloseTab { .. } => "close_tab",
+            Self::Mouse { .. } => "mouse",
+            Self::Transcript { .. } => "transcript",
+            Self::WaitOutput { .. } => "wait_output",
+            Self::ResizePane { .. } => "resize_pane",
+            Self::MovePane { .. } => "move_pane",
+            Self::SetFlag { .. } => "set_flag",
+            Self::Signal { .. } => "signal",
             Self::Inspect => "inspect",
             Self::InspectMedia => "inspect_media",
             Self::TraceMedia { .. } => "trace_media",

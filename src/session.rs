@@ -711,6 +711,8 @@ struct Pane {
     /// resumed agent from a different program the user started. The name is applied once the agent
     /// is actually detected.
     pending_alias: Option<crate::agent::AgentAlias>,
+    /// A bounded rolling window of this pane's raw output.
+    transcript: PaneTranscript,
     /// The durable name a user gave this pane, unique within the session.
     ///
     /// Survives a server restart, unlike the pane's ID: see [`crate::layout::PaneName`].
@@ -770,6 +772,14 @@ enum AutomationWaitKind {
     Text {
         pattern: AutomationTextPattern,
         after_screen: Option<u64>,
+    },
+    /// Match against a pane's raw output stream rather than its screen.
+    ///
+    /// The difference that matters: a screen wait can miss text entirely, because the pane may
+    /// overwrite it before any snapshot runs. Output is matched as it arrives.
+    Output {
+        pattern: AutomationTextPattern,
+        after_offset: Option<u64>,
     },
     ScreenChange {
         after_screen: u64,
@@ -883,6 +893,54 @@ struct CopyState {
     search: Option<CopySearch>,
     matches: Vec<SearchMatch>,
     current: Option<SearchMatch>,
+}
+
+/// Bytes to be shown as text later.
+///
+/// The last resort for observing output that was never on screen long enough to snapshot: a
+/// progress line overwritten by carriage returns, or output that scrolled past between two polls.
+/// `get-text` reads the grid, which by then holds whatever replaced it.
+///
+/// In memory and bounded, and deliberately not the opt-in on-disk `[session] pane_history`: this
+/// is a small rolling window a caller can wait on, not a recording of everything a pane ever
+/// printed. Nothing here is written anywhere.
+#[derive(Debug, Default)]
+struct PaneTranscript {
+    bytes: VecDeque<u8>,
+    /// Total bytes ever fed to this pane, which is the offset just past the end of `bytes`.
+    ///
+    /// Monotonic and never reset, so an offset a caller read stays comparable even after the
+    /// window it pointed into has been overwritten — which is how a gap is detectable at all.
+    offset: u64,
+}
+
+impl PaneTranscript {
+    fn push(&mut self, chunk: &[u8]) {
+        self.offset = self.offset.saturating_add(chunk.len() as u64);
+        // A chunk larger than the whole window keeps only its tail; the older bytes were going to
+        // be dropped by the loop below regardless, and copying them first is wasted work.
+        let tail = chunk.len().min(MAX_TRANSCRIPT_BYTES);
+        self.bytes.extend(&chunk[chunk.len() - tail..]);
+        while self.bytes.len() > MAX_TRANSCRIPT_BYTES {
+            let excess = self.bytes.len() - MAX_TRANSCRIPT_BYTES;
+            self.bytes.drain(..excess);
+        }
+    }
+
+    /// The offset of the oldest byte still retained.
+    fn start(&self) -> u64 {
+        self.offset.saturating_sub(self.bytes.len() as u64)
+    }
+
+    /// Bytes from `after` onward, and whether anything between `after` and them was dropped.
+    fn since(&self, after: Option<u64>) -> (Vec<u8>, bool) {
+        let start = self.start();
+        let after = after.unwrap_or(start);
+        let gap = after < start;
+        let from = after.max(start).min(self.offset);
+        let skip = (from - start) as usize;
+        (self.bytes.iter().skip(skip).copied().collect(), gap)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2035,7 +2093,13 @@ impl SessionActor {
                 }
             }
             ActorEvent::PtyOutput(pane_id, bytes) => {
+                // Recorded before the terminal consumes it: the point of the transcript is the
+                // bytes the grid is about to overwrite.
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    pane.transcript.push(&bytes);
+                }
                 self.drive_pane_terminal(pane_id, |terminal| terminal.feed(&bytes));
+                self.check_automation_waiters();
             }
             ActorEvent::PtyExit(pane_id, status) => {
                 self.publish_plugin_event(
@@ -3561,6 +3625,107 @@ impl SessionActor {
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
+            AutomationMethod::Mouse {
+                action,
+                position,
+                button,
+                route,
+                shift,
+                alt,
+                ctrl,
+                scroll,
+                ref points,
+                duration_ms: _,
+                wait_rendered: _,
+                timeout_ms: _,
+            } => {
+                let pane_id = pane_id.unwrap();
+                let request = MouseRequest {
+                    action,
+                    position,
+                    button,
+                    route,
+                    shift,
+                    alt,
+                    ctrl,
+                    scroll,
+                    points: points.clone(),
+                };
+                match self.automation_mouse(pane_id, request) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::Transcript {
+                after_offset,
+                base64,
+                max_bytes,
+            } => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_transcript(pane_id, after_offset, base64, max_bytes) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::WaitOutput {
+                pattern,
+                regex,
+                after_offset,
+                timeout_ms,
+            } => {
+                let pattern = match automation_text_pattern(pattern, regex) {
+                    Ok(pattern) => pattern,
+                    Err(error) => {
+                        self.reply_automation_error(target, error);
+                        return;
+                    }
+                };
+                self.add_automation_waiter(AutomationWaiter {
+                    reply: target,
+                    pane_id,
+                    deadline: deadline(timeout_ms),
+                    kind: AutomationWaitKind::Output {
+                        pattern,
+                        after_offset,
+                    },
+                });
+            }
+            AutomationMethod::ResizePane { columns, rows } => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_resize_pane(pane_id, columns, rows) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::MovePane {
+                ref to_tab,
+                swap,
+                to_layer,
+            } => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_move_pane(pane_id, to_tab.as_ref(), swap, to_layer) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::SetFlag {
+                flag,
+                enabled,
+                offset,
+            } => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_set_flag(pane_id, flag, enabled, offset) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::Signal { signal } => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_signal(pane_id, signal) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
             AutomationMethod::InspectMedia => {
                 let pane_id = pane_id.unwrap();
                 let status = self.vivid.pane_status(
@@ -5075,6 +5240,869 @@ impl SessionActor {
         })
     }
 
+    /// Sanitized process detail for one pane.
+    ///
+    /// Names only, never argv: a foreground command line routinely carries an agent's session
+    /// identity, an API key passed as a flag, or a path a caller has no business seeing, and this
+    /// is a broad observation surface rather than a debugging one. The pane's own PID and the
+    /// group holding the terminal are enough to tell "the shell is at its prompt" from "a job is
+    /// running", which is what a caller is actually asking.
+    fn pane_process_json(&self, pane: &Pane) -> serde_json::Value {
+        let group = pane.control.foreground_process_group_id();
+        let foreground = group
+            .map(|group| {
+                crate::agent::foreground_job(&self.agent_catalog, pane.child_pid, Some(group)).1
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|process| serde_json::json!({"pid": process.pid, "name": process.name}))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "pid": pane.child_pid,
+            "foreground_process_group": group,
+            // A group that is not the pane's own child means something claimed the terminal, which
+            // is the difference between a shell waiting and a job running under it.
+            "foreground_job": group.is_some_and(|group| group != pane.child_pid),
+            "foreground": foreground,
+            "cwd": pane_cwd(pane.child_pid),
+            "spawn_cwd": pane.spawn_cwd.display().to_string(),
+            "exit": pane.exit_status.map(|status| {
+                serde_json::json!({"code": status.code, "signal": status.signal})
+            }),
+        })
+    }
+
+    /// Resolve a pane-local position to a cell in the session's own coordinate space.
+    ///
+    /// Pane-local on the way in because a caller should not have to know where a pane sits, and
+    /// session-absolute on the way out because that is what every existing mouse path speaks. The
+    /// pixel form needs the attached client's cell metrics; without a client there is no scale to
+    /// convert by, and guessing one would silently put the click somewhere else.
+    fn resolve_mouse_position(
+        &self,
+        content: Rect,
+        position: crate::ipc::MousePosition,
+    ) -> Result<ResolvedMousePoint, AutomationError> {
+        use crate::ipc::MousePosition;
+        let display = self.layout_display();
+        let (column, row, pixels) = match position {
+            MousePosition::Cell { column, row } => (column, row, None),
+            MousePosition::Relative { x, y } => {
+                if x > 1000 || y > 1000 {
+                    return Err(AutomationError::new(
+                        "invalid_params",
+                        "relative coordinates are per-mille, 0 through 1000",
+                    ));
+                }
+                // Multiply before dividing, and clamp: the last cell must be reachable at 1000
+                // without rounding past the edge.
+                let column = (u32::from(x) * u32::from(content.width) / 1000)
+                    .min(u32::from(content.width.saturating_sub(1)))
+                    as u16;
+                let row = (u32::from(y) * u32::from(content.height) / 1000)
+                    .min(u32::from(content.height.saturating_sub(1)))
+                    as u16;
+                (column, row, None)
+            }
+            MousePosition::Pixel { x, y } => {
+                let (cell_width, cell_height) = (display.cell_width, display.cell_height);
+                if cell_width == 0 || cell_height == 0 {
+                    return Err(AutomationError::new(
+                        "invalid_state",
+                        "pixel coordinates need an attached client's cell metrics; use --cell-column and --cell-row",
+                    ));
+                }
+                let column = (x / u32::from(cell_width)) as u16;
+                let row = (y / u32::from(cell_height)) as u16;
+                // Session-absolute pixels, which is what the SGR pixel encoder subtracts the
+                // pane origin from.
+                let absolute = (
+                    (u32::from(content.x) * u32::from(cell_width)).saturating_add(x) as u16,
+                    (u32::from(content.y) * u32::from(cell_height)).saturating_add(y) as u16,
+                );
+                (column, row, Some(absolute))
+            }
+        };
+        if column >= content.width || row >= content.height {
+            return Err(AutomationError::new(
+                "invalid_params",
+                format!(
+                    "position is outside the pane's {}x{} content area",
+                    content.width, content.height
+                ),
+            ));
+        }
+        Ok(ResolvedMousePoint {
+            x: content.x.saturating_add(column),
+            y: content.y.saturating_add(row),
+            pixels,
+        })
+    }
+
+    /// The content rectangle a pane's mouse coordinates are relative to.
+    fn pane_content_rect(&self, pane_id: PaneId) -> Result<Rect, AutomationError> {
+        let area = self.content_area();
+        if self.direct_pane() == Some(pane_id) {
+            return Ok(area);
+        }
+        let tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.contains(pane_id))
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+        Self::topology_projections(tab, area)
+            .into_iter()
+            .find(|projection| projection.pane_id == pane_id)
+            .map(|projection| projection.content)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no geometry"))
+    }
+
+    /// Send one mouse action to a pane.
+    fn automation_mouse(
+        &mut self,
+        pane_id: PaneId,
+        request: MouseRequest,
+    ) -> Result<serde_json::Value, AutomationError> {
+        use crate::ipc::{MouseAction, MouseRoute};
+        let content = self.pane_content_rect(pane_id)?;
+        let before_session = self.session_sequence;
+
+        if request.action == MouseAction::Path {
+            return self.automation_mouse_path(pane_id, content, request, before_session);
+        }
+        let position = request.position.ok_or_else(|| {
+            AutomationError::new(
+                "invalid_params",
+                "this mouse action needs a position; pass --cell-column and --cell-row",
+            )
+        })?;
+        let ResolvedMousePoint { x, y, pixels } = self.resolve_mouse_position(content, position)?;
+
+        let mut sent = 0_usize;
+        let mut send = |actor: &mut Self, kind: MouseKind, button: u8| {
+            let event = MouseEvent {
+                button,
+                x,
+                y,
+                kind,
+                shift: request.shift,
+                alt: request.alt,
+                ctrl: request.ctrl,
+            };
+            match request.route {
+                MouseRoute::Application => actor.send_application_mouse(pane_id, event, pixels),
+                // Through the session's own handler, so copy-mode selection, float drag, and
+                // focus behave exactly as they do for a real pointer.
+                MouseRoute::Mux => actor.mouse(event, pixels.is_some()),
+            }
+            sent += 1;
+        };
+
+        let button = request.button.code();
+        match request.action {
+            MouseAction::Move => send(self, MouseKind::Move, 0),
+            MouseAction::Down => send(self, MouseKind::Press, button),
+            MouseAction::Up => send(self, MouseKind::Release, button),
+            MouseAction::Click | MouseAction::Drag => {
+                send(self, MouseKind::Press, button);
+                if request.action == MouseAction::Drag {
+                    // A drag with one point is a press and a release at the same place; the motion
+                    // report between them is what makes an application treat it as a drag.
+                    send(self, MouseKind::Move, button);
+                }
+                send(self, MouseKind::Release, button);
+            }
+            MouseAction::DoubleClick => {
+                for _ in 0..2 {
+                    send(self, MouseKind::Press, button);
+                    send(self, MouseKind::Release, button);
+                }
+            }
+            MouseAction::Scroll => {
+                if request.scroll == 0 {
+                    return Err(AutomationError::new(
+                        "invalid_params",
+                        "scroll needs a nonzero notch count",
+                    ));
+                }
+                let wheel = if request.scroll < 0 {
+                    crate::agent_drive::WHEEL_UP
+                } else {
+                    crate::agent_drive::WHEEL_DOWN
+                };
+                for _ in 0..request.scroll.unsigned_abs().min(MAX_MOUSE_SCROLL_NOTCHES) {
+                    send(self, MouseKind::Wheel, (wheel & 0xff) as u8);
+                }
+            }
+            MouseAction::Path => unreachable!("handled above"),
+        }
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "events": sent,
+            "cell": {"column": x.saturating_sub(content.x), "row": y.saturating_sub(content.y)},
+            "route": request.route,
+            "session_sequence": self.session_sequence,
+            "before_session_sequence": before_session,
+        }))
+    }
+
+    /// One bounded press/move/release gesture over a list of points.
+    ///
+    /// Delivered in a single request rather than as one call per point: a gesture is a press, a
+    /// path, and a release that belong together, and splitting it across processes leaves a button
+    /// held down if any of them fails.
+    fn automation_mouse_path(
+        &mut self,
+        pane_id: PaneId,
+        content: Rect,
+        request: MouseRequest,
+        before_session: u64,
+    ) -> Result<serde_json::Value, AutomationError> {
+        use crate::ipc::MouseRoute;
+        if !(2..=MAX_MOUSE_PATH_POINTS).contains(&request.points.len()) {
+            return Err(AutomationError::new(
+                "invalid_params",
+                format!("a mouse path takes 2 through {MAX_MOUSE_PATH_POINTS} points"),
+            ));
+        }
+        let resolved = request
+            .points
+            .iter()
+            .map(|point| self.resolve_mouse_position(content, *point))
+            .collect::<Result<Vec<_>, _>>()?;
+        let button = request.button.code();
+        let last = resolved.len() - 1;
+        for (index, ResolvedMousePoint { x, y, pixels }) in resolved.into_iter().enumerate() {
+            let kind = match index {
+                0 => MouseKind::Press,
+                index if index == last => MouseKind::Release,
+                _ => MouseKind::Move,
+            };
+            let event = MouseEvent {
+                button,
+                x,
+                y,
+                kind,
+                shift: request.shift,
+                alt: request.alt,
+                ctrl: request.ctrl,
+            };
+            match request.route {
+                MouseRoute::Application => self.send_application_mouse(pane_id, event, pixels),
+                MouseRoute::Mux => self.mouse(event, pixels.is_some()),
+            }
+        }
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "events": request.points.len(),
+            "route": request.route,
+            "session_sequence": self.session_sequence,
+            "before_session_sequence": before_session,
+        }))
+    }
+
+    /// Encode one event through a pane's own terminal modes and write it to that pane's PTY.
+    ///
+    /// Addressed rather than hit-tested, which is what lets an explicitly targeted event reach a
+    /// pane that is hidden, in another tab, or covered by a zoom. The interactive path has to hit
+    /// test because it starts from a pointer position with no pane attached to it; this one was
+    /// told which pane.
+    fn send_application_mouse(
+        &mut self,
+        pane_id: PaneId,
+        mouse: MouseEvent,
+        pixels: Option<(u16, u16)>,
+    ) {
+        let display = self.layout_display();
+        let Ok(content) = self.pane_content_rect(pane_id) else {
+            return;
+        };
+        let Some(modes) = self.panes.get(&pane_id).map(|pane| pane.terminal.modes()) else {
+            return;
+        };
+        let mut button = u16::from(mouse.button);
+        if mouse.kind == MouseKind::Wheel {
+            button |= 64;
+        }
+        if mouse.kind == MouseKind::Move {
+            button |= 32;
+        }
+        if mouse.alt {
+            button |= 8;
+        }
+        if mouse.ctrl {
+            button |= 16;
+        }
+        if mouse.shift {
+            button |= 4;
+        }
+        let (x, y) =
+            application_mouse_coordinates(mouse, pixels, content, display, modes.sgr_pixels);
+        let encoded =
+            crate::agent_drive::encode_sgr_mouse(button, x, y, mouse.kind != MouseKind::Release);
+        self.send_pane_input(pane_id, encoded.as_bytes());
+    }
+
+    /// Read a pane's rolling output window.
+    fn automation_transcript(
+        &self,
+        pane_id: PaneId,
+        after_offset: Option<u64>,
+        base64: bool,
+        max_bytes: Option<u32>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
+        if after_offset.is_some_and(|offset| offset > pane.transcript.offset) {
+            return Err(AutomationError::new(
+                "sequence_gap",
+                format!(
+                    "output offset is {}, before requested {}",
+                    pane.transcript.offset,
+                    after_offset.unwrap_or_default()
+                ),
+            ));
+        }
+        let (mut bytes, gap) = pane.transcript.since(after_offset);
+        let dropped_before = gap.then(|| pane.transcript.start());
+        // Truncate from the front: a caller capping the reply wants the most recent output, and
+        // the offsets reported below say exactly which window it got.
+        let requested = max_bytes.map_or(bytes.len(), |max| max as usize);
+        let truncated = bytes.len() > requested;
+        if truncated {
+            bytes.drain(..bytes.len() - requested);
+        }
+        let from_offset = pane.transcript.offset.saturating_sub(bytes.len() as u64);
+        let mut result = serde_json::json!({
+            "pane_id": pane_id,
+            "from_offset": from_offset,
+            "output_offset": pane.transcript.offset,
+            "retained_from_offset": pane.transcript.start(),
+            "bytes": bytes.len(),
+            "truncated": truncated,
+            // Present only when output the caller asked for is genuinely gone, so its absence is
+            // a promise rather than an omission.
+            "dropped_before_offset": dropped_before,
+        });
+        if base64 {
+            use base64::Engine as _;
+            result["base64"] = base64::engine::general_purpose::STANDARD
+                .encode(&bytes)
+                .into();
+        } else {
+            result["text"] = String::from_utf8_lossy(&bytes).into_owned().into();
+        }
+        Ok(result)
+    }
+
+    /// Give a pane an exact size along either axis.
+    ///
+    /// `action resize <direction>` nudges one step, which is right for a keybinding and useless
+    /// for a caller that needs a deterministic grid — a TUI test wants 80 columns, not "a bit
+    /// wider than before". The committed geometry is reported because the tree may not be able to
+    /// grant the request exactly: minimum pane sizes and integer cell division both round it.
+    fn automation_resize_pane(
+        &mut self,
+        pane_id: PaneId,
+        columns: Option<u16>,
+        rows: Option<u16>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        if columns.is_none() && rows.is_none() {
+            return Err(AutomationError::new(
+                "invalid_params",
+                "resize-pane needs --columns, --rows, or both",
+            ));
+        }
+        let area = self.content_area();
+        let tab_index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.contains(pane_id))
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+        if self.tabs[tab_index].zoomed.is_some() {
+            return Err(AutomationError::new(
+                "invalid_state",
+                "unzoom the tab before resizing a pane",
+            ));
+        }
+        let mut refused = Vec::new();
+        if self.tabs[tab_index].floating.contains(pane_id) {
+            let rect = self.tabs[tab_index]
+                .floating
+                .get(pane_id)
+                .map(|float| float.rect)
+                .ok_or_else(|| AutomationError::new("pane_not_found", "float no longer exists"))?;
+            // A float's frame is part of its rectangle, so a caller asking for a content size is
+            // asking for two more columns and two more rows of window than that.
+            let next = Rect {
+                width: columns.map_or(rect.width, |columns| columns.saturating_add(2)),
+                height: rows.map_or(rect.height, |rows| rows.saturating_add(2)),
+                ..rect
+            };
+            self.tabs[tab_index].floating.set_rect(pane_id, next, area);
+        } else {
+            for (requested, axis, name) in [
+                (columns, Axis::Vertical, "columns"),
+                (rows, Axis::Horizontal, "rows"),
+            ] {
+                let Some(requested) = requested else { continue };
+                // The frame again: the tree divides outer rectangles, the caller means content.
+                let span = requested.saturating_add(2);
+                let applied = self.tabs[tab_index]
+                    .tree
+                    .as_mut()
+                    .is_some_and(|tree| tree.set_pane_span(pane_id, axis, span, area));
+                if !applied {
+                    refused.push(name);
+                }
+            }
+            if refused.len() == 2 || (refused.len() == 1 && columns.is_none() != rows.is_none()) {
+                return Err(AutomationError::new(
+                    "invalid_state",
+                    format!(
+                        "pane {pane_id} cannot be resized in {}: it has no split on that axis, or \
+                         the result would be below the minimum pane size",
+                        refused.join(" or ")
+                    ),
+                ));
+            }
+        }
+        self.relayout();
+        let geometry = self
+            .tabs
+            .get(tab_index)
+            .map(|tab| Self::topology_projections(tab, self.content_area()))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|projection| projection.pane_id == pane_id);
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "geometry": geometry.map(|projection| rect_json(projection.outer)),
+            "content_geometry": geometry.map(|projection| rect_json(projection.content)),
+            "columns": self.panes.get(&pane_id).map(|pane| pane.terminal.cols()),
+            "rows": self.panes.get(&pane_id).map(|pane| pane.terminal.rows()),
+            "layout_sequence": self.layout_revision,
+        }))
+    }
+
+    /// Move a pane to another tab, swap it with a neighbour, or change its layer.
+    ///
+    /// The pane keeps its ID, its name, its agent, and its Vivid media ownership: only where it
+    /// sits changes. That matters more here than anywhere else in the layout surface — media
+    /// identity is the complete owner/context/surface/track tuple, and a move that renumbered or
+    /// re-registered anything would look to the bridge like one producer's sources vanishing.
+    fn automation_move_pane(
+        &mut self,
+        pane_id: PaneId,
+        to_tab: Option<&TabSelector>,
+        swap: Option<Direction>,
+        to_layer: Option<crate::ipc::PaneLayerRequest>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let requests = [to_tab.is_some(), swap.is_some(), to_layer.is_some()];
+        if requests.iter().filter(|given| **given).count() != 1 {
+            return Err(AutomationError::new(
+                "invalid_params",
+                "move-pane takes exactly one of --to-tab, --swap, or --to-layer",
+            ));
+        }
+        let area = self.content_area();
+        let from_index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.contains(pane_id))
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+        if self.tabs[from_index].zoomed == Some(pane_id) {
+            self.tabs[from_index].zoomed = None;
+        }
+
+        if let Some(direction) = swap {
+            let projections = Self::topology_projections(&self.tabs[from_index], area);
+            let other = directional_focus(&projections, pane_id, direction).ok_or_else(|| {
+                AutomationError::new(
+                    "pane_not_found",
+                    format!("no pane lies {} of pane {pane_id}", direction.as_str()),
+                )
+            })?;
+            let tree = self.tabs[from_index].tree.as_mut().ok_or_else(|| {
+                AutomationError::new("unsupported", "tab has no tiled layout to swap within")
+            })?;
+            if !tree.swap(pane_id, other) {
+                return Err(AutomationError::new(
+                    "unsupported",
+                    "both panes must be tiled to swap places",
+                ));
+            }
+            self.relayout();
+            return Ok(self.moved_pane_json(pane_id, "swap"));
+        }
+
+        if let Some(layer) = to_layer {
+            let floating = self.tabs[from_index].floating.contains(pane_id);
+            match (layer, floating) {
+                (crate::ipc::PaneLayerRequest::Floating, false) => {
+                    let remaining = self.tabs[from_index]
+                        .tree
+                        .take()
+                        .and_then(|tree| tree.close(pane_id));
+                    if remaining.is_none() {
+                        // Nothing would be left behind it, and a tab whose only pane floats over
+                        // an empty tiled area is a shape the layout engine does not describe.
+                        self.tabs[from_index].tree = Some(TiledNode::leaf(pane_id));
+                        return Err(AutomationError::new(
+                            "invalid_state",
+                            "the tab's only tiled pane cannot be made floating",
+                        ));
+                    }
+                    self.tabs[from_index].tree = remaining;
+                    let percent = (
+                        self.config.floating.default_width_percent,
+                        self.config.floating.default_height_percent,
+                    );
+                    self.tabs[from_index]
+                        .floating
+                        .insert(pane_id, area, percent.0, percent.1);
+                }
+                (crate::ipc::PaneLayerRequest::Tiled, true) => {
+                    self.tabs[from_index].floating.remove(pane_id);
+                    let tree = match self.tabs[from_index].tree.take() {
+                        Some(mut tree) => {
+                            let anchor = self.tabs[from_index]
+                                .last_focused_tiled
+                                .filter(|anchor| tree.contains(*anchor))
+                                .or_else(|| tree.pane_ids().into_iter().next());
+                            match anchor {
+                                Some(anchor) => {
+                                    tree.split(anchor, pane_id, Axis::Vertical, area).map_err(
+                                        |_| {
+                                            AutomationError::new(
+                                                "invalid_state",
+                                                "no room to tile this pane",
+                                            )
+                                        },
+                                    )?;
+                                    tree
+                                }
+                                None => TiledNode::leaf(pane_id),
+                            }
+                        }
+                        None => TiledNode::leaf(pane_id),
+                    };
+                    self.tabs[from_index].tree = Some(tree);
+                }
+                // Already where it was asked to be. Idempotent on purpose: a retried move is not
+                // an error, and reporting one would make every retry loop handle a false failure.
+                _ => {}
+            }
+            self.relayout();
+            return Ok(self.moved_pane_json(pane_id, "layer"));
+        }
+
+        let to_index = self.resolve_tab(to_tab.expect("checked above"))?;
+        if to_index == from_index {
+            return Ok(self.moved_pane_json(pane_id, "tab"));
+        }
+        let floating = self.tabs[from_index].floating.contains(pane_id);
+        if floating {
+            self.tabs[from_index].floating.remove(pane_id);
+        } else {
+            let remaining = self.tabs[from_index]
+                .tree
+                .take()
+                .and_then(|tree| tree.close(pane_id));
+            self.tabs[from_index].tree = remaining;
+        }
+        if self.tabs[from_index].is_empty() {
+            // The source tab is gone. Removing it shifts every later index, including the
+            // destination, so both are re-resolved from the tab ID rather than reused.
+            let to_id = self.tabs[to_index].id;
+            self.tabs.remove(from_index);
+            if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len().saturating_sub(1);
+            }
+            let to_index = self
+                .tabs
+                .iter()
+                .position(|tab| tab.id == to_id)
+                .expect("the destination tab is not the one that was removed");
+            self.attach_pane_to_tab(to_index, pane_id, floating, area)?;
+        } else {
+            if let Some(tab) = self.tabs.get_mut(from_index)
+                && !tab.contains(tab.focused)
+                && let Some(next) = tab.fallback_focus()
+            {
+                tab.set_focus(next);
+            }
+            self.attach_pane_to_tab(to_index, pane_id, floating, area)?;
+        }
+        self.relayout();
+        Ok(self.moved_pane_json(pane_id, "tab"))
+    }
+
+    /// Put a pane into a tab it did not previously belong to, on the requested layer.
+    fn attach_pane_to_tab(
+        &mut self,
+        tab_index: usize,
+        pane_id: PaneId,
+        floating: bool,
+        area: Rect,
+    ) -> Result<(), AutomationError> {
+        if floating {
+            let percent = (
+                self.config.floating.default_width_percent,
+                self.config.floating.default_height_percent,
+            );
+            self.tabs[tab_index]
+                .floating
+                .insert(pane_id, area, percent.0, percent.1);
+            return Ok(());
+        }
+        let tree = match self.tabs[tab_index].tree.take() {
+            Some(mut tree) => {
+                let anchor = self.tabs[tab_index]
+                    .last_focused_tiled
+                    .filter(|anchor| tree.contains(*anchor))
+                    .or_else(|| tree.pane_ids().into_iter().next());
+                match anchor {
+                    Some(anchor) => {
+                        tree.split(anchor, pane_id, Axis::Vertical, area)
+                            .map_err(|_| {
+                                AutomationError::new(
+                                    "invalid_state",
+                                    "no room in the destination tab",
+                                )
+                            })?;
+                        tree
+                    }
+                    None => TiledNode::leaf(pane_id),
+                }
+            }
+            None => TiledNode::leaf(pane_id),
+        };
+        self.tabs[tab_index].tree = Some(tree);
+        Ok(())
+    }
+
+    fn moved_pane_json(&mut self, pane_id: PaneId, kind: &str) -> serde_json::Value {
+        self.mark_snapshot_dirty();
+        let tab = self.tabs.iter().find(|tab| tab.contains(pane_id));
+        serde_json::json!({
+            "pane_id": pane_id,
+            "moved": kind,
+            "tab_id": tab.map(|tab| tab.id),
+            "split_path": tab
+                .and_then(|tab| tab.tree.as_ref())
+                .and_then(|tree| tree.split_path(pane_id)),
+            "layer": match tab {
+                Some(tab) if tab.floating.get(pane_id).is_some_and(|float| float.pinned) => "pinned",
+                Some(tab) if tab.floating.contains(pane_id) => "floating",
+                _ => "tiled",
+            },
+            "layout_sequence": self.layout_revision,
+        })
+    }
+
+    /// Set one pane or tab flag outright.
+    fn automation_set_flag(
+        &mut self,
+        pane_id: PaneId,
+        flag: crate::ipc::PaneFlag,
+        enabled: bool,
+        offset: Option<usize>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        use crate::ipc::PaneFlag;
+        let tab_index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.contains(pane_id))
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+        let previous = self.pane_flag(tab_index, pane_id, flag);
+        match flag {
+            PaneFlag::Zoom => {
+                // Tab-scoped: zooming this pane unzooms whatever was zoomed, and turning zoom off
+                // only clears it when it is this pane that is zoomed.
+                let zoomed = self.tabs[tab_index].zoomed;
+                if enabled {
+                    if self.tabs[tab_index].floating.contains(pane_id) {
+                        return Err(AutomationError::new(
+                            "unsupported",
+                            "floating panes cannot be zoomed",
+                        ));
+                    }
+                    self.tabs[tab_index].zoomed = Some(pane_id);
+                } else if zoomed == Some(pane_id) {
+                    self.tabs[tab_index].zoomed = None;
+                }
+                self.force_full = true;
+                self.relayout();
+            }
+            PaneFlag::Pinned => {
+                if !self.tabs[tab_index].floating.contains(pane_id) {
+                    return Err(AutomationError::new(
+                        "unsupported",
+                        "only floating panes can be pinned",
+                    ));
+                }
+                self.tabs[tab_index].floating.set_pinned(pane_id, enabled);
+                self.force_full = true;
+                self.projection_changed();
+            }
+            PaneFlag::Transparent => {
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    pane.transparent = enabled;
+                }
+                self.mark_snapshot_dirty();
+                self.schedule_render();
+            }
+            PaneFlag::CopyMode => {
+                self.set_copy_mode(pane_id, enabled, offset)?;
+            }
+            PaneFlag::FloatsVisible => {
+                if self.tabs[tab_index].zoomed.is_some() {
+                    return Err(AutomationError::new(
+                        "invalid_state",
+                        "unzoom before changing floating pane visibility",
+                    ));
+                }
+                self.tabs[tab_index].floating.ordinary_visible = enabled;
+                if let Some(tab) = self.tabs.get_mut(tab_index) {
+                    let focused_hidden = !tab.floating.ordinary_visible
+                        && tab
+                            .floating
+                            .get(tab.focused)
+                            .is_some_and(|float| !float.pinned);
+                    if focused_hidden && let Some(next) = tab.fallback_focus() {
+                        tab.set_focus(next);
+                    }
+                }
+                self.force_full = true;
+                self.relayout();
+            }
+            PaneFlag::SyncInput => {
+                self.tabs[tab_index].sync_input = enabled;
+                self.mark_snapshot_dirty();
+                self.schedule_render();
+            }
+        }
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "tab_id": self.tabs[tab_index].id,
+            "flag": flag,
+            "enabled": self.pane_flag(tab_index, pane_id, flag),
+            // A setter is idempotent, so "did anything change" is the useful answer rather than
+            // "did it succeed" — which it always did.
+            "changed": previous != self.pane_flag(tab_index, pane_id, flag),
+            "layout_sequence": self.layout_revision,
+        }))
+    }
+
+    fn pane_flag(&self, tab_index: usize, pane_id: PaneId, flag: crate::ipc::PaneFlag) -> bool {
+        use crate::ipc::PaneFlag;
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return false;
+        };
+        match flag {
+            PaneFlag::Zoom => tab.zoomed == Some(pane_id),
+            PaneFlag::Pinned => tab.floating.get(pane_id).is_some_and(|float| float.pinned),
+            PaneFlag::Transparent => self
+                .panes
+                .get(&pane_id)
+                .is_some_and(|pane| pane.transparent),
+            PaneFlag::CopyMode => self
+                .panes
+                .get(&pane_id)
+                .is_some_and(|pane| pane.copy.is_some()),
+            PaneFlag::FloatsVisible => tab.floating.ordinary_visible,
+            PaneFlag::SyncInput => tab.sync_input,
+        }
+    }
+
+    /// Enter or leave copy mode on one pane, optionally at a scrollback offset.
+    ///
+    /// The same state the interactive `enter-copy-mode` builds, so a pane entered through
+    /// automation behaves identically to one a keybinding opened — including the search and
+    /// selection a caller may drive afterwards.
+    fn set_copy_mode(
+        &mut self,
+        pane_id: PaneId,
+        enabled: bool,
+        offset: Option<usize>,
+    ) -> Result<(), AutomationError> {
+        let rows = self.content_area().height.saturating_sub(2) as usize;
+        let pane = self
+            .panes
+            .get_mut(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
+        if !enabled {
+            if offset.is_some() {
+                return Err(AutomationError::new(
+                    "invalid_params",
+                    "--offset only applies when entering copy mode",
+                ));
+            }
+            pane.copy = None;
+            self.mark_pane_screen_change(pane_id, None);
+            self.schedule_render();
+            return Ok(());
+        }
+        // Clamped rather than refused: scrollback shrinks as a pane keeps writing, so an offset
+        // that was in range when a caller read it can be past the end by the time it is used.
+        let offset = offset.unwrap_or(0).min(pane.terminal.history_len());
+        pane.copy = Some(CopyState {
+            offset,
+            row: rows.saturating_sub(1),
+            column: 0,
+            selection_start: None,
+            search: None,
+            matches: Vec::new(),
+            current: None,
+        });
+        self.mark_pane_screen_change(pane_id, None);
+        self.schedule_render();
+        Ok(())
+    }
+
+    /// Deliver one signal to a pane's foreground process group.
+    ///
+    /// The pane is not closed and its process is not reaped here: a signalled job may exit, stop,
+    /// or ignore it entirely, and the ordinary exit path already owns whichever of those happens.
+    /// The reply reports the group that was signalled so a caller can tell "delivered to the job"
+    /// from "delivered to the shell that was waiting at its prompt".
+    fn automation_signal(
+        &mut self,
+        pane_id: PaneId,
+        signal: crate::ipc::SignalName,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
+        if pane.exit_status.is_some() {
+            return Err(AutomationError::new(
+                "pty_closed",
+                "pane process has already exited",
+            ));
+        }
+        let child_pid = pane.child_pid;
+        let group = pane.control.signal(signal.number()).map_err(|error| {
+            let code = match error.kind() {
+                io::ErrorKind::Unsupported => "unsupported",
+                io::ErrorKind::BrokenPipe | io::ErrorKind::NotFound => "pty_closed",
+                _ => "invalid_state",
+            };
+            AutomationError::new(code, error.to_string())
+        })?;
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "signal": signal.as_str(),
+            "process_group": group,
+            // A group that is not the pane's own child means a job had claimed the terminal, which
+            // is the difference between interrupting `cargo test` and interrupting its shell.
+            "foreground_job": group != child_pid,
+        }))
+    }
+
     /// Give a pane a name, or clear it.
     ///
     /// Uniqueness is per session and checked here: a name is a target, and two panes answering to
@@ -6283,6 +7311,9 @@ impl SessionActor {
             "modes": terminal_mode_names(pane.terminal.modes()),
             "screen": if pane.terminal.alternate_screen() { "alternate" } else { "primary" },
             "process_state": if pane.exit_status.is_some() { "exited" } else { "running" },
+            "process": self.pane_process_json(pane),
+            "output_offset": pane.transcript.offset,
+            "retained_output_from_offset": pane.transcript.start(),
             "screen_sequence": pane.screen_sequence,
             "session_sequence": self.session_sequence,
         }))
@@ -6977,6 +8008,35 @@ impl SessionActor {
                         matched.then(|| {
                             Ok(serde_json::json!({
                                 "pane_id": pane_id,
+                                "screen_sequence": pane.screen_sequence,
+                            }))
+                        })
+                    }
+                    AutomationWaitKind::Output {
+                        pattern,
+                        after_offset,
+                    } => {
+                        let (bytes, gap) = pane.transcript.since(*after_offset);
+                        if gap {
+                            return Some(Err(AutomationError::new(
+                                "sequence_gap",
+                                format!(
+                                    "output before offset {} has already been dropped",
+                                    pane.transcript.start()
+                                ),
+                            )));
+                        }
+                        // Lossy rather than refused: a pane's output is bytes, and a multi-byte
+                        // character split across two reads must not make a wait fail.
+                        let text = String::from_utf8_lossy(&bytes);
+                        let matched = match pattern {
+                            AutomationTextPattern::Literal(pattern) => text.contains(pattern),
+                            AutomationTextPattern::Regex(pattern) => pattern.is_match(&text),
+                        };
+                        matched.then(|| {
+                            Ok(serde_json::json!({
+                                "pane_id": pane_id,
+                                "output_offset": pane.transcript.offset,
                                 "screen_sequence": pane.screen_sequence,
                             }))
                         })
@@ -10807,6 +11867,7 @@ impl SessionActor {
                 agent_change_seq: 0,
                 pending_resume: None,
                 pending_alias: None,
+                transcript: PaneTranscript::default(),
                 name: None,
                 copy: None,
                 mouse_selection: None,
@@ -12562,6 +13623,85 @@ impl From<&Cell> for StyleKey {
     }
 }
 
+/// Where a pane's child process is now, as opposed to where it started.
+///
+/// Read from the process rather than tracked, because a shell's `cd` is invisible to vvmux: no
+/// escape sequence is required to change directory, so the only authority is the kernel. Absent
+/// where that is not readable, which a caller must treat as "unknown" rather than "unchanged".
+#[cfg(target_os = "linux")]
+fn pane_cwd(child_pid: u32) -> Option<String> {
+    (child_pid != 0)
+        .then(|| std::fs::read_link(format!("/proc/{child_pid}/cwd")).ok())
+        .flatten()
+        .map(|path| path.display().to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pane_cwd(_child_pid: u32) -> Option<String> {
+    None
+}
+
+/// Build a text pattern from a literal or a bounded regular expression.
+///
+/// Shared by `wait text` and `wait output` so the two cannot come to disagree about how large a
+/// regex may be or what an invalid one is called.
+fn automation_text_pattern(
+    pattern: String,
+    regex: bool,
+) -> Result<AutomationTextPattern, AutomationError> {
+    if !regex {
+        return Ok(AutomationTextPattern::Literal(pattern));
+    }
+    if pattern.len() > 8 * 1024 {
+        return Err(AutomationError::new(
+            "limit_exceeded",
+            "regular expression exceeds 8 KiB",
+        ));
+    }
+    regex::Regex::new(&pattern)
+        .map(AutomationTextPattern::Regex)
+        .map_err(|error| AutomationError::new("regex_invalid", error.to_string()))
+}
+
+/// A pane-local mouse position, resolved into the session's own coordinate space.
+///
+/// `pixels` is present only when the caller gave pixels, because that is the one form the SGR
+/// pixel encoder can pass through exactly; a cell has no sub-cell position to preserve.
+struct ResolvedMousePoint {
+    x: u16,
+    y: u16,
+    pixels: Option<(u16, u16)>,
+}
+
+/// One mouse request's parameters, gathered so the handlers take one argument instead of nine.
+struct MouseRequest {
+    action: crate::ipc::MouseAction,
+    position: Option<crate::ipc::MousePosition>,
+    button: crate::ipc::MouseButton,
+    route: crate::ipc::MouseRoute,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    scroll: i16,
+    points: Vec<crate::ipc::MousePosition>,
+}
+
+/// Points one `mouse path` gesture may carry.
+///
+/// Matches Vivido's bound, so a caller that learned the gesture there does not find a different
+/// ceiling here. Two is the minimum a press-and-release needs.
+const MAX_MOUSE_PATH_POINTS: usize = 1_000;
+
+/// Wheel notches one `mouse scroll` may send.
+const MAX_MOUSE_SCROLL_NOTCHES: u16 = 1_000;
+
+/// Raw output one pane retains for `transcript` and `wait output`.
+///
+/// In memory, per pane, and never written to disk. Large enough to hold a burst a caller might
+/// have missed between two polls, small enough that a session full of chatty panes cannot grow
+/// without bound.
+const MAX_TRANSCRIPT_BYTES: usize = 256 * 1024;
+
 /// Steps one `resolve_pane` route may take.
 ///
 /// A route crosses one split per step, so a session cannot need more than its pane count; this is
@@ -13251,6 +14391,28 @@ fn valid_plugin_reference(reference: &str) -> bool {
 }
 
 fn automation_limits() -> serde_json::Value {
+    let mut limits = automation_base_limits();
+    // Merged rather than declared inline: `serde_json::json!` recurses once per key, and the base
+    // object already sits at the macro's expansion limit.
+    if let Some(object) = limits.as_object_mut() {
+        for (name, value) in [
+            ("transcript_bytes_per_pane", MAX_TRANSCRIPT_BYTES),
+            ("mouse_path_points", MAX_MOUSE_PATH_POINTS),
+            (
+                "mouse_scroll_notches",
+                usize::from(MAX_MOUSE_SCROLL_NOTCHES),
+            ),
+            ("resolve_pane_steps", MAX_RESOLVE_PANE_STEPS),
+            ("pane_name_bytes", crate::layout::MAX_PANE_NAME_BYTES),
+            ("tab_name_bytes", MAX_TAB_NAME_BYTES),
+        ] {
+            object.insert(name.into(), value.into());
+        }
+    }
+    limits
+}
+
+fn automation_base_limits() -> serde_json::Value {
     serde_json::json!({
         "request_bytes": 1024 * 1024,
         "reply_bytes": 16 * 1024 * 1024,

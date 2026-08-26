@@ -36,32 +36,50 @@ Use this release-matched workflow:
    `rename-tab`, `reset-tab-title`, and `close-tab` are direct methods; the interactive rename and
    close-confirmation modals are for humans and are not automation surface. A `--tab-name` that
    matches two tabs is refused rather than guessed.
-7. Capture the relevant screen, session, outer-projection, or trace sequence before acting.
-8. Use `focus` or `select-tab --tab-id ID` with `--wait outer` when media projection is the
+7. Reach for `msg transcript` or `msg wait output` when the question is "what did it print",
+   not "what is on screen". A pane overwrites its own output — a progress line rewritten by
+   carriage returns, anything that scrolled past between two polls — and `get-text` reads the grid,
+   which by then holds whatever replaced it. Both take a byte `--after-offset` from `inspect`, and
+   a request for output that has already scrolled out reports `dropped_before_offset` rather than
+   quietly returning less.
+8. Prefer `msg set-flag FLAG --on|--off` over `action toggle-*`. A toggle cannot be replayed: run it
+   twice and the flag is back where it started, which makes a retry loop wrong. The setter reports
+   `changed`, so a repeat is a no-op you can see.
+9. `msg mouse` takes pane-local cells and needs no hit testing, so `--route application` reaches a
+   pane that is hidden, on another tab, or under a zoom. Use `--route mux` only for vvmux's own
+   handling — copy-mode selection, float drag, pane focus. Send a drag as one `mouse path` with
+   `--point COL,ROW` repeated, never as separate down/move/up calls: a failure between them leaves
+   a button held. Pixel coordinates need an attached client and are refused without one.
+10. Use `msg signal INT` rather than typing `Ctrl+C` when a job must actually be interrupted: a
+   signal reaches the foreground process group even when nothing is reading input. The reply's
+   `foreground_job` says whether it reached a running job or the shell at its prompt. Windows has
+   no process groups and refuses rather than approximating.
+11. Capture the relevant screen, session, outer-projection, or trace sequence before acting.
+12. Use `focus` or `select-tab --tab-id ID` with `--wait outer` when media projection is the
    assertion, or `--wait rendered` for the attached terminal frame. Use Vivido `wait frame`
    separately when GPU presentation matters.
-9. Follow `trace-media --after SEQUENCE --follow` with complete owner filters during recovery.
-10. On failure, capture `diagnose --all-panes --trace-limit 512`; create a metadata-only
+13. Follow `trace-media --after SEQUENCE --follow` with complete owner filters during recovery.
+14. On failure, capture `diagnose --all-panes --trace-limit 512`; create a metadata-only
    `vvmux debug-bundle` unless the user explicitly authorizes pane grid/text or log content.
-11. When a pane's reported agent state looks wrong, use `agent-explain --pane-id ID` before
+15. When a pane's reported agent state looks wrong, use `agent-explain --pane-id ID` before
    changing anything: it names the rule that decided and shows every rule's evidence. `diagnose`
    covers infrastructure, not classification.
-12. To run Codex in an available shell pane, use `agent-start --kind codex --pane-id ID`. Then send
+16. To run Codex in an available shell pane, use `agent-start --kind codex --pane-id ID`. Then send
    work with `agent-prompt --pane-id ID --wait --until blocked,done TEXT`; it separates prompt text
    from Enter and waits on agent lifecycle rather than screen text. Use `agent-send-keys` only for
    its bounded allow-listed control/navigation keys.
-13. For prior full-screen context, use `agent-read --pane-id ID --lines 200`. It requires an idle
+17. For prior full-screen context, use `agent-read --pane-id ID --lines 200`. It requires an idle
    alternate-screen agent and restores the viewport. If those gates do not hold, ask the agent to
    write a Markdown file and read it directly. When state looks wrong, inspect
    `agent-explain --pane-id ID` before changing anything.
-14. `agent-start` verifies the pane is a shell at its prompt, quotes arguments for that shell, and
+18. `agent-start` verifies the pane is a shell at its prompt, quotes arguments for that shell, and
    returns only once the agent is detected and settled. `agent_pane_busy` means the pane is running
    something else; `agent_not_launchable` means that provider is detection-only.
-15. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
+19. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
    polling each one. Treat a `gap` record as missed events, not as an error; it is never filtered
    out even when the stream is narrowed.
 
-16. Name an agent you will come back to: `agent-rename --pane-id ID --name reviewer`. Then target it
+20. Name an agent you will come back to: `agent-rename --pane-id ID --name reviewer`. Then target it
    with `--alias reviewer` on any `msg` command instead of `--pane-id`, which keeps working after
    splits, closes, and renumbering. Names are unique per session (`agent_alias_taken`), belong to
    the agent process rather than the pane, and are cleared when that agent exits or is replaced —
@@ -69,16 +87,16 @@ Use this release-matched workflow:
    `agent-rename --pane-id ID --clear` to release a name. Pane IDs remain correct for everything
    else; a name is for an agent you drive repeatedly.
 
-17. A session's shape survives its server restarting, so do not rebuild it by hand after a restart.
+21. A session's shape survives its server restarting, so do not rebuild it by hand after a restart.
    `snapshot` reports whether this session came from one. Pane IDs are reassigned on restore — they
    are stable only within one run of a server — so never persist a pane ID across a restart. Use
    `pane-rename` for a pane and `agent-rename` for an agent running in one; both survive.
 
-18. Pane history (`[session] pane_history`) is off by default and must stay a user decision: it
+22. Pane history (`[session] pane_history`) is off by default and must stay a user decision: it
    writes whatever scrolled past a pane — including secrets — to disk. Never enable it on a user's
    behalf to make a task easier.
 
-19. After a restart, an agent pane reopens its own conversation when a client attaches — check
+23. After a restart, an agent pane reopens its own conversation when a client attaches — check
    `inspect`'s `pending_resume` before concluding a pane is a bare shell, and do not launch a second
    agent into it. A resume needs the agent's provider plugin installed with its integration
    (`vvmux plugin install claude`), because the session identity it uses comes from that
