@@ -9,7 +9,13 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use vvmux_terminal::Terminal;
 use vvmux_terminal::pty::PtyProcess;
+
+/// Size of the PTY the attach client renders into. The assertions replay its output through
+/// an emulator of the same size, so the two must stay in step.
+const ATTACH_COLUMNS: u16 = 90;
+const ATTACH_ROWS: u16 = 20;
 
 struct SessionGuard {
     runtime: PathBuf,
@@ -98,8 +104,8 @@ while IFS= read -r line; do printf 'OUT pane=%s:%s\n' "$VVMUX_PANE_ID" "$line"; 
         std::ffi::OsStr::new("/bin/sh"),
         None,
         directory.path(),
-        90,
-        20,
+        ATTACH_COLUMNS,
+        ATTACH_ROWS,
         &environment,
     )
     .unwrap();
@@ -126,7 +132,9 @@ while IFS= read -r line; do printf 'OUT pane=%s:%s\n' "$VVMUX_PANE_ID" "$line"; 
         )
         .unwrap();
     let mut transcript = Vec::new();
-    assert!(wait_for(&receiver, &mut transcript, b"READY pane=2"));
+    assert!(wait_for_screen(&receiver, &mut transcript, |screen| screen
+        .visible_text(0)
+        .contains("READY pane=2")));
     parts.input.send(b"direct-only\n").unwrap();
     assert!(wait_for_pane_text(
         &runtime,
@@ -138,7 +146,9 @@ while IFS= read -r line; do printf 'OUT pane=%s:%s\n' "$VVMUX_PANE_ID" "$line"; 
     assert!(!pane_text(&runtime, &config, &session, 1).contains("direct-only"));
 
     parts.input.send(b"\x02q").unwrap();
-    assert!(wait_for(&receiver, &mut transcript, b"\x1b[?1049l"));
+    assert!(wait_for_screen(&receiver, &mut transcript, |screen| {
+        !screen.alternate_screen()
+    }));
     drop(parts.input);
     drop(receiver);
     let _ = reader_thread.join();
@@ -187,22 +197,32 @@ fn wait_for_pane_text(
     false
 }
 
-fn wait_for(receiver: &mpsc::Receiver<Vec<u8>>, transcript: &mut Vec<u8>, needle: &[u8]) -> bool {
+/// Wait until the attach client's output, replayed into an emulator, satisfies `reached`.
+///
+/// The client repaints incrementally: a cell that already holds the right glyph is skipped with a
+/// cursor jump instead of being rewritten, so `READY pane=2` arrives as `READY`, a reposition, and
+/// `pane=2`. Scanning the raw transcript for that literal only matched when the pane happened to
+/// fill before the client's first full paint, which is a race the test does not control. Replaying
+/// the stream asserts on what the screen shows, which is what the client is contracted to deliver.
+fn wait_for_screen(
+    receiver: &mpsc::Receiver<Vec<u8>>,
+    transcript: &mut Vec<u8>,
+    reached: impl Fn(&Terminal) -> bool,
+) -> bool {
     let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline {
-        if transcript
-            .windows(needle.len())
-            .any(|window| window == needle)
-        {
+    loop {
+        let mut screen = Terminal::new(ATTACH_ROWS as usize, ATTACH_COLUMNS as usize, 0);
+        screen.feed(transcript);
+        if reached(&screen) {
             return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(bytes) => transcript.extend(bytes),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
         }
     }
-    transcript
-        .windows(needle.len())
-        .any(|window| window == needle)
 }
