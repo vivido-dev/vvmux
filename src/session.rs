@@ -364,6 +364,12 @@ pub struct AutomationReplyTarget {
     request_id: u64,
     writer: SharedWriter,
     cancel: crate::platform::ConnectionCancel,
+    /// The key this request claimed, so its successful reply is what a retry replays.
+    ///
+    /// Carried on the reply target rather than looked up again because a reply can be produced
+    /// long after dispatch — a wait resolves from a timer, a media trace from an event — and by
+    /// then the request is gone.
+    idempotency_key: Option<String>,
 }
 
 impl AutomationReplyTarget {
@@ -780,6 +786,23 @@ enum AutomationWaitKind {
     Output {
         pattern: AutomationTextPattern,
         after_offset: Option<u64>,
+    },
+    /// A command running in a pane's own shell, waiting for its OSC 133 completion marker.
+    ShellCommand {
+        /// The command counter before the command was submitted; completion must be past it.
+        after_command_id: u64,
+        started_screen: u64,
+    },
+    /// Settle, then read: the wait half of the `capture` composite.
+    ///
+    /// One waiter rather than a chain of them because the read has to happen at the moment the
+    /// condition holds. A caller that waited and then read separately would be reading a screen
+    /// that had moved on again.
+    Capture {
+        after_screen: Option<u64>,
+        quiet: Option<Duration>,
+        rendered_after_session: Option<u64>,
+        grid: bool,
     },
     ScreenChange {
         after_screen: u64,
@@ -1585,6 +1608,10 @@ struct SessionActor {
     actor_wakeups: u64,
     response_sender: mpsc::SyncSender<AutomationResponseJob>,
     automation_inflight: HashMap<u64, HashSet<u64>>,
+    /// Replies already produced for an idempotency key, so a retry returns the first answer.
+    idempotency_keys: HashMap<String, serde_json::Value>,
+    /// Insertion order, so the bounded map evicts the oldest key rather than an arbitrary one.
+    idempotency_order: VecDeque<String>,
     pending_actor_work: HashSet<(u64, u64)>,
     plugin_supervisor: Option<crate::plugin_supervisor::PluginSupervisor>,
     plugin_event_sequence: u64,
@@ -1814,6 +1841,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         actor_wakeups: 0,
         response_sender,
         automation_inflight: HashMap::new(),
+        idempotency_keys: HashMap::new(),
+        idempotency_order: VecDeque::new(),
         pending_actor_work: HashSet::new(),
         plugin_supervisor,
         plugin_event_sequence: 0,
@@ -3127,11 +3156,12 @@ impl SessionActor {
         cancel: crate::platform::ConnectionCancel,
         request: AutomationRequest,
     ) {
-        let target = AutomationReplyTarget {
+        let mut target = AutomationReplyTarget {
             client_id,
             request_id: request.id,
             writer,
             cancel,
+            idempotency_key: None,
         };
         let requests = self.automation_inflight.entry(client_id).or_default();
         if requests.contains(&request.id) {
@@ -3189,6 +3219,28 @@ impl SessionActor {
         } else {
             None
         };
+
+        // Both guards run after the pane is resolved and before any handler: an expectation about
+        // a pane's screen needs to know which pane, and a replayed key must not reach a PTY.
+        if let Some(expect) = request.expect
+            && let Err(error) = self.check_expected_state(pane_id, expect)
+        {
+            self.reply_automation_error(target, error);
+            return;
+        }
+        if let Some(key) = request.idempotency_key.clone() {
+            match self.claim_idempotency_key(&request.method, key.clone()) {
+                Ok(None) => target.idempotency_key = Some(key),
+                Ok(Some(previous)) => {
+                    self.reply_automation(target, previous);
+                    return;
+                }
+                Err(error) => {
+                    self.reply_automation_error(target, error);
+                    return;
+                }
+            }
+        }
 
         match request.method {
             AutomationMethod::Capabilities => {
@@ -3624,6 +3676,49 @@ impl SessionActor {
                     Ok(result) => self.reply_automation(target, result),
                     Err(error) => self.reply_automation_error(target, error),
                 }
+            }
+            AutomationMethod::ShellCommand {
+                ref command,
+                timeout_ms,
+            } => {
+                let pane_id = pane_id.unwrap();
+                match self.start_shell_command(pane_id, command) {
+                    Ok(kind) => self.add_automation_waiter(AutomationWaiter {
+                        reply: target,
+                        pane_id: Some(pane_id),
+                        deadline: deadline(timeout_ms),
+                        kind,
+                    }),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::Capture {
+                no_activate,
+                after_screen,
+                stable_ms,
+                rendered,
+                grid,
+                timeout_ms,
+            } => {
+                let pane_id = pane_id.unwrap();
+                // Activation first and synchronously: a pane nobody can see has no settled state
+                // to wait for, and its media projection is not running either.
+                if !no_activate && let Err(error) = self.automation_activate_pane(pane_id) {
+                    self.reply_automation_error(target, error);
+                    return;
+                }
+                let after_session = rendered.then_some(self.session_sequence);
+                self.add_automation_waiter(AutomationWaiter {
+                    reply: target,
+                    pane_id: Some(pane_id),
+                    deadline: deadline(timeout_ms),
+                    kind: AutomationWaitKind::Capture {
+                        after_screen,
+                        quiet: stable_ms.map(Duration::from_millis),
+                        rendered_after_session: after_session,
+                        grid,
+                    },
+                });
             }
             AutomationMethod::Mouse {
                 action,
@@ -4467,6 +4562,13 @@ impl SessionActor {
     }
 
     fn reply_automation(&mut self, target: AutomationReplyTarget, result: serde_json::Value) {
+        // Only a success is remembered. A failed request changed nothing, so a retry of it should
+        // run rather than be handed back the failure.
+        if let Some(key) = &target.idempotency_key
+            && let Some(slot) = self.idempotency_keys.get_mut(key)
+        {
+            *slot = result.clone();
+        }
         self.finish_automation_request(target.client_id, target.request_id);
         self.send_automation_response(
             &target,
@@ -4475,6 +4577,11 @@ impl SessionActor {
     }
 
     fn reply_automation_error(&mut self, target: AutomationReplyTarget, error: AutomationError) {
+        // Release the claim: nothing happened, so the key must not shadow a later attempt.
+        if let Some(key) = &target.idempotency_key {
+            self.idempotency_keys.remove(key);
+            self.idempotency_order.retain(|held| held != key);
+        }
         self.finish_automation_request(target.client_id, target.request_id);
         self.send_automation_response(
             &target,
@@ -5543,6 +5650,92 @@ impl SessionActor {
         self.send_pane_input(pane_id, encoded.as_bytes());
     }
 
+    /// Submit a command line to a pane's shell, once that shell is in a state to accept one.
+    fn start_shell_command(
+        &mut self,
+        pane_id: PaneId,
+        command: &str,
+    ) -> Result<AutomationWaitKind, AutomationError> {
+        if command.is_empty() || command.len() > MAX_RUN_COMMAND_BYTES {
+            return Err(AutomationError::new(
+                "invalid_params",
+                format!("a shell command holds 1..={MAX_RUN_COMMAND_BYTES} bytes"),
+            ));
+        }
+        // One line, one command. A newline in the middle would submit two, and the completion
+        // marker this waits for would belong to whichever one finished first.
+        if command.contains(['\n', '\r']) {
+            return Err(AutomationError::new(
+                "invalid_params",
+                "a shell command is one line; it cannot contain a newline",
+            ));
+        }
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
+        if pane.terminal.alternate_screen() {
+            return Err(AutomationError::new(
+                "not_alternate_screen",
+                "the pane is running a full-screen application, not sitting at a shell prompt",
+            ));
+        }
+        let shell = pane.terminal.shell_integration();
+        if !shell.is_active() {
+            return Err(AutomationError::new(
+                "unsupported",
+                "this pane's shell does not emit OSC 133 command markers, so a command's exit \
+                 status cannot be observed; use `submit` and wait on output instead",
+            ));
+        }
+        if shell.phase != vvmux_terminal::ShellPhase::Prompt {
+            return Err(AutomationError::new(
+                "invalid_state",
+                "the pane's shell is already running a command",
+            ));
+        }
+        let started_screen = pane.screen_sequence;
+        let after_command_id = shell.completed_command_id;
+        // The same single write `submit_line` uses: the text and its Enter cannot be separated by
+        // a failure that would leave half a command line at the prompt.
+        self.send_pane_input(pane_id, format!("{command}\r").as_bytes());
+        Ok(AutomationWaitKind::ShellCommand {
+            after_command_id,
+            started_screen,
+        })
+    }
+
+    /// Everything `capture` returns once its pane has settled.
+    fn capture_payload(
+        &self,
+        pane_id: PaneId,
+        grid: bool,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
+        let offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
+        let mut result = serde_json::json!({
+            "pane_id": pane_id,
+            "text": pane.terminal.visible_text(offset),
+            "columns": pane.terminal.cols(),
+            "rows": pane.terminal.rows(),
+            "screen_sequence": pane.screen_sequence,
+            "session_sequence": self.session_sequence,
+            "output_offset": pane.transcript.offset,
+            "visible": self.pane_is_visibly_present(pane_id),
+            "geometry": self
+                .pane_content_rect(pane_id)
+                .ok()
+                .map(rect_json),
+        });
+        if grid {
+            result["grid"] = self.grid_snapshot(pane_id, None, None, None)?;
+        }
+        Ok(result)
+    }
+
     /// Read a pane's rolling output window.
     fn automation_transcript(
         &self,
@@ -6061,6 +6254,97 @@ impl SessionActor {
         self.mark_pane_screen_change(pane_id, None);
         self.schedule_render();
         Ok(())
+    }
+
+    /// Refuse a request whose view of the session has already moved on.
+    ///
+    /// Checked before the handler rather than inside it, so a stale action never reaches a PTY or
+    /// a layout mutation. Only the fields a caller supplied are compared: pinning a screen
+    /// sequence should not also require the layout to have stood still.
+    fn check_expected_state(
+        &self,
+        pane_id: Option<PaneId>,
+        expect: crate::ipc::ExpectedState,
+    ) -> Result<(), AutomationError> {
+        let stale = |what: &str, expected: u64, actual: u64| {
+            AutomationError::new(
+                "invalid_state",
+                format!("{what} is {actual}, not the expected {expected}"),
+            )
+        };
+        if let Some(expected) = expect.screen_sequence {
+            let pane_id = pane_id.ok_or_else(|| {
+                AutomationError::new(
+                    "invalid_params",
+                    "an expected screen sequence needs a pane to compare it against",
+                )
+            })?;
+            let actual = self
+                .panes
+                .get(&pane_id)
+                .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?
+                .screen_sequence;
+            if actual != expected {
+                return Err(stale("screen sequence", expected, actual));
+            }
+        }
+        if let Some(expected) = expect.session_sequence
+            && self.session_sequence != expected
+        {
+            return Err(stale("session sequence", expected, self.session_sequence));
+        }
+        if let Some(expected) = expect.layout_sequence
+            && self.layout_revision != expected
+        {
+            return Err(stale("layout sequence", expected, self.layout_revision));
+        }
+        Ok(())
+    }
+
+    /// Record an idempotency key, or return the reply the first request with it produced.
+    ///
+    /// Only mutating methods are deduplicated. An observation is safe to repeat and its answer
+    /// goes stale immediately, so replaying a cached `get-text` would be a lie about the present
+    /// rather than a protection against a double action.
+    fn claim_idempotency_key(
+        &mut self,
+        method: &AutomationMethod,
+        key: String,
+    ) -> Result<Option<serde_json::Value>, AutomationError> {
+        if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+            return Err(AutomationError::new(
+                "invalid_params",
+                format!("an idempotency key holds 1..={MAX_IDEMPOTENCY_KEY_BYTES} bytes"),
+            ));
+        }
+        if !crate::ipc::METHOD_CAPABILITIES
+            .iter()
+            .find(|capability| capability.name == method.name())
+            .is_some_and(|capability| capability.mutating)
+        {
+            return Err(AutomationError::new(
+                "invalid_params",
+                format!(
+                    "{} does not change anything, so an idempotency key would only hide fresh state",
+                    method.name()
+                ),
+            ));
+        }
+        if let Some(previous) = self.idempotency_keys.get(&key) {
+            return Ok(Some(previous.clone()));
+        }
+        // Reserved with a null result before the handler runs. A second request arriving while the
+        // first is still in flight is a retry too, and it must not be applied a second time
+        // because the first has not answered yet.
+        while self.idempotency_keys.len() >= MAX_IDEMPOTENCY_KEYS {
+            let Some(oldest) = self.idempotency_order.pop_front() else {
+                break;
+            };
+            self.idempotency_keys.remove(&oldest);
+        }
+        self.idempotency_order.push_back(key.clone());
+        self.idempotency_keys.insert(key, serde_json::Value::Null);
+        Ok(None)
     }
 
     /// Deliver one signal to a pane's foreground process group.
@@ -8040,6 +8324,52 @@ impl SessionActor {
                                 "screen_sequence": pane.screen_sequence,
                             }))
                         })
+                    }
+                    AutomationWaitKind::ShellCommand {
+                        after_command_id,
+                        started_screen,
+                    } => {
+                        let shell = pane.terminal.shell_integration();
+                        (shell.completed_command_id > *after_command_id).then(|| {
+                            Ok(serde_json::json!({
+                                "pane_id": pane_id,
+                                "command_id": shell.completed_command_id,
+                                // Absent when the shell reported a boundary but no status, which
+                                // is a different answer from "it exited zero".
+                                "exit_code": shell.exit_code,
+                                "cwd": pane_cwd(pane.child_pid),
+                                "started_screen_sequence": started_screen,
+                                "completed_screen_sequence": pane.screen_sequence,
+                                "output_offset": pane.transcript.offset,
+                            }))
+                        })
+                    }
+                    AutomationWaitKind::Capture {
+                        after_screen,
+                        quiet,
+                        rendered_after_session,
+                        grid,
+                    } => {
+                        if after_screen.is_some_and(|sequence| pane.screen_sequence <= sequence) {
+                            return None;
+                        }
+                        if let Some(quiet) = quiet
+                            && now.saturating_duration_since(pane.last_screen_change) < *quiet
+                        {
+                            return None;
+                        }
+                        if let Some(after_session) = rendered_after_session {
+                            let Some(client) = self.attached.as_ref() else {
+                                return Some(Err(AutomationError::new(
+                                    "unsupported",
+                                    "no attached client can acknowledge a render",
+                                )));
+                            };
+                            if client.rendered_session_sequence < *after_session {
+                                return None;
+                            }
+                        }
+                        Some(self.capture_payload(pane_id, *grid))
                     }
                     AutomationWaitKind::ScreenChange { after_screen } => {
                         (pane.screen_sequence > *after_screen).then(|| {
@@ -13701,6 +14031,14 @@ const MAX_MOUSE_SCROLL_NOTCHES: u16 = 1_000;
 /// have missed between two polls, small enough that a session full of chatty panes cannot grow
 /// without bound.
 const MAX_TRANSCRIPT_BYTES: usize = 256 * 1024;
+
+/// Idempotency keys one session remembers, and how large one may be.
+///
+/// Bounded because the map is filled by callers: a chatty or hostile one must not be able to grow
+/// it without limit. Oldest-first eviction means a key stays claimed for a long run of subsequent
+/// requests, which is the window a retry actually happens in.
+const MAX_IDEMPOTENCY_KEYS: usize = 256;
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 
 /// Steps one `resolve_pane` route may take.
 ///

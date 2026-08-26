@@ -105,6 +105,69 @@ upper of the two panes to its right, because that is where focus would go. Read 
 question is really about position on screen, and inspect `split_path` and the rectangles before
 translating a phrase like "the bottom pane" into a target.
 
+Every `msg` command also takes `--expect-screen`, `--expect-session`, and `--expect-layout`, which
+refuse the request unless the session is still where the caller last read it. That closes the race
+every `inspect`-then-act pair has: the screen you reasoned about can change before you act on it,
+and typing into a dialog that already closed is worse than being told the state moved. A refused
+request never reaches the PTY.
+
+`--idempotency-key` applies a request at most once however many times it is sent, and hands a retry
+the original reply. A caller that retries after a lost answer cannot otherwise tell "never arrived"
+from "the reply did not come back", and pressing Enter twice is not pressing it once. Mutating
+methods only — replaying a cached read would be a lie about the present — and a failed request
+releases its key so a corrected retry can reuse it.
+
+## Plans
+
+`run-plan` runs a bounded list of steps over **one** connection, with results flowing between them:
+
+```sh
+vvmux msg run-plan --file work.json          # execute
+vvmux msg run-plan --file work.json --preflight   # observations only, mutations skipped
+vvmux msg run-plan --file work.json --dry-run     # report what would run, connect for nothing else
+```
+
+```json
+{
+  "version": 1,
+  "steps": [
+    {"id": "split", "method": "split", "params": {"axis": "Vertical"}, "pane_id": 1,
+     "bind": {"right": "/new_pane_id"}},
+    {"id": "name", "method": "pane_rename", "pane_id": {"$ref": "right"},
+     "params": {"name": "worker"}},
+    {"id": "run", "method": "submit_line", "pane_name": "worker",
+     "params": {"text": "cargo test", "report": true},
+     "verify": {"screen_changed": true, "capture": true, "timeout_ms": 5000}}
+  ]
+}
+```
+
+A step names a wire method (as `capabilities` advertises it) and its params. `bind` reads a JSON
+Pointer out of the step's result under an alias; `{"$ref": "alias"}` substitutes it anywhere in a
+later step. References are **backward-only** and the whole plan is validated before any of it runs,
+so a typo on the last step does not first perform the mutations in the steps before it. `when`
+runs a step only when a bound alias equals a value, and `on_error: "continue"` keeps going past a
+failure instead of aborting. Steps also take `expect` and `idempotency_key`, exactly as the global
+flags express them.
+
+`verify` belongs to the step rather than following it, because the "before" sequence has to be read
+before the action. vvmux has no GPU frame, so a step verifies against the pane's screen sequence
+(`screen_changed`) or the attached client's render acknowledgement (`rendered`) — neither of which
+is GPU presentation. Pair `rendered` with Vivido's own `wait frame` when that is what matters.
+
+Output is NDJSON: one `plan_started`, one line per step, one `plan_completed`. Exit is nonzero if
+any step failed. There are no loops, no conditionals beyond one equality test, and no arithmetic —
+which is what makes a plan safe to accept and possible to preflight without running it.
+
+`capture` is the read composite: activate the pane, wait for it to settle, and read it in one
+request rather than three the caller has to sequence. `--no-activate` reads it where it is.
+
+`shell-command` runs one command in the pane's **existing** interactive shell and returns its real
+exit status, so aliases, functions, virtual environments and the current directory all still apply.
+It needs the shell to emit OSC 133 command markers; without them the boundary between a command and
+its output can only be guessed from prompt text, so a pane whose shell reports nothing is refused
+rather than guessed at. Most shell-integration setups already emit them.
+
 `mouse` takes **pane-local** coordinates, so a caller never has to know where a pane sits.
 `--route application` encodes through that pane's own live terminal modes and writes to its PTY,
 which reaches a pane whether or not it is visible, in another tab, or under a zoom — an explicitly
@@ -180,6 +243,7 @@ Available commands are:
 
 ```text
 capabilities
+run-plan [--file PATH] [--dry-run|--preflight]
 get-config
 reload-config
 reload-plugins
@@ -222,6 +286,8 @@ resize-pane [--columns N] [--rows N] [--pane-id ID]
 move-pane (--to-tab ID|--to-tab-name NAME | --swap left|right|up|down | --to-layer tiled|floating) [--pane-id ID]
 set-flag zoom|pinned|transparent|copy-mode|floats-visible|sync-input (--on|--off) [--offset N] [--pane-id ID]
 transcript [--after-offset N] [--max-bytes N] [--base64] [--pane-id ID]
+capture [--no-activate] [--after-screen SEQ] [--stable DURATION] [--rendered] [--grid] [--timeout DURATION] [--pane-id ID]
+shell-command COMMAND [--timeout DURATION] [--pane-id ID]
 typing TEXT [--pane-id ID] [--report]
 key KEY [--mods Shift,Alt,Ctrl,Super] [--repeat N] [--pane-id ID] [--report]
 paste TEXT [--pane-id ID] [--report]

@@ -33,6 +33,9 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
+/// Version 28 adds atomicity: a request may carry the sequences it expects the session to be at
+/// and an idempotency key, so a stale action is refused before it reaches a PTY and a retried one
+/// is not applied twice. One bump covers the batch.
 /// Version 27 adds input, process, and observation parity: mouse, signals, exact pane resize, a
 /// bounded output transcript with byte-offset waits, idempotent setters, and pane movement. One
 /// bump covers the batch.
@@ -42,7 +45,7 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 /// Version 25 adds the typed capability handshake and `get_config`: `capabilities` now describes
 /// every method's class and whether it mutates, so a caller can tell an observation from a mutation
 /// before running one. One bump covers the batch.
-pub const VERSION: u16 = 27;
+pub const VERSION: u16 = 28;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -104,7 +107,42 @@ pub struct AutomationRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_name: Option<crate::layout::PaneName>,
     pub allow_focused: bool,
+    /// State this request assumes, rejected rather than applied when it no longer holds.
+    ///
+    /// The race every `inspect`-then-act pair has: the screen a caller reasoned about can change
+    /// between reading it and acting on it, and typing into a dialog that already closed is worse
+    /// than being told the state moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<ExpectedState>,
+    /// Deduplicate a retried request, so a destructive action is applied at most once.
+    ///
+    /// A caller that retries after a lost reply cannot otherwise tell "the request never arrived"
+    /// from "the reply did not come back", and pressing Enter twice is not the same as pressing it
+    /// once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub method: AutomationMethod,
+}
+
+/// Session state a request requires before it will run.
+///
+/// Every field is optional and checked only when present; an empty expectation matches anything.
+/// The sequences are the ones `inspect` and `layout` already report, so a caller pins exactly what
+/// it read.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
+)]
+pub struct ExpectedState {
+    /// The target pane's screen sequence.
+    pub screen_sequence: Option<u64>,
+    pub session_sequence: Option<u64>,
+    pub layout_sequence: Option<u64>,
+}
+
+impl ExpectedState {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
 }
 
 /// What a mouse request does.
@@ -446,6 +484,36 @@ pub enum AutomationMethod {
         wait_rendered: bool,
         timeout_ms: u64,
     },
+    /// Run one command in a pane's existing interactive shell and wait for its real exit status.
+    ///
+    /// Needs the shell to emit OSC 133 command markers. Without them the boundary between a
+    /// command and its output can only be guessed from prompt text, which breaks on every unusual
+    /// prompt — so a pane whose shell reports nothing is refused rather than guessed at.
+    ///
+    /// The pane's own shell, not a new one: aliases, functions, virtual environments, exported
+    /// variables and the current directory are all state a fresh process would not have.
+    ShellCommand {
+        command: String,
+        timeout_ms: u64,
+    },
+    /// Reveal a pane, optionally wait for it to settle, and read it — in one request.
+    ///
+    /// The composite an observation actually needs: a hidden pane has to be activated before its
+    /// state means anything, and a pane still painting has to settle before a read is worth having.
+    /// Three round trips a caller would otherwise have to sequence itself, with the same race
+    /// between them that `expect` exists to close.
+    Capture {
+        /// Skip activation and read the pane where it is.
+        no_activate: bool,
+        after_screen: Option<u64>,
+        /// Wait for the screen to stay unchanged this long before reading.
+        stable_ms: Option<u64>,
+        /// Also wait for the attached client to acknowledge a render.
+        rendered: bool,
+        /// Include the structured grid as well as the text.
+        grid: bool,
+        timeout_ms: u64,
+    },
     /// Read a pane's bounded rolling window of raw output.
     ///
     /// The answer to "what did it print" when the grid has already overwritten it. Reports a gap
@@ -723,10 +791,14 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         capability("submit_line", Input),
         capability("agent_send_keys", Input),
         capability("mouse", Input),
+        capability("shell_command", Input),
         capability("split", Pane),
         capability("run", Pane),
         capability("close_pane", Pane),
         capability("activate_pane", Layout),
+        // Activation is a layout change, so a read-only pass must skip this even though what it
+        // returns is an observation. `--no-activate` exists for exactly that case.
+        capability("capture", Layout),
         capability("close_tab", Layout),
         capability("new_tab", Layout),
         capability("pane_rename", Layout),
@@ -789,6 +861,8 @@ impl AutomationMethod {
             Self::RenameTab { .. } => "rename_tab",
             Self::ResetTabTitle { .. } => "reset_tab_title",
             Self::CloseTab { .. } => "close_tab",
+            Self::ShellCommand { .. } => "shell_command",
+            Self::Capture { .. } => "capture",
             Self::Mouse { .. } => "mouse",
             Self::Transcript { .. } => "transcript",
             Self::WaitOutput { .. } => "wait_output",

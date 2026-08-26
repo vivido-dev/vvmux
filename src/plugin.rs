@@ -2240,6 +2240,8 @@ fn session_capabilities(target: &str) -> io::Result<Value> {
             pane_id: None,
             agent: None,
             pane_name: None,
+            expect: None,
+            idempotency_key: None,
             allow_focused: false,
             method: AutomationMethod::Capabilities,
         }))?;
@@ -2264,6 +2266,8 @@ fn invoke_via_session(
             pane_id: None,
             agent: None,
             pane_name: None,
+            expect: None,
+            idempotency_key: None,
             allow_focused: false,
             method: AutomationMethod::Plugin(PluginMethod::Invoke {
                 reference,
@@ -2324,6 +2328,8 @@ fn events(target: &str, after_sequence: Option<u64>) -> io::Result<()> {
             pane_id: None,
             agent: None,
             pane_name: None,
+            expect: None,
+            idempotency_key: None,
             allow_focused: false,
             method: AutomationMethod::Plugin(PluginMethod::EventSubscribe { after_sequence }),
         }))?;
@@ -2367,6 +2373,8 @@ fn plugin_session_request(target: &str, method: crate::ipc::PluginMethod) -> io:
             pane_id: None,
             agent: None,
             pane_name: None,
+            expect: None,
+            idempotency_key: None,
             allow_focused: false,
             method: AutomationMethod::Plugin(method),
         }))?;

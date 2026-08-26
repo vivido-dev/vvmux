@@ -17,6 +17,7 @@ mod media;
 mod media_trace;
 mod metrics;
 mod notify;
+mod plan;
 mod platform;
 mod plugin;
 mod plugin_component;
@@ -145,6 +146,25 @@ enum Command {
         /// reassigned when a session is restored from its snapshot.
         #[arg(long, global = true)]
         pane_name: Option<crate::layout::PaneName>,
+        /// Refuse the request unless the target pane's screen sequence is still this.
+        ///
+        /// Closes the race between reading state and acting on it: a screen that changed since the
+        /// caller looked is a different screen, and typing into a dialog that already closed is
+        /// worse than being told so.
+        #[arg(long, global = true)]
+        expect_screen: Option<u64>,
+        /// Refuse the request unless the session sequence is still this.
+        #[arg(long, global = true)]
+        expect_session: Option<u64>,
+        /// Refuse the request unless the layout sequence is still this.
+        #[arg(long, global = true)]
+        expect_layout: Option<u64>,
+        /// Apply this request at most once, however many times it is sent.
+        ///
+        /// A retry after a lost reply cannot otherwise tell "never arrived" from "the answer did
+        /// not come back", and pressing Enter twice is not pressing it once. Mutating methods only.
+        #[arg(long, global = true)]
+        idempotency_key: Option<String>,
         #[command(subcommand)]
         command: Box<automation::MsgCommand>,
     },
@@ -341,8 +361,25 @@ fn run(cli: Cli) -> io::Result<()> {
             target,
             alias,
             pane_name,
+            expect_screen,
+            expect_session,
+            expect_layout,
+            idempotency_key,
             command,
-        }) => automation::run(target.as_deref(), alias, pane_name, *command),
+        }) => automation::run(
+            target.as_deref(),
+            automation::RequestOptions {
+                alias,
+                pane_name,
+                expect: crate::ipc::ExpectedState {
+                    screen_sequence: expect_screen,
+                    session_sequence: expect_session,
+                    layout_sequence: expect_layout,
+                },
+                idempotency_key,
+            },
+            *command,
+        ),
         Some(Command::Plugin { command }) => plugin::run(command),
         Some(Command::Api { command }) => api::run(command),
         Some(Command::Update { check }) => update::run(check),

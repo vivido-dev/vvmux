@@ -213,6 +213,21 @@ impl TabTarget {
 pub enum MsgCommand {
     /// Print the server's pane-automation capabilities.
     Capabilities,
+    /// Run a bounded multi-step plan over one connection.
+    ///
+    /// Results flow between steps by alias, so a plan does not have to be re-parsed and re-passed
+    /// by hand. Emits NDJSON: one `plan_started`, one line per step, one `plan_completed`.
+    RunPlan {
+        /// The plan file. Omitted or `-` reads stdin.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Report what would run without connecting to anything that changes.
+        #[arg(long, conflicts_with = "preflight")]
+        dry_run: bool,
+        /// Run only the steps that observe, skipping every mutation.
+        #[arg(long, conflicts_with = "dry_run")]
+        preflight: bool,
+    },
     /// Re-read the session's config file now, without waiting for the watcher.
     ReloadConfig,
     /// Print the configuration this session is actually running with.
@@ -298,6 +313,38 @@ pub enum MsgCommand {
         /// Wheel notches for `scroll`: negative scrolls up, positive down.
         #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
         scroll: i16,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Run one command in a pane's own shell and wait for its real exit status.
+    ///
+    /// Needs the shell to emit OSC 133 markers; a pane whose shell reports no command boundaries
+    /// is refused rather than guessed at.
+    ShellCommand {
+        command: String,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Reveal a pane, wait for it to settle, and read it, in one request.
+    Capture {
+        /// Read the pane where it is instead of revealing it first.
+        #[arg(long)]
+        no_activate: bool,
+        #[arg(long)]
+        after_screen: Option<u64>,
+        /// Wait for the screen to stay unchanged this long before reading.
+        #[arg(long, value_parser = parse_timeout)]
+        stable: Option<Duration>,
+        /// Also wait for the attached client to acknowledge a render.
+        #[arg(long)]
+        rendered: bool,
+        /// Include the structured grid as well as the text.
+        #[arg(long)]
+        grid: bool,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
         #[arg(long)]
         pane_id: Option<u64>,
     },
@@ -849,12 +896,29 @@ pub enum WaitCommand {
     },
 }
 
+/// Everything a `msg` invocation says about a request other than which verb it is.
+///
+/// Gathered into one struct because these are all global flags: which pane a request addresses and
+/// what it assumes about the session are properties of the request, not of the verb.
+#[derive(Debug, Default)]
+pub struct RequestOptions {
+    pub alias: Option<crate::agent::AgentAlias>,
+    pub pane_name: Option<crate::layout::PaneName>,
+    pub expect: crate::ipc::ExpectedState,
+    pub idempotency_key: Option<String>,
+}
+
 pub fn run(
     explicit_target: Option<&str>,
-    alias: Option<crate::agent::AgentAlias>,
-    pane_name: Option<crate::layout::PaneName>,
+    options: RequestOptions,
     command: MsgCommand,
 ) -> io::Result<()> {
+    let RequestOptions {
+        alias,
+        pane_name,
+        expect,
+        idempotency_key,
+    } = options;
     let target = explicit_target
         .map(ToOwned::to_owned)
         .or_else(|| {
@@ -867,6 +931,20 @@ pub fn run(
     let inherited_pane = (env::var("VVMUX_SESSION").ok().as_deref() == Some(target.as_str()))
         .then(inherited_pane_from_environment)
         .flatten();
+    // Handled before the single-request path: a plan is many requests over one connection, and
+    // has no single method to build.
+    if let MsgCommand::RunPlan {
+        file,
+        dry_run,
+        preflight,
+    } = command
+    {
+        return crate::plan::run(
+            &target,
+            file.as_deref(),
+            crate::plan::PlanOptions { dry_run, preflight },
+        );
+    }
     let (method, explicit_pane, allow_focused, output) = build_request(command)?;
     for (first, second, message) in [
         (
@@ -924,6 +1002,8 @@ pub fn run(
         agent: alias,
         pane_name,
         allow_focused,
+        expect: (!expect.is_empty()).then_some(expect),
+        idempotency_key,
         method,
     };
     let (mut reader, writer) = crate::server::connect(&target)?;
@@ -932,10 +1012,10 @@ pub fn run(
     }
     if matches!(output, Output::EventStream) {
         let id = request.id;
-        send_automation_request(&writer, request)?;
+        send_request(&writer, request)?;
         return stream_events(&mut reader, id);
     }
-    send_automation_request(&writer, request.clone())?;
+    send_request(&writer, request.clone())?;
     let result = response_result(receive_response(&mut reader, request.id)?)?;
     match output {
         Output::Silent => Ok(()),
@@ -995,15 +1075,17 @@ pub(crate) fn request_json(
         pane_id,
         agent: None,
         pane_name: None,
+        expect: None,
+        idempotency_key: None,
         allow_focused,
         method,
     };
     let (mut reader, writer) = crate::server::connect(target)?;
-    send_automation_request(&writer, request.clone())?;
+    send_request(&writer, request.clone())?;
     response_result(receive_response(&mut reader, request.id)?)
 }
 
-fn send_automation_request(
+pub(crate) fn send_request(
     writer: &crate::ipc::SharedWriter,
     request: AutomationRequest,
 ) -> io::Result<()> {
@@ -1031,7 +1113,7 @@ fn run_trace_follow(
 ) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     loop {
-        send_automation_request(writer, request.clone())?;
+        send_request(writer, request.clone())?;
         let result = response_result(receive_response(reader, request.id)?)?;
         let batch: MediaTraceBatch = serde_json::from_value(result).map_err(|error| {
             io::Error::new(
@@ -1153,6 +1235,8 @@ fn mouse_modifiers(mods: &[String]) -> io::Result<(bool, bool, bool)> {
 fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u64>, bool, Output)> {
     let tuple = match command {
         MsgCommand::Capabilities => (AutomationMethod::Capabilities, None, false, Output::Json),
+        // Routed before `build_request` is reached; it is many requests, not one.
+        MsgCommand::RunPlan { .. } => unreachable!("run-plan does not build a single request"),
         MsgCommand::ReloadConfig => (AutomationMethod::ReloadConfig, None, false, Output::Json),
         MsgCommand::GetConfig => (AutomationMethod::GetConfig, None, false, Output::Json),
         MsgCommand::ReloadPlugins => (
@@ -1242,6 +1326,40 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 Output::Json,
             )
         }
+        MsgCommand::ShellCommand {
+            command,
+            timeout,
+            pane_id,
+        } => (
+            AutomationMethod::ShellCommand {
+                command,
+                timeout_ms: millis(timeout),
+            },
+            pane_id,
+            true,
+            Output::Json,
+        ),
+        MsgCommand::Capture {
+            no_activate,
+            after_screen,
+            stable,
+            rendered,
+            grid,
+            timeout,
+            pane_id,
+        } => (
+            AutomationMethod::Capture {
+                no_activate,
+                after_screen,
+                stable_ms: stable.map(millis),
+                rendered,
+                grid,
+                timeout_ms: millis(timeout),
+            },
+            pane_id,
+            true,
+            Output::Json,
+        ),
         MsgCommand::Transcript {
             after_offset,
             base64,

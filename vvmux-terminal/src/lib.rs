@@ -66,6 +66,41 @@ struct AgentOscTracker {
     body: Vec<u8>,
     title: Option<String>,
     progress: Option<String>,
+    shell: ShellIntegration,
+}
+
+/// Where a pane's shell says it is, from its OSC 133 markers.
+///
+/// Reported rather than inferred. Prompt detection by pattern matching is guesswork that breaks on
+/// every unusual prompt; a shell that emits these markers is stating the boundary, and one that
+/// does not leaves this `Unknown` so a caller can tell "at a prompt" from "no idea".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShellIntegration {
+    pub phase: ShellPhase,
+    /// Bumped when a command starts. Zero until one does.
+    pub command_id: u64,
+    /// The most recent command to have finished.
+    pub completed_command_id: u64,
+    /// The exit status the last finished command reported, when it reported one.
+    pub exit_code: Option<i64>,
+}
+
+impl ShellIntegration {
+    /// Whether this pane's shell reports command boundaries at all.
+    pub fn is_active(self) -> bool {
+        self.phase != ShellPhase::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShellPhase {
+    /// No OSC 133 marker has ever arrived, so nothing is known.
+    #[default]
+    Unknown,
+    /// At a prompt, ready for a command.
+    Prompt,
+    /// Running a command.
+    Running,
 }
 
 #[derive(Debug, Default)]
@@ -270,6 +305,38 @@ impl AgentOscTracker {
         }
     }
 
+    /// Record one OSC 133 shell-integration marker.
+    ///
+    /// The four that matter: `A` starts a prompt, `B` ends it and starts the command line, `C`
+    /// starts command output, and `D` ends the command and may carry its exit status. Only a shell
+    /// configured to emit these produces any of them, so a pane without shell integration simply
+    /// stays in the `Unknown` state and every caller that needs a boundary is told so rather than
+    /// being given a guess.
+    fn shell_marker(&mut self, value: &str) {
+        let (kind, payload) = value
+            .split_once(';')
+            .map_or((value, None), |(kind, rest)| (kind, Some(rest)));
+        match kind {
+            "A" | "B" => self.shell.phase = ShellPhase::Prompt,
+            "C" => {
+                self.shell.phase = ShellPhase::Running;
+                self.shell.command_id = self.shell.command_id.saturating_add(1);
+            }
+            "D" => {
+                // A `D` without a preceding `C` is a prompt redraw rather than a finished command;
+                // counting it would invent a command that never ran.
+                if self.shell.phase == ShellPhase::Running {
+                    self.shell.completed_command_id = self.shell.command_id;
+                    self.shell.exit_code = payload
+                        .and_then(|payload| payload.split(';').next())
+                        .and_then(|code| code.trim().parse::<i64>().ok());
+                }
+                self.shell.phase = ShellPhase::Prompt;
+            }
+            _ => {}
+        }
+    }
+
     fn push(&mut self, byte: u8) {
         self.body.push(byte);
         if self.body.len() > Self::MAX_BODY_BYTES {
@@ -292,6 +359,7 @@ impl AgentOscTracker {
         match command {
             b"0" | b"2" => self.title = (!value.is_empty()).then_some(value),
             b"9" => self.progress = Some(value),
+            b"133" => self.shell_marker(&value),
             _ => {}
         }
         self.body.clear();
@@ -556,6 +624,11 @@ impl Terminal {
     }
 
     /// Prevent a replacement foreground process from inheriting stale OSC evidence.
+    /// What the pane's shell integration has reported, if it reports any.
+    pub fn shell_integration(&self) -> ShellIntegration {
+        self.agent_osc.shell
+    }
+
     pub fn clear_agent_osc(&mut self) {
         self.agent_osc.title = None;
         self.agent_osc.progress = None;

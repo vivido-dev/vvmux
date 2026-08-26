@@ -627,3 +627,372 @@ fn resize_pane_sets_an_exact_size_and_move_pane_relocates_without_respawning() {
         "the swap did not move the pane"
     );
 }
+
+/// A plan is one connection, and results flow between its steps.
+#[test]
+fn run_plan_binds_results_between_steps_and_verifies_them() {
+    let fixture = Fixture::start("plan");
+    let plan = fixture._directory.path().join("plan.json");
+    fs::write(
+        &plan,
+        r#"{
+  "version": 1,
+  "steps": [
+    {"id": "split", "method": "split", "params": {"axis": "Vertical"}, "pane_id": 1,
+     "bind": {"right": "/new_pane_id"}},
+    {"id": "name", "method": "pane_rename", "pane_id": {"$ref": "right"},
+     "params": {"name": "worker"}},
+    {"id": "run", "method": "submit_line", "pane_name": "worker",
+     "params": {"text": "printf 'plan-ran\\n'", "report": true},
+     "verify": {"screen_changed": true, "capture": true, "timeout_ms": 5000}},
+    {"id": "confirm", "method": "wait_text", "pane_name": "worker",
+     "params": {"text": "plan-ran", "regex": false, "after_screen": null, "timeout_ms": 5000}}
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let output = fixture.msg(&["run-plan", "--file", plan.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = ndjson(&output.stdout);
+    assert_eq!(events[0]["type"], "plan_started");
+    assert_eq!(events[0]["mode"], "execute");
+    assert_eq!(events.last().unwrap()["status"], "ok");
+    assert_eq!(events.last().unwrap()["failures"], 0);
+
+    let step = |id: &str| {
+        events
+            .iter()
+            .find(|event| event["id"] == id)
+            .unwrap_or_else(|| panic!("no step {id} in {events:?}"))
+            .clone()
+    };
+    for id in ["split", "name", "run", "confirm"] {
+        assert_eq!(step(id)["status"], "ok", "{id} did not run");
+    }
+    // The second step targeted a pane the first one created; without binding it could not have.
+    assert_eq!(step("name")["result"]["pane_name"], "worker");
+    // Verification rides inside the step, so its result is part of that step's answer.
+    let verification = &step("run")["result"]["verification"];
+    assert!(verification["screen"].is_object(), "{verification}");
+    assert!(verification["capture"].is_string(), "{verification}");
+}
+
+#[test]
+fn run_plan_preflight_skips_mutations_and_validation_rejects_a_plan_whole() {
+    let fixture = Fixture::start("plan-guards");
+    let plan = fixture._directory.path().join("plan.json");
+    fs::write(
+        &plan,
+        r#"{
+  "version": 1,
+  "steps": [
+    {"id": "look", "method": "list_panes"},
+    {"id": "change", "method": "split", "params": {"axis": "Vertical"}, "pane_id": 1}
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let preflight = fixture.msg(&["run-plan", "--file", plan.to_str().unwrap(), "--preflight"]);
+    assert!(preflight.status.success());
+    let events = ndjson(&preflight.stdout);
+    let step = |id: &str| {
+        events
+            .iter()
+            .find(|event| event["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(step("look")["status"], "ok");
+    assert_eq!(step("change")["status"], "skipped");
+    assert_eq!(step("change")["reason"], "preflight_mutation");
+    // The mutation really was skipped, not merely reported as skipped.
+    assert_eq!(
+        fixture.json(&["list-panes"])["panes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let dry = fixture.msg(&["run-plan", "--file", plan.to_str().unwrap(), "--dry-run"]);
+    assert!(dry.status.success());
+    for event in ndjson(&dry.stdout).iter().filter(|e| e["type"] == "step") {
+        assert_eq!(event["status"], "planned");
+    }
+
+    // A plan is rejected before any of it runs, so a typo on the last step does not first perform
+    // the mutations in the steps before it.
+    let forward = fixture._directory.path().join("forward.json");
+    fs::write(
+        &forward,
+        r#"{"version":1,"steps":[
+          {"id":"uses","method":"inspect","pane_id":{"$ref":"later"}},
+          {"id":"binds","method":"list_panes","bind":{"later":"/panes/0/pane_id"}}]}"#,
+    )
+    .unwrap();
+    let rejected = fixture.msg(&["run-plan", "--file", forward.to_str().unwrap()]);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("no earlier step binds"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        rejected.stdout.is_empty(),
+        "a rejected plan must not have started running: {:?}",
+        String::from_utf8_lossy(&rejected.stdout)
+    );
+
+    let unknown = fixture._directory.path().join("unknown.json");
+    fs::write(
+        &unknown,
+        r#"{"version":1,"steps":[{"id":"nope","method":"teleport"}]}"#,
+    )
+    .unwrap();
+    let refused = fixture.msg(&["run-plan", "--file", unknown.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("does not serve"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+/// The race every inspect-then-act pair has, and the retry every lost reply causes.
+#[test]
+fn expectations_reject_stale_actions_and_idempotency_keys_apply_once() {
+    let fixture = Fixture::start("atomicity");
+    let sequence = fixture.json(&["inspect", "--pane-id", "1"])["pane"]["screen_sequence"]
+        .as_u64()
+        .unwrap();
+
+    // A current expectation is accepted.
+    assert!(
+        fixture
+            .msg(&[
+                "--expect-screen",
+                &sequence.to_string(),
+                "typing",
+                "--pane-id",
+                "1",
+                "x",
+            ])
+            .status
+            .success()
+    );
+
+    // A stale one is refused before anything reaches the PTY.
+    let stale = fixture.msg(&[
+        "--expect-screen",
+        "999999",
+        "typing",
+        "--pane-id",
+        "1",
+        "never-typed",
+    ]);
+    assert!(!stale.status.success());
+    let message = String::from_utf8_lossy(&stale.stderr);
+    assert!(message.contains("invalid_state"), "{message}");
+    assert!(
+        !String::from_utf8_lossy(&fixture.msg(&["transcript", "--pane-id", "1"]).stdout)
+            .contains("never-typed"),
+        "a refused request still reached the PTY"
+    );
+
+    // A retried mutation is applied once, and the retry gets the first answer back.
+    let first = fixture.json(&[
+        "--idempotency-key",
+        "k1",
+        "split",
+        "vertical",
+        "--pane-id",
+        "1",
+    ]);
+    let retry = fixture.json(&[
+        "--idempotency-key",
+        "k1",
+        "split",
+        "vertical",
+        "--pane-id",
+        "1",
+    ]);
+    assert_eq!(first, retry, "a retry must replay the original reply");
+    assert_eq!(
+        fixture.json(&["list-panes"])["panes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "the retry created a second pane"
+    );
+
+    // An observation refuses a key: replaying a cached read would be a lie about the present.
+    let observation = fixture.msg(&["--idempotency-key", "k2", "get-text", "--pane-id", "1"]);
+    assert!(!observation.status.success());
+
+    // A failed request releases its key, so a corrected retry can use it.
+    let failed = fixture.msg(&[
+        "--idempotency-key",
+        "k3",
+        "pane-rename",
+        "--pane-id",
+        "9999",
+        "--name",
+        "ghost",
+    ]);
+    assert!(!failed.status.success());
+    assert!(
+        fixture
+            .msg(&[
+                "--idempotency-key",
+                "k3",
+                "pane-rename",
+                "--pane-id",
+                "1",
+                "--name",
+                "real"
+            ])
+            .status
+            .success(),
+        "a key claimed by a failed request stayed claimed"
+    );
+}
+
+/// A command boundary is reported by the shell or not known at all.
+#[test]
+fn shell_command_returns_a_real_exit_status_and_refuses_a_shell_that_reports_none() {
+    let fixture = Fixture::start("shell-command");
+
+    // The fixture shell emits no OSC 133, so the boundary is genuinely unknowable. Refused rather
+    // than guessed at from prompt text, which is the whole point of requiring the markers.
+    let refused = fixture.msg(&["shell-command", "true", "--pane-id", "1"]);
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("OSC 133"), "{message}");
+
+    // A pane whose shell does report boundaries. bash needs no rc file for this: a DEBUG trap
+    // marks the start of a command and PROMPT_COMMAND marks its end with the real status.
+    let opened = fixture.json(&["run", "exec bash --norc --noprofile", "--hold"]);
+    let pane = opened["pane_id"].as_u64().unwrap().to_string();
+    for setup in [
+        r#"trap 'printf "\033]133;C\007"' DEBUG"#,
+        r#"PROMPT_COMMAND='printf "\033]133;D;%s\007" "$?"'"#,
+    ] {
+        assert!(
+            fixture
+                .msg(&["submit", "--pane-id", &pane, setup])
+                .status
+                .success()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    // Wait for the markers to be seen before relying on them.
+    for _ in 0..50 {
+        if fixture
+            .msg(&[
+                "shell-command",
+                "true",
+                "--pane-id",
+                &pane,
+                "--timeout",
+                "5s",
+            ])
+            .status
+            .success()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    for (command, expected) in [("true", 0), ("false", 1), ("(exit 7)", 7)] {
+        let result = fixture.json(&[
+            "shell-command",
+            command,
+            "--pane-id",
+            &pane,
+            "--timeout",
+            "10s",
+        ]);
+        assert_eq!(
+            result["exit_code"], expected,
+            "`{command}` reported the wrong status: {result}"
+        );
+        // The status comes from the shell, so it is the command's own, not a guess from output.
+        assert!(result["command_id"].as_u64().unwrap() > 0);
+        assert!(result["cwd"].is_string(), "{result}");
+    }
+
+    // One line, one command: a newline would submit two and the marker waited for would belong to
+    // whichever finished first.
+    let multiline = fixture.msg(&["shell-command", "true\nfalse", "--pane-id", &pane]);
+    assert!(!multiline.status.success());
+}
+
+#[test]
+fn capture_reveals_waits_and_reads_in_one_request() {
+    let fixture = Fixture::start("capture");
+    assert!(
+        fixture
+            .msg(&["split", "vertical", "--pane-id", "1"])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .msg(&["new-tab", "--name", "elsewhere"])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .msg(&["select-tab", "--tab-name", "elsewhere"])
+            .status
+            .success()
+    );
+
+    // The target is on a tab nobody is looking at. `capture` activates it as part of the read,
+    // which is the sequencing a caller would otherwise have to get right itself.
+    let captured = fixture.json(&["capture", "--pane-id", "2", "--stable", "200ms", "--grid"]);
+    assert_eq!(captured["pane_id"], 2);
+    assert!(captured["text"].is_string());
+    assert!(captured["grid"].is_object(), "--grid was ignored");
+    assert!(captured["geometry"].is_object());
+    assert!(captured["screen_sequence"].is_number());
+    assert_eq!(
+        fixture.json(&["layout"])["active_tab_id"],
+        fixture.json(&["inspect", "--pane-id", "2"])["pane"]["tab_id"],
+        "capture did not reveal the pane's tab"
+    );
+
+    // `--no-activate` reads where the pane is, for a caller that must not disturb the layout.
+    assert!(
+        fixture
+            .msg(&["select-tab", "--tab-name", "elsewhere"])
+            .status
+            .success()
+    );
+    let elsewhere = fixture.json(&["list-tabs"])["active_tab_id"].clone();
+    let quiet = fixture.json(&["capture", "--pane-id", "2", "--no-activate"]);
+    assert_eq!(quiet["pane_id"], 2);
+    assert_eq!(
+        fixture.json(&["list-tabs"])["active_tab_id"],
+        elsewhere,
+        "--no-activate changed the selected tab"
+    );
+}
+
+/// Every NDJSON line a plan run emitted.
+fn ndjson(bytes: &[u8]) -> Vec<Value> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line}")))
+        .collect()
+}
