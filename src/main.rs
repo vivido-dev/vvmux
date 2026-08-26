@@ -138,6 +138,13 @@ enum Command {
         /// already means an agent *kind* on `report-agent`.
         #[arg(long, global = true)]
         alias: Option<crate::agent::AgentAlias>,
+        /// Target the pane carrying this name, instead of `--pane-id`.
+        ///
+        /// Global for the same reason `--alias` is. Unlike an agent name, a pane name survives a
+        /// server restart, so it is the form to use in anything saved or re-run: pane IDs are
+        /// reassigned when a session is restored from its snapshot.
+        #[arg(long, global = true)]
+        pane_name: Option<crate::layout::PaneName>,
         #[command(subcommand)]
         command: Box<automation::MsgCommand>,
     },
@@ -333,8 +340,9 @@ fn run(cli: Cli) -> io::Result<()> {
         Some(Command::Msg {
             target,
             alias,
+            pane_name,
             command,
-        }) => automation::run(target.as_deref(), alias, *command),
+        }) => automation::run(target.as_deref(), alias, pane_name, *command),
         Some(Command::Plugin { command }) => plugin::run(command),
         Some(Command::Api { command }) => api::run(command),
         Some(Command::Update { check }) => update::run(check),

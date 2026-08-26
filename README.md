@@ -69,9 +69,45 @@ prefix keys and does not replace the foreground client, so an attached Vivido wi
 rendering normally while another shell controls or observes individual panes.
 
 The session target is resolved from `--target`, then `VVMUX_SESSION`, then `default`. A pane target
-is resolved from `--pane-id`, then a same-session `VVMUX_PANE_ID`, then the focused pane in the
-active tab. `close-pane` deliberately has no focused fallback. Pane shells inherit the exact
-`VVMUX_SESSION`, `VVMUX_TAB_ID`, and `VVMUX_PANE_ID` values for their owner.
+is resolved from `--pane-id`, then `--alias`, then `--pane-name`, then a same-session
+`VVMUX_PANE_ID`, then the focused pane in the active tab. `close-pane` deliberately has no focused
+fallback. Pane shells inherit the exact `VVMUX_SESSION`, `VVMUX_TAB_ID`, and `VVMUX_PANE_ID` values
+for their owner.
+
+**Pane IDs are stable only within one run of a server.** Restoring a session from its snapshot
+rebuilds it and reassigns them, so anything saved or re-run should name its panes instead:
+
+```sh
+vvmux msg pane-rename --pane-id 2 --name editor
+vvmux msg typing --pane-name editor 'cargo test'     # still correct after a restart
+```
+
+A pane name is unique per session (`pane_name_taken`), is written into the snapshot, and comes back
+attached to the same pane. It is not an agent alias: an alias names the agent *process* and is
+cleared when that process exits, while a pane name outlives whatever is running in the pane, which
+is what makes it usable for a plain shell.
+
+`layout` is the discovery call. It returns every tab and pane with a one-based `split_path` from the
+tab root, cell rectangles, visibility, zoom, a `locator`, and directional `neighbors` — plus a
+`caller` block locating the pane the request came from. `resolve-pane` walks that graph without
+touching focus:
+
+```sh
+vvmux msg resolve-pane --path left
+vvmux msg resolve-pane --pane-id 1 --path right,down
+vvmux msg resolve-pane --tab-name Logs --path down
+```
+
+`neighbors` and `resolve-pane` are the *navigation* graph, computed by the same rule `action focus`
+uses, so resolving a pane and focusing it can never disagree. That also means a direction is one
+navigation step rather than a global edge selector: from a full-height left pane, `up` lands on the
+upper of the two panes to its right, because that is where focus would go. Read `geometry` when the
+question is really about position on screen, and inspect `split_path` and the rectangles before
+translating a phrase like "the bottom pane" into a target.
+
+`activate-pane` reveals a pane — selecting its tab and lifting a zoom that hides it — **without**
+moving focus. Visibility is what drives media projection, so "let me see this" and "type here now"
+are separate requests.
 
 A pane does **not** inherit an outer `VIVIDO_SOCKET`, `VIVIDO_WINDOW_ID`, or `VIVIDO_SESSION`. The
 session server outlives the Vivido window that started it, so those name a window that may be gone,
@@ -116,7 +152,15 @@ action ACTION [--pane-id ID]
 list-panes
 session-inspect
 list-tabs
-select-tab --tab-id ID [--wait outer|rendered] [--timeout DURATION]
+layout
+resolve-pane [--path left,down] [--pane-id ID] [--tab-id ID|--tab-name NAME]
+pane-rename [--pane-id ID] (--name NAME | --clear)
+activate-pane [--pane-id ID]
+new-tab [--name NAME]
+rename-tab --name NAME [--tab-id ID|--tab-name NAME]
+reset-tab-title [--tab-id ID|--tab-name NAME]
+close-tab [--tab-id ID|--tab-name NAME]
+select-tab [--tab-id ID|--tab-name NAME] [--wait outer|rendered] [--timeout DURATION]
 diagnose [--pane-id ID|--all-panes] [--trace-limit N]
 report-agent --agent AGENT --state idle|working|blocked --source ID --sequence N [--message TEXT] [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]
 report-agent-session --agent AGENT --source ID --sequence N [--agent-session-id ID] [--agent-session-path PATH] [--pane-id ID]

@@ -119,6 +119,12 @@ pub struct FloatExtras {
 pub struct PaneExtras {
     pub slot: usize,
     pub title: Option<String>,
+    /// The name a user gave this pane, if any.
+    ///
+    /// A plain string rather than the validated newtype, for the same reason
+    /// [`PaneAgentExtras::alias`] is: this is file content, and the guarantee has to be
+    /// re-established by parsing on load rather than assumed because the field has a type.
+    pub name: Option<String>,
     pub agent: Option<PaneAgentExtras>,
 }
 
@@ -398,6 +404,7 @@ mod tests {
                     panes: vec![PaneExtras {
                         slot: 0,
                         title: Some("editor".to_owned()),
+                        name: Some("editor-pane".to_owned()),
                         agent: Some(PaneAgentExtras {
                             alias: Some("reviewer".to_owned()),
                             kind: Some("claude".to_owned()),

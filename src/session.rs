@@ -27,7 +27,7 @@ use crate::ipc::{
     BridgeSource, BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface,
     BridgeSurfaceKey, ClientMessage, Direction, DisplayMetrics, FloatingEditCommand,
     FloatingEditKind, MediaTrackIdentity, MediaTrackWaitCondition, MouseEvent, MouseKind,
-    PluginEventEnvelope, ServerMessage, SharedWriter, TextSource,
+    PluginEventEnvelope, ServerMessage, SharedWriter, TabSelector, TextSource,
 };
 use crate::layout::{
     EdgeMask, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode, directional_focus,
@@ -711,6 +711,10 @@ struct Pane {
     /// resumed agent from a different program the user started. The name is applied once the agent
     /// is actually detected.
     pending_alias: Option<crate::agent::AgentAlias>,
+    /// The durable name a user gave this pane, unique within the session.
+    ///
+    /// Survives a server restart, unlike the pane's ID: see [`crate::layout::PaneName`].
+    name: Option<crate::layout::PaneName>,
     copy: Option<CopyState>,
     mouse_selection: Option<MouseSelection>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
@@ -3107,6 +3111,7 @@ impl SessionActor {
                     &request.method,
                     request.pane_id,
                     request.agent.as_ref(),
+                    request.pane_name.as_ref(),
                     request.allow_focused,
                 )
             };
@@ -3185,21 +3190,60 @@ impl SessionActor {
             AutomationMethod::ListTabs => {
                 self.reply_automation(target, self.automation_tabs());
             }
+            AutomationMethod::Layout => {
+                // `request.pane_id` rather than the resolved pane: `layout` is session-scoped, so
+                // nothing was resolved, and the raw field is the inherited `VVMUX_PANE_ID` that
+                // says where the caller is sitting.
+                let caller = request.pane_id;
+                self.reply_automation(target, self.automation_layout(caller));
+            }
+            AutomationMethod::ResolvePane { ref tab, ref path } => {
+                // `pane_name` comes from the request's targeting fields like every other method's
+                // does. `resolve_pane` is session-scoped, so nothing consumed it, and a second
+                // copy on the method would be two ways to say one thing.
+                match self.automation_resolve_pane(
+                    request.pane_id,
+                    tab.as_ref(),
+                    path,
+                    request.pane_name.as_ref(),
+                ) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::NewTab { ref name } => match self.automation_new_tab(name.clone()) {
+                Ok(result) => self.reply_automation(target, result),
+                Err(error) => self.reply_automation_error(target, error),
+            },
+            AutomationMethod::RenameTab { ref tab, ref name } => {
+                match self.automation_rename_tab(tab, Some(name.clone())) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::ResetTabTitle { ref tab } => {
+                match self.automation_rename_tab(tab, None) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::CloseTab { ref tab } => match self.automation_close_tab(tab) {
+                Ok(result) => self.reply_automation(target, result),
+                Err(error) => self.reply_automation_error(target, error),
+            },
             AutomationMethod::SelectTab {
-                tab_id,
+                ref tab,
                 wait,
                 timeout_ms,
             } => {
-                let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
-                    self.reply_automation_error(
-                        target,
-                        AutomationError::new(
-                            "tab_not_found",
-                            format!("tab {tab_id} does not exist"),
-                        ),
-                    );
-                    return;
+                let index = match self.resolve_tab(tab) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        self.reply_automation_error(target, error);
+                        return;
+                    }
                 };
+                let tab_id = self.tabs[index].id;
                 let before_outer = self.outer_projection_revision;
                 self.active_tab = index;
                 self.force_full = true;
@@ -3502,6 +3546,20 @@ impl SessionActor {
                         "limits": automation_limits(),
                     }),
                 );
+            }
+            AutomationMethod::PaneRename { ref name } => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_pane_rename(pane_id, name.clone()) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::ActivatePane => {
+                let pane_id = pane_id.unwrap();
+                match self.automation_activate_pane(pane_id) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
             }
             AutomationMethod::InspectMedia => {
                 let pane_id = pane_id.unwrap();
@@ -4198,6 +4256,7 @@ impl SessionActor {
         method: &AutomationMethod,
         requested: Option<PaneId>,
         alias: Option<&crate::agent::AgentAlias>,
+        pane_name: Option<&crate::layout::PaneName>,
         allow_focused: bool,
     ) -> Result<PaneId, AutomationError> {
         if let Some(pane) = requested {
@@ -4218,6 +4277,13 @@ impl SessionActor {
                     "agent_alias_not_found",
                     format!("no agent is named {alias}"),
                 )
+            });
+        }
+        // Below the alias: an alias names a process that may have moved, a name names this pane.
+        // A caller that gave both meant the agent, and is told so by being sent to it.
+        if let Some(name) = pane_name {
+            return self.pane_with_name(name).ok_or_else(|| {
+                AutomationError::new("pane_not_found", format!("no pane is named {name}"))
             });
         }
         if allow_focused {
@@ -4712,6 +4778,468 @@ impl SessionActor {
                 result,
             },
         });
+    }
+
+    /// Which tab a selector means, as an index into `self.tabs`.
+    fn resolve_tab(&self, selector: &TabSelector) -> Result<usize, AutomationError> {
+        match selector {
+            TabSelector::Id(tab_id) => self
+                .tabs
+                .iter()
+                .position(|tab| tab.id == *tab_id)
+                .ok_or_else(|| {
+                    AutomationError::new("tab_not_found", format!("tab {tab_id} does not exist"))
+                }),
+            TabSelector::Name(name) => {
+                // Case-insensitive, like Vivida's tab locators: a name is typed by a person, and
+                // "Logs" and "logs" are the same tab to everyone except a byte comparison.
+                let mut matches = self.tabs.iter().enumerate().filter(|(_, tab)| {
+                    tab.name
+                        .as_deref()
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+                });
+                let first = matches.next().map(|(index, _)| index).ok_or_else(|| {
+                    AutomationError::new("tab_not_found", format!("no tab is named {name}"))
+                })?;
+                // Ambiguity is refused rather than resolved by position: acting on the wrong tab is
+                // worse than saying the name does not identify one.
+                if matches.next().is_some() {
+                    return Err(AutomationError::new(
+                        "invalid_params",
+                        format!("more than one tab is named {name}; use --tab-id"),
+                    ));
+                }
+                Ok(first)
+            }
+            TabSelector::Active => (!self.tabs.is_empty())
+                .then_some(self.active_tab)
+                .ok_or_else(|| AutomationError::new("tab_not_found", "session has no tabs")),
+        }
+    }
+
+    /// Every pane in a tab with the rectangle it would occupy unzoomed.
+    ///
+    /// Deliberately not [`visible_projections`], which collapses a zoomed tab to its single
+    /// zoomed pane. Zoom is a projection of one leaf and never changes the tree, so a topology
+    /// answer that disappeared while a pane was zoomed would be describing the screen rather than
+    /// the layout. Zoom is reported per pane instead.
+    fn topology_projections(tab: &Tab, area: Rect) -> Vec<PaneProjection> {
+        let mut projections = Vec::new();
+        if let Some(tree) = &tab.tree {
+            for (pane_id, outer) in tree.geometry(area) {
+                projections.push(PaneProjection {
+                    pane_id,
+                    outer,
+                    content: outer.content(),
+                    layer: PaneLayer::Tiled,
+                    focused: tab.focused == pane_id,
+                });
+            }
+        }
+        for float in tab.floating.panes() {
+            projections.push(PaneProjection {
+                pane_id: float.pane_id,
+                outer: float.rect,
+                content: float.rect.content(),
+                layer: if float.pinned {
+                    PaneLayer::Pinned
+                } else {
+                    PaneLayer::Floating
+                },
+                focused: tab.focused == float.pane_id,
+            });
+        }
+        projections
+    }
+
+    /// The whole session's shape: tabs, panes, tree positions, rectangles, and neighbors.
+    ///
+    /// `caller` locates the pane the request came from, taken from the inherited `VVMUX_PANE_ID`,
+    /// so an agent can ask "where am I" and "what is next to me" in the same call it uses to
+    /// discover the session.
+    ///
+    /// `neighbors` is the *navigation* graph, not a strict geometric one: each entry is where one
+    /// step in that direction lands, computed by the same [`directional_focus`] that
+    /// `Action::Focus` uses. That is deliberate — `resolve_pane` and moving focus must agree, or an
+    /// agent resolves one pane and focuses another. It also means a direction can point at a pane
+    /// that is not strictly on that side: from a full-height left pane, "up" lands on the upper of
+    /// the two panes to its right, because that is where focus would go. Read `geometry` when the
+    /// question is really about position on screen.
+    fn automation_layout(&self, caller: Option<PaneId>) -> serde_json::Value {
+        let area = self.content_area();
+        let caller = caller.filter(|pane_id| self.panes.contains_key(pane_id));
+        let tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let projections = Self::topology_projections(tab, area);
+                let panes = projections
+                    .iter()
+                    .map(|projection| {
+                        let pane_id = projection.pane_id;
+                        let neighbors = [
+                            ("left", Direction::Left),
+                            ("right", Direction::Right),
+                            ("up", Direction::Up),
+                            ("down", Direction::Down),
+                        ]
+                        .into_iter()
+                        .map(|(name, direction)| {
+                            (
+                                name.to_owned(),
+                                serde_json::to_value(directional_focus(
+                                    &projections,
+                                    pane_id,
+                                    direction,
+                                ))
+                                .unwrap_or(serde_json::Value::Null),
+                            )
+                        })
+                        .collect::<serde_json::Map<_, _>>();
+                        let pane_name = self
+                            .panes
+                            .get(&pane_id)
+                            .and_then(|pane| pane.name.as_ref())
+                            .map(ToString::to_string);
+                        serde_json::json!({
+                            "pane_id": pane_id,
+                            "pane_name": pane_name,
+                            "locator": {
+                                "tab_id": tab.id,
+                                "tab_name": tab.name,
+                                "pane_name": pane_name,
+                                "pane_id": pane_id,
+                            },
+                            "split_path": tab
+                                .tree
+                                .as_ref()
+                                .and_then(|tree| tree.split_path(pane_id)),
+                            "layer": match projection.layer {
+                                PaneLayer::Tiled => "tiled",
+                                PaneLayer::Floating => "floating",
+                                PaneLayer::Pinned => "pinned",
+                            },
+                            "geometry": rect_json(projection.outer),
+                            "content_geometry": rect_json(projection.content),
+                            "focused": projection.focused,
+                            "visible": self.pane_is_visibly_present(pane_id),
+                            "zoomed": tab.zoomed == Some(pane_id),
+                            "is_caller": caller == Some(pane_id),
+                            "title": self
+                                .panes
+                                .get(&pane_id)
+                                .and_then(|pane| pane.terminal.title()),
+                            "agent_alias": self
+                                .panes
+                                .get(&pane_id)
+                                .and_then(|pane| pane.agent.alias())
+                                .map(ToString::to_string),
+                            "neighbors": neighbors,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "tab_id": tab.id,
+                    "tab_name": tab.name,
+                    "display_index": index,
+                    "active": index == self.active_tab,
+                    "focused_pane_id": tab.focused,
+                    "zoomed_pane_id": tab.zoomed,
+                    "sync_input": tab.sync_input,
+                    "panes": panes,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "schema_version": 1,
+            "session": self.name,
+            "session_instance": self.session_instance,
+            "session_sequence": self.session_sequence,
+            "layout_sequence": self.layout_revision,
+            "active_tab_id": self.active_tab().map(|tab| tab.id),
+            "area": rect_json(area),
+            "caller": caller.map(|pane_id| {
+                serde_json::json!({
+                    "pane_id": pane_id,
+                    "tab_id": self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.contains(pane_id))
+                        .map(|tab| tab.id),
+                })
+            }),
+            "tabs": tabs,
+        })
+    }
+
+    /// Walk a directional route, or resolve a name, without touching focus.
+    fn automation_resolve_pane(
+        &self,
+        caller: Option<PaneId>,
+        selector: Option<&TabSelector>,
+        path: &[Direction],
+        pane_name: Option<&crate::layout::PaneName>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        if let Some(name) = pane_name {
+            if !path.is_empty() {
+                return Err(AutomationError::new(
+                    "invalid_params",
+                    "--pane-name resolves a pane directly; it cannot also take a --path",
+                ));
+            }
+            let pane_id = self.pane_with_name(name).ok_or_else(|| {
+                AutomationError::new("pane_not_found", format!("no pane is named {name}"))
+            })?;
+            return Ok(serde_json::json!({
+                "schema_version": 1,
+                "selector": {"pane_name": name.as_str()},
+                "steps": [],
+                "target": self.resolved_pane_json(pane_id),
+            }));
+        }
+        if path.len() > MAX_RESOLVE_PANE_STEPS {
+            return Err(AutomationError::new(
+                "limit_exceeded",
+                format!("a route may take at most {MAX_RESOLVE_PANE_STEPS} steps"),
+            ));
+        }
+        let caller = caller.filter(|pane_id| self.panes.contains_key(pane_id));
+        // With no tab named, the route starts where the caller is, even when that tab is not the
+        // active one: an agent asking for "the pane to my left" means its own tab.
+        let tab_index = match selector {
+            Some(selector) => self.resolve_tab(selector)?,
+            None => caller
+                .and_then(|pane_id| self.tabs.iter().position(|tab| tab.contains(pane_id)))
+                .or((!self.tabs.is_empty()).then_some(self.active_tab))
+                .ok_or_else(|| AutomationError::new("tab_not_found", "session has no tabs"))?,
+        };
+        let tab = &self.tabs[tab_index];
+        // The caller's own pane when the route stays in its tab, otherwise that tab's focused pane.
+        let start = caller
+            .filter(|pane_id| tab.contains(*pane_id))
+            .unwrap_or(tab.focused);
+        if !self.panes.contains_key(&start) {
+            return Err(AutomationError::new(
+                "no_focused_pane",
+                "the selected tab has no resolvable starting pane",
+            ));
+        }
+        let projections = Self::topology_projections(tab, self.content_area());
+        let mut current = start;
+        let mut steps = Vec::with_capacity(path.len());
+        for direction in path {
+            let next = directional_focus(&projections, current, *direction).ok_or_else(|| {
+                AutomationError::new(
+                    "pane_not_found",
+                    format!("no pane lies {} of pane {current}", direction.as_str()),
+                )
+            })?;
+            steps.push(serde_json::json!({
+                "direction": direction,
+                "from_pane_id": current,
+                "to_pane_id": next,
+            }));
+            current = next;
+        }
+        Ok(serde_json::json!({
+            "schema_version": 1,
+            "selector": {
+                "tab_id": tab.id,
+                "tab_name": tab.name,
+                "path": path,
+            },
+            "source_pane_id": start,
+            "steps": steps,
+            "target": self.resolved_pane_json(current),
+        }))
+    }
+
+    /// The identity block every resolution returns, so a caller can act on it without a second call.
+    fn resolved_pane_json(&self, pane_id: PaneId) -> serde_json::Value {
+        let tab = self.tabs.iter().find(|tab| tab.contains(pane_id));
+        serde_json::json!({
+            "pane_id": pane_id,
+            "pane_name": self
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| pane.name.as_ref())
+                .map(ToString::to_string),
+            "tab_id": tab.map(|tab| tab.id),
+            "tab_name": tab.and_then(|tab| tab.name.clone()),
+            "split_path": tab
+                .and_then(|tab| tab.tree.as_ref())
+                .and_then(|tree| tree.split_path(pane_id)),
+            "visible": self.pane_is_visibly_present(pane_id),
+            "focused": tab.is_some_and(|tab| tab.focused == pane_id),
+        })
+    }
+
+    /// Give a pane a name, or clear it.
+    ///
+    /// Uniqueness is per session and checked here: a name is a target, and two panes answering to
+    /// one would make every command that uses it ambiguous. Renaming a pane to the name it already
+    /// has succeeds rather than colliding with itself.
+    fn automation_pane_rename(
+        &mut self,
+        pane_id: PaneId,
+        name: Option<crate::layout::PaneName>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        if let Some(name) = &name
+            && self
+                .pane_with_name(name)
+                .is_some_and(|held| held != pane_id)
+        {
+            return Err(AutomationError::new(
+                "pane_name_taken",
+                format!("another pane is already named {name}"),
+            ));
+        }
+        let pane = self
+            .panes
+            .get_mut(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
+        let previous = std::mem::replace(&mut pane.name, name.clone());
+        // A name lives in the snapshot, so the session that comes back after a restart is only
+        // correct if the rename is written down.
+        self.mark_snapshot_dirty();
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "pane_name": name.as_ref().map(ToString::to_string),
+            "previous_pane_name": previous.as_ref().map(ToString::to_string),
+        }))
+    }
+
+    /// Make a pane visible without moving focus.
+    ///
+    /// Selects the owning tab and lifts a zoom that is hiding the target. It deliberately does not
+    /// focus the pane or disturb the attachment: visibility is what drives media projection, so
+    /// "let me see this" and "type here now" are different requests.
+    fn automation_activate_pane(
+        &mut self,
+        pane_id: PaneId,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let tab_index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.contains(pane_id))
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+        let tab_selected = self.active_tab != tab_index;
+        // Zoom projects one leaf over the whole tab, so any other pane in that tab is hidden by it.
+        let unzoomed = self.tabs[tab_index]
+            .zoomed
+            .is_some_and(|zoomed| zoomed != pane_id);
+        // An ordinary float that the layer has hidden cannot be revealed pane by pane: the toggle
+        // is per tab, so the whole ordinary block comes back.
+        let revealed_floats = self.tabs[tab_index].floating.contains(pane_id)
+            && !self.tabs[tab_index]
+                .floating
+                .visible()
+                .any(|float| float.pane_id == pane_id);
+        if tab_selected {
+            self.active_tab = tab_index;
+            self.force_full = true;
+        }
+        if unzoomed {
+            self.tabs[tab_index].zoomed = None;
+        }
+        if revealed_floats {
+            self.tabs[tab_index].floating.ordinary_visible = true;
+        }
+        if tab_selected || unzoomed || revealed_floats {
+            self.relayout();
+        }
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "tab_id": self.tabs[tab_index].id,
+            "tab_selected": tab_selected,
+            "unzoomed": unzoomed,
+            "revealed_floats": revealed_floats,
+            "visible": self.pane_is_visibly_present(pane_id),
+            "focused": self.tabs[tab_index].focused == pane_id,
+            // Stated rather than implied: the whole point of this method is that it does not.
+            "focus_changed": false,
+            "layout_sequence": self.layout_revision,
+        }))
+    }
+
+    /// Open a tab and report the IDs it was given.
+    ///
+    /// `action new-tab` does the same thing but answers nothing, so a caller that needs to act on
+    /// the new tab has to guess or re-list. This returns the identities it just created.
+    fn automation_new_tab(
+        &mut self,
+        name: Option<String>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let name = name.map(validated_tab_name).transpose()?;
+        if self.tabs.len() >= MAX_LAYOUT_TABS {
+            return Err(AutomationError::new(
+                "limit_exceeded",
+                format!("a session holds at most {MAX_LAYOUT_TABS} tabs"),
+            ));
+        }
+        self.new_tab()
+            .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
+        let tab = self
+            .tabs
+            .last_mut()
+            .expect("new_tab pushed the tab it created");
+        tab.name = name.clone();
+        let result = serde_json::json!({
+            "tab_id": tab.id,
+            "tab_name": name,
+            "pane_id": tab.focused,
+            "display_index": self.tabs.len() - 1,
+        });
+        self.mark_snapshot_dirty();
+        self.relayout();
+        Ok(result)
+    }
+
+    /// Set or clear a tab's name.
+    fn automation_rename_tab(
+        &mut self,
+        selector: &TabSelector,
+        name: Option<String>,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let name = name.map(validated_tab_name).transpose()?;
+        let index = self.resolve_tab(selector)?;
+        let previous = std::mem::replace(&mut self.tabs[index].name, name.clone());
+        self.mark_snapshot_dirty();
+        self.schedule_render();
+        Ok(serde_json::json!({
+            "tab_id": self.tabs[index].id,
+            "tab_name": name,
+            "previous_tab_name": previous,
+        }))
+    }
+
+    /// Close a tab and everything in it.
+    fn automation_close_tab(
+        &mut self,
+        selector: &TabSelector,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let index = self.resolve_tab(selector)?;
+        let tab_id = self.tabs[index].id;
+        let mut pane_ids = self.tabs[index]
+            .tree
+            .as_ref()
+            .map_or_else(Vec::new, TiledNode::pane_ids);
+        pane_ids.extend(self.tabs[index].floating.pane_ids());
+        pane_ids.sort_unstable();
+        pane_ids.dedup();
+        // Closing every pane is what removes the tab: `close_pane` already owns tab collapse,
+        // focus fallback, media teardown, and the `pane.closed` event, and reimplementing any of
+        // that here would be a second path that has to stay in agreement with it.
+        for pane_id in &pane_ids {
+            self.close_pane(*pane_id);
+        }
+        Ok(serde_json::json!({
+            "tab_id": tab_id,
+            "closed_pane_ids": pane_ids,
+            "accepted": true,
+            "layout_sequence": self.layout_revision,
+        }))
     }
 
     fn automation_tabs(&self) -> serde_json::Value {
@@ -5677,10 +6205,29 @@ impl SessionActor {
             PaneRole::Plugin(owner) => Some(owner.title.as_str()),
             PaneRole::Core => None,
         });
+        let projections = Self::topology_projections(tab, area);
+        let neighbors = [
+            ("left", Direction::Left),
+            ("right", Direction::Right),
+            ("up", Direction::Up),
+            ("down", Direction::Down),
+        ]
+        .into_iter()
+        .map(|(name, direction)| {
+            (
+                name.to_owned(),
+                serde_json::to_value(directional_focus(&projections, pane_id, direction))
+                    .unwrap_or(serde_json::Value::Null),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
         Some(serde_json::json!({
             "pane_id": pane_id,
+            "pane_name": pane.name.as_ref().map(ToString::to_string),
             "tab_id": tab.id,
             "tab_name": tab.name,
+            "split_path": tab.tree.as_ref().and_then(|tree| tree.split_path(pane_id)),
+            "neighbors": neighbors,
             "active_tab": tab_index == self.active_tab,
             "focused": self.attached_focus_pane() == Some(pane_id),
             "visible": visible,
@@ -9566,6 +10113,7 @@ impl SessionActor {
                 restored_active = Some(self.tabs.len());
             }
             if let Some(tab_extras) = tab_extras {
+                self.restore_pane_names(tab_extras, &slot_ids, &failed);
                 self.arm_pane_resumes(tab_extras, &slot_ids, &failed, &mut resumed_sessions);
             }
             if let Some(tab_history) = tab_history {
@@ -9738,6 +10286,56 @@ impl SessionActor {
     /// the alias, and the session reference are all reparsed, and the reporting source is checked
     /// against the provider that owns the kind — the resume becomes a command line on the user's
     /// machine, so a reference from anywhere else is not one this may act on.
+    /// Give restored panes back the names they had.
+    ///
+    /// This is the whole point of a pane name: the restore reassigned every pane ID, so a caller
+    /// holding one is now addressing whichever pane inherited that number. A name comes back
+    /// attached to the pane it was given to.
+    ///
+    /// A name from the file is re-parsed rather than trusted, and a duplicate is dropped rather
+    /// than allowed to shadow the pane that already took it — the snapshot cannot have contained
+    /// one, but it is file content and this is the only place that can still say no.
+    fn restore_pane_names(
+        &mut self,
+        tab_extras: &TabExtras,
+        slot_ids: &[PaneId],
+        failed: &HashSet<PaneId>,
+    ) {
+        for pane_extras in &tab_extras.panes {
+            let Some(pane_id) = slot_ids.get(pane_extras.slot).copied() else {
+                continue;
+            };
+            if failed.contains(&pane_id) {
+                continue;
+            }
+            let Some(name) = pane_extras
+                .name
+                .as_deref()
+                .and_then(|name| crate::layout::PaneName::new(name).ok())
+            else {
+                continue;
+            };
+            if self.pane_with_name(&name).is_some() {
+                continue;
+            }
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                pane.name = Some(name);
+            }
+        }
+    }
+
+    /// The pane holding `name`, if one does.
+    ///
+    /// A linear scan for the same reason [`Self::pane_with_agent_alias`] uses one: a session holds
+    /// at most [`crate::layout_file::MAX_LAYOUT_PANES`] panes, and an index would be a second copy
+    /// of state to invalidate everywhere a name is cleared.
+    fn pane_with_name(&self, name: &crate::layout::PaneName) -> Option<PaneId> {
+        self.panes
+            .iter()
+            .find(|(_, pane)| pane.name.as_ref() == Some(name))
+            .map(|(pane_id, _)| *pane_id)
+    }
+
     fn arm_pane_resumes(
         &mut self,
         tab_extras: &TabExtras,
@@ -10016,6 +10614,11 @@ impl SessionActor {
                 .get(&pane_id)
                 .and_then(|pane| pane.terminal.title())
                 .map(ToOwned::to_owned),
+            name: self
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| pane.name.as_ref())
+                .map(ToString::to_string),
             agent,
         }
     }
@@ -10204,6 +10807,7 @@ impl SessionActor {
                 agent_change_seq: 0,
                 pending_resume: None,
                 pending_alias: None,
+                name: None,
                 copy: None,
                 mouse_selection: None,
                 vivid_metrics: None,
@@ -11958,6 +12562,12 @@ impl From<&Cell> for StyleKey {
     }
 }
 
+/// Steps one `resolve_pane` route may take.
+///
+/// A route crosses one split per step, so a session cannot need more than its pane count; this is
+/// well past that and keeps a hostile caller from asking for an unbounded walk.
+const MAX_RESOLVE_PANE_STEPS: usize = 32;
+
 fn method_needs_pane(method: &AutomationMethod) -> bool {
     !matches!(
         method,
@@ -11970,6 +12580,12 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
             | AutomationMethod::WaitRendered { .. }
             | AutomationMethod::ReloadConfig
             | AutomationMethod::GetConfig
+            | AutomationMethod::Layout
+            | AutomationMethod::ResolvePane { .. }
+            | AutomationMethod::NewTab { .. }
+            | AutomationMethod::RenameTab { .. }
+            | AutomationMethod::ResetTabTitle { .. }
+            | AutomationMethod::CloseTab { .. }
             | AutomationMethod::SaveLayout { .. }
             | AutomationMethod::SessionSnapshot
             | AutomationMethod::Plugin(_)
@@ -12427,6 +13043,7 @@ pub(crate) const AUTOMATION_ERROR_CODES: &[&str] = &[
     "no_focused_pane",
     "not_alternate_screen",
     "output_invalid",
+    "pane_name_taken",
     "pane_not_found",
     "pane_required",
     "plugin_disabled",
@@ -12686,6 +13303,28 @@ fn automation_limits() -> serde_json::Value {
 
 fn deadline(timeout_ms: u64) -> Instant {
     Instant::now() + Duration::from_millis(timeout_ms.clamp(1, 24 * 60 * 60 * 1000))
+}
+
+/// A tab name a caller supplied, held to what the interactive rename accepts.
+///
+/// Same ceiling and same control-character handling as the modal path, so a name typed at the
+/// prompt and a name set through automation cannot end up being different kinds of string. An
+/// empty or all-blank name clears the tab's name rather than setting a blank one.
+fn validated_tab_name(name: String) -> Result<String, AutomationError> {
+    if name.len() > MAX_TAB_NAME_BYTES {
+        return Err(AutomationError::new(
+            "limit_exceeded",
+            format!("a tab name holds at most {MAX_TAB_NAME_BYTES} bytes"),
+        ));
+    }
+    let name = single_line(&name).trim().to_owned();
+    if name.is_empty() {
+        return Err(AutomationError::new(
+            "invalid_params",
+            "a tab name cannot be blank; use reset-tab-title to clear one",
+        ));
+    }
+    Ok(name)
 }
 
 fn rect_json(rect: Rect) -> serde_json::Value {

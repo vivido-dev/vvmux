@@ -33,10 +33,13 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
+/// Version 26 adds the topology surface: `layout` and `resolve_pane` describe and navigate the
+/// split tree, panes carry durable names that survive a restart, and tabs are addressable and
+/// renameable by name. One bump covers the batch.
 /// Version 25 adds the typed capability handshake and `get_config`: `capabilities` now describes
 /// every method's class and whether it mutates, so a caller can tell an observation from a mutation
 /// before running one. One bump covers the batch.
-pub const VERSION: u16 = 25;
+pub const VERSION: u16 = 26;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -90,8 +93,28 @@ pub struct AutomationRequest {
     /// already resolves a request's pane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<crate::agent::AgentAlias>,
+    /// Target the pane carrying this name, when no `pane_id` is given.
+    ///
+    /// A third targeting field for the same reason `agent` is a second one, and outranked by both
+    /// of them: a caller that named a pane *and* an agent gets the agent, because an agent moves
+    /// and a pane does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_name: Option<crate::layout::PaneName>,
     pub allow_focused: bool,
     pub method: AutomationMethod,
+}
+
+/// Which tab a request means.
+///
+/// Never a display index: a tab's position changes when another tab is closed, so an index that
+/// was correct when it was read may name a different tab by the time it is used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TabSelector {
+    Id(u64),
+    Name(String),
+    /// The tab currently selected in the session.
+    Active,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -102,7 +125,7 @@ pub enum AutomationMethod {
     SessionInspect,
     ListTabs,
     SelectTab {
-        tab_id: u64,
+        tab: TabSelector,
         wait: Option<AutomationCompletion>,
         timeout_ms: u64,
     },
@@ -175,6 +198,52 @@ pub enum AutomationMethod {
     AgentRead {
         lines: u16,
         json: bool,
+    },
+    /// Describe every tab and pane: the split tree, cell rectangles, and directional neighbors.
+    ///
+    /// The discovery call. `list_panes` and `list_tabs` are flat, so neither can answer "which pane
+    /// is to the left of this one" or "where does this pane sit in the tree".
+    Layout,
+    /// Walk a directional route through the split tree without moving focus.
+    ///
+    /// Distinct from `Action::Focus`, which answers the same geometric question but commits to the
+    /// answer. A caller translating "the pane below" into a target needs to look without touching.
+    ResolvePane {
+        /// Which tab the route runs in. Defaults to the caller's own tab, else the active one.
+        tab: Option<TabSelector>,
+        /// One navigation step per entry, applied in order. Empty resolves the start pane itself.
+        ///
+        /// The route starts at the request's `pane_id` when it names a pane in the selected tab,
+        /// and at that tab's focused pane otherwise. A request that carries a `pane_name` instead
+        /// resolves that name and takes no steps.
+        path: Vec<Direction>,
+    },
+    /// Name one pane, or clear its name when `name` is absent.
+    PaneRename {
+        name: Option<crate::layout::PaneName>,
+    },
+    /// Make one pane visible without moving focus or stealing the attachment.
+    ///
+    /// Selects the owning tab, and lifts a zoom that is hiding the target. Visibility is what
+    /// media projection keys off, so revealing a pane is a real operation and not a synonym for
+    /// focusing it.
+    ActivatePane,
+    /// Open a tab, optionally named, and report the IDs it was given.
+    NewTab {
+        name: Option<String>,
+    },
+    /// Give a tab a name, replacing any name it had.
+    RenameTab {
+        tab: TabSelector,
+        name: String,
+    },
+    /// Drop a tab's name so it falls back to its process-derived title.
+    ResetTabTitle {
+        tab: TabSelector,
+    },
+    /// Close a tab and every pane in it.
+    CloseTab {
+        tab: TabSelector,
     },
     Inspect,
     InspectMedia,
@@ -367,8 +436,10 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
     &[
         capability("capabilities", Observe),
         capability("get_config", Observe),
+        capability("layout", Observe),
         capability("list_panes", Observe),
         capability("list_tabs", Observe),
+        capability("resolve_pane", Observe),
         capability("session_inspect", Observe),
         capability("session_snapshot", Observe),
         capability("inspect", Observe),
@@ -396,6 +467,12 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         capability("split", Pane),
         capability("run", Pane),
         capability("close_pane", Pane),
+        capability("activate_pane", Layout),
+        capability("close_tab", Layout),
+        capability("new_tab", Layout),
+        capability("pane_rename", Layout),
+        capability("rename_tab", Layout),
+        capability("reset_tab_title", Layout),
         capability("select_tab", Layout),
         capability("focus", Layout),
         capability("focus_wait", Layout),
@@ -441,6 +518,14 @@ impl AutomationMethod {
             Self::AgentPrompt { .. } => "agent_prompt",
             Self::AgentSendKeys { .. } => "agent_send_keys",
             Self::AgentRead { .. } => "agent_read",
+            Self::Layout => "layout",
+            Self::ResolvePane { .. } => "resolve_pane",
+            Self::PaneRename { .. } => "pane_rename",
+            Self::ActivatePane => "activate_pane",
+            Self::NewTab { .. } => "new_tab",
+            Self::RenameTab { .. } => "rename_tab",
+            Self::ResetTabTitle { .. } => "reset_tab_title",
+            Self::CloseTab { .. } => "close_tab",
             Self::Inspect => "inspect",
             Self::InspectMedia => "inspect_media",
             Self::TraceMedia { .. } => "trace_media",
@@ -687,11 +772,23 @@ pub enum RunPlacement {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum Direction {
     Left,
     Right,
     Up,
     Down,
+}
+
+impl Direction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]

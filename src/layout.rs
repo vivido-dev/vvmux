@@ -4,6 +4,64 @@ use crate::ipc::{Axis, Direction};
 
 pub type PaneId = u64;
 
+/// A name a user gives one pane, usable as an automation target in place of a pane ID.
+///
+/// The durable half of pane identity. A `PaneId` is stable only within one run of a server: a
+/// snapshot restore rebuilds the session and reassigns them, so a saved plan or a long-lived script
+/// that remembered one is addressing whatever pane inherited that number. A name is written into
+/// the snapshot and comes back attached to the same pane.
+///
+/// Distinct from [`crate::agent::AgentAlias`], which names an *agent process* and is cleared when
+/// that process exits. A pane name outlives whatever is running in the pane, which is what makes it
+/// usable for a plain shell.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema)]
+pub struct PaneName(String);
+
+/// User-assigned pane name, usable as an automation target.
+pub const MAX_PANE_NAME_BYTES: usize = 32;
+
+impl PaneName {
+    pub fn new(value: impl Into<String>) -> Result<Self, &'static str> {
+        let value = value.into();
+        crate::agent::valid_target_name(&value, MAX_PANE_NAME_BYTES)
+            .then_some(Self(value))
+            .ok_or(
+                "pane name must start with a lowercase letter and contain only lowercase letters, \
+                 digits, '-' or '_' (1..=32 bytes)",
+            )
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PaneName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for PaneName {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl serde::Serialize for PaneName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PaneName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 pub const MIN_CONTENT_COLUMNS: u16 = 4;
 pub const MIN_CONTENT_ROWS: u16 = 2;
 const FRAME_COLUMNS: u16 = 2;
@@ -483,6 +541,32 @@ impl TiledNode {
         let mut panes = Vec::new();
         self.collect(&mut panes);
         panes
+    }
+
+    /// Where `pane` sits in the tree, as one-based child positions from the root.
+    ///
+    /// `[1, 2]` means "the second child of the first child of the root". A leaf that *is* the root
+    /// has an empty path. This is the stable description of shape that a rectangle cannot give: two
+    /// panes can swap rectangles on a resize without either one moving in the tree.
+    pub fn split_path(&self, pane: PaneId) -> Option<Vec<u16>> {
+        let mut path = Vec::new();
+        self.find_split_path(pane, &mut path).then_some(path)
+    }
+
+    fn find_split_path(&self, pane: PaneId, path: &mut Vec<u16>) -> bool {
+        match self {
+            Self::Leaf(id) => *id == pane,
+            Self::Split { first, second, .. } => {
+                for (position, child) in [(1, first), (2, second)] {
+                    path.push(position);
+                    if child.find_split_path(pane, path) {
+                        return true;
+                    }
+                    path.pop();
+                }
+                false
+            }
+        }
     }
 
     pub fn contains(&self, pane: PaneId) -> bool {

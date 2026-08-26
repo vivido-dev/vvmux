@@ -118,19 +118,30 @@ impl<'de> Deserialize<'de> for AgentId {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema)]
 pub struct AgentAlias(String);
 
+/// The shared spelling rule for a name typed on a command line as an automation target.
+///
+/// Lowercase, letter-initial, and never mistakable for a pane ID, a flag, or a differently-cased
+/// spelling of another name. Shared by [`AgentAlias`] and [`crate::layout::PaneName`] so the two
+/// cannot drift into accepting different things — a caller should not have to remember which
+/// target kind tolerates an uppercase letter.
+pub fn valid_target_name(value: &str, max_bytes: usize) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= max_bytes
+        && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
 impl AgentAlias {
     pub fn new(value: impl Into<String>) -> Result<Self, &'static str> {
         let value = value.into();
-        let mut bytes = value.bytes();
-        let valid = value.len() <= MAX_AGENT_ALIAS_BYTES
-            && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
-            && bytes.all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-            });
-        valid.then_some(Self(value)).ok_or(
-            "agent alias must start with a lowercase letter and contain only lowercase letters, \
-             digits, '-' or '_' (1..=32 bytes)",
-        )
+        valid_target_name(&value, MAX_AGENT_ALIAS_BYTES)
+            .then_some(Self(value))
+            .ok_or(
+                "agent alias must start with a lowercase letter and contain only lowercase \
+                 letters, digits, '-' or '_' (1..=32 bytes)",
+            )
     }
 
     pub fn as_str(&self) -> &str {

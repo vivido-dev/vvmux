@@ -9,7 +9,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use crate::ipc::{
     Action, AutomationCompletion, AutomationMethod, AutomationRequest, AutomationResponse, Axis,
     ClientMessage, Direction, MediaTrackIdentity, MediaTrackWaitCondition, PluginMethod,
-    RunPlacement, ServerMessage, TextSource,
+    RunPlacement, ServerMessage, TabSelector, TextSource,
 };
 use crate::media_trace::{
     MAX_MEDIA_TRACE_QUERY_EVENTS, MediaTraceBatch, MediaTraceCategory, MediaTraceFilter,
@@ -186,6 +186,29 @@ pub struct PaneTarget {
     pane_id: Option<u64>,
 }
 
+/// Which tab a command means: a stable ID, a name, or the active one.
+#[derive(Debug, Args)]
+pub struct TabTarget {
+    /// The tab's stable ID, from `list-tabs` or `layout`.
+    #[arg(long, conflicts_with = "tab_name")]
+    tab_id: Option<u64>,
+    /// The tab's name, matched case-insensitively. Refused when two tabs share it.
+    #[arg(long, conflicts_with = "tab_id")]
+    tab_name: Option<String>,
+}
+
+impl TabTarget {
+    /// The active tab when neither is given: a caller acting on "this tab" should not have to look
+    /// its ID up first.
+    fn selector(self) -> TabSelector {
+        match (self.tab_id, self.tab_name) {
+            (Some(tab_id), _) => TabSelector::Id(tab_id),
+            (None, Some(name)) => TabSelector::Name(name),
+            (None, None) => TabSelector::Active,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum MsgCommand {
     /// Print the server's pane-automation capabilities.
@@ -209,14 +232,61 @@ pub enum MsgCommand {
     SessionInspect,
     /// List tabs with stable IDs in display order.
     ListTabs,
-    /// Select a tab by its stable ID.
+    /// Select a tab by its stable ID or name.
     SelectTab {
-        #[arg(long)]
-        tab_id: u64,
+        #[command(flatten)]
+        tab: TabTarget,
         #[arg(long, value_enum)]
         wait: Option<CompletionArg>,
         #[arg(long, default_value = "30s", value_parser = parse_timeout)]
         timeout: Duration,
+    },
+    /// Describe every tab and pane: split tree, rectangles, and directional neighbors.
+    Layout,
+    /// Resolve a directional route, or the global `--pane-name`, to a pane without moving focus.
+    ResolvePane {
+        /// One step per direction, applied in order, e.g. `--path left,down`.
+        #[arg(long, value_delimiter = ',', value_enum)]
+        path: Vec<DirectionArg>,
+        /// Where the route starts. Defaults to the calling pane, else the tab's focused pane.
+        #[arg(long)]
+        pane_id: Option<u64>,
+        #[command(flatten)]
+        tab: TabTarget,
+    },
+    /// Name one pane so it stays addressable across a server restart.
+    PaneRename {
+        #[arg(long, conflicts_with = "clear")]
+        name: Option<crate::layout::PaneName>,
+        /// Release the pane's name.
+        #[arg(long, conflicts_with = "name")]
+        clear: bool,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Reveal a pane without moving focus or stealing the attachment.
+    ActivatePane(PaneTarget),
+    /// Open a tab and report the IDs it was given.
+    NewTab {
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Give a tab a name.
+    RenameTab {
+        #[arg(long)]
+        name: String,
+        #[command(flatten)]
+        tab: TabTarget,
+    },
+    /// Drop a tab's name so it falls back to its process-derived title.
+    ResetTabTitle {
+        #[command(flatten)]
+        tab: TabTarget,
+    },
+    /// Close a tab and every pane in it.
+    CloseTab {
+        #[command(flatten)]
+        tab: TabTarget,
     },
     /// Capture one non-blocking correlated diagnostic snapshot.
     Diagnose {
@@ -680,6 +750,7 @@ pub enum WaitCommand {
 pub fn run(
     explicit_target: Option<&str>,
     alias: Option<crate::agent::AgentAlias>,
+    pane_name: Option<crate::layout::PaneName>,
     command: MsgCommand,
 ) -> io::Result<()> {
     let target = explicit_target
@@ -695,15 +766,34 @@ pub fn run(
         .then(inherited_pane_from_environment)
         .flatten();
     let (method, explicit_pane, allow_focused, output) = build_request(command)?;
-    if alias.is_some() && explicit_pane.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+    for (first, second, message) in [
+        (
+            alias.is_some(),
+            explicit_pane.is_some(),
             "--alias and --pane-id name different panes; pass one",
-        ));
+        ),
+        (
+            pane_name.is_some(),
+            explicit_pane.is_some(),
+            "--pane-name and --pane-id name different panes; pass one",
+        ),
+        (
+            alias.is_some(),
+            pane_name.is_some(),
+            "--alias and --pane-name name different panes; pass one",
+        ),
+    ] {
+        if first && second {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
     }
     // An alias overrides an inherited pane, but an explicit `--pane-id` still wins over both. A
     // caller inside a pane who names an agent means that agent, not the pane they happen to be in.
-    let pane_id = explicit_pane.or_else(|| alias.is_none().then_some(inherited_pane).flatten());
+    let pane_id = explicit_pane.or_else(|| {
+        (alias.is_none() && pane_name.is_none())
+            .then_some(inherited_pane)
+            .flatten()
+    });
     if matches!(
         &method,
         AutomationMethod::ClosePane
@@ -713,11 +803,12 @@ pub fn run(
             | AutomationMethod::ReportMetadata { .. }
     ) && pane_id.is_none()
         && alias.is_none()
+        && pane_name.is_none()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{} requires --pane-id, --alias, or a same-session VVMUX_PANE_ID",
+                "{} requires --pane-id, --pane-name, --alias, or a same-session VVMUX_PANE_ID",
                 method.name()
             ),
         ));
@@ -729,6 +820,7 @@ pub fn run(
         id: 1,
         pane_id,
         agent: alias,
+        pane_name,
         allow_focused,
         method,
     };
@@ -800,6 +892,7 @@ pub(crate) fn request_json(
         id: 1,
         pane_id,
         agent: None,
+        pane_name: None,
         allow_focused,
         method,
     };
@@ -906,15 +999,68 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
         MsgCommand::ListPanes => (AutomationMethod::ListPanes, None, false, Output::Json),
         MsgCommand::SessionInspect => (AutomationMethod::SessionInspect, None, false, Output::Json),
         MsgCommand::ListTabs => (AutomationMethod::ListTabs, None, false, Output::Json),
-        MsgCommand::SelectTab {
-            tab_id,
-            wait,
-            timeout,
-        } => (
+        MsgCommand::SelectTab { tab, wait, timeout } => (
             AutomationMethod::SelectTab {
-                tab_id,
+                tab: tab.selector(),
                 wait: wait.map(Into::into),
                 timeout_ms: millis(timeout),
+            },
+            None,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::Layout => (AutomationMethod::Layout, None, false, Output::Json),
+        MsgCommand::ResolvePane { path, pane_id, tab } => (
+            AutomationMethod::ResolvePane {
+                // Absent rather than `Active` when nothing was named: the server then starts the
+                // route in the caller's own tab, which is what an agent asking for "the pane to my
+                // left" means even when it is looking at a tab that is not selected.
+                tab: (tab.tab_id.is_some() || tab.tab_name.is_some()).then(|| tab.selector()),
+                path: path.into_iter().map(Into::into).collect(),
+            },
+            pane_id,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::PaneRename {
+            name,
+            clear: _,
+            pane_id,
+        } => (
+            AutomationMethod::PaneRename { name },
+            pane_id,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::ActivatePane(target) => (
+            AutomationMethod::ActivatePane,
+            target.pane_id,
+            true,
+            Output::Json,
+        ),
+        MsgCommand::NewTab { name } => {
+            (AutomationMethod::NewTab { name }, None, false, Output::Json)
+        }
+        MsgCommand::RenameTab { name, tab } => (
+            AutomationMethod::RenameTab {
+                tab: tab.selector(),
+                name,
+            },
+            None,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::ResetTabTitle { tab } => (
+            AutomationMethod::ResetTabTitle {
+                tab: tab.selector(),
+            },
+            None,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::CloseTab { tab } => (
+            AutomationMethod::CloseTab {
+                tab: tab.selector(),
             },
             None,
             false,

@@ -15,32 +15,53 @@ Use this release-matched workflow:
    `class` and `mutating`, and only `observe` is non-mutating. Branch on `error_codes` rather than on
    message text, and filter `subscribe --name` against `event_kinds`. Capture `session-inspect`,
    `list-tabs`, and `list-panes`, then use exact stable tab and pane IDs.
-3. Capture the relevant screen, session, outer-projection, or trace sequence before acting.
-4. Use `focus` or `select-tab --tab-id ID` with `--wait outer` when media projection is the
+3. Discover shape with `msg layout`, not `list-panes`: it is the only call that reports the split
+   tree (`split_path`), pane rectangles, and directional `neighbors`, plus a `caller` block locating
+   your own pane. Translate "the pane on the left" with
+   `msg resolve-pane --path left` rather than guessing an ID; add `--tab-name` or `--tab-id` to
+   route in another tab, and repeat directions (`--path right,down`) to cross nested splits.
+   `neighbors` and `resolve-pane` are the navigation graph `action focus` uses, so a direction is
+   one step and not a global edge selector — a direction can land on a pane that is not strictly on
+   that side. Inspect `split_path` and `geometry` before acting on a phrase like "the bottom pane",
+   and ask the user when the wording still matches more than one pane.
+4. Name any pane you will come back to: `msg pane-rename --pane-id ID --name editor`, then target
+   it with `--pane-name editor`. Pane IDs are reassigned when a session is restored from its
+   snapshot; a pane name is written into that snapshot and comes back attached to the same pane, so
+   it is the only durable handle for a pane that is not running an agent. Names are unique per
+   session (`pane_name_taken`) and released with `--clear`.
+5. Use `msg activate-pane --pane-id ID` to make a hidden pane visible — it selects the owning tab
+   and lifts a zoom covering it — **without** moving focus or disturbing the attachment. Media
+   projection keys off visibility, so revealing a pane and focusing it are different requests.
+6. Address a tab by its stable `tab_id` or its `--tab-name`, never by display index. `new-tab`,
+   `rename-tab`, `reset-tab-title`, and `close-tab` are direct methods; the interactive rename and
+   close-confirmation modals are for humans and are not automation surface. A `--tab-name` that
+   matches two tabs is refused rather than guessed.
+7. Capture the relevant screen, session, outer-projection, or trace sequence before acting.
+8. Use `focus` or `select-tab --tab-id ID` with `--wait outer` when media projection is the
    assertion, or `--wait rendered` for the attached terminal frame. Use Vivido `wait frame`
    separately when GPU presentation matters.
-5. Follow `trace-media --after SEQUENCE --follow` with complete owner filters during recovery.
-6. On failure, capture `diagnose --all-panes --trace-limit 512`; create a metadata-only
+9. Follow `trace-media --after SEQUENCE --follow` with complete owner filters during recovery.
+10. On failure, capture `diagnose --all-panes --trace-limit 512`; create a metadata-only
    `vvmux debug-bundle` unless the user explicitly authorizes pane grid/text or log content.
-7. When a pane's reported agent state looks wrong, use `agent-explain --pane-id ID` before
+11. When a pane's reported agent state looks wrong, use `agent-explain --pane-id ID` before
    changing anything: it names the rule that decided and shows every rule's evidence. `diagnose`
    covers infrastructure, not classification.
-8. To run Codex in an available shell pane, use `agent-start --kind codex --pane-id ID`. Then send
+12. To run Codex in an available shell pane, use `agent-start --kind codex --pane-id ID`. Then send
    work with `agent-prompt --pane-id ID --wait --until blocked,done TEXT`; it separates prompt text
    from Enter and waits on agent lifecycle rather than screen text. Use `agent-send-keys` only for
    its bounded allow-listed control/navigation keys.
-9. For prior full-screen context, use `agent-read --pane-id ID --lines 200`. It requires an idle
+13. For prior full-screen context, use `agent-read --pane-id ID --lines 200`. It requires an idle
    alternate-screen agent and restores the viewport. If those gates do not hold, ask the agent to
    write a Markdown file and read it directly. When state looks wrong, inspect
    `agent-explain --pane-id ID` before changing anything.
-10. `agent-start` verifies the pane is a shell at its prompt, quotes arguments for that shell, and
+14. `agent-start` verifies the pane is a shell at its prompt, quotes arguments for that shell, and
    returns only once the agent is detected and settled. `agent_pane_busy` means the pane is running
    something else; `agent_not_launchable` means that provider is detection-only.
-11. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
+15. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
    polling each one. Treat a `gap` record as missed events, not as an error; it is never filtered
    out even when the stream is narrowed.
 
-12. Name an agent you will come back to: `agent-rename --pane-id ID --name reviewer`. Then target it
+16. Name an agent you will come back to: `agent-rename --pane-id ID --name reviewer`. Then target it
    with `--alias reviewer` on any `msg` command instead of `--pane-id`, which keeps working after
    splits, closes, and renumbering. Names are unique per session (`agent_alias_taken`), belong to
    the agent process rather than the pane, and are cleared when that agent exits or is replaced —
@@ -48,16 +69,16 @@ Use this release-matched workflow:
    `agent-rename --pane-id ID --clear` to release a name. Pane IDs remain correct for everything
    else; a name is for an agent you drive repeatedly.
 
-13. A session's shape survives its server restarting, so do not rebuild it by hand after a restart.
+17. A session's shape survives its server restarting, so do not rebuild it by hand after a restart.
    `snapshot` reports whether this session came from one. Pane IDs are reassigned on restore — they
-   are stable only within one run of a server — so never persist a pane ID across a restart; name
-   the agent and target it by name instead.
+   are stable only within one run of a server — so never persist a pane ID across a restart. Use
+   `pane-rename` for a pane and `agent-rename` for an agent running in one; both survive.
 
-14. Pane history (`[session] pane_history`) is off by default and must stay a user decision: it
+18. Pane history (`[session] pane_history`) is off by default and must stay a user decision: it
    writes whatever scrolled past a pane — including secrets — to disk. Never enable it on a user's
    behalf to make a task easier.
 
-15. After a restart, an agent pane reopens its own conversation when a client attaches — check
+19. After a restart, an agent pane reopens its own conversation when a client attaches — check
    `inspect`'s `pending_resume` before concluding a pane is a bare shell, and do not launch a second
    agent into it. A resume needs the agent's provider plugin installed with its integration
    (`vvmux plugin install claude`), because the session identity it uses comes from that

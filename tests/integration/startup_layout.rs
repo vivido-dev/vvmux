@@ -1291,3 +1291,231 @@ fn a_resuming_pane_gets_no_history_replay_but_its_neighbour_does() {
         "the pane with no agent lost its history too"
     );
 }
+
+/// The whole point of a pane name: a pane ID does not survive a restart, and a name does.
+#[test]
+fn pane_names_survive_a_restart_that_reassigns_pane_ids() {
+    let fixture = Fixture::new("pane-names");
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1 tab=1");
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
+    for pane in 1..=3 {
+        fixture.wait_text(pane, &format!("READY pane={pane}"));
+    }
+
+    // Name the pane that is neither first nor focused, so a restart that "restored the name" by
+    // accident of ordering would be caught.
+    assert_success(&fixture.msg(&["pane-rename", "--pane-id", "2", "--name", "editor"]));
+    let named = json(fixture.msg(&["inspect", "--pane-name", "editor"]));
+    assert_eq!(named["pane"]["pane_id"], 2);
+    let before_path = named["pane"]["split_path"].clone();
+    assert!(before_path.is_array(), "no split path: {named}");
+
+    fixture.kill();
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1");
+    assert_eq!(
+        json(fixture.msg(&["snapshot"]))["restored_from_snapshot"],
+        true
+    );
+
+    let after = json(fixture.msg(&["inspect", "--pane-name", "editor"]));
+    assert!(
+        after["pane"]["pane_id"].is_number(),
+        "the name did not survive the restart: {after}"
+    );
+    assert_eq!(after["pane"]["pane_name"], "editor");
+    // The name came back attached to the same *place* in the layout, which is what makes it a
+    // usable target: restoring it onto whichever pane happened to be first would be worse than
+    // losing it.
+    assert_eq!(
+        after["pane"]["split_path"], before_path,
+        "the restored name landed on a different pane"
+    );
+}
+
+#[test]
+fn a_pane_name_is_unique_and_releasable() {
+    let fixture = Fixture::new("pane-name-unique");
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1 tab=1");
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    fixture.wait_text(2, "READY pane=2");
+
+    assert_success(&fixture.msg(&["pane-rename", "--pane-id", "1", "--name", "editor"]));
+    let taken = fixture.msg(&["pane-rename", "--pane-id", "2", "--name", "editor"]);
+    assert!(!taken.status.success());
+    assert!(
+        String::from_utf8_lossy(&taken.stderr).contains("pane_name_taken"),
+        "{}",
+        String::from_utf8_lossy(&taken.stderr)
+    );
+
+    // Renaming a pane to the name it already holds is not a collision with itself.
+    assert_success(&fixture.msg(&["pane-rename", "--pane-id", "1", "--name", "editor"]));
+
+    // Cleared, then free for another pane.
+    assert_success(&fixture.msg(&["pane-rename", "--pane-id", "1", "--clear"]));
+    assert_success(&fixture.msg(&["pane-rename", "--pane-id", "2", "--name", "editor"]));
+    assert_eq!(
+        json(fixture.msg(&["inspect", "--pane-name", "editor"]))["pane"]["pane_id"],
+        2
+    );
+}
+
+/// `layout` has to describe the tree, and `resolve-pane` has to walk the same graph focus does.
+#[test]
+fn layout_describes_the_tree_and_resolve_pane_agrees_with_focus() {
+    let fixture = Fixture::new("topology");
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1 tab=1");
+    // 1 on the left; 2 above 3 on the right.
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "2"]));
+    for pane in 1..=3 {
+        fixture.wait_text(pane, &format!("READY pane={pane}"));
+    }
+
+    let layout = json(fixture.msg(&["layout"]));
+    assert_eq!(layout["schema_version"], 1);
+    let panes = layout["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(panes.len(), 3);
+    let path_of = |pane_id: u64| {
+        panes
+            .iter()
+            .find(|pane| pane["pane_id"] == pane_id)
+            .map(|pane| pane["split_path"].clone())
+            .unwrap()
+    };
+    // Position in the tree, not on screen: a resize moves the rectangles and leaves these alone.
+    assert_eq!(path_of(1), serde_json::json!([1]));
+    assert_eq!(path_of(2), serde_json::json!([2, 1]));
+    assert_eq!(path_of(3), serde_json::json!([2, 2]));
+
+    // Every direction resolve-pane can walk must land where `action focus` would, or the two
+    // models an agent holds — "where is that pane" and "go to that pane" — disagree.
+    for direction in ["left", "right", "up", "down"] {
+        let resolved = fixture.msg(&["resolve-pane", "--pane-id", "1", "--path", direction]);
+        assert_success(&fixture.msg(&["focus", "--pane-id", "1"]));
+        let focused = fixture.msg(&["action", "focus", direction, "--pane-id", "1"]);
+        if !resolved.status.success() {
+            // Nothing that way: focus must have stayed put rather than moved somewhere else.
+            assert_success(&focused);
+            assert_eq!(
+                json(fixture.msg(&["layout"]))["tabs"][0]["focused_pane_id"],
+                1,
+                "{direction}: resolve-pane found nothing but focus moved"
+            );
+            continue;
+        }
+        let target = json(resolved)["target"]["pane_id"].clone();
+        assert_success(&focused);
+        assert_eq!(
+            json(fixture.msg(&["layout"]))["tabs"][0]["focused_pane_id"],
+            target,
+            "{direction}: resolve-pane and action focus disagree"
+        );
+    }
+
+    // A route is a sequence of steps, and a step that cannot be taken fails rather than stopping
+    // early on a pane the caller did not ask for.
+    let over = fixture.msg(&["resolve-pane", "--pane-id", "1", "--path", "left,left"]);
+    assert!(!over.status.success());
+    assert!(
+        String::from_utf8_lossy(&over.stderr).contains("pane_not_found"),
+        "{}",
+        String::from_utf8_lossy(&over.stderr)
+    );
+}
+
+/// Revealing a pane and typing into it are different requests.
+#[test]
+fn activate_pane_reveals_without_taking_focus() {
+    let fixture = Fixture::new("activate");
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1 tab=1");
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    fixture.wait_text(2, "READY pane=2");
+    assert_success(&fixture.msg(&["action", "new-tab"]));
+    fixture.wait_text(3, "READY pane=3");
+
+    // Zoom pane 1, which hides pane 2 behind it, and select the other tab.
+    assert_success(&fixture.msg(&["focus", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["action", "toggle-zoom", "--pane-id", "1"]));
+    let first_tab = json(fixture.msg(&["list-tabs"]))["tabs"][0]["tab_id"].clone();
+    let second_tab = json(fixture.msg(&["list-tabs"]))["tabs"][1]["tab_id"].clone();
+    assert_success(&fixture.msg(&["select-tab", "--tab-id", &second_tab.to_string()]));
+
+    let activated = json(fixture.msg(&["activate-pane", "--pane-id", "2"]));
+    assert_eq!(activated["tab_selected"], true, "{activated}");
+    assert_eq!(
+        activated["unzoomed"], true,
+        "a zoom hiding the target must be lifted: {activated}"
+    );
+    assert_eq!(activated["focus_changed"], false);
+
+    let layout = json(fixture.msg(&["layout"]));
+    assert_eq!(layout["active_tab_id"], first_tab);
+    let tab = layout["tabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tab| tab["tab_id"] == first_tab)
+        .unwrap();
+    assert!(tab["zoomed_pane_id"].is_null(), "zoom was not lifted");
+    // The pane that had focus still has it. Revealing is not selecting.
+    assert_eq!(
+        tab["focused_pane_id"], 1,
+        "activate-pane moved focus: {layout}"
+    );
+}
+
+#[test]
+fn tabs_are_addressable_and_renameable_by_name() {
+    let fixture = Fixture::new("tab-names");
+    assert_success(&fixture.start_without_layout());
+    fixture.wait_text(1, "READY pane=1 tab=1");
+
+    let created = json(fixture.msg(&["new-tab", "--name", "logs"]));
+    assert_eq!(created["tab_name"], "logs");
+    let logs_tab = created["tab_id"].clone();
+    // `action new-tab` answers nothing; this reports the identities it just made.
+    assert!(created["pane_id"].is_number(), "{created}");
+
+    // Matched case-insensitively: a name is typed by a person.
+    let selected = json(fixture.msg(&["select-tab", "--tab-name", "LOGS"]));
+    assert_eq!(selected["tab_id"], logs_tab);
+
+    let renamed = json(fixture.msg(&["rename-tab", "--tab-name", "logs", "--name", "server"]));
+    assert_eq!(renamed["previous_tab_name"], "logs");
+    assert_eq!(renamed["tab_name"], "server");
+
+    let reset = json(fixture.msg(&["reset-tab-title", "--tab-name", "server"]));
+    assert!(reset["tab_name"].is_null(), "{reset}");
+
+    // An ambiguous name is refused rather than resolved by position: acting on the wrong tab is
+    // worse than saying the name does not identify one.
+    assert_success(&fixture.msg(&["new-tab", "--name", "twin"]));
+    assert_success(&fixture.msg(&["new-tab", "--name", "twin"]));
+    let ambiguous = fixture.msg(&["select-tab", "--tab-name", "twin"]);
+    assert!(!ambiguous.status.success());
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr).contains("more than one tab"),
+        "{}",
+        String::from_utf8_lossy(&ambiguous.stderr)
+    );
+
+    let closed = json(fixture.msg(&["close-tab", "--tab-id", &logs_tab.to_string()]));
+    assert_eq!(closed["accepted"], true);
+    assert!(!closed["closed_pane_ids"].as_array().unwrap().is_empty());
+    let remaining = json(fixture.msg(&["list-tabs"]));
+    assert!(
+        !remaining["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tab| tab["tab_id"] == logs_tab),
+        "the tab was not closed: {remaining}"
+    );
+}
