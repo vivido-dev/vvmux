@@ -3,7 +3,7 @@ name = "vvmux"
 version = "0.4.2"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/vivido-dev/vvmux"
 description = "A detachable Vivid-aware terminal multiplexer"
@@ -69,15 +69,17 @@ vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
 zeroize = { version = "1.9", features = ["serde"] }
 vvmux-plugin-api = { version = "0.5", path = "vvmux-plugin-api" }
-# 38.0.4 was the original design pin but now has applicable RustSec sandbox/WASI advisories.
-# 36.0.13 is the fully patched maintenance line that still supports this workspace's Rust 1.88.
-wasmtime = { version = "47", default-features = false, features = [
+# Track the current wasmtime line rather than an older maintenance one: the sandbox and WASI
+# host surfaces are where security fixes land, and falling behind is how this pin previously
+# ended up on a release with open advisories. `wasmtime` and `wasmtime-wasi` are one versioned
+# surface and must move together. Both require Rust 1.95, which sets this crate's MSRV.
+wasmtime = { version = "48", default-features = false, features = [
   "component-model",
   "cranelift",
   "runtime",
   "std",
 ] }
-wasmtime-wasi = { version = "47", default-features = false }
+wasmtime-wasi = { version = "48", default-features = false }
 
 [features]
 default = ["server-capability"]

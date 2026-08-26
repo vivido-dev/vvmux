@@ -16,7 +16,7 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{
     Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline,
 };
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::plugin_supervisor::{BrokerLease, HostBroker};
 
@@ -236,21 +236,16 @@ impl ComponentRuntime {
         for preopen in preopens {
             match preopen {
                 ComponentPreopen::Package => {
-                    wasi.preopened_dir(root, "/package", DirPerms::READ, FilePerms::READ)
+                    wasi.preopened_dir(root, "/package", FsPerms::ReadOnly)
                         .map_err(component_error)?;
                 }
                 ComponentPreopen::Config => {
-                    wasi.preopened_dir(&paths.config, "/config", DirPerms::READ, FilePerms::READ)
+                    wasi.preopened_dir(&paths.config, "/config", FsPerms::ReadOnly)
                         .map_err(component_error)?;
                 }
                 ComponentPreopen::Data => {
-                    wasi.preopened_dir(
-                        &paths.data,
-                        "/data",
-                        DirPerms::READ | DirPerms::MUTATE,
-                        FilePerms::READ | FilePerms::WRITE,
-                    )
-                    .map_err(component_error)?;
+                    wasi.preopened_dir(&paths.data, "/data", FsPerms::ReadWrite)
+                        .map_err(component_error)?;
                 }
             }
         }
