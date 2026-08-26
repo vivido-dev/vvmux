@@ -150,6 +150,7 @@ pub fn attach(
         display,
         vivid,
         kitty_graphics,
+        outer_identity(vivid, display),
     )?;
     let terminal = ClientTerminal::enter()?;
 
@@ -579,6 +580,41 @@ fn host_supports_kitty_graphics(term: Option<&std::ffi::OsStr>) -> bool {
     )
 }
 
+/// What this client can say about the Vivido window presenting it, with nothing sensitive in it.
+///
+/// Read here and nowhere else: the environment this reads is the foreground client's, and it is
+/// deliberately scrubbed from every pane. `VIVID_*` never appears in the result — not the
+/// endpoint, not the root secret, not a derived value — because the whole reason this struct
+/// exists is to give the daemon an identity without giving it authority.
+fn outer_identity(
+    vivid: bool,
+    display: crate::ipc::DisplayMetrics,
+) -> Option<crate::ipc::OuterIdentity> {
+    let window_id = std::env::var("VIVIDO_WINDOW_ID")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let session = std::env::var("VIVIDO_SESSION")
+        .ok()
+        .filter(|value| !value.is_empty());
+    // Set by `vvssh` in the remote shell, so a pane here is on a different machine from the
+    // Vivido window presenting it and cannot reach its automation socket.
+    let remote = std::env::var_os("VIVID_REMOTE").is_some_and(|value| value == "1");
+    // Nothing to say. A client with no window ID, no session name, and no Vivid endpoint is not
+    // hosted by a Vivido window in any way a pane agent could act on.
+    if window_id.is_none() && session.is_none() && !vivid {
+        return None;
+    }
+    Some(crate::ipc::OuterIdentity {
+        vivido_window_id: window_id,
+        vivido_session: session,
+        has_outer_endpoint: vivid,
+        remote,
+        cell_width: display.cell_width,
+        cell_height: display.cell_height,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn request_attachment(
     reader: &mut crate::ipc::RecordReader,
     writer: &SharedWriter,
@@ -587,6 +623,7 @@ fn request_attachment(
     display: crate::ipc::DisplayMetrics,
     vivid: bool,
     kitty_graphics: bool,
+    outer: Option<crate::ipc::OuterIdentity>,
 ) -> io::Result<bool> {
     send_client(
         writer,
@@ -596,6 +633,7 @@ fn request_attachment(
             display,
             vivid,
             kitty_graphics,
+            outer,
         },
     )?;
     match reader.recv_server()? {
@@ -2352,6 +2390,7 @@ mod tests {
             },
             true,
             false,
+            None,
         )
         .unwrap_err();
 

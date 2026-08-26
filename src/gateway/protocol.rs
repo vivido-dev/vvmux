@@ -36,6 +36,23 @@ pub(crate) enum ClientControl {
         #[serde(default)]
         vivid: bool,
     },
+    /// Open a session for automation without taking its terminal attachment.
+    ///
+    /// What an automation-scoped token uses instead of `attach`: a request needs a connection, not
+    /// a terminal, and evicting whoever is sitting at the session is exactly the authority that
+    /// token does not have.
+    SelectSession {
+        request_id: u64,
+        name: String,
+    },
+    /// One automation request, carried verbatim.
+    ///
+    /// The same `AutomationRequest` the local socket takes, so the remote surface cannot drift
+    /// from the local one — there is no second definition of what a method is.
+    Automation {
+        request_id: u64,
+        request: Box<crate::ipc::AutomationRequest>,
+    },
     Resize {
         display: WireDisplay,
     },
@@ -206,6 +223,22 @@ pub(crate) enum ServerControl<'a> {
         server_version: &'static str,
         capabilities: &'static [&'static str],
         vivid: VividAccess<'a>,
+    },
+    SessionSelected {
+        request_id: u64,
+        name: String,
+    },
+    /// One automation reply, carried verbatim.
+    Automation {
+        request_id: u64,
+        response: Box<crate::ipc::AutomationResponse>,
+    },
+    /// A reply too large for one frame, in order.
+    AutomationChunk {
+        request_id: u64,
+        index: u32,
+        last: bool,
+        base64: String,
     },
     Sessions {
         request_id: u64,

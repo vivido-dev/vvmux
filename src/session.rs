@@ -531,6 +531,12 @@ struct AttachedClient {
     kitty_graphics: bool,
     rendered_session_sequence: u64,
     frame_sequences: VecDeque<(u64, u64)>,
+    /// Which Vivido window is presenting this session, as the client reported it.
+    ///
+    /// Replaced wholesale on every attach, because a reattach can be a different window. Gone when
+    /// nothing is attached, which is itself the answer a pane agent needs: with no client there is
+    /// no window to address.
+    outer: Option<crate::ipc::OuterIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1609,6 +1615,10 @@ struct SessionActor {
     response_sender: mpsc::SyncSender<AutomationResponseJob>,
     automation_inflight: HashMap<u64, HashSet<u64>>,
     /// Replies already produced for an idempotency key, so a retry returns the first answer.
+    /// Advisory pane leases, so several agents can share one session without fighting.
+    leases: crate::lease::Leases,
+    /// A recording in progress, started explicitly and never by default.
+    recorder: Option<crate::record::Recorder>,
     idempotency_keys: HashMap<String, serde_json::Value>,
     /// Insertion order, so the bounded map evicts the oldest key rather than an arbitrary one.
     idempotency_order: VecDeque<String>,
@@ -1841,6 +1851,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         actor_wakeups: 0,
         response_sender,
         automation_inflight: HashMap::new(),
+        leases: crate::lease::Leases::default(),
+        recorder: None,
         idempotency_keys: HashMap::new(),
         idempotency_order: VecDeque::new(),
         pending_actor_work: HashSet::new(),
@@ -2127,10 +2139,20 @@ impl SessionActor {
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
                     pane.transcript.push(&bytes);
                 }
+                if self.recorder.is_some() {
+                    use base64::Engine as _;
+                    let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    self.record(crate::record::RecordedEvent::Output { pane_id, base64 });
+                }
                 self.drive_pane_terminal(pane_id, |terminal| terminal.feed(&bytes));
                 self.check_automation_waiters();
             }
             ActorEvent::PtyExit(pane_id, status) => {
+                self.record(crate::record::RecordedEvent::PaneExited {
+                    pane_id,
+                    code: status.and_then(|status| status.code),
+                    signal: status.and_then(|status| status.signal),
+                });
                 self.publish_plugin_event(
                     "pane.exited",
                     serde_json::json!({
@@ -2622,6 +2644,7 @@ impl SessionActor {
                 display,
                 vivid,
                 kitty_graphics,
+                outer,
             } => {
                 let view = match target {
                     AttachmentTarget::Session => AttachmentView::Session,
@@ -2694,6 +2717,7 @@ impl SessionActor {
                 self.attached = Some(AttachedClient {
                     id,
                     writer: writer.clone(),
+                    outer,
                     display,
                     view,
                     // This client never received the session's historical frames. Start its
@@ -3220,6 +3244,33 @@ impl SessionActor {
             None
         };
 
+        // Input is recorded as a class and a byte count and never as bytes: a recording is a file,
+        // and what is typed into a terminal is passwords and tokens.
+        if self.recorder.is_some()
+            && let Some(pane_id) = pane_id
+            && let Some(bytes) = automation_input_bytes(&request.method)
+        {
+            self.record(crate::record::RecordedEvent::Input {
+                pane_id,
+                bytes,
+                class: request.method.name().to_owned(),
+            });
+        }
+        // A lease is checked first: being refused because somebody else holds the pane is a
+        // different answer from being refused because the screen moved, and the caller should get
+        // the one that is actually blocking them.
+        if !matches!(request.method, AutomationMethod::Lease(_)) {
+            let class = crate::ipc::METHOD_CAPABILITIES
+                .iter()
+                .find(|capability| capability.name == request.method.name())
+                .map(|capability| capability.class);
+            if let Some(class) = class
+                && let Err(error) = self.leases.check(pane_id, class, request.lease.as_deref())
+            {
+                self.reply_automation_error(target, error);
+                return;
+            }
+        }
         // Both guards run after the pane is resolved and before any handler: an expectation about
         // a pane's screen needs to know which pane, and a replayed key must not reach a PTY.
         if let Some(expect) = request.expect
@@ -3673,6 +3724,37 @@ impl SessionActor {
             AutomationMethod::ActivatePane => {
                 let pane_id = pane_id.unwrap();
                 match self.automation_activate_pane(pane_id) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::Record(ref operation) => match self.automation_record(operation) {
+                Ok(result) => self.reply_automation(target, result),
+                Err(error) => self.reply_automation_error(target, error),
+            },
+            AutomationMethod::Lease(ref operation) => {
+                let instance = self.session_instance.clone();
+                let result = match operation {
+                    crate::ipc::LeaseOperation::Acquire {
+                        scope,
+                        ttl_ms,
+                        holder,
+                    } => self.leases.acquire(
+                        pane_id.unwrap(),
+                        *scope,
+                        Duration::from_millis(*ttl_ms),
+                        holder.clone(),
+                        &instance,
+                    ),
+                    crate::ipc::LeaseOperation::Renew { lease_id, ttl_ms } => {
+                        self.leases.renew(lease_id, Duration::from_millis(*ttl_ms))
+                    }
+                    crate::ipc::LeaseOperation::Release { lease_id } => {
+                        self.leases.release(lease_id)
+                    }
+                    crate::ipc::LeaseOperation::List => Ok(self.leases.list()),
+                };
+                match result {
                     Ok(result) => self.reply_automation(target, result),
                     Err(error) => self.reply_automation_error(target, error),
                 }
@@ -5705,6 +5787,124 @@ impl SessionActor {
         })
     }
 
+    /// Start, stop, or report on a session recording.
+    fn automation_record(
+        &mut self,
+        operation: &crate::ipc::RecordOperation,
+    ) -> Result<serde_json::Value, AutomationError> {
+        match operation {
+            crate::ipc::RecordOperation::Start { path } => {
+                if self.recorder.is_some() {
+                    return Err(AutomationError::new(
+                        "invalid_state",
+                        "this session is already recording",
+                    ));
+                }
+                let path = std::path::PathBuf::from(path);
+                if !path.is_absolute() {
+                    return Err(AutomationError::new(
+                        "invalid_params",
+                        "a recording path must be absolute; the session's working directory is                          not the caller's",
+                    ));
+                }
+                let mut recorder = crate::record::Recorder::new(path.clone());
+                // The opening frame is the session's shape, so a replay has somewhere to start
+                // rather than inferring a layout from whichever panes happen to produce output.
+                recorder.push(
+                    self.session_sequence,
+                    crate::record::RecordedEvent::Opened {
+                        session: self.name.clone(),
+                        layout: self.automation_layout(None),
+                    },
+                );
+                self.recorder = Some(recorder);
+                Ok(serde_json::json!({
+                    "recording": true,
+                    "path": path.display().to_string(),
+                }))
+            }
+            crate::ipc::RecordOperation::Stop => {
+                let recorder = self.recorder.take().ok_or_else(|| {
+                    AutomationError::new("invalid_state", "this session is not recording")
+                })?;
+                recorder
+                    .finish()
+                    .map_err(|error| AutomationError::new("save_failed", error.to_string()))
+            }
+            crate::ipc::RecordOperation::Status => Ok(serde_json::json!({
+                "recording": self.recorder.is_some(),
+                "path": self
+                    .recorder
+                    .as_ref()
+                    .map(|recorder| recorder.path().display().to_string()),
+                "events": self.recorder.as_ref().map(crate::record::Recorder::len),
+            })),
+        }
+    }
+
+    /// Note something in the recording, if one is running.
+    fn record(&mut self, event: crate::record::RecordedEvent) {
+        let sequence = self.session_sequence;
+        if let Some(recorder) = self.recorder.as_mut() {
+            recorder.push(sequence, event);
+        }
+    }
+
+    /// Who is presenting this session, and how to address them.
+    ///
+    /// Never carries the outer Vivid endpoint or root secret; those stay in the foreground client
+    /// by design and this struct exists precisely so the daemon can answer "which window" without
+    /// ever holding "how to reach it".
+    fn outer_identity_json(&self) -> serde_json::Value {
+        let Some(outer) = self
+            .attached
+            .as_ref()
+            .and_then(|client| client.outer.as_ref())
+        else {
+            return serde_json::Value::Null;
+        };
+        serde_json::json!({
+            "vivido_window_id": outer.vivido_window_id,
+            "vivido_session": outer.vivido_session,
+            "has_outer_endpoint": outer.has_outer_endpoint,
+            "remote": outer.remote,
+            "cell_width": outer.cell_width,
+            "cell_height": outer.cell_height,
+            // Stated rather than left to be worked out: a `vivido msg` from a pane on another
+            // machine cannot reach an owner-only local socket, so the route does not exist.
+            "vivido_automation_reachable": !outer.remote && outer.vivido_window_id.is_some(),
+        })
+    }
+
+    /// Where a pane sits inside the presenting Vivido window, in physical pixels.
+    ///
+    /// The crop a caller applies to `vivido msg screenshot` to get just this pane. Absent when no
+    /// client is attached or its cell metrics are unknown, because a rectangle computed from a
+    /// guessed cell size would be confidently wrong.
+    fn pane_outer_crop_json(&self, pane_id: PaneId) -> serde_json::Value {
+        let Some(outer) = self
+            .attached
+            .as_ref()
+            .and_then(|client| client.outer.as_ref())
+        else {
+            return serde_json::Value::Null;
+        };
+        let (Ok(content), true) = (
+            self.pane_content_rect(pane_id),
+            outer.cell_width > 0 && outer.cell_height > 0,
+        ) else {
+            return serde_json::Value::Null;
+        };
+        let (cell_width, cell_height) = (u32::from(outer.cell_width), u32::from(outer.cell_height));
+        serde_json::json!({
+            "x": u32::from(content.x) * cell_width,
+            "y": u32::from(content.y) * cell_height,
+            "width": u32::from(content.width) * cell_width,
+            "height": u32::from(content.height) * cell_height,
+            "vivido_window_id": outer.vivido_window_id,
+        })
+    }
+
     /// Everything `capture` returns once its pane has settled.
     fn capture_payload(
         &self,
@@ -6597,6 +6797,9 @@ impl SessionActor {
                 "rendered_session_sequence": client.rendered_session_sequence,
                 "pending_frame_acknowledgements": client.frame_sequences.len(),
             })),
+            // Null with nothing attached, which is the honest answer: with no client there is no
+            // window presenting this session and nothing for a pane agent to address.
+            "outer": self.outer_identity_json(),
             "active_tab_id": self.active_tab().map(|tab| tab.id),
             "active_pane_id": self.active_tab().map(|tab| tab.focused),
             "session_sequence": self.session_sequence,
@@ -7598,6 +7801,7 @@ impl SessionActor {
             "process": self.pane_process_json(pane),
             "output_offset": pane.transcript.offset,
             "retained_output_from_offset": pane.transcript.start(),
+            "outer_crop": self.pane_outer_crop_json(pane_id),
             "screen_sequence": pane.screen_sequence,
             "session_sequence": self.session_sequence,
         }))
@@ -12240,6 +12444,9 @@ impl SessionActor {
             self.pending_media_projections.clear();
             self.vivid.deactivate_bridge();
         }
+        // A lease on a pane that no longer exists would keep refusing requests for a pane nobody
+        // can reach, until it expired.
+        self.leases.forget_pane(pane_id);
         if let Some(pending) = self.alt_reads.remove(&pane_id) {
             self.reply_automation_error(
                 pending.reply,
@@ -12544,6 +12751,14 @@ impl SessionActor {
             serde_json::json!({"layout_revision": self.layout_revision}),
             None,
         );
+        if self.recorder.is_some() {
+            let layout_sequence = self.layout_revision;
+            let layout = self.automation_layout(None);
+            self.record(crate::record::RecordedEvent::Layout {
+                layout_sequence,
+                layout,
+            });
+        }
         self.schedule_render();
     }
 
@@ -13971,6 +14186,22 @@ fn pane_cwd(_child_pid: u32) -> Option<String> {
     None
 }
 
+/// How many bytes a request would write to a PTY, when it writes any.
+///
+/// The length only. A recording that stored the bytes would be a credential dump wearing a
+/// feature's clothes, and the shape of a session is reproducible without them.
+fn automation_input_bytes(method: &AutomationMethod) -> Option<usize> {
+    match method {
+        AutomationMethod::Typing { text, .. }
+        | AutomationMethod::Paste { text, .. }
+        | AutomationMethod::SubmitLine { text, .. } => Some(text.len()),
+        AutomationMethod::Key { key, repeat, .. } => Some(key.len() * usize::from(*repeat).max(1)),
+        AutomationMethod::ShellCommand { command, .. } => Some(command.len()),
+        AutomationMethod::Mouse { .. } => Some(0),
+        _ => None,
+    }
+}
+
 /// Build a text pattern from a literal or a bounded regular expression.
 ///
 /// Shared by `wait text` and `wait output` so the two cannot come to disagree about how large a
@@ -14065,6 +14296,12 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
             | AutomationMethod::ResetTabTitle { .. }
             | AutomationMethod::CloseTab { .. }
             | AutomationMethod::SaveLayout { .. }
+            | AutomationMethod::Record(_)
+            | AutomationMethod::Lease(
+                crate::ipc::LeaseOperation::Renew { .. }
+                    | crate::ipc::LeaseOperation::Release { .. }
+                    | crate::ipc::LeaseOperation::List,
+            )
             | AutomationMethod::SessionSnapshot
             | AutomationMethod::Plugin(_)
             // Session-wide. Its filter may name a pane, but that narrows the stream rather than
@@ -14515,6 +14752,8 @@ pub(crate) const AUTOMATION_ERROR_CODES: &[&str] = &[
     "invalid_params",
     "invalid_state",
     "job_not_found",
+    "lease_denied",
+    "lease_not_found",
     "limit_exceeded",
     "missing_attachment",
     "mouse_reporting_disabled",

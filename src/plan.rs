@@ -580,6 +580,7 @@ fn plain_request(id: u64, method: AutomationMethod) -> AutomationRequest {
         pane_id: None,
         agent: None,
         pane_name: None,
+        lease: None,
         allow_focused: false,
         expect: None,
         idempotency_key: None,
@@ -675,6 +676,7 @@ fn execute_step(
         pane_id,
         agent: alias,
         pane_name,
+        lease: None,
         // A plan is explicit about its targets. Falling back to whatever happens to be focused
         // would make the same plan act on different panes on different runs.
         allow_focused: false,

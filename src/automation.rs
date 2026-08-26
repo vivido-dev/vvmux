@@ -213,6 +213,16 @@ impl TabTarget {
 pub enum MsgCommand {
     /// Print the server's pane-automation capabilities.
     Capabilities,
+    /// Start or stop a bounded session recording.
+    Record {
+        #[command(subcommand)]
+        command: RecordCommand,
+    },
+    /// Take, renew, release, or list advisory pane leases, so several agents can share a session.
+    Lease {
+        #[command(subcommand)]
+        command: LeaseCommand,
+    },
     /// Run a bounded multi-step plan over one connection.
     ///
     /// Results flow between steps by alias, so a plan does not have to be re-parsed and re-passed
@@ -794,6 +804,46 @@ pub enum MsgCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum RecordCommand {
+    /// Begin recording. Nothing is written until `stop`.
+    Start {
+        /// Absolute path the recording is written to.
+        path: String,
+    },
+    /// Stop recording and write the file.
+    Stop,
+    /// Report whether this session is recording.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LeaseCommand {
+    /// Take a lease on one pane.
+    Acquire {
+        #[arg(long, value_enum)]
+        scope: crate::lease::LeaseScope,
+        /// How long it lives. Bounded, because a crashed holder must not keep a pane forever.
+        #[arg(long, default_value = "60s", value_parser = parse_timeout)]
+        ttl: Duration,
+        /// A name shown to whoever is refused, so "who has this pane" has an answer.
+        #[arg(long)]
+        holder: Option<String>,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Extend a lease you already hold.
+    Renew {
+        lease_id: String,
+        #[arg(long, default_value = "60s", value_parser = parse_timeout)]
+        ttl: Duration,
+    },
+    /// Give a lease back.
+    Release { lease_id: String },
+    /// Show every live lease.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum WaitCommand {
     /// Wait until visible pane text contains a literal or regular expression.
     Text {
@@ -904,6 +954,7 @@ pub enum WaitCommand {
 pub struct RequestOptions {
     pub alias: Option<crate::agent::AgentAlias>,
     pub pane_name: Option<crate::layout::PaneName>,
+    pub lease: Option<String>,
     pub expect: crate::ipc::ExpectedState,
     pub idempotency_key: Option<String>,
 }
@@ -916,6 +967,7 @@ pub fn run(
     let RequestOptions {
         alias,
         pane_name,
+        lease,
         expect,
         idempotency_key,
     } = options;
@@ -1001,6 +1053,7 @@ pub fn run(
         pane_id,
         agent: alias,
         pane_name,
+        lease,
         allow_focused,
         expect: (!expect.is_empty()).then_some(expect),
         idempotency_key,
@@ -1075,6 +1128,7 @@ pub(crate) fn request_json(
         pane_id,
         agent: None,
         pane_name: None,
+        lease: None,
         expect: None,
         idempotency_key: None,
         allow_focused,
@@ -1326,6 +1380,54 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 Output::Json,
             )
         }
+        MsgCommand::Record { command } => (
+            AutomationMethod::Record(match command {
+                RecordCommand::Start { path } => crate::ipc::RecordOperation::Start { path },
+                RecordCommand::Stop => crate::ipc::RecordOperation::Stop,
+                RecordCommand::Status => crate::ipc::RecordOperation::Status,
+            }),
+            None,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::Lease { command } => match command {
+            LeaseCommand::Acquire {
+                scope,
+                ttl,
+                holder,
+                pane_id,
+            } => (
+                AutomationMethod::Lease(crate::ipc::LeaseOperation::Acquire {
+                    scope,
+                    ttl_ms: millis(ttl),
+                    holder,
+                }),
+                pane_id,
+                true,
+                Output::Json,
+            ),
+            LeaseCommand::Renew { lease_id, ttl } => (
+                AutomationMethod::Lease(crate::ipc::LeaseOperation::Renew {
+                    lease_id,
+                    ttl_ms: millis(ttl),
+                }),
+                None,
+                false,
+                Output::Json,
+            ),
+            LeaseCommand::Release { lease_id } => (
+                AutomationMethod::Lease(crate::ipc::LeaseOperation::Release { lease_id }),
+                None,
+                false,
+                Output::Json,
+            ),
+            LeaseCommand::List => (
+                AutomationMethod::Lease(crate::ipc::LeaseOperation::List),
+                None,
+                false,
+                Output::Json,
+            ),
+        },
         MsgCommand::ShellCommand {
             command,
             timeout,

@@ -951,3 +951,275 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
         assert!(killed.status.success());
     });
 }
+
+/// A scoped token drives automation and nothing else.
+///
+/// The security property the whole scoped-token mechanism exists for: an agent given remote
+/// automation must not thereby be able to sit at the user's terminal, and a read-scoped agent must
+/// not be able to type. Both are checked against a live gateway rather than against the table,
+/// because the table being right is not the same as the gateway consulting it.
+#[test]
+fn a_scoped_token_runs_only_the_automation_its_scope_allows() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let directory = tempfile::Builder::new()
+            .prefix("vvmux-scoped-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let runtime_root = directory.path().join("runtime");
+        let config_root = directory.path().join("config");
+        private_directory(&runtime_root);
+        private_directory(&config_root);
+        let config_directory = config_root.join("vvmux");
+        private_directory(&config_directory);
+        fs::write(
+            config_directory.join("config.toml"),
+            "[general]\nrender_interval_ms = 1\n\n[server]\noutbound_queue_bytes = 524288\n",
+        )
+        .unwrap();
+        let auth_file = config_root.join("server-auth.json");
+        let executable = Path::new(env!("CARGO_BIN_EXE_vvmux"));
+
+        let full = command(executable, &runtime_root, &config_root)
+            .args(["token", "create", "--auth-file"])
+            .arg(&auth_file)
+            .output()
+            .unwrap();
+        assert!(full.status.success());
+
+        let scoped = |scope: &str| {
+            let output = command(executable, &runtime_root, &config_root)
+                .args(["token", "create-scoped", "--scope", scope, "--auth-file"])
+                .arg(&auth_file)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "scoped token creation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let read_token = scoped("automation-read");
+        let input_token = scoped("automation-input");
+        assert_ne!(read_token, input_token);
+        assert_eq!(read_token.len(), 43);
+
+        // The bearer token still works after scoped ones were added beside it.
+        let bearer = String::from_utf8(full.stdout).unwrap().trim().to_owned();
+
+        let session = format!("scoped-{}", std::process::id());
+        assert!(
+            command(executable, &runtime_root, &config_root)
+                .args(["new", "--session", &session, "--detached"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let _session_guard = SessionKiller {
+            executable: executable.to_owned(),
+            runtime: runtime_root.clone(),
+            config: config_root.clone(),
+            name: session.clone(),
+        };
+
+        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let child = command(executable, &runtime_root, &config_root)
+            .args(["serve", "--listen"])
+            .arg(address.to_string())
+            .args(["--allow-origin", "http://127.0.0.1:3000", "--auth-file"])
+            .arg(&auth_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _gateway = ChildGuard(child);
+        let url = format!("ws://{address}/v1/ws");
+
+        let connect = |token: String| {
+            let url = url.clone();
+            async move {
+                for _ in 0..100 {
+                    if let Ok((mut socket, _)) = tokio_tungstenite::connect_async(
+                        websocket_request(&url, "http://127.0.0.1:3000"),
+                    )
+                    .await
+                    {
+                        socket
+                            .send(Message::Text(
+                                serde_json::json!({
+                                    "type": "hello",
+                                    "protocol": 1,
+                                    "token": token,
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        // The hello reply.
+                        let _ = socket.next().await;
+                        return Some(socket);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                None
+            }
+        };
+
+        // A read-scoped token: select a session, observe, and be refused a mutation.
+        let mut reader = connect(read_token).await.expect("gateway did not start");
+        reader
+            .send(Message::Text(
+                serde_json::json!({"type": "select_session", "request_id": 1, "name": session})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let selected = next_json(&mut reader).await;
+        assert_eq!(selected["type"], "session_selected", "{selected}");
+
+        reader
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "automation",
+                    "request_id": 2,
+                    "request": {
+                        "id": 2, "pane_id": 1, "allow_focused": false,
+                        "method": {"method": "list_panes"}
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let observed = next_json(&mut reader).await;
+        assert_eq!(observed["type"], "automation", "{observed}");
+        assert_eq!(observed["response"]["ok"], true, "{observed}");
+
+        reader
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "automation",
+                    "request_id": 3,
+                    "request": {
+                        "id": 3, "pane_id": 1, "allow_focused": false,
+                        "method": {"method": "typing", "text": "hello", "report": false}
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let refused = next_json(&mut reader).await;
+        assert_eq!(refused["type"], "error", "{refused}");
+        assert_eq!(refused["code"], "scope_denied", "{refused}");
+
+        // The same token cannot attach a terminal either. Automation authority is not a way to sit
+        // at somebody's session.
+        reader
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "attach", "request_id": 4, "name": session,
+                    "display": {"columns": 80, "rows": 24, "cell_width": 8, "cell_height": 16}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let attach = next_json(&mut reader).await;
+        assert_eq!(attach["type"], "error", "{attach}");
+        assert_eq!(attach["code"], "scope_denied", "{attach}");
+
+        // An input-scoped token runs the mutation the read-scoped one was refused.
+        let mut writer = connect(input_token).await.unwrap();
+        writer
+            .send(Message::Text(
+                serde_json::json!({"type": "select_session", "request_id": 1, "name": session})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut writer).await["type"], "session_selected");
+        writer
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "automation",
+                    "request_id": 2,
+                    "request": {
+                        "id": 2, "pane_id": 1, "allow_focused": false,
+                        "method": {"method": "typing", "text": "hello", "report": false}
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let typed = next_json(&mut writer).await;
+        assert_eq!(typed["type"], "automation", "{typed}");
+        assert_eq!(typed["response"]["ok"], true, "{typed}");
+
+        // And the full bearer token still attaches, which the scoped ones must not have broken.
+        let mut bearer_socket = connect(bearer).await.unwrap();
+        bearer_socket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "attach", "request_id": 1, "name": session,
+                    "display": {"columns": 80, "rows": 24, "cell_width": 8, "cell_height": 16}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let attached = next_json(&mut bearer_socket).await;
+        assert_eq!(attached["type"], "attached", "{attached}");
+    });
+}
+
+/// The next JSON control frame, skipping any binary render traffic.
+async fn next_json<S>(socket: &mut S) -> serde_json::Value
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    for _ in 0..200 {
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) => {
+                return serde_json::from_str(&text).unwrap_or_else(|error| {
+                    panic!("invalid control frame ({error}): {text}");
+                });
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("gateway closed: {other:?}"),
+        }
+    }
+    panic!("no control frame arrived");
+}
+
+struct SessionKiller {
+    executable: std::path::PathBuf,
+    runtime: std::path::PathBuf,
+    config: std::path::PathBuf,
+    name: String,
+}
+
+impl Drop for SessionKiller {
+    fn drop(&mut self) {
+        let _ = command(&self.executable, &self.runtime, &self.config)
+            .args(["kill-session", "--target", &self.name])
+            .output();
+    }
+}

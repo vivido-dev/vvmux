@@ -365,13 +365,13 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     permit: Option<OwnedSemaphorePermit>,
     tunnel: Option<TunnelContext>,
 ) {
-    if authenticate_connection(&mut stream, &state, tunnel.as_ref())
-        .await
-        .is_err()
-    {
-        let _ = close_socket(&mut sink, 1008, "authentication failed").await;
-        return;
-    }
+    let authorization = match authenticate_connection(&mut stream, &state, tunnel.as_ref()).await {
+        Ok(authorization) => authorization,
+        Err(_) => {
+            let _ = close_socket(&mut sink, 1008, "authentication failed").await;
+            return;
+        }
+    };
     let broker = match vivid::VividBroker::new() {
         Ok(broker) => broker,
         Err(_) => {
@@ -470,6 +470,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
                     &mut float_scanner,
                     &mut float_mode,
                     tunnel.as_ref(),
+                    &authorization,
                 )
                 .await
             }
@@ -559,7 +560,7 @@ async fn authenticate_connection<St: FrameStream>(
     stream: &mut St,
     state: &GatewayState,
     tunnel: Option<&TunnelContext>,
-) -> io::Result<()> {
+) -> io::Result<auth::Authorization> {
     let first = tokio::time::timeout(AUTH_TIMEOUT, stream.next_frame())
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "authentication timed out"))?
@@ -589,7 +590,11 @@ async fn authenticate_connection<St: FrameStream>(
     }
     match (tunnel, auth) {
         // A tunnel leg asserts identity; the bearer token is never involved.
-        (Some(_), Some(protocol::HelloAuth::Tunnel)) if token.is_none() => Ok(()),
+        // A tunnel leg was already authenticated by the control plane that issued its ticket, so
+        // it carries the same authority an interactive client does.
+        (Some(_), Some(protocol::HelloAuth::Tunnel)) if token.is_none() => {
+            Ok(auth::Authorization::full())
+        }
         (Some(_), _) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "tunnel legs require the tunnel hello form",
@@ -604,18 +609,13 @@ async fn authenticate_connection<St: FrameStream>(
                 io::Error::new(io::ErrorKind::InvalidData, "hello requires a bearer token")
             })?;
             let token = Zeroizing::new(token);
-            if !auth::authenticate(
+            auth::authorize(
                 state.auth_file.as_deref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "no bearer record configured")
                 })?,
                 &token,
-            )? {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "authentication failed",
-                ));
-            }
-            Ok(())
+            )?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "authentication failed"))
         }
     }
 }
@@ -632,6 +632,7 @@ async fn handle_socket_message(
     float_scanner: &mut FloatEditScanner,
     float_mode: &mut Option<u64>,
     tunnel: Option<&TunnelContext>,
+    authorization: &auth::Authorization,
 ) -> io::Result<()> {
     match message {
         Frame::Text(text) => {
@@ -650,6 +651,94 @@ async fn handle_socket_message(
                         "invalid_state",
                         "hello is valid only as the first message".into(),
                     )?;
+                }
+                ClientControl::SelectSession { request_id, name } => {
+                    if session.is_some() {
+                        send_error(
+                            writer,
+                            Some(request_id),
+                            "invalid_state",
+                            "a session is already open on this connection".into(),
+                        )?;
+                    } else if let Err(error) = crate::runtime::validate_session_name(&name) {
+                        send_error(
+                            writer,
+                            Some(request_id),
+                            "invalid_request",
+                            error.to_string(),
+                        )?;
+                    } else {
+                        match SessionAdapter::connect_for_automation(
+                            name.clone(),
+                            state.config.server.outbound_queue_bytes,
+                        )
+                        .await
+                        {
+                            Ok((adapter, session_name, _)) => {
+                                *session = Some(adapter);
+                                send_control(
+                                    writer,
+                                    &ServerControl::SessionSelected {
+                                        request_id,
+                                        name: session_name,
+                                    },
+                                )?;
+                            }
+                            Err(error) => send_error(
+                                writer,
+                                Some(request_id),
+                                "unavailable",
+                                error.to_string(),
+                            )?,
+                        }
+                    }
+                }
+                ClientControl::Automation {
+                    request_id,
+                    request,
+                } => {
+                    let Some(adapter) = session.as_ref() else {
+                        send_error(
+                            writer,
+                            Some(request_id),
+                            "invalid_state",
+                            "attach or select a session before running automation".into(),
+                        )?;
+                        return Ok(());
+                    };
+                    // The class comes from the same table `capabilities` advertises, so a scoped
+                    // token cannot be widened by adding a method: an unclassified one does not
+                    // compile, and an unknown name here is refused outright.
+                    let class = crate::ipc::METHOD_CAPABILITIES
+                        .iter()
+                        .find(|capability| capability.name == request.method.name())
+                        .map(|capability| capability.class);
+                    match class {
+                        Some(class) if authorization.allows(class) => {}
+                        Some(_) => {
+                            send_error(
+                                writer,
+                                Some(request_id),
+                                "scope_denied",
+                                format!("this token may not run `{}`", request.method.name()),
+                            )?;
+                            return Ok(());
+                        }
+                        None => {
+                            send_error(
+                                writer,
+                                Some(request_id),
+                                "unsupported",
+                                format!("`{}` is not an automation method", request.method.name()),
+                            )?;
+                            return Ok(());
+                        }
+                    }
+                    // The request's own ID is replaced by the frame's, so a caller cannot collide
+                    // with the interactive traffic already using this session connection.
+                    let mut request = *request;
+                    request.id = request_id;
+                    adapter.send(ClientMessage::Automation(request))?;
                 }
                 ClientControl::ListSessions { request_id } => {
                     if session.is_some() {
@@ -731,7 +820,18 @@ async fn handle_socket_message(
                     takeover,
                     vivid,
                 } => {
-                    if session.is_some() {
+                    // Scope first: a token that may never attach should be told that, rather than
+                    // being told the connection state is wrong and left to discover the real
+                    // reason by retrying from a fresh connection. Refused here rather than at the
+                    // session, which cannot tell one gateway client from another.
+                    if !authorization.may_attach() {
+                        send_error(
+                            writer,
+                            Some(request_id),
+                            "scope_denied",
+                            "an automation-scoped token cannot attach a terminal".into(),
+                        )?;
+                    } else if session.is_some() {
                         send_error(
                             writer,
                             Some(request_id),
@@ -1108,14 +1208,31 @@ async fn handle_session_message(
                 "session sent a duplicate attachment reply",
             ));
         }
-        ServerMessage::Automation(_)
-        | ServerMessage::AutomationChunk { .. }
-        | ServerMessage::PluginEvent { .. } => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "session sent automation data to an attached gateway",
-            ));
-        }
+        ServerMessage::Automation(response) => send_control(
+            writer,
+            &ServerControl::Automation {
+                request_id: response.id,
+                response: Box::new(response),
+            },
+        )?,
+        ServerMessage::AutomationChunk {
+            request_id,
+            index,
+            last,
+            base64,
+        } => send_control(
+            writer,
+            &ServerControl::AutomationChunk {
+                request_id,
+                index,
+                last,
+                base64,
+            },
+        )?,
+        // Event subscriptions stream indefinitely and have no frame to carry them yet. Dropped
+        // rather than forwarded as something else, so a caller never mistakes silence for a
+        // subscription that is working.
+        ServerMessage::PluginEvent { .. } => {}
     }
     Ok(())
 }

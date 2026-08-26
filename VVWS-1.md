@@ -198,6 +198,61 @@ Action names are `split`, `focus`, `resize`, `new_tab`, `next_tab`, `previous_ta
 Raw terminal input is passed through the same prefix, mouse, close-confirmation, and floating-edit
 state machine as the native vvmux client, so normal `Ctrl-b` bindings work without action frames.
 
+## Automation
+
+A client may run the same automation methods the private VVMX socket serves. The request and reply
+are the wire records themselves, carried verbatim, so the remote surface cannot drift from the local
+one — there is no second definition of what a method is. `capabilities` remains authoritative for
+which methods a release serves and what class each one falls under.
+
+Open a session for automation without taking its terminal attachment:
+
+```json
+{"type":"select_session","request_id":1,"name":"work"}
+{"type":"session_selected","request_id":1,"name":"work"}
+```
+
+Then run methods on it:
+
+```json
+{"type":"automation","request_id":2,"request":{"id":2,"pane_id":1,"allow_focused":false,
+ "method":{"method":"get_text","rows":null,"source":"visible"}}}
+{"type":"automation","request_id":2,"response":{"id":2,"ok":true,"result":{}}}
+```
+
+A reply too large for one frame arrives as ordered `automation_chunk` frames terminated by
+`"last":true`, matching the private socket's own chunking.
+
+The request's `id` is replaced by the frame's `request_id`, so automation cannot collide with the
+interactive traffic already using the connection. Event subscriptions are not carried: they stream
+indefinitely and have no frame yet, so they are dropped rather than forwarded as something a client
+would mistake for a working subscription.
+
+### Token scopes
+
+Possession of the bearer token is equivalent to shell access to every session that OS user owns,
+which is more authority than an agent driving automation needs. A record may hold **scoped** tokens
+beside it:
+
+| Scope | May run | May attach |
+|---|---|---|
+| *(bearer)* | everything | yes |
+| `automation_input` | every automation method | no |
+| `automation_read` | non-mutating automation methods only | no |
+
+Scope is enforced against the per-method class `capabilities` advertises, so a method added without
+a class fails to build rather than silently widening every scoped credential. A refused request
+answers `scope_denied`.
+
+A scoped token cannot `attach`, and is answered `scope_denied` whether or not it has already
+selected a session — the reason it cannot attach does not depend on connection state. `select_session`
+is what it uses instead, and unlike `attach` it does not evict whoever is sitting at the session.
+
+Create one with `vvmux token create-scoped --scope automation-read|automation-input`. The raw token
+is printed once; only its hash is retained. Records holding scoped tokens are written at schema 2,
+which an older binary refuses outright rather than reading, dropping the tokens it does not
+understand, and rewriting the file without them.
+
 ## Server controls
 
 Successful correlated replies are:
@@ -207,6 +262,9 @@ Successful correlated replies are:
 {"type":"created","request_id":2,"name":"work"}
 {"type":"killed","request_id":3,"name":"work"}
 {"type":"attached","request_id":4,"name":"work","text_only":false}
+{"type":"session_selected","request_id":5,"name":"work"}
+{"type":"automation","request_id":6,"response":{"id":6,"ok":true,"result":{}}}
+{"type":"automation_chunk","request_id":6,"index":0,"last":false,"base64":"..."}
 ```
 
 Uncorrelated terminal events are:

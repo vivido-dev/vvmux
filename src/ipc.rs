@@ -33,6 +33,8 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
+/// Version 29 adds the outer identity an attached client publishes, multi-agent leases, and
+/// session recording. One bump covers the batch.
 /// Version 28 adds atomicity: a request may carry the sequences it expects the session to be at
 /// and an idempotency key, so a stale action is refused before it reaches a PTY and a retried one
 /// is not applied twice. One bump covers the batch.
@@ -45,7 +47,7 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 /// Version 25 adds the typed capability handshake and `get_config`: `capabilities` now describes
 /// every method's class and whether it mutates, so a caller can tell an observation from a mutation
 /// before running one. One bump covers the batch.
-pub const VERSION: u16 = 28;
+pub const VERSION: u16 = 29;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -107,6 +109,12 @@ pub struct AutomationRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_name: Option<crate::layout::PaneName>,
     pub allow_focused: bool,
+    /// A lease this request acts under.
+    ///
+    /// Only needed when somebody holds an exclusive lease on the target: an unleased pane is
+    /// always open, which is what keeps leases advisory rather than a mode a session enters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
     /// State this request assumes, rejected rather than applied when it no longer holds.
     ///
     /// The race every `inspect`-then-act pair has: the screen a caller reasoned about can change
@@ -122,6 +130,37 @@ pub struct AutomationRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     pub method: AutomationMethod,
+}
+
+/// Who is presenting this session, published by the foreground client.
+///
+/// **Deliberately credential-free.** The outer Vivid endpoint and root secret stay in the client
+/// and never reach the hidden server, which is a standing invariant — a daemon that held them
+/// could present media on behalf of a window it does not own. What crosses is only the identity a
+/// pane agent needs in order to address the right Vivido window: a window ID it can pass to
+/// `vivido msg --window-id`, and the metrics that make a pane's pixel rectangle meaningful.
+///
+/// This exists because the alternative was worse. A pane used to inherit `VIVIDO_SOCKET` and
+/// `VIVIDO_WINDOW_ID` from whatever window started the daemon; the daemon outlives that window, so
+/// after a detach and a reattach they addressed the wrong one, and over `vvssh` they addressed a
+/// machine the pane could not reach. Those are now scrubbed, and this is what replaces them: the
+/// live answer, from whoever is attached now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OuterIdentity {
+    /// The presenting Vivido window's ID, as `vivido msg --window-id` takes it.
+    pub vivido_window_id: Option<u64>,
+    /// The presenting Vivido instance's session name, for `vivido msg --target`.
+    pub vivido_session: Option<String>,
+    /// Whether the client holds an outer Vivid endpoint, without saying what it is.
+    pub has_outer_endpoint: bool,
+    /// True when the client reached this session over `vvssh`.
+    ///
+    /// The Vivido automation socket is not forwarded and never will be — it is an owner-only local
+    /// socket on another machine. A pane agent that sees this must not attempt `vivido msg` at
+    /// all, rather than trying and getting a confusing failure.
+    pub remote: bool,
+    pub cell_width: u16,
+    pub cell_height: u16,
 }
 
 /// Session state a request requires before it will run.
@@ -227,6 +266,38 @@ pub enum MousePosition {
         x: u16,
         y: u16,
     },
+}
+
+/// What a `record` request does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum RecordOperation {
+    Start {
+        /// Where the recording is written when it stops.
+        path: String,
+    },
+    Stop,
+    Status,
+}
+
+/// What a `lease` request does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum LeaseOperation {
+    Acquire {
+        scope: crate::lease::LeaseScope,
+        ttl_ms: u64,
+        /// A name shown to whoever is refused, so "who has this pane" has an answer.
+        holder: Option<String>,
+    },
+    Renew {
+        lease_id: String,
+        ttl_ms: u64,
+    },
+    Release {
+        lease_id: String,
+    },
+    List,
 }
 
 /// Which layer a pane should live on.
@@ -484,6 +555,13 @@ pub enum AutomationMethod {
         wait_rendered: bool,
         timeout_ms: u64,
     },
+    /// Start or stop a bounded session recording.
+    ///
+    /// Always explicit, never a default: a recording holds pane output, which is whatever scrolled
+    /// past — the same data `[session] pane_history` gates behind an opt-in, for the same reason.
+    Record(RecordOperation),
+    /// Take, renew, release, or list advisory leases on panes.
+    Lease(LeaseOperation),
     /// Run one command in a pane's existing interactive shell and wait for its real exit status.
     ///
     /// Needs the shell to emit OSC 133 command markers. Without them the boundary between a
@@ -719,6 +797,8 @@ pub enum MethodClass {
     Agent,
     /// Enters the plugin host, whose own operations carry their own permissions.
     Plugin,
+    /// Changes what the session persists about itself.
+    Lifecycle,
 }
 
 impl MethodClass {
@@ -756,7 +836,7 @@ const fn capability(name: &'static str, class: MethodClass) -> MethodCapability 
 /// than silently becoming an unadvertised method — which is how `session_snapshot` came to be
 /// advertised under a name that was never on the wire.
 pub const METHOD_CAPABILITIES: &[MethodCapability] = {
-    use MethodClass::{Agent, Config, Input, Layout, Observe, Pane, Plugin, Process};
+    use MethodClass::{Agent, Config, Input, Layout, Lifecycle, Observe, Pane, Plugin, Process};
     &[
         capability("capabilities", Observe),
         capability("get_config", Observe),
@@ -792,6 +872,12 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         capability("agent_send_keys", Input),
         capability("mouse", Input),
         capability("shell_command", Input),
+        // Layout rather than observe even for `list`: acquiring one excludes other callers, and
+        // one class per method is what keeps a scoped token's check a single lookup.
+        capability("lease", Layout),
+        // Lifecycle rather than observe: starting one writes a file of everything the session
+        // prints, which a read-only pass must not do on a caller's behalf.
+        capability("record", Lifecycle),
         capability("split", Pane),
         capability("run", Pane),
         capability("close_pane", Pane),
@@ -861,6 +947,8 @@ impl AutomationMethod {
             Self::RenameTab { .. } => "rename_tab",
             Self::ResetTabTitle { .. } => "reset_tab_title",
             Self::CloseTab { .. } => "close_tab",
+            Self::Record(_) => "record",
+            Self::Lease(_) => "lease",
             Self::ShellCommand { .. } => "shell_command",
             Self::Capture { .. } => "capture",
             Self::Mouse { .. } => "mouse",
@@ -1213,6 +1301,8 @@ pub enum ClientMessage {
         vivid: bool,
         /// The directly hosting terminal speaks the Kitty graphics protocol.
         kitty_graphics: bool,
+        /// Which Vivido window is presenting this session, and nothing that could reach it.
+        outer: Option<OuterIdentity>,
     },
     Input(Vec<u8>),
     Mouse(MouseEvent),

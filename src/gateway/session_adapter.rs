@@ -45,8 +45,34 @@ impl SessionAdapter {
         vivid: bool,
         outbound_queue_bytes: usize,
     ) -> io::Result<(Self, String, bool)> {
+        Self::open(name, Some((takeover, display, vivid)), outbound_queue_bytes).await
+    }
+
+    /// Open a session connection for automation only, without taking its attachment.
+    ///
+    /// The same thing `vvmux msg` does locally: a request needs a connection, not a terminal. This
+    /// exists because an automation-scoped token must be able to drive a session without evicting
+    /// whoever is sitting at it — attaching is exactly the authority that token does not have.
+    pub(crate) async fn connect_for_automation(
+        name: String,
+        outbound_queue_bytes: usize,
+    ) -> io::Result<(Self, String, bool)> {
+        Self::open(name, None, outbound_queue_bytes).await
+    }
+
+    async fn open(
+        name: String,
+        attach: Option<(bool, DisplayMetrics, bool)>,
+        outbound_queue_bytes: usize,
+    ) -> io::Result<(Self, String, bool)> {
+        // Whether media records are worth forwarding. An automation-only connection is never a
+        // presenter, so it wants none of them.
+        let vivid = attach.is_some_and(|(_, _, vivid)| vivid);
         let (mut reader, writer, session, text_only) = tokio::task::spawn_blocking(move || {
             let (mut reader, writer) = crate::server::connect(&name)?;
+            let Some((takeover, display, vivid)) = attach else {
+                return Ok((reader, writer, name, false));
+            };
             writer
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -56,6 +82,9 @@ impl SessionAdapter {
                     display,
                     vivid,
                     kitty_graphics: false,
+                    // A browser or tunnelled client is not hosted by a Vivido window, so there is
+                    // no outer identity to publish and a pane agent must not be told there is one.
+                    outer: None,
                 })?;
             match reader.recv_server()? {
                 ServerMessage::Attached { session, text_only } => {

@@ -52,6 +52,9 @@ vvmux api schema --json            emit the automation JSON Schema
 vvmux channel set stable|preview   select the Unix update stream
 vvmux update [--check]             verify/install a signed Unix release
 vvmux token create [--rotate]      create/rotate the VVWS bearer token
+vvmux token create-scoped --scope automation-read|automation-input
+                                   create an automation-only token that cannot attach a terminal
+vvmux replay FILE [--pane-id ID]   reconstruct state from a recording, running nothing
 vvmux serve [OPTIONS]              run the loopback VVWS/1 session gateway
 vvmux --config PATH ...            use an explicit strict TOML config
 ```
@@ -116,6 +119,42 @@ the original reply. A caller that retries after a lost answer cannot otherwise t
 from "the reply did not come back", and pressing Enter twice is not pressing it once. Mutating
 methods only — replaying a cached read would be a lie about the present — and a failed request
 releases its key so a corrected retry can reuse it.
+
+## Sharing a session between agents
+
+A vvmux session routinely has several agents working in different panes, and nothing stopped two of
+them typing into the same one. A lease says a pane is yours for a while:
+
+```sh
+lease=$(vvmux msg lease acquire --scope input --pane-id 2 --holder reviewer | jq -r .lease_id)
+vvmux msg --lease "$lease" typing --pane-id 2 'cargo test'
+vvmux msg lease release "$lease"
+```
+
+Leases are **advisory in one direction**: a caller holding no lease is never blocked unless somebody
+else holds an exclusive one on that pane and scope, so nothing that worked before starts failing and
+an interactive user is never locked out of their own terminal. `observe` is shared — watching a pane
+changes nothing — while `input`, `layout`, and `process` admit one holder each. Every lease expires,
+because a TTL is the only release that does not need the holder to still be alive.
+
+## Recording a session
+
+```sh
+vvmux msg record start /tmp/session.ndjson
+vvmux msg record stop
+vvmux replay /tmp/session.ndjson
+```
+
+A recording holds pane output, layout changes, exits, and agent transitions. It records **input
+classes, never input content**: that a pane was written to and how much, not which bytes. Knowing 14
+bytes were typed reproduces the shape of a session; knowing which 14 bytes is a credential leak with
+an excuse. Starting one is always explicit for the same reason `[session] pane_history` is opt-in —
+it writes what scrolled past to a file.
+
+Both the buffer and the file are bounded and report what they dropped, so a partial recording says
+so before it is read. `replay` reconstructs terminal and layout state and **runs nothing**: a
+recording is evidence about a session that already happened, and re-executing its commands would be
+a different session with different, possibly destructive, side effects.
 
 ## Plans
 
@@ -213,6 +252,15 @@ may now be a different one after a reattach, or — over `vvssh` — may live on
 entirely. They are stripped along with the whole `VIVID_*` namespace and an outer `TMUX`/`STY`
 identity, so a pane agent cannot silently drive somebody else's terminal.
 
+The live answer comes from `session-inspect` instead, under `outer`: which Vivido window is
+presenting the session right now, its cell metrics, and `vivido_automation_reachable`. It is `null`
+when nothing is attached, and `remote` is true when the client reached vvmux over `vvssh` — in which
+case the Vivido automation socket is on another machine and `vivido msg` is not a route that exists.
+`inspect` adds `outer_crop`, the pane's rectangle in that window's physical pixels, which is the
+crop to apply to a `vivido msg screenshot`. **None of it carries the outer Vivid endpoint or root
+secret**: those stay in the foreground client, which is what lets the daemon answer "which window"
+without ever holding "how to reach it".
+
 `capabilities` is authoritative for a release and describes the surface rather than just naming it:
 
 ```sh
@@ -288,6 +336,9 @@ set-flag zoom|pinned|transparent|copy-mode|floats-visible|sync-input (--on|--off
 transcript [--after-offset N] [--max-bytes N] [--base64] [--pane-id ID]
 capture [--no-activate] [--after-screen SEQ] [--stable DURATION] [--rendered] [--grid] [--timeout DURATION] [--pane-id ID]
 shell-command COMMAND [--timeout DURATION] [--pane-id ID]
+lease acquire --scope observe|input|layout|process [--ttl DURATION] [--holder NAME] [--pane-id ID]
+lease renew LEASE_ID [--ttl DURATION] | lease release LEASE_ID | lease list
+record start PATH | record stop | record status
 typing TEXT [--pane-id ID] [--report]
 key KEY [--mods Shift,Alt,Ctrl,Super] [--repeat N] [--pane-id ID] [--report]
 paste TEXT [--pane-id ID] [--report]
@@ -915,8 +966,22 @@ remote access. Possession of the bearer token is equivalent to shell access to e
 owned by that OS user. The raw token is printed once; only its hash is retained in an owner-only
 record.
 
-The gateway lists, creates, and exclusively attaches to sessions. It serves no HTML or JavaScript
-and does not expose session kill operations on the loopback listener. Plain xterm.js clients can
+The gateway lists, creates, and exclusively attaches to sessions, and runs automation on them. It
+serves no HTML or JavaScript and does not expose session kill operations on the loopback listener.
+
+Possession of the bearer token is equivalent to shell access, which is too much authority to hand an
+agent that only needs to drive automation. A **scoped token** carries less:
+
+```sh
+vvmux token create-scoped --scope automation-read      # observations only
+vvmux token create-scoped --scope automation-input     # observations and mutations
+```
+
+A scoped token cannot attach a terminal at all, and uses `select_session` instead — which opens a
+session for automation without evicting whoever is sitting at it. Its scope is enforced against the
+same per-method class `capabilities` advertises, so a method added without a class does not compile
+rather than silently widening every scoped credential. The bearer token is unchanged and keeps full
+authority; scoped tokens live beside it in the same owner-only record. Plain xterm.js clients can
 attach text-only; the byte-transparent Vivid route accepts only Vivid 1.5 Control and Track
 connections, uses the route's ephemeral 32-byte secret as its Vivid root secret, and advertises
 `wire_version: "1.5"`. See [VVWS-1.md](VVWS-1.md) for the normative wire contract and client

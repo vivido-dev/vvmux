@@ -7,7 +7,10 @@ use serde_json::Value;
 /// The two JSON-compatible automation records carried inside typed VVMX messages.
 #[derive(JsonSchema)]
 #[schemars(untagged)]
-#[allow(dead_code)]
+// Never constructed: this exists only to name both records in one schema document, so the size
+// difference between its variants costs nothing. Boxing one to even them out would change the
+// generated schema, which is the published contract.
+#[allow(dead_code, clippy::large_enum_variant)]
 enum AutomationRecord {
     Request(crate::ipc::AutomationRequest),
     Response(crate::ipc::AutomationResponse),

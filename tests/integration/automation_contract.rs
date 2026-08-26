@@ -996,3 +996,252 @@ fn ndjson(bytes: &[u8]) -> Vec<Value> {
         .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{error}: {line}")))
         .collect()
 }
+
+/// Several agents share one session; a lease is how one says a pane is theirs.
+#[test]
+fn a_lease_excludes_other_automation_without_locking_anyone_out() {
+    let fixture = Fixture::start("lease");
+    assert!(
+        fixture
+            .msg(&["split", "vertical", "--pane-id", "1"])
+            .status
+            .success()
+    );
+
+    // Nothing held: everything is allowed. Leases are advisory, so adding the mechanism must not
+    // make anything that worked before start failing.
+    assert!(
+        fixture
+            .msg(&["typing", "--pane-id", "1", "x"])
+            .status
+            .success()
+    );
+
+    let held = fixture.json(&[
+        "lease",
+        "acquire",
+        "--scope",
+        "input",
+        "--pane-id",
+        "1",
+        "--holder",
+        "agent-a",
+    ]);
+    let lease = held["lease_id"].as_str().unwrap().to_owned();
+    assert_eq!(held["scope"], "input");
+
+    // Another caller is refused, and told who has it rather than just that it failed.
+    let refused = fixture.msg(&["typing", "--pane-id", "1", "x"]);
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("lease_denied"), "{message}");
+    assert!(message.contains("agent-a"), "{message}");
+
+    // The holder acts under it.
+    assert!(
+        fixture
+            .msg(&["--lease", &lease, "typing", "--pane-id", "1", "x"])
+            .status
+            .success()
+    );
+    // Observation is never excluded: watching a pane changes nothing about it.
+    assert!(
+        fixture
+            .msg(&["get-text", "--pane-id", "1"])
+            .status
+            .success()
+    );
+    // An unleased pane is unaffected, and so is a scope nobody holds on this one.
+    assert!(
+        fixture
+            .msg(&["typing", "--pane-id", "2", "x"])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .msg(&["set-flag", "zoom", "--on", "--pane-id", "1"])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .msg(&["set-flag", "zoom", "--off", "--pane-id", "1"])
+            .status
+            .success()
+    );
+
+    // A second holder of the same scope is refused at acquire time, not at use time.
+    let contested = fixture.msg(&[
+        "lease",
+        "acquire",
+        "--scope",
+        "input",
+        "--pane-id",
+        "1",
+        "--holder",
+        "agent-b",
+    ]);
+    assert!(!contested.status.success());
+
+    assert_eq!(
+        fixture.json(&["lease", "list"])["leases"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(fixture.msg(&["lease", "release", &lease]).status.success());
+    assert!(
+        fixture
+            .msg(&["typing", "--pane-id", "1", "x"])
+            .status
+            .success(),
+        "releasing the lease did not free the pane"
+    );
+
+    // A lease must expire, so a crashed holder cannot keep a pane forever.
+    let unbounded = fixture.msg(&[
+        "lease",
+        "acquire",
+        "--scope",
+        "input",
+        "--pane-id",
+        "1",
+        "--ttl",
+        "48h",
+    ]);
+    assert!(!unbounded.status.success());
+}
+
+/// A recording reproduces a session's shape without becoming a credential dump.
+#[test]
+fn a_recording_replays_output_and_never_stores_what_was_typed() {
+    let fixture = Fixture::start("record");
+    let path = fixture._directory.path().join("recording.ndjson");
+
+    assert_eq!(fixture.json(&["record", "status"])["recording"], false);
+    let started = fixture.json(&["record", "start", path.to_str().unwrap()]);
+    assert_eq!(started["recording"], true);
+    // Nothing is written until it stops, so a running recording cannot be half-read.
+    assert!(!path.exists());
+
+    // A marker that is typed, so it must NOT survive into the file as text, and output derived
+    // from it, which must.
+    assert!(
+        fixture
+            .msg(&[
+                "submit",
+                "--pane-id",
+                "1",
+                r#"S=hunter2-typed-secret; printf 'echoed-%s\n' "${S#hunter2-}""#,
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .msg(&[
+                "wait",
+                "output",
+                "echoed-typed-secret",
+                "--pane-id",
+                "1",
+                "--timeout",
+                "5s"
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .msg(&["split", "vertical", "--pane-id", "1"])
+            .status
+            .success()
+    );
+
+    let stopped = fixture.json(&["record", "stop"]);
+    assert!(stopped["events"].as_u64().unwrap() > 0);
+    assert_eq!(stopped["dropped_events"], 0);
+    assert_eq!(fixture.json(&["record", "status"])["recording"], false);
+
+    let raw = fs::read_to_string(&path).unwrap();
+    // The input frame records that a pane was written to and how much, never the bytes.
+    assert!(
+        raw.contains("\"submit_line\""),
+        "no input class was recorded"
+    );
+    assert!(
+        !raw.contains("hunter2"),
+        "the recording stored what was typed"
+    );
+
+    let output = fixture.msg(&["replay", "--pane-id", "1"]);
+    // `replay` is a top-level command, not a `msg` one: it reads a file and talks to no session.
+    let _ = output;
+    let replayed: Value = serde_json::from_slice(
+        &Command::new(fixture.binary)
+            .args(["replay"])
+            .arg(&path)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(replayed["events"].as_u64().unwrap() > 0);
+    assert!(
+        replayed["gap"].is_null(),
+        "an unbounded recording reported a gap"
+    );
+    let pane = replayed["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pane| pane["pane_id"] == 1)
+        .expect("no pane 1 in the replay");
+    assert!(
+        pane["text"]
+            .as_str()
+            .unwrap()
+            .contains("echoed-typed-secret"),
+        "replay did not reconstruct the pane's output: {pane}"
+    );
+}
+
+/// A pane cannot inherit the outer identity, so the session publishes the live one instead.
+#[test]
+fn the_session_reports_the_presenting_window_or_says_there_is_none() {
+    let fixture = Fixture::start("outer");
+    // Detached: there is no window presenting this session, and saying so is the useful answer.
+    // A stale value here is exactly the bug the environment scrub removed.
+    let inspected = fixture.json(&["session-inspect"]);
+    assert!(
+        inspected["outer"].is_null(),
+        "a detached session claimed a presenting window: {}",
+        inspected["outer"]
+    );
+    assert!(
+        inspected["attachment"].is_null(),
+        "the fixture session is not attached"
+    );
+
+    // The per-pane crop is absent for the same reason: a rectangle in a window that is not there
+    // would be confidently wrong.
+    let pane = fixture.json(&["inspect", "--pane-id", "1"]);
+    assert!(pane["pane"]["outer_crop"].is_null(), "{pane}");
+
+    // Whatever the session reports, it never carries anything that could reach the outer
+    // presenter. This is the standing invariant the whole struct exists to keep.
+    let encoded = serde_json::to_string(&inspected).unwrap();
+    for secret in [
+        "VIVID_ROOT_SECRET",
+        "VIVID_ENDPOINT",
+        "root_secret",
+        "token",
+    ] {
+        assert!(
+            !encoded.contains(secret),
+            "session-inspect leaked {secret}: {encoded}"
+        );
+    }
+}

@@ -13,6 +13,7 @@ mod gateway;
 mod ipc;
 mod layout;
 mod layout_file;
+mod lease;
 mod media;
 mod media_trace;
 mod metrics;
@@ -23,6 +24,7 @@ mod plugin;
 mod plugin_component;
 mod plugin_integration;
 mod plugin_supervisor;
+mod record;
 mod region;
 mod runtime;
 mod screen;
@@ -165,8 +167,22 @@ enum Command {
         /// not come back", and pressing Enter twice is not pressing it once. Mutating methods only.
         #[arg(long, global = true)]
         idempotency_key: Option<String>,
+        /// Act under this lease, when another caller holds the pane.
+        #[arg(long, global = true)]
+        lease: Option<String>,
         #[command(subcommand)]
         command: Box<automation::MsgCommand>,
+    },
+    /// Reconstruct terminal and layout state from a recording, without running anything.
+    ///
+    /// Deliberately not a re-execution: a recording is evidence about a session that already ran,
+    /// and running its commands again would be a different session with different side effects.
+    Replay {
+        /// The recording to read.
+        file: PathBuf,
+        /// Reconstruct only this pane.
+        #[arg(long)]
+        pane_id: Option<u64>,
     },
     /// Install, inspect, and invoke user plugins.
     Plugin {
@@ -261,6 +277,21 @@ enum TokenCommand {
     Create {
         #[arg(long)]
         rotate: bool,
+        #[arg(long)]
+        auth_file: Option<PathBuf>,
+    },
+    /// Create an automation-only token that cannot attach a terminal.
+    ///
+    /// The bearer token is all-or-nothing: anything holding it can attach and drive the session as
+    /// a user. A scoped token is for an agent, and carries only the automation authority it needs
+    /// — `automation-read` runs observations, `automation-input` also runs mutations. Printed
+    /// exactly once.
+    CreateScoped {
+        #[arg(long, value_enum, required = true, value_delimiter = ',')]
+        scope: Vec<gateway::auth::TokenScope>,
+        /// A note naming who this was issued to, shown by `token list`. Never a secret.
+        #[arg(long)]
+        label: Option<String>,
         #[arg(long)]
         auth_file: Option<PathBuf>,
     },
@@ -365,12 +396,14 @@ fn run(cli: Cli) -> io::Result<()> {
             expect_session,
             expect_layout,
             idempotency_key,
+            lease,
             command,
         }) => automation::run(
             target.as_deref(),
             automation::RequestOptions {
                 alias,
                 pane_name,
+                lease,
                 expect: crate::ipc::ExpectedState {
                     screen_sequence: expect_screen,
                     session_sequence: expect_session,
@@ -380,6 +413,14 @@ fn run(cli: Cli) -> io::Result<()> {
             },
             *command,
         ),
+        Some(Command::Replay { file, pane_id }) => {
+            let replayed = record::replay(&file, pane_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&replayed).map_err(io::Error::other)?
+            );
+            Ok(())
+        }
         Some(Command::Plugin { command }) => plugin::run(command),
         Some(Command::Api { command }) => api::run(command),
         Some(Command::Update { check }) => update::run(check),
@@ -475,6 +516,17 @@ fn run(cli: Cli) -> io::Result<()> {
                 let config = config::Config::load(cli.config.as_deref())?;
                 let path = auth_file.as_deref().or(config.server.auth_file.as_deref());
                 let token = gateway::auth::create_token(path, rotate)?;
+                println!("{}", token.as_str());
+                Ok(())
+            }
+            TokenCommand::CreateScoped {
+                scope,
+                label,
+                auth_file,
+            } => {
+                let config = config::Config::load(cli.config.as_deref())?;
+                let path = auth_file.as_deref().or(config.server.auth_file.as_deref());
+                let token = gateway::auth::create_scoped_token(path, scope, label)?;
                 println!("{}", token.as_str());
                 Ok(())
             }
@@ -758,11 +810,26 @@ fn crc32(bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Parse a command line on a stack large enough for the whole clap tree.
+    ///
+    /// The same reason `main` uses a worker thread on Windows: clap's generated parser visits every
+    /// nested subcommand, and libtest's per-test stack is smaller than a worker thread's default.
+    /// A test that overflows here is reporting the parser's depth, not a bug in the command it was
+    /// checking, so the depth is given room rather than the tests being made to avoid it.
+    fn parse<const N: usize>(arguments: [&'static str; N]) -> Result<Cli, clap::Error> {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(arguments))
+            .expect("test parser thread")
+            .join()
+            .expect("test parser thread panicked")
+    }
     use super::*;
 
     #[test]
     fn attach_detach_other_flag_defaults_to_default_session() {
-        let cli = Cli::try_parse_from(["vvmux", "attach", "-d"]).unwrap();
+        let cli = parse(["vvmux", "attach", "-d"]).unwrap();
         let Some(command) = cli.command else {
             panic!("attach command was not parsed");
         };
@@ -783,7 +850,7 @@ mod tests {
 
     #[test]
     fn attach_detach_other_flag_accepts_an_explicit_target() {
-        let cli = Cli::try_parse_from(["vvmux", "attach", "-d", "-t", "work"]).unwrap();
+        let cli = parse(["vvmux", "attach", "-d", "-t", "work"]).unwrap();
         let Some(command) = cli.command else {
             panic!("attach command was not parsed");
         };
@@ -799,7 +866,7 @@ mod tests {
 
     #[test]
     fn attach_without_detach_other_keeps_replacement_disabled() {
-        let cli = Cli::try_parse_from(["vvmux", "attach"]).unwrap();
+        let cli = parse(["vvmux", "attach"]).unwrap();
         let Some(command) = cli.command else {
             panic!("attach command was not parsed");
         };
@@ -815,12 +882,10 @@ mod tests {
 
     #[test]
     fn parses_pane_automation_commands_and_enforces_cli_bounds() {
-        assert!(Cli::try_parse_from(["vvmux", "attach", "-t", "work", "--pane-id", "7"]).is_ok());
+        assert!(parse(["vvmux", "attach", "-t", "work", "--pane-id", "7"]).is_ok());
+        assert!(parse(["vvmux", "attach", "-t", "work", "--alias", "reviewer"]).is_ok());
         assert!(
-            Cli::try_parse_from(["vvmux", "attach", "-t", "work", "--alias", "reviewer"]).is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
+            parse([
                 "vvmux",
                 "attach",
                 "-t",
@@ -832,11 +897,11 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(Cli::try_parse_from(["vvmux", "api", "schema", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["vvmux", "channel", "set", "preview"]).is_ok());
-        assert!(Cli::try_parse_from(["vvmux", "update", "--check"]).is_ok());
+        assert!(parse(["vvmux", "api", "schema", "--json"]).is_ok());
+        assert!(parse(["vvmux", "channel", "set", "preview"]).is_ok());
+        assert!(parse(["vvmux", "update", "--check"]).is_ok());
         assert!(
-            Cli::try_parse_from([
+            parse([
                 "vvmux",
                 "msg",
                 "--target",
@@ -851,31 +916,20 @@ mod tests {
             ])
             .is_ok()
         );
+        assert!(parse(["vvmux", "msg", "key", "Enter", "--repeat", "1001",]).is_err());
+        assert!(parse(["vvmux", "msg", "get-grid", "--start-line", "0",]).is_err());
+        assert!(parse(["vvmux", "msg", "wait", "screen-stable", "--quiet", "25h",]).is_err());
+        assert!(parse(["vvmux", "msg", "inspect-media", "--pane-id", "7"]).is_ok());
+        assert!(parse(["vvmux", "msg", "sync-input", "--on"]).is_ok());
+        assert!(parse(["vvmux", "msg", "sync-input", "--off"]).is_ok());
+        assert!(parse(["vvmux", "msg", "sync-input"]).is_err());
+        assert!(parse(["vvmux", "msg", "sync-input", "--on", "--off"]).is_err());
+        assert!(parse(["vvmux", "msg", "action", "toggle-zoom", "--pane-id", "7",]).is_ok());
+        assert!(parse(["vvmux", "--skill"]).is_ok());
+        assert!(parse(["vvmux", "plugin", "catalog", "--target", "work", "--json",]).is_ok());
+        assert!(parse(["vvmux", "plugin", "catalog", "--json"]).is_err());
         assert!(
-            Cli::try_parse_from(["vvmux", "msg", "key", "Enter", "--repeat", "1001",]).is_err()
-        );
-        assert!(Cli::try_parse_from(["vvmux", "msg", "get-grid", "--start-line", "0",]).is_err());
-        assert!(
-            Cli::try_parse_from(["vvmux", "msg", "wait", "screen-stable", "--quiet", "25h",])
-                .is_err()
-        );
-        assert!(Cli::try_parse_from(["vvmux", "msg", "inspect-media", "--pane-id", "7"]).is_ok());
-        assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input", "--on"]).is_ok());
-        assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input", "--off"]).is_ok());
-        assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input"]).is_err());
-        assert!(Cli::try_parse_from(["vvmux", "msg", "sync-input", "--on", "--off"]).is_err());
-        assert!(
-            Cli::try_parse_from(["vvmux", "msg", "action", "toggle-zoom", "--pane-id", "7",])
-                .is_ok()
-        );
-        assert!(Cli::try_parse_from(["vvmux", "--skill"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["vvmux", "plugin", "catalog", "--target", "work", "--json",])
-                .is_ok()
-        );
-        assert!(Cli::try_parse_from(["vvmux", "plugin", "catalog", "--json"]).is_err());
-        assert!(
-            Cli::try_parse_from([
+            parse([
                 "vvmux",
                 "plugin",
                 "invoke",
@@ -885,9 +939,9 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vvmux", "plugin", "invoke", "dev.example/run"]).is_err());
+        assert!(parse(["vvmux", "plugin", "invoke", "dev.example/run"]).is_err());
         assert!(
-            Cli::try_parse_from([
+            parse([
                 "vvmux",
                 "plugin",
                 "pane",
@@ -898,12 +952,9 @@ mod tests {
             ])
             .is_ok()
         );
+        assert!(parse(["vvmux", "plugin", "pane", "open", "dev.example/dashboard",]).is_err());
         assert!(
-            Cli::try_parse_from(["vvmux", "plugin", "pane", "open", "dev.example/dashboard",])
-                .is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
+            parse([
                 "vvmux",
                 "msg",
                 "report-agent",
@@ -921,7 +972,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            Cli::try_parse_from([
+            parse([
                 "vvmux",
                 "msg",
                 "report-agent",
@@ -939,7 +990,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            Cli::try_parse_from([
+            parse([
                 "vvmux",
                 "msg",
                 "clear-agent-report",
@@ -953,7 +1004,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            Cli::try_parse_from([
+            parse([
                 "vvmux",
                 "msg",
                 "trace-media",
@@ -973,9 +1024,9 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vvmux", "msg", "trace-media", "--source-id", "9",]).is_err());
+        assert!(parse(["vvmux", "msg", "trace-media", "--source-id", "9",]).is_err());
         assert!(
-            Cli::try_parse_from([
+            parse([
                 "vvmux",
                 "msg",
                 "wait",
