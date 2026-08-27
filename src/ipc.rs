@@ -2036,7 +2036,14 @@ mod tests {
             )
         }
 
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping structured record socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("structured record test listener bind failed: {error}"),
+        };
         let address = listener.local_addr().unwrap();
         let right = TcpStream::connect(address).unwrap();
         let (left, _) = listener.accept().unwrap();

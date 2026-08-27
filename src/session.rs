@@ -18121,10 +18121,10 @@ mod tests {
 
     #[test]
     fn osc52_selections_map_onto_the_single_copy_buffer() {
-        for selection in [b'c', b'p', b's'] {
+        for selection in *b"cps" {
             assert!(is_supported_clipboard_selection(selection));
         }
-        for selection in [b'q', b'0', b'?'] {
+        for selection in *b"q0?" {
             assert!(!is_supported_clipboard_selection(selection));
         }
     }

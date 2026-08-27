@@ -159,7 +159,7 @@ fn run() -> io::Result<()> {
             let force_full = frame_id == 4 || (inject_bad_delta && index == 0 && frame_id == 3);
             if force_full && frame_id == 4 {
                 let mut full = vec![0_u8; pixel_bytes];
-                for pixel in full.chunks_exact_mut(4) {
+                for pixel in full.as_chunks_mut::<4>().0 {
                     pixel.copy_from_slice(&overwrite);
                 }
                 channel.send_raster(0, frame_id, &full, false)?;

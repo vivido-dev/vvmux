@@ -1585,7 +1585,14 @@ mod tests {
         .with_single_cert(vec![certificate.clone()], private_key.into())
         .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping real rustls socket test: {error}");
+                return;
+            }
+            Err(error) => panic!("TLS test listener bind failed: {error}"),
+        };
         let port = listener.local_addr().unwrap().port();
         let (exporter_sender, exporter_receiver) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {

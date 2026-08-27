@@ -10,6 +10,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
@@ -17,12 +18,18 @@ use serde_json::Value;
 struct SessionGuard {
     binary: &'static str,
     name: String,
+    runtime: PathBuf,
+    state: PathBuf,
+    config_home: PathBuf,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         let _ = Command::new(self.binary)
             .args(["kill-session", "--target", &self.name])
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env("XDG_STATE_HOME", &self.state)
+            .env("XDG_CONFIG_HOME", &self.config_home)
             .output();
     }
 }
@@ -30,8 +37,11 @@ impl Drop for SessionGuard {
 struct Fixture {
     binary: &'static str,
     name: String,
-    _directory: tempfile::TempDir,
+    runtime: PathBuf,
+    state: PathBuf,
+    config_home: PathBuf,
     _guard: SessionGuard,
+    _directory: tempfile::TempDir,
 }
 
 impl Fixture {
@@ -41,7 +51,16 @@ impl Fixture {
     /// scrub, and a fixture that never sets it would pass no matter what the launcher did.
     fn start(label: &str) -> Self {
         let binary = env!("CARGO_BIN_EXE_vvmux");
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("vvmux-contract-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let runtime = directory.path().join("runtime");
+        let state = directory.path().join("state");
+        let config_home = directory.path().join("config-home");
+        private_directory(&runtime);
+        private_directory(&state);
+        private_directory(&config_home);
         let shell = directory.path().join("sh");
         fs::write(
             &shell,
@@ -86,6 +105,9 @@ exec /bin/sh
             .env("VIVIDO_SOCKET", "/tmp/does-not-exist-vivido.sock")
             .env("VIVIDO_WINDOW_ID", "4242")
             .env("VIVIDO_SESSION", "outer-window")
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", &config_home)
             .output()
             .unwrap();
         assert!(
@@ -97,8 +119,17 @@ exec /bin/sh
         let fixture = Fixture {
             binary,
             name: name.clone(),
+            runtime: runtime.clone(),
+            state: state.clone(),
+            config_home: config_home.clone(),
+            _guard: SessionGuard {
+                binary,
+                name,
+                runtime,
+                state,
+                config_home,
+            },
             _directory: directory,
-            _guard: SessionGuard { binary, name },
         };
         let ready = fixture.msg(&[
             "wait",
@@ -117,8 +148,17 @@ exec /bin/sh
         fixture
     }
 
+    fn command(&self) -> Command {
+        let mut command = Command::new(self.binary);
+        command
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env("XDG_STATE_HOME", &self.state)
+            .env("XDG_CONFIG_HOME", &self.config_home);
+        command
+    }
+
     fn msg(&self, arguments: &[&str]) -> Output {
-        Command::new(self.binary)
+        self.command()
             .args(["msg", "--target", &self.name])
             .args(arguments)
             .output()
@@ -139,6 +179,11 @@ exec /bin/sh
             )
         })
     }
+}
+
+fn private_directory(path: &Path) {
+    fs::create_dir(path).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[test]
@@ -226,7 +271,8 @@ fn session_started_replays_without_plugins() {
 
     // Replay from the beginning rather than waiting for a live event: `session.started` fires once,
     // before any subscriber can exist, so the journal is the only place it can be observed.
-    let mut streaming = Command::new(fixture.binary)
+    let mut streaming = fixture
+        .command()
         .args([
             "msg",
             "--target",
@@ -926,7 +972,10 @@ fn shell_command_returns_a_real_exit_status_and_refuses_a_shell_that_reports_non
         );
         // The status comes from the shell, so it is the command's own, not a guess from output.
         assert!(result["command_id"].as_u64().unwrap() > 0);
+        #[cfg(target_os = "linux")]
         assert!(result["cwd"].is_string(), "{result}");
+        #[cfg(not(target_os = "linux"))]
+        assert!(result["cwd"].is_null(), "{result}");
     }
 
     // One line, one command: a newline would submit two and the marker waited for would belong to
