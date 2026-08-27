@@ -731,6 +731,11 @@ pub enum AutomationMethod {
     },
     WaitScreenStable {
         quiet_ms: u64,
+        /// Rows at the bottom of the pane that do not count as activity.
+        ///
+        /// A TUI painting a live clock or spinner into its status bar never lets the whole screen
+        /// go quiet, so an unqualified stability wait can never fire while such a program runs.
+        ignore_bottom: u16,
         after_screen: Option<u64>,
         timeout_ms: u64,
     },

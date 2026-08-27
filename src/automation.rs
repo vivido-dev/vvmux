@@ -898,6 +898,10 @@ pub enum WaitCommand {
     ScreenStable {
         #[arg(long, default_value = "200ms", value_parser = parse_timeout)]
         quiet: Duration,
+        /// Rows at the bottom of the pane that do not count as activity, for a program whose
+        /// status bar repaints a clock or spinner and would otherwise never let it settle.
+        #[arg(long, default_value_t = 0)]
+        ignore_bottom: u16,
         #[arg(long)]
         after_screen: Option<u64>,
         #[arg(long, default_value = "30s", value_parser = parse_timeout)]
@@ -2132,12 +2136,14 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             ),
             WaitCommand::ScreenStable {
                 quiet,
+                ignore_bottom,
                 after_screen,
                 timeout,
                 pane_id,
             } => (
                 AutomationMethod::WaitScreenStable {
                     quiet_ms: millis(quiet),
+                    ignore_bottom,
                     after_screen,
                     timeout_ms: millis(timeout),
                 },

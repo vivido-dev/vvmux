@@ -129,18 +129,34 @@ Use this release-matched workflow:
    work with `agent-prompt --pane-id ID --wait --until blocked,done TEXT`; it separates prompt text
    from Enter and waits on agent lifecycle rather than screen text. Use `agent-send-keys` only for
    its bounded allow-listed control/navigation keys.
-27. For prior full-screen context, use `agent-read --pane-id ID --lines 200`. It requires an idle
+27. When a pane runs an agent vvmux does not recognize — `inspect`'s `agent` is `null` and
+   `agent-start`/`agent-prompt`/`wait agent-state` are all unavailable — that is a missing provider
+   plugin, not a fault. Say so and offer `vvmux plugin install NAME` rather than silently falling
+   back, because the fallback loses lifecycle waiting and conversation resume. To drive one anyway:
+   - Read `inspect`'s `output_offset` **before** submitting. That is the only way to ask for
+     exactly the answer afterwards; without it `transcript` cannot separate the reply from
+     everything before it, and the grid holds only the last screen, which a long answer outruns.
+   - Send the request with `submit`, which is `typing` plus Enter.
+   - Wait with `wait screen-stable --quiet 3s --ignore-bottom N`, sized to the agent's status bar.
+     Without `--ignore-bottom` this **never fires** for an agent that paints a spinner, elapsed
+     timer, or token counter: the screen changes every second for as long as the agent works, which
+     is exactly the interval being waited on. Give it a timeout matching the work, not the default.
+   - Collect with `transcript --after-offset OFFSET`, using the offset captured before the submit.
+   A quiet screen is weaker evidence than an agent lifecycle state — an agent that pauses mid-answer
+   looks finished — so prefer a provider plugin wherever one exists and treat this as the fallback.
+
+28. For prior full-screen context, use `agent-read --pane-id ID --lines 200`. It requires an idle
    alternate-screen agent and restores the viewport. If those gates do not hold, ask the agent to
    write a Markdown file and read it directly. When state looks wrong, inspect
    `agent-explain --pane-id ID` before changing anything.
-28. `agent-start` verifies the pane is a shell at its prompt, quotes arguments for that shell, and
+29. `agent-start` verifies the pane is a shell at its prompt, quotes arguments for that shell, and
    returns only once the agent is detected and settled. `agent_pane_busy` means the pane is running
    something else; `agent_not_launchable` means that provider is detection-only.
-29. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
+30. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
    polling each one. Treat a `gap` record as missed events, not as an error; it is never filtered
    out even when the stream is narrowed.
 
-30. Name an agent you will come back to: `agent-rename --pane-id ID --name reviewer`. Then target it
+31. Name an agent you will come back to: `agent-rename --pane-id ID --name reviewer`. Then target it
    with `--alias reviewer` on any `msg` command instead of `--pane-id`, which keeps working after
    splits, closes, and renumbering. Names are unique per session (`agent_alias_taken`), belong to
    the agent process rather than the pane, and are cleared when that agent exits or is replaced —
@@ -148,16 +164,16 @@ Use this release-matched workflow:
    `agent-rename --pane-id ID --clear` to release a name. Pane IDs remain correct for everything
    else; a name is for an agent you drive repeatedly.
 
-31. A session's shape survives its server restarting, so do not rebuild it by hand after a restart.
+32. A session's shape survives its server restarting, so do not rebuild it by hand after a restart.
    `snapshot` reports whether this session came from one. Pane IDs are reassigned on restore — they
    are stable only within one run of a server — so never persist a pane ID across a restart. Use
    `pane-rename` for a pane and `agent-rename` for an agent running in one; both survive.
 
-32. Pane history (`[session] pane_history`) is off by default and must stay a user decision: it
+33. Pane history (`[session] pane_history`) is off by default and must stay a user decision: it
    writes whatever scrolled past a pane — including secrets — to disk. Never enable it on a user's
    behalf to make a task easier.
 
-33. After a restart, an agent pane reopens its own conversation when a client attaches — check
+34. After a restart, an agent pane reopens its own conversation when a client attaches — check
    `inspect`'s `pending_resume` before concluding a pane is a bare shell, and do not launch a second
    agent into it. A resume needs the agent's provider plugin installed with its integration
    (`vvmux plugin install claude`), because the session identity it uses comes from that

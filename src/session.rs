@@ -766,6 +766,9 @@ struct Pane {
 struct ScreenChange {
     sequence: u64,
     rows: Option<Vec<usize>>,
+    /// When this change landed, so stability can be measured over a subset of the screen rather
+    /// than only against the pane's single most recent change.
+    at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -911,6 +914,8 @@ enum AutomationWaitKind {
     },
     ScreenStable {
         quiet: Duration,
+        /// Rows at the bottom of the pane that do not count as activity.
+        ignore_bottom: u16,
         after_screen: Option<u64>,
     },
     Rendered {
@@ -2613,6 +2618,7 @@ impl SessionActor {
                 pane.screen_changes.push_back(ScreenChange {
                     sequence: pane.screen_sequence,
                     rows,
+                    at: pane.last_screen_change,
                 });
                 while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
                     pane.screen_changes.pop_front();
@@ -4558,6 +4564,7 @@ impl SessionActor {
             }
             AutomationMethod::WaitScreenStable {
                 quiet_ms,
+                ignore_bottom,
                 after_screen,
                 timeout_ms,
             } => {
@@ -4578,6 +4585,7 @@ impl SessionActor {
                     deadline: deadline(timeout_ms),
                     kind: AutomationWaitKind::ScreenStable {
                         quiet: Duration::from_millis(quiet_ms),
+                        ignore_bottom,
                         after_screen,
                     },
                 })
@@ -8394,10 +8402,21 @@ impl SessionActor {
             .iter()
             .map(|waiter| {
                 let stable_ready = match (&waiter.kind, waiter.pane_id) {
-                    (AutomationWaitKind::ScreenStable { quiet, .. }, Some(pane)) => self
-                        .panes
-                        .get(&pane)
-                        .map(|pane| pane.last_screen_change + *quiet),
+                    (
+                        AutomationWaitKind::ScreenStable {
+                            quiet,
+                            ignore_bottom,
+                            ..
+                        },
+                        Some(pane),
+                    ) => self.panes.get(&pane).map(|pane| {
+                        last_meaningful_change(
+                            &pane.screen_changes,
+                            pane.last_screen_change,
+                            pane.terminal.rows(),
+                            *ignore_bottom,
+                        ) + *quiet
+                    }),
                     // A launch is unanswerable until its settle window ends, so the actor has to
                     // wake then even if nothing else happens — otherwise an agent that starts
                     // silently is only noticed at the next unrelated wake.
@@ -8998,18 +9017,25 @@ impl SessionActor {
                     }
                     AutomationWaitKind::ScreenStable {
                         quiet,
+                        ignore_bottom,
                         after_screen,
                     } => {
                         let newer =
                             after_screen.is_none_or(|sequence| pane.screen_sequence > sequence);
-                        (newer && now.saturating_duration_since(pane.last_screen_change) >= *quiet)
-                            .then(|| {
-                                Ok(serde_json::json!({
-                                    "pane_id": pane_id,
-                                    "screen_sequence": pane.screen_sequence,
-                                    "quiet_ms": quiet.as_millis(),
-                                }))
-                            })
+                        let since = now.saturating_duration_since(last_meaningful_change(
+                            &pane.screen_changes,
+                            pane.last_screen_change,
+                            pane.terminal.rows(),
+                            *ignore_bottom,
+                        ));
+                        (newer && since >= *quiet).then(|| {
+                            Ok(serde_json::json!({
+                                "pane_id": pane_id,
+                                "screen_sequence": pane.screen_sequence,
+                                "quiet_ms": quiet.as_millis(),
+                                "ignore_bottom": ignore_bottom,
+                            }))
+                        })
                     }
                     _ => None,
                 }
@@ -9043,6 +9069,7 @@ impl SessionActor {
         pane.screen_changes.push_back(ScreenChange {
             sequence: pane.screen_sequence,
             rows,
+            at: pane.last_screen_change,
         });
         while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
             pane.screen_changes.pop_front();
@@ -13270,6 +13297,7 @@ impl SessionActor {
                     pane.screen_changes.push_back(ScreenChange {
                         sequence: pane.screen_sequence,
                         rows: None,
+                        at: pane.last_screen_change,
                     });
                     while pane.screen_changes.len() > SCREEN_CHANGE_HISTORY {
                         pane.screen_changes.pop_front();
@@ -14742,6 +14770,46 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 /// A route crosses one split per step, so a session cannot need more than its pane count; this is
 /// well past that and keeps a hostile caller from asking for an unbounded walk.
 const MAX_RESOLVE_PANE_STEPS: usize = 32;
+
+/// When this pane last changed anywhere above its bottom `ignore_bottom` rows.
+///
+/// A TUI that paints a live clock, spinner, or token counter into its status bar never lets the
+/// whole screen go quiet, so plain stability never fires while such a program runs — which is
+/// exactly when a caller is waiting for it to finish. Discounting the rows the caller names makes
+/// the wait answer the question being asked instead of timing out on a ticking second counter.
+///
+/// Falls back to the oldest retained change when the entire history is status-bar noise: the pane
+/// demonstrably has not changed meaningfully in at least that long, which is the conservative
+/// answer rather than claiming it never has.
+fn last_meaningful_change(
+    changes: &VecDeque<ScreenChange>,
+    last_change: Instant,
+    rows: usize,
+    ignore_bottom: u16,
+) -> Instant {
+    if ignore_bottom == 0 {
+        return last_change;
+    }
+    let oldest = || changes.front().map_or(last_change, |change| change.at);
+    let cutoff = rows.saturating_sub(usize::from(ignore_bottom));
+    if cutoff == 0 {
+        // Every row was discounted. Nothing can be evidence of activity, so the pane counts as
+        // quiet since its oldest retained change.
+        return oldest();
+    }
+    changes
+        .iter()
+        .rev()
+        .find(|change| {
+            change
+                .rows
+                .as_ref()
+                // A whole-screen repaint is always meaningful: nothing says it was confined to
+                // the discounted band.
+                .is_none_or(|rows| rows.iter().any(|row| *row < cutoff))
+        })
+        .map_or_else(oldest, |change| change.at)
+}
 
 /// A pane's advertised cell size, raised while a scaled capture is in flight.
 ///
@@ -17438,6 +17506,75 @@ mod tests {
             CaptureSettleStep::Capture
         );
         assert!(CAPTURE_SETTLE_QUIET < CAPTURE_SETTLE_LIMIT);
+    }
+
+    fn changed(sequence: u64, rows: Option<Vec<usize>>, at: Instant) -> ScreenChange {
+        ScreenChange { sequence, rows, at }
+    }
+
+    #[test]
+    fn a_ticking_status_bar_does_not_count_as_pane_activity() {
+        // The failure this fixes, measured on a real agent pane: a TUI repainting a seconds
+        // counter into its status bar changes the screen every second, so an unqualified
+        // stability wait can never fire while the agent is working — which is precisely when a
+        // caller is waiting for it to finish.
+        let base = Instant::now();
+        let last = base + Duration::from_secs(10);
+        let changes = VecDeque::from([
+            // Real output, five seconds ago.
+            changed(1, Some(vec![3, 4]), base + Duration::from_secs(5)),
+            // Status-bar repaints since then, in the bottom four rows.
+            changed(2, Some(vec![21]), base + Duration::from_secs(8)),
+            changed(3, Some(vec![22, 23]), base + Duration::from_secs(10)),
+        ]);
+
+        // Counting every row, the pane looks busy as of the last tick.
+        assert_eq!(
+            last_meaningful_change(&changes, last, 24, 0),
+            base + Duration::from_secs(10)
+        );
+        // Discounting the status bar, it has been quiet since the real output.
+        assert_eq!(
+            last_meaningful_change(&changes, last, 24, 4),
+            base + Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn a_whole_screen_repaint_is_always_activity() {
+        // `rows: None` is a screen switch or clear. Nothing says it was confined to the discounted
+        // band, so it must never be dismissed as status-bar noise.
+        let base = Instant::now();
+        let last = base + Duration::from_secs(9);
+        let changes = VecDeque::from([
+            changed(1, Some(vec![2]), base + Duration::from_secs(1)),
+            changed(2, None, base + Duration::from_secs(9)),
+        ]);
+        assert_eq!(
+            last_meaningful_change(&changes, last, 24, 4),
+            base + Duration::from_secs(9)
+        );
+    }
+
+    #[test]
+    fn a_pane_that_only_ever_ticked_reports_its_oldest_retained_change() {
+        // With nothing but status-bar noise retained, the honest answer is "quiet since at least
+        // the oldest thing still remembered" rather than "never changed".
+        let base = Instant::now();
+        let last = base + Duration::from_secs(9);
+        let changes = VecDeque::from([
+            changed(1, Some(vec![22]), base + Duration::from_secs(3)),
+            changed(2, Some(vec![23]), base + Duration::from_secs(9)),
+        ]);
+        assert_eq!(
+            last_meaningful_change(&changes, last, 24, 4),
+            base + Duration::from_secs(3)
+        );
+        // Discounting every row cannot make a pane look busy either.
+        assert_eq!(
+            last_meaningful_change(&changes, last, 24, 99),
+            base + Duration::from_secs(3)
+        );
     }
 
     #[test]
