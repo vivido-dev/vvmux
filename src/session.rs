@@ -733,6 +733,13 @@ struct Pane {
     copy: Option<CopyState>,
     mouse_selection: Option<MouseSelection>,
     vivid_metrics: Option<(u16, u16, u16, u16)>,
+    /// Temporary cell-metric multiplier while a scaled capture is in flight.
+    ///
+    /// A producer sizes its raster to the pane viewport in pixels, and the only lever the closed
+    /// `terminal-surface-v1` descriptor offers for that is the cell size. Raising it asks the
+    /// producer to re-render the same grid at a higher density, which is what makes small text
+    /// legible in a capture; it is cleared again as soon as the capture finishes or fails.
+    capture_scale: Option<u32>,
     /// Whether the pane leaves its background to the outer terminal rather than painting one.
     ///
     /// A transparent pane's default-background cells stay SGR 49, so a translucent host window
@@ -774,6 +781,82 @@ struct AutomationWaiter {
     kind: AutomationWaitKind,
 }
 
+/// How long the layers must stop changing before a scaled capture is taken.
+const CAPTURE_SETTLE_QUIET: Duration = Duration::from_millis(250);
+/// How long a scaled capture waits for quiet before taking whatever is there.
+const CAPTURE_SETTLE_LIMIT: Duration = Duration::from_secs(3);
+
+/// What the settle state says to do next, kept pure so the timing rule can be tested directly.
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureSettleStep {
+    /// Nothing to capture yet, carrying forward new settle state when it changed.
+    Wait(Option<CaptureSettling>),
+    /// Frames have gone quiet, or waited long enough; take the capture.
+    Capture,
+}
+
+/// Decide whether a scaled capture may be taken yet.
+///
+/// The rule exists because a producer answers a cell-metric change by replacing its raster track,
+/// and that replacement track's first frame is the blank buffer it was created with. Resolving on
+/// the first observed change therefore captures an empty page — which is exactly what it did
+/// before this was a settle. Waiting for the frames to stop instead catches the render that
+/// follows, and the give-up bound keeps a pane that never stops animating from waiting forever.
+fn capture_settle_step(
+    baseline: &[CaptureIdentity],
+    current: Vec<CaptureIdentity>,
+    settling: Option<&CaptureSettling>,
+    now: Instant,
+) -> CaptureSettleStep {
+    if current == baseline {
+        // The resize has not reached the producer yet.
+        return CaptureSettleStep::Wait(None);
+    }
+    let Some(settling) = settling else {
+        return CaptureSettleStep::Wait(Some(CaptureSettling {
+            seen: current,
+            quiet_since: now,
+            give_up_at: now + CAPTURE_SETTLE_LIMIT,
+        }));
+    };
+    if settling.seen != current {
+        return CaptureSettleStep::Wait(Some(CaptureSettling {
+            seen: current,
+            quiet_since: now,
+            give_up_at: settling.give_up_at,
+        }));
+    }
+    if now >= settling.quiet_since + CAPTURE_SETTLE_QUIET || now >= settling.give_up_at {
+        return CaptureSettleStep::Capture;
+    }
+    CaptureSettleStep::Wait(None)
+}
+
+/// What one poll of a scaled capture decided.
+enum ScaledCapturePoll {
+    /// Keep waiting, optionally with new settle state to carry forward.
+    Pending(Option<CaptureSettling>),
+    Done(Result<serde_json::Value, AutomationError>),
+}
+
+/// One layer's identity, enough to notice a producer re-rendering: the node, the raster size it
+/// rendered at, and which frame it is.
+type CaptureIdentity = (u64, u32, u32, Option<u64>);
+
+/// Waiting out the frames that follow a capture resize.
+///
+/// A producer answers a cell-metric change by replacing its raster track, and the first frame on
+/// that new track is the blank buffer it was created with — the rendered content arrives after it.
+/// Capturing on the first change therefore captures nothing, so this waits for the frames to stop
+/// arriving instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureSettling {
+    seen: Vec<CaptureIdentity>,
+    quiet_since: Instant,
+    /// Capture regardless past this point, so a pane that never stops animating still answers.
+    give_up_at: Instant,
+}
+
 struct PendingAgentRead {
     reply: AutomationReplyTarget,
     read: crate::alt_read::PendingAltRead,
@@ -782,6 +865,18 @@ struct PendingAgentRead {
 }
 
 enum AutomationWaitKind {
+    /// A scaled capture, waiting for the producer to re-render at the raised cell metrics.
+    ///
+    /// `baseline` is what the pane's layers looked like before the resize, so the wait resolves on
+    /// the producer having actually produced something new rather than on a timer. The pane's
+    /// `capture_scale` must be cleared on every exit from this wait, the timeout included, or the
+    /// pane is left resized.
+    CaptureMedia {
+        path: String,
+        baseline: Vec<CaptureIdentity>,
+        /// Set once the resize has landed, to wait out the frames that follow it.
+        settling: Option<CaptureSettling>,
+    },
     Text {
         pattern: AutomationTextPattern,
         after_screen: Option<u64>,
@@ -3780,10 +3875,31 @@ impl SessionActor {
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
-            AutomationMethod::CaptureMedia { ref path } => {
+            AutomationMethod::CaptureMedia {
+                ref path,
+                scale,
+                force,
+                timeout_ms,
+            } => {
                 let pane_id = pane_id.unwrap();
-                match self.capture_media_payload(pane_id, path) {
-                    Ok(result) => self.reply_automation(target, result),
+                if scale <= 1 {
+                    match self.capture_media_payload(pane_id, path) {
+                        Ok(result) => self.reply_automation(target, result),
+                        Err(error) => self.reply_automation_error(target, error),
+                    }
+                    return;
+                }
+                match self.begin_scaled_capture(pane_id, scale, force) {
+                    Ok(baseline) => self.add_automation_waiter(AutomationWaiter {
+                        reply: target,
+                        pane_id: Some(pane_id),
+                        deadline: deadline(timeout_ms),
+                        kind: AutomationWaitKind::CaptureMedia {
+                            path: path.clone(),
+                            baseline,
+                            settling: None,
+                        },
+                    }),
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
@@ -5914,6 +6030,138 @@ impl SessionActor {
         })
     }
 
+    /// What a pane's layers look like right now, as the baseline a scaled capture waits past.
+    ///
+    /// Identity is the node plus its raster dimensions and frame id: a re-render at new metrics
+    /// changes the dimensions, and a producer that re-sent the same size still advances the frame.
+    fn capture_baseline(&self, pane_id: PaneId) -> Vec<CaptureIdentity> {
+        self.vivid
+            .capture_pane(pane_id, 0)
+            .iter()
+            .map(|layer| match &layer.content {
+                vivid_gateway::CaptureContent::Raster(raster) => (
+                    layer.node_id,
+                    raster.width,
+                    raster.height,
+                    Some(raster.frame_id),
+                ),
+                vivid_gateway::CaptureContent::EncodedImage(_) => (layer.node_id, 0, 0, None),
+            })
+            .collect()
+    }
+
+    /// Raise a pane's cell metrics so its producer re-renders at a higher density.
+    ///
+    /// Refused while a client is attached unless forced: the transition is an ordinary resize to
+    /// everything downstream, so the human watching the pane sees it change shape and change back.
+    fn begin_scaled_capture(
+        &mut self,
+        pane_id: PaneId,
+        scale: u32,
+        force: bool,
+    ) -> Result<Vec<CaptureIdentity>, AutomationError> {
+        if !self.panes.contains_key(&pane_id) {
+            return Err(AutomationError::new(
+                "pane_not_found",
+                "pane no longer exists",
+            ));
+        }
+        if self.panes.values().any(|pane| pane.capture_scale.is_some()) {
+            return Err(AutomationError::new(
+                "capture_in_progress",
+                "another scaled capture is still running in this session",
+            ));
+        }
+        if self.attached.is_some() && !force {
+            return Err(AutomationError::new(
+                "capture_would_disturb_client",
+                "a scaled capture resizes the pane in view of the attached client; pass --force to allow it",
+            ));
+        }
+        let content = self.pane_content_rect(pane_id)?;
+        let (cell_width, cell_height) =
+            (self.last_display.cell_width, self.last_display.cell_height);
+        if cell_width == 0 || cell_height == 0 {
+            return Err(AutomationError::new(
+                "cell_metrics_unknown",
+                "no client has reported cell metrics, so a pane has no pixel size yet",
+            ));
+        }
+        // Bound the request against the same budget the compositor enforces, before anything is
+        // asked to allocate a framebuffer this large.
+        let (scaled_width, scaled_height) = scaled_cells(cell_width, cell_height, Some(scale));
+        let pixels = u64::from(content.width)
+            .checked_mul(u64::from(scaled_width))
+            .and_then(|width| {
+                u64::from(content.height)
+                    .checked_mul(u64::from(scaled_height))
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or_else(|| {
+                AutomationError::new("capture_scale_rejected", "scaled pane size overflows")
+            })?;
+        if pixels > crate::capture_media::MAX_CAPTURE_PIXELS {
+            return Err(AutomationError::new(
+                "capture_scale_rejected",
+                format!(
+                    "scale {scale} would need {pixels} pixels, past the {} budget",
+                    crate::capture_media::MAX_CAPTURE_PIXELS
+                ),
+            ));
+        }
+        let baseline = self.capture_baseline(pane_id);
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.capture_scale = Some(scale);
+        }
+        self.resize_all();
+        Ok(baseline)
+    }
+
+    /// Has the producer finished re-rendering? If so, capture; if not, keep waiting.
+    ///
+    /// Two things make this a settle rather than a single edge. A producer answers the resize by
+    /// replacing its raster track, and that new track's first frame is the blank buffer it was
+    /// created with, so capturing on the first change captures an empty page. And a producer is
+    /// entitled to clamp what it was asked for — `vvrd` at its 16,384px render ceiling, `vrowser`
+    /// against its pixel contract — so a wait keyed to the arithmetic ideal would hang forever on
+    /// exactly the panes that most need capturing.
+    fn poll_scaled_capture(
+        &mut self,
+        pane_id: PaneId,
+        path: &str,
+        baseline: &[CaptureIdentity],
+        settling: Option<&CaptureSettling>,
+        now: Instant,
+    ) -> ScaledCapturePoll {
+        if !self.panes.contains_key(&pane_id) {
+            return ScaledCapturePoll::Done(Err(AutomationError::new(
+                "pane_not_found",
+                "pane closed while its capture was in flight",
+            )));
+        }
+        let current = self.capture_baseline(pane_id);
+        match capture_settle_step(baseline, current, settling, now) {
+            CaptureSettleStep::Wait(next) => ScaledCapturePoll::Pending(next),
+            CaptureSettleStep::Capture => {
+                ScaledCapturePoll::Done(self.capture_media_payload(pane_id, path))
+            }
+        }
+    }
+
+    /// Drop a pane back to the client's real cell metrics.
+    ///
+    /// Called from every exit out of a scaled capture, the timeout and a vanished pane included:
+    /// leaving `capture_scale` set would strand the pane at capture density.
+    fn finish_scaled_capture(&mut self, pane_id: PaneId) {
+        let was_scaled = self
+            .panes
+            .get_mut(&pane_id)
+            .is_some_and(|pane| pane.capture_scale.take().is_some());
+        if was_scaled {
+            self.resize_all();
+        }
+    }
+
     /// Compose a pane's retained media and write it out as a PNG.
     ///
     /// Reads the gateway's own retained framebuffers rather than the outer projection, so it is
@@ -5930,8 +6178,14 @@ impl SessionActor {
             .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
         let offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
         let content = self.pane_content_rect(pane_id)?;
-        let (cell_width, cell_height) =
-            (self.last_display.cell_width, self.last_display.cell_height);
+        // The scaled cells, not the client's: while a capture is in flight the producer has been
+        // asked to render at capture density, so composing against the client's cell size would
+        // resample the extra detail straight back out and leave `--scale` doing nothing at all.
+        let (cell_width, cell_height) = scaled_cells(
+            self.last_display.cell_width,
+            self.last_display.cell_height,
+            pane.capture_scale,
+        );
         if cell_width == 0 || cell_height == 0 {
             return Err(AutomationError::new(
                 "cell_metrics_unknown",
@@ -8106,6 +8360,18 @@ impl SessionActor {
                     // wake then even if nothing else happens — otherwise an agent that starts
                     // silently is only noticed at the next unrelated wake.
                     (AutomationWaitKind::AgentLaunch { ready_after, .. }, _) => Some(*ready_after),
+                    // A settling capture is answered by frames going quiet, which is the absence
+                    // of an event. Without this the actor would sleep through the quiet window and
+                    // only notice at the next unrelated wake.
+                    (
+                        AutomationWaitKind::CaptureMedia {
+                            settling: Some(settling),
+                            ..
+                        },
+                        _,
+                    ) => {
+                        Some((settling.quiet_since + CAPTURE_SETTLE_QUIET).min(settling.give_up_at))
+                    }
                     (
                         AutomationWaitKind::AgentPrompt {
                             phase: AgentPromptPhase::Stall { stall_deadline, .. },
@@ -8139,8 +8405,48 @@ impl SessionActor {
                             .query(after_sequence, limit, waiter.pane_id, filter);
                     self.reply_automation(waiter.reply, serde_json::to_value(result).unwrap());
                 } else {
+                    // A scaled capture holds the pane at capture density. Drop it back before
+                    // reporting the timeout, or an expired wait strands the pane resized.
+                    if matches!(waiter.kind, AutomationWaitKind::CaptureMedia { .. })
+                        && let Some(pane_id) = waiter.pane_id
+                    {
+                        self.finish_scaled_capture(pane_id);
+                    }
                     let (code, message) = self.automation_timeout_error(&waiter);
                     self.reply_automation_error(waiter.reply, AutomationError::new(code, message));
+                }
+                continue;
+            }
+            // Writing the capture and dropping the pane back both need `&mut self`, so this one
+            // cannot resolve through `automation_waiter_result`.
+            if let AutomationWaitKind::CaptureMedia {
+                path,
+                baseline,
+                settling,
+            } = &waiter.kind
+            {
+                let (path, baseline) = (path.clone(), baseline.clone());
+                let settling = settling.clone();
+                let Some(pane_id) = waiter.pane_id else {
+                    continue;
+                };
+                match self.poll_scaled_capture(pane_id, &path, &baseline, settling.as_ref(), now) {
+                    ScaledCapturePoll::Done(result) => {
+                        self.finish_scaled_capture(pane_id);
+                        match result {
+                            Ok(value) => self.reply_automation(waiter.reply, value),
+                            Err(error) => self.reply_automation_error(waiter.reply, error),
+                        }
+                    }
+                    ScaledCapturePoll::Pending(next) => {
+                        let mut waiter = waiter;
+                        if let AutomationWaitKind::CaptureMedia { settling, .. } = &mut waiter.kind
+                            && let Some(next) = next
+                        {
+                            *settling = Some(next);
+                        }
+                        self.automation_waiters.push(waiter);
+                    }
                 }
                 continue;
             }
@@ -12510,6 +12816,7 @@ impl SessionActor {
                 copy: None,
                 mouse_selection: None,
                 vivid_metrics: None,
+                capture_scale: None,
                 transparent: spec.transparent.unwrap_or(self.config.panes.transparent),
                 hold_on_exit: spec.hold_on_exit,
                 exit_status: None,
@@ -12905,12 +13212,12 @@ impl SessionActor {
                 // and its program intact.
                 let columns = content.width.max(1);
                 let rows = content.height.max(1);
-                let metrics = (
-                    content.width,
-                    content.height,
-                    display.cell_width,
-                    display.cell_height,
-                );
+                // A capture in flight raises this pane's advertised cell size so its producer
+                // re-renders at a higher density. It rides the ordinary metrics path so the
+                // change is a normal resize to the producer and reverts the same way.
+                let (cell_width, cell_height) =
+                    scaled_cells(display.cell_width, display.cell_height, pane.capture_scale);
+                let metrics = (content.width, content.height, cell_width, cell_height);
                 let dimensions_changed = pane.terminal.rows() != rows as usize
                     || pane.terminal.cols() != columns as usize;
                 let metrics_changed = pane.vivid_metrics != Some(metrics);
@@ -12929,11 +13236,11 @@ impl SessionActor {
                 }
                 if dimensions_changed || metrics_changed {
                     let pixel_width = u32::from(columns)
-                        .checked_mul(u32::from(display.cell_width))
+                        .checked_mul(u32::from(cell_width))
                         .and_then(|value| u16::try_from(value).ok())
                         .unwrap_or(0);
                     let pixel_height = u32::from(rows)
-                        .checked_mul(u32::from(display.cell_height))
+                        .checked_mul(u32::from(cell_height))
                         .and_then(|value| u16::try_from(value).ok())
                         .unwrap_or(0);
                     if pane
@@ -12949,7 +13256,7 @@ impl SessionActor {
                         projection.pane_id,
                         content.width,
                         content.height,
-                        (display.cell_width, display.cell_height),
+                        (cell_width, cell_height),
                     );
                     pane.vivid_metrics = Some(metrics);
                 }
@@ -14394,6 +14701,23 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 /// well past that and keeps a hostile caller from asking for an unbounded walk.
 const MAX_RESOLVE_PANE_STEPS: usize = 32;
 
+/// A pane's advertised cell size, raised while a scaled capture is in flight.
+///
+/// Saturating rather than checked because the caller has already validated the scale against a
+/// pixel budget; this only has to refuse to wrap.
+fn scaled_cells(cell_width: u16, cell_height: u16, scale: Option<u32>) -> (u16, u16) {
+    let Some(scale) = scale.filter(|scale| *scale > 1) else {
+        return (cell_width, cell_height);
+    };
+    let apply = |cell: u16| {
+        u32::from(cell)
+            .saturating_mul(scale)
+            .try_into()
+            .unwrap_or(u16::MAX)
+    };
+    (apply(cell_width), apply(cell_height))
+}
+
 fn method_needs_pane(method: &AutomationMethod) -> bool {
     !matches!(
         method,
@@ -14856,6 +15180,9 @@ pub(crate) const AUTOMATION_ERROR_CODES: &[&str] = &[
     "cancelled",
     "capability_denied",
     "capture_failed",
+    "capture_in_progress",
+    "capture_scale_rejected",
+    "capture_would_disturb_client",
     "capture_write_failed",
     "cell_metrics_unknown",
     "dependency_failed",
@@ -16988,6 +17315,123 @@ mod tests {
             pane_id: 1,
             bytes: vec![b'\r'],
         }
+    }
+
+    #[test]
+    fn a_scaled_capture_waits_out_the_blank_frame_of_a_replacement_track() {
+        // The bug this locks: a producer answers the resize by replacing its raster track, and
+        // that track's first frame is the blank buffer it was created with. Resolving on the first
+        // change wrote an empty page to disk while reporting a plausible size and frame id.
+        let before = vec![(2_u64, 1485_u32, 1666_u32, Some(2_u64))];
+        let blank = vec![(2, 2970, 3332, Some(1))];
+        let rendered = vec![(2, 2970, 3332, Some(3))];
+        let start = Instant::now();
+
+        // Nothing has reached the producer yet.
+        assert_eq!(
+            capture_settle_step(&before, before.clone(), None, start),
+            CaptureSettleStep::Wait(None)
+        );
+
+        // The replacement track appears. This must not capture.
+        let CaptureSettleStep::Wait(Some(first)) =
+            capture_settle_step(&before, blank.clone(), None, start)
+        else {
+            panic!("the blank first frame of a replacement track was captured");
+        };
+        assert_eq!(first.seen, blank);
+
+        // Still inside the quiet window with nothing new: keep waiting rather than capture.
+        assert_eq!(
+            capture_settle_step(&before, blank.clone(), Some(&first), start),
+            CaptureSettleStep::Wait(None)
+        );
+
+        // The render lands, which restarts the quiet window.
+        let CaptureSettleStep::Wait(Some(second)) = capture_settle_step(
+            &before,
+            rendered.clone(),
+            Some(&first),
+            start + Duration::from_millis(100),
+        ) else {
+            panic!("a newer frame must restart the settle rather than resolve it");
+        };
+        assert_eq!(second.seen, rendered);
+        assert_eq!(
+            second.give_up_at, first.give_up_at,
+            "the bound is not reset"
+        );
+
+        // Quiet elapses with nothing newer, so the rendered frame is the one captured.
+        assert_eq!(
+            capture_settle_step(
+                &before,
+                rendered.clone(),
+                Some(&second),
+                second.quiet_since + CAPTURE_SETTLE_QUIET,
+            ),
+            CaptureSettleStep::Capture
+        );
+    }
+
+    #[test]
+    fn a_pane_that_never_goes_quiet_still_answers() {
+        // A page that animates forever would never satisfy the quiet window. The give-up bound
+        // makes the capture terminate with a real frame instead of a timeout.
+        let before = vec![(2_u64, 100_u32, 100_u32, Some(1_u64))];
+        let start = Instant::now();
+        let settling = CaptureSettling {
+            seen: vec![(2, 200, 200, Some(9))],
+            quiet_since: start,
+            give_up_at: start + CAPTURE_SETTLE_LIMIT,
+        };
+        // Frames still arriving right at the bound: capture anyway.
+        assert_eq!(
+            capture_settle_step(
+                &before,
+                settling.seen.clone(),
+                Some(&settling),
+                start + CAPTURE_SETTLE_LIMIT,
+            ),
+            CaptureSettleStep::Capture
+        );
+        assert!(CAPTURE_SETTLE_QUIET < CAPTURE_SETTLE_LIMIT);
+    }
+
+    #[test]
+    fn a_capture_scale_multiplies_the_advertised_cell_size() {
+        // The producer sizes its raster from the cell metrics, so this is the only lever the
+        // closed terminal-surface-v1 descriptor offers for asking it to re-render denser.
+        assert_eq!(scaled_cells(3, 9, None), (3, 9));
+        assert_eq!(scaled_cells(3, 9, Some(0)), (3, 9));
+        assert_eq!(scaled_cells(3, 9, Some(1)), (3, 9));
+        assert_eq!(scaled_cells(3, 9, Some(10)), (30, 90));
+        // A scale that would wrap saturates instead; the caller has already bounded the request
+        // against the pixel budget, so this only has to refuse to produce nonsense.
+        assert_eq!(
+            scaled_cells(u16::MAX, u16::MAX, Some(4)),
+            (u16::MAX, u16::MAX)
+        );
+    }
+
+    #[test]
+    fn a_scaled_capture_composes_at_the_larger_canvas() {
+        // The bug this guards: composing against the client's cell size while the producer renders
+        // at capture density resamples the extra detail straight back out, and `--scale` silently
+        // does nothing. The measured pane from the design work is 101x53 cells at 3x9.
+        let cells = |scale| {
+            let (width, height) = scaled_cells(3, 9, scale);
+            crate::capture_media::CaptureTarget {
+                columns: 101,
+                rows: 52,
+                cell_width: u32::from(width),
+                cell_height: u32::from(height),
+            }
+            .pixel_size()
+            .expect("pane has a drawable size")
+        };
+        assert_eq!(cells(None), (303, 468), "unscaled, and illegible for CJK");
+        assert_eq!(cells(Some(10)), (3030, 4680));
     }
 
     #[test]

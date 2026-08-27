@@ -580,6 +580,16 @@ pub enum AutomationMethod {
     CaptureMedia {
         /// Where to write the PNG. Pixels are never returned inline.
         path: String,
+        /// Ask the producer to re-render at this many device pixels per cell pixel.
+        ///
+        /// The producer sizes its raster to the pane viewport, so at scale 1 a capture inherits
+        /// whatever density the last attached client implied — on a small pane that is far too
+        /// coarse to read CJK text. Raising this asks for a genuine re-render rather than an
+        /// upscale, and reverts as soon as the capture finishes.
+        scale: u32,
+        /// Allow a scaled capture while a client is attached, which visibly resizes the pane.
+        force: bool,
+        timeout_ms: u64,
     },
     Capture {
         /// Skip activation and read the pane where it is.

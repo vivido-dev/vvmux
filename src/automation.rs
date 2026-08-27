@@ -342,6 +342,14 @@ pub enum MsgCommand {
         /// File to write the composed PNG to.
         #[arg(long)]
         out: PathBuf,
+        /// Re-render the pane at this many pixels per pixel before capturing.
+        #[arg(long, default_value_t = 1)]
+        scale: u32,
+        /// Permit a scaled capture while a client is attached, resizing the pane in view.
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
         #[arg(long)]
         pane_id: Option<u64>,
     },
@@ -1449,9 +1457,18 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             true,
             Output::Json,
         ),
-        MsgCommand::CaptureMedia { out, pane_id } => (
+        MsgCommand::CaptureMedia {
+            out,
+            scale,
+            force,
+            timeout,
+            pane_id,
+        } => (
             AutomationMethod::CaptureMedia {
                 path: out.to_string_lossy().into_owned(),
+                scale,
+                force,
+                timeout_ms: millis(timeout),
             },
             pane_id,
             true,
