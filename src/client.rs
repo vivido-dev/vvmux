@@ -947,6 +947,14 @@ fn pack_cell_size(display: crate::ipc::DisplayMetrics) -> u32 {
     u32::from(display.cell_width) | (u32::from(display.cell_height) << 16)
 }
 
+fn recovery_media_allowed_while_paused(
+    source: BridgeSourceKey,
+    recovering_sources: &HashSet<BridgeSourceKey>,
+    recovery_handoffs: &HashSet<BridgeSourceKey>,
+) -> bool {
+    recovering_sources.contains(&source) || recovery_handoffs.contains(&source)
+}
+
 fn apply_cell_size(display: &mut crate::ipc::DisplayMetrics, packed: u32) {
     display.cell_width = packed as u16;
     display.cell_height = (packed >> 16) as u16;
@@ -1169,7 +1177,6 @@ fn run_bridge_worker(
                 .difference(&recovering_sources)
                 .copied()
                 .collect::<HashSet<_>>();
-            recovery_handoffs.extend(newly_recovering_sources.iter().copied());
             requested_virtual_keyframes.retain(|source| needing_virtual_keyframes.contains(source));
             let mut early_keyframes = pending
                 .videos_needing_keyframes
@@ -1199,6 +1206,24 @@ fn run_bridge_worker(
                 .iter()
                 .map(|source| (source.producer, source.context, source.surface))
                 .collect::<HashSet<_>>();
+            // Recovery is surface-coherent: linked audio and every video follower belong to the
+            // same handoff as the requested keyframe. Keep accepting their paused pre-roll after
+            // the virtual presenter reports that the keyframe reached the outer track. That
+            // acknowledgement clears `videos_needing_keyframes` before the producer's later PLAY,
+            // and over vvssh the falling-edge snapshot can arrive well before the remaining bulk
+            // packets. Dropping those packets creates a reference gap, so the physical decoder
+            // asks for another keyframe and the bridge rebuilds the same tracks forever.
+            recovery_handoffs.extend(pending.tracks.iter().filter_map(|source| {
+                (recovering_surfaces.contains(&(
+                    source.key.producer,
+                    source.key.context,
+                    source.key.surface,
+                )) && matches!(
+                    &source.kind,
+                    BridgeSourceKind::Video { .. } | BridgeSourceKind::Audio { .. }
+                ))
+                .then_some(source.key)
+            }));
             for source in &mut pending.tracks {
                 if recovering_surfaces.contains(&(
                     source.key.producer,
@@ -1499,7 +1524,11 @@ fn run_bridge_worker(
             vivid_protocol::messages::VIDEO_PACKET | vivid_protocol::messages::AUDIO_PACKET
         ) && !source_is_playing(&active_sources, media.source)
             && started_sources.contains(&media.source)
-            && !recovering_sources.contains(&media.source)
+            && !recovery_media_allowed_while_paused(
+                media.source,
+                &recovering_sources,
+                &recovery_handoffs,
+            )
         {
             acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
             continue;
@@ -2481,6 +2510,34 @@ mod tests {
         assert!(!hydrates_retained_source(
             vivid_protocol::messages::VIDEO_PACKET
         ));
+    }
+
+    #[test]
+    fn paused_recovery_handoff_keeps_timed_followers_admissible_until_play() {
+        let video = BridgeSourceKey {
+            producer: 3,
+            context: 1,
+            surface: 7,
+            track: 8,
+        };
+        let audio = BridgeSourceKey { track: 7, ..video };
+        let current_recovery = HashSet::new();
+        let handoff = HashSet::from([video, audio]);
+
+        assert!(recovery_media_allowed_while_paused(
+            video,
+            &current_recovery,
+            &handoff,
+        ));
+        assert!(recovery_media_allowed_while_paused(
+            audio,
+            &current_recovery,
+            &handoff,
+        ));
+        assert!(
+            !recovery_media_allowed_while_paused(video, &current_recovery, &HashSet::new()),
+            "ordinary media on a previously started paused source must still be rejected"
+        );
     }
 
     #[test]
