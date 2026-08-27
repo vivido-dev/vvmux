@@ -337,6 +337,14 @@ pub enum MsgCommand {
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Write a pane's media content to a PNG, with no presenter involved.
+    CaptureMedia {
+        /// File to write the composed PNG to.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
     /// Reveal a pane, wait for it to settle, and read it, in one request.
     Capture {
         /// Read the pane where it is instead of revealing it first.
@@ -1436,6 +1444,14 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             AutomationMethod::ShellCommand {
                 command,
                 timeout_ms: millis(timeout),
+            },
+            pane_id,
+            true,
+            Output::Json,
+        ),
+        MsgCommand::CaptureMedia { out, pane_id } => (
+            AutomationMethod::CaptureMedia {
+                path: out.to_string_lossy().into_owned(),
             },
             pane_id,
             true,

@@ -3780,6 +3780,13 @@ impl SessionActor {
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
+            AutomationMethod::CaptureMedia { ref path } => {
+                let pane_id = pane_id.unwrap();
+                match self.capture_media_payload(pane_id, path) {
+                    Ok(result) => self.reply_automation(target, result),
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
             AutomationMethod::Capture {
                 no_activate,
                 after_screen,
@@ -5905,6 +5912,70 @@ impl SessionActor {
             "height": u32::from(content.height) * cell_height,
             "vivido_window_id": outer.vivido_window_id,
         })
+    }
+
+    /// Compose a pane's retained media and write it out as a PNG.
+    ///
+    /// Reads the gateway's own retained framebuffers rather than the outer projection, so it is
+    /// correct with nothing attached and with the pane hidden. Nothing here activates the pane or
+    /// disturbs the projection: this is `observe`-class and stays that way.
+    fn capture_media_payload(
+        &self,
+        pane_id: PaneId,
+        path: &str,
+    ) -> Result<serde_json::Value, AutomationError> {
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
+        let offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
+        let content = self.pane_content_rect(pane_id)?;
+        let (cell_width, cell_height) =
+            (self.last_display.cell_width, self.last_display.cell_height);
+        if cell_width == 0 || cell_height == 0 {
+            return Err(AutomationError::new(
+                "cell_metrics_unknown",
+                "no client has reported cell metrics, so a pane has no pixel size yet",
+            ));
+        }
+        let target = crate::capture_media::CaptureTarget {
+            columns: u32::from(content.width),
+            rows: u32::from(content.height),
+            cell_width: u32::from(cell_width),
+            cell_height: u32::from(cell_height),
+        };
+        let layers = self.vivid.capture_pane(pane_id, offset);
+        let captured = crate::capture_media::compose(&layers, target)
+            .map_err(|error| AutomationError::new("capture_failed", error.to_string()))?;
+        std::fs::write(path, &captured.png).map_err(|error| {
+            AutomationError::new("capture_write_failed", format!("{path}: {error}"))
+        })?;
+        Ok(serde_json::json!({
+            "pane_id": pane_id,
+            "path": path,
+            "width": captured.width,
+            "height": captured.height,
+            "bytes": captured.png.len(),
+            "cell_width": cell_width,
+            "cell_height": cell_height,
+            "session_sequence": self.session_sequence,
+            "layers": captured
+                .layers
+                .iter()
+                .map(|layer| serde_json::json!({
+                    "producer_id": layer.source.producer,
+                    "context_id": layer.source.context,
+                    "surface_id": layer.source.surface,
+                    "track_id": layer.source.track,
+                    "node_id": layer.node_id,
+                    "width": layer.source_width,
+                    "height": layer.source_height,
+                    "frame_id": layer.frame_id,
+                    "epoch": layer.epoch,
+                    "encoded_image": layer.encoded_image,
+                }))
+                .collect::<Vec<_>>(),
+        }))
     }
 
     /// Everything `capture` returns once its pane has settled.
@@ -14784,6 +14855,9 @@ pub(crate) const AUTOMATION_ERROR_CODES: &[&str] = &[
     "busy",
     "cancelled",
     "capability_denied",
+    "capture_failed",
+    "capture_write_failed",
+    "cell_metrics_unknown",
     "dependency_failed",
     "duplicate_request_id",
     "empty_agent_prompt",

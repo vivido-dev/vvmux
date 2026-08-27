@@ -570,6 +570,17 @@ pub enum AutomationMethod {
     /// state means anything, and a pane still painting has to settle before a read is worth having.
     /// Three round trips a caller would otherwise have to sequence itself, with the same race
     /// between them that `expect` exists to close.
+    /// Compose a pane's retained media into one PNG, with no presenter involved.
+    ///
+    /// Not a screenshot: terminal text is the presenter's to render, and vvmux has no font
+    /// rasterizer. This carries the producer's own surfaces, which for a document reader or a
+    /// browser is the whole visible content, at the producer's native resolution rather than
+    /// scaled into a cell rectangle. It reads state the gateway already holds, so it works while
+    /// the session is detached and while the pane is hidden.
+    CaptureMedia {
+        /// Where to write the PNG. Pixels are never returned inline.
+        path: String,
+    },
     Capture {
         /// Skip activation and read the pane where it is.
         no_activate: bool,
@@ -838,6 +849,7 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         capability("session_snapshot", Observe),
         capability("inspect", Observe),
         capability("inspect_media", Observe),
+        capability("capture_media", Observe),
         capability("diagnose", Observe),
         capability("trace_media", Observe),
         capability("get_text", Observe),
@@ -941,6 +953,7 @@ impl AutomationMethod {
             Self::Lease(_) => "lease",
             Self::ShellCommand { .. } => "shell_command",
             Self::Capture { .. } => "capture",
+            Self::CaptureMedia { .. } => "capture_media",
             Self::Mouse { .. } => "mouse",
             Self::Transcript { .. } => "transcript",
             Self::WaitOutput { .. } => "wait_output",

@@ -4,6 +4,7 @@ mod alt_read;
 mod api;
 mod automation;
 mod bridge;
+mod capture_media;
 mod client;
 mod client_input;
 mod config;
