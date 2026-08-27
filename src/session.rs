@@ -6037,6 +6037,7 @@ impl SessionActor {
     fn capture_baseline(&self, pane_id: PaneId) -> Vec<CaptureIdentity> {
         self.vivid
             .capture_pane(pane_id, 0)
+            .layers
             .iter()
             .map(|layer| match &layer.content {
                 vivid_gateway::CaptureContent::Raster(raster) => (
@@ -6198,8 +6199,8 @@ impl SessionActor {
             cell_width: u32::from(cell_width),
             cell_height: u32::from(cell_height),
         };
-        let layers = self.vivid.capture_pane(pane_id, offset);
-        let captured = crate::capture_media::compose(&layers, target)
+        let captured_pane = self.vivid.capture_pane(pane_id, offset);
+        let captured = crate::capture_media::compose(&captured_pane.layers, target)
             .map_err(|error| AutomationError::new("capture_failed", error.to_string()))?;
         std::fs::write(path, &captured.png).map_err(|error| {
             AutomationError::new("capture_write_failed", format!("{path}: {error}"))
@@ -6213,6 +6214,22 @@ impl SessionActor {
             "cell_width": cell_width,
             "cell_height": cell_height,
             "session_sequence": self.session_sequence,
+            // Why a source contributed nothing. A blank capture that explains itself is a fact a
+            // caller can act on; one that says nothing reads as a broken request, and the reasons
+            // want different responses — encoded video will never appear here, while a track
+            // awaiting recovery will as soon as its keyframe lands.
+            "skipped": captured_pane
+                .skipped
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "producer_id": entry.source.producer,
+                    "context_id": entry.source.context,
+                    "surface_id": entry.source.surface,
+                    "track_id": entry.source.track,
+                    "node_id": entry.node_id,
+                    "reason": entry.reason.as_str(),
+                }))
+                .collect::<Vec<_>>(),
             "layers": captured
                 .layers
                 .iter()
@@ -8070,6 +8087,31 @@ impl SessionActor {
             "sync_input": tab.sync_input,
             "transparent": pane.transparent,
             "title": title,
+            // What media this pane carries, so "which pane is the browser / the document / the
+            // desktop, and can I capture it" is one call rather than one round trip per pane.
+            // Omitted rather than emitted empty, like the agent metadata below: most panes carry
+            // no media and a bulk listing should not pay an empty container per pane to say so.
+            "media": Some(self.vivid.pane_media_summary(pane_id))
+                .filter(|summary| !summary.is_empty())
+                .map(|summary| serde_json::json!({
+                    "surfaces": summary.surfaces,
+                    // True when a capture would produce pixels right now. Strictly stronger than
+                    // having a visual track: an encoded-video pane has one and can never be
+                    // composed here, which is exactly the distinction a caller needs up front.
+                    "capturable": summary.capturable(),
+                    "tracks": summary
+                        .tracks
+                        .iter()
+                        .map(|track| serde_json::json!({
+                            "kind": track.kind,
+                            "capturable": track.capturable,
+                            "producer_id": track.source.producer,
+                            "context_id": track.source.context,
+                            "surface_id": track.source.surface,
+                            "track_id": track.source.track,
+                        }))
+                        .collect::<Vec<_>>(),
+                })),
             "plugin": plugin,
             "agent": pane.agent.snapshot().map(|snapshot| {
                 let mut agent = agent_json(snapshot);

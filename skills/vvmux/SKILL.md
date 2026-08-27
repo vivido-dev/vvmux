@@ -18,7 +18,9 @@ Use this release-matched workflow:
 3. Discover shape with `msg layout`, not `list-panes`: it is the only call that reports the split
    tree (`split_path`), pane rectangles, and directional `neighbors`, plus a `caller` block locating
    your own pane. Translate "the pane on the left" with
-   `msg resolve-pane --path left` rather than guessing an ID; add `--tab-name` or `--tab-id` to
+   `msg resolve-pane --path left` rather than reading rectangles out of `layout` and comparing
+   them yourself — the directions are relative to your own pane, which is what a user pointing at
+   "the left pane" means, and a split makes "left top" `--path left,up` rather than arithmetic; add `--tab-name` or `--tab-id` to
    route in another tab, and repeat directions (`--path right,down`) to cross nested splits.
    `neighbors` and `resolve-pane` are the navigation graph `action focus` uses, so a direction is
    one step and not a global edge selector — a direction can land on a pane that is not strictly on
@@ -69,49 +71,76 @@ Use this release-matched workflow:
    reply instead of acting again; a failed request releases its key. Mutating methods only.
 14. Use `msg capture` rather than activate-then-wait-then-read: it is the same three operations
    without the races between them, and `--no-activate` reads a pane without disturbing the layout.
-15. Use `msg shell-command 'cargo test'` when you need a command's real exit status. It runs in the
+   `capture` reads the text grid; for what a pane is *showing* — a document page, a web page, a
+   canvas — use `capture-media` below.
+
+15. To find which pane holds a document, a browser, or a desktop, read `media` in `list-panes`.
+   It names each pane's surfaces and track kinds in one call, so this never needs a round trip per
+   pane. `capturable` is the field that matters: it is true only when pixels are in hand right
+   now, which is a stronger claim than the pane having visual media.
+
+16. `msg capture-media --pane-id ID --out FILE` writes what a pane is presenting to a PNG, then
+   read the file. It composes the producer's own surfaces out of media vvmux already holds, so it
+   works while the session is detached, while the pane is hidden, and with no Vivido anywhere —
+   and it needs none of `session-inspect`'s `outer` block. It is **not** a screenshot: terminal
+   text belongs to the presenter's renderer and never appears. Pixels are never returned inline.
+   - A blank capture explains itself in `skipped`. `undecoded_video` means the pane is an encoded
+     video source (vvland, vvcam): those are relayed to the presenter and never decoded here, so
+     no scale or retry will ever help — ask the program inside instead, or screenshot from the
+     machine running Vivido. `no_retained_pixels` means a track that will appear once its frame
+     lands, so retrying is worthwhile.
+   - `--scale N` asks the producer to re-render denser before capturing, for the panes that size
+     their raster to the pane viewport (`vvrd`, `vrowser`). Reach for it when small text is
+     unreadable at scale 1 — a pane a few hundred pixels wide cannot resolve CJK glyphs. A
+     producer whose raster is its own document rather than the viewport (`vvpaint`) is already at
+     full resolution and needs no scale. The scale is refused while a client is attached unless
+     `--force`, because it visibly resizes the pane and changes it back.
+17. Use `msg shell-command 'cargo test'` when you need a command's real exit status. It runs in the
    pane's own shell, so aliases, virtual environments, and the current directory still apply. It
    requires the shell to emit OSC 133 markers and refuses when it does not — that refusal is
    information, not an obstacle: fall back to `submit` plus `wait output`.
-16. Read `session-inspect`'s `outer` block before ever running `vivido msg`. It names the Vivido
+18. Read `session-inspect`'s `outer` block before ever running `vivido msg` — and first check
+   whether `capture-media` already answers the question, because it needs no Vivido at all. Reach
+   for a Vivido screenshot only when the terminal text itself has to be in the picture, or when the
+   pane is an undecoded video source. The `outer` block names the Vivido
    window presenting the session right now; it is `null` when nothing is attached, and `remote` is
    true when the client reached vvmux over `vvssh`, in which case the Vivido automation socket is on
    another machine and that route does not exist. Never reconstruct a window ID from the
    environment — a pane does not inherit one, deliberately. `inspect`'s `outer_crop` is the pane's
    rectangle in that window's pixels, which is the crop for a `vivido msg screenshot`.
-17. When more than one agent is working in a session, take a lease before driving a pane:
+19. When more than one agent is working in a session, take a lease before driving a pane:
    `msg lease acquire --scope input --pane-id ID --holder your-name`, then pass `--lease ID`.
    Leases are advisory — an unleased pane is open to anyone — and every one expires, so renew a
    long job rather than asking for a long TTL. Release it when done.
-18. `msg record start PATH` / `record stop` captures a session for later `vvmux replay`. It records
+20. `msg record start PATH` / `record stop` captures a session for later `vvmux replay`. It records
    input classes and lengths but never what was typed, and it writes pane output to a file — so
    start one only when the user has asked for it, exactly as with `pane_history`.
-19. Capture the relevant screen, session, outer-projection, or trace sequence before acting.
-20. Use `focus` or `select-tab --tab-id ID` with `--wait outer` when media projection is the
+21. Capture the relevant screen, session, outer-projection, or trace sequence before acting.
+22. Use `focus` or `select-tab --tab-id ID` with `--wait outer` when media projection is the
    assertion, or `--wait rendered` for the attached terminal frame. Use Vivido `wait frame`
    separately when GPU presentation matters.
-21. Follow `trace-media --after SEQUENCE --follow` with complete owner filters during recovery.
-22. On failure, capture `diagnose --all-panes --trace-limit 512`; create a metadata-only
+23. Follow `trace-media --after SEQUENCE --follow` with complete owner filters during recovery.
+24. On failure, capture `diagnose --all-panes --trace-limit 512`; create a metadata-only
    `vvmux debug-bundle` unless the user explicitly authorizes pane grid/text or log content.
-23. When a pane's reported agent state looks wrong, use `agent-explain --pane-id ID` before
+25. When a pane's reported agent state looks wrong, use `agent-explain --pane-id ID` before
    changing anything: it names the rule that decided and shows every rule's evidence. `diagnose`
    covers infrastructure, not classification.
-24. To run Codex in an available shell pane, use `agent-start --kind codex --pane-id ID`. Then send
+26. To run Codex in an available shell pane, use `agent-start --kind codex --pane-id ID`. Then send
    work with `agent-prompt --pane-id ID --wait --until blocked,done TEXT`; it separates prompt text
    from Enter and waits on agent lifecycle rather than screen text. Use `agent-send-keys` only for
    its bounded allow-listed control/navigation keys.
-25. For prior full-screen context, use `agent-read --pane-id ID --lines 200`. It requires an idle
+27. For prior full-screen context, use `agent-read --pane-id ID --lines 200`. It requires an idle
    alternate-screen agent and restores the viewport. If those gates do not hold, ask the agent to
    write a Markdown file and read it directly. When state looks wrong, inspect
    `agent-explain --pane-id ID` before changing anything.
-26. `agent-start` verifies the pane is a shell at its prompt, quotes arguments for that shell, and
+28. `agent-start` verifies the pane is a shell at its prompt, quotes arguments for that shell, and
    returns only once the agent is detected and settled. `agent_pane_busy` means the pane is running
    something else; `agent_not_launchable` means that provider is detection-only.
-27. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
+29. To watch many panes at once, stream `msg subscribe --name agent.status_changed` instead of
    polling each one. Treat a `gap` record as missed events, not as an error; it is never filtered
    out even when the stream is narrowed.
 
-28. Name an agent you will come back to: `agent-rename --pane-id ID --name reviewer`. Then target it
+30. Name an agent you will come back to: `agent-rename --pane-id ID --name reviewer`. Then target it
    with `--alias reviewer` on any `msg` command instead of `--pane-id`, which keeps working after
    splits, closes, and renumbering. Names are unique per session (`agent_alias_taken`), belong to
    the agent process rather than the pane, and are cleared when that agent exits or is replaced —
@@ -119,16 +148,16 @@ Use this release-matched workflow:
    `agent-rename --pane-id ID --clear` to release a name. Pane IDs remain correct for everything
    else; a name is for an agent you drive repeatedly.
 
-29. A session's shape survives its server restarting, so do not rebuild it by hand after a restart.
+31. A session's shape survives its server restarting, so do not rebuild it by hand after a restart.
    `snapshot` reports whether this session came from one. Pane IDs are reassigned on restore — they
    are stable only within one run of a server — so never persist a pane ID across a restart. Use
    `pane-rename` for a pane and `agent-rename` for an agent running in one; both survive.
 
-30. Pane history (`[session] pane_history`) is off by default and must stay a user decision: it
+32. Pane history (`[session] pane_history`) is off by default and must stay a user decision: it
    writes whatever scrolled past a pane — including secrets — to disk. Never enable it on a user's
    behalf to make a task easier.
 
-31. After a restart, an agent pane reopens its own conversation when a client attaches — check
+33. After a restart, an agent pane reopens its own conversation when a client attaches — check
    `inspect`'s `pending_resume` before concluding a pane is a bare shell, and do not launch a second
    agent into it. A resume needs the agent's provider plugin installed with its integration
    (`vvmux plugin install claude`), because the session identity it uses comes from that
