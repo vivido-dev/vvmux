@@ -141,7 +141,13 @@ Use this release-matched workflow:
      Without `--ignore-bottom` this **never fires** for an agent that paints a spinner, elapsed
      timer, or token counter: the screen changes every second for as long as the agent works, which
      is exactly the interval being waited on. Give it a timeout matching the work, not the default.
-   - Collect with `transcript --after-offset OFFSET`, using the offset captured before the submit.
+   - Collect with `get-text --rows N`, which reads the pane's scrollback with soft wraps joined.
+     Prefer it over `transcript` for a long answer from a status-bar agent: the retained output
+     window is bounded in *bytes*, and a status bar repainting once a second burns through it in
+     minutes, evicting the answer while keeping the ticks. Measured on a real agent pane, a
+     transcript covering the whole run held one mention of the subject and hundreds of counter
+     repaints. `transcript --after-offset` remains right for a quiet program, and only it can
+     recover output the terminal has already scrolled past — check `dropped_before_offset`.
    A quiet screen is weaker evidence than an agent lifecycle state — an agent that pauses mid-answer
    looks finished — so prefer a provider plugin wherever one exists and treat this as the fallback.
 
