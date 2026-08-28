@@ -952,6 +952,144 @@ fn apply_cell_size(display: &mut crate::ipc::DisplayMetrics, packed: u32) {
     display.cell_height = (packed >> 16) as u16;
 }
 
+fn reconcile_in_place_keyframe_recoveries(
+    armed: &mut HashSet<BridgeSourceKey>,
+    observed: &mut HashSet<BridgeSourceKey>,
+    current_sources: &HashSet<BridgeSourceKey>,
+    needing_keyframes: &HashSet<BridgeSourceKey>,
+) -> HashSet<BridgeSourceKey> {
+    armed.retain(|source| current_sources.contains(source));
+    observed.retain(|source| armed.contains(source));
+    observed.extend(armed.intersection(needing_keyframes).copied());
+    // Keep completed sources armed through this projection. The falling-edge snapshot is also the
+    // one that carries the producer's advanced decoder-reset serial; clearing here makes that
+    // serial look like a fresh seek and replaces the decoder that just requested recovery.
+    observed.difference(needing_keyframes).copied().collect()
+}
+
+fn finish_in_place_keyframe_recoveries(
+    armed: &mut HashSet<BridgeSourceKey>,
+    observed: &mut HashSet<BridgeSourceKey>,
+    completed: &HashSet<BridgeSourceKey>,
+) {
+    for source in completed {
+        armed.remove(source);
+        observed.remove(source);
+    }
+}
+
+/// Video resets initiated by the nested producer rather than requested by the outer presenter.
+///
+/// ADVANCE_CHANNEL/FLUSH increments the decoder-reset serial and makes the virtual presenter ask
+/// for a keyframe. The producer is already opening that new generation at a random-access unit, so
+/// reflecting another NEED_KEYFRAME back to it only abandons the seek that is currently in flight.
+fn producer_decoder_resets(
+    previous: &[BridgeSource],
+    current: &[BridgeSource],
+    needing_keyframes: &HashSet<BridgeSourceKey>,
+) -> HashSet<BridgeSourceKey> {
+    current
+        .iter()
+        .filter(|source| needing_keyframes.contains(&source.key))
+        .filter(|source| {
+            previous.iter().any(|old| {
+                old.key == source.key
+                    && old.kind == source.kind
+                    && old.live == source.live
+                    && source.decoder_reset_serial > old.decoder_reset_serial
+            })
+        })
+        .map(|source| source.key)
+        .collect()
+}
+
+/// Whether this projection contains only part of an explicitly grouped linked-track timeline
+/// discontinuity.
+///
+/// `ADVANCE_CHANNEL` controls are individually acknowledged, so audio and video necessarily
+/// produce intermediate snapshots even though the producer has grouped them with one causation
+/// ID. Applying that intermediate state replaces one outer decoder twice and can discard the only
+/// replacement pre-roll. Keep the old physical projection until every linked member names the
+/// same group; newer snapshots supersede the deferred one and exact reset-serial gates keep their
+/// media parked meanwhile.
+fn grouped_discontinuity_is_incomplete(
+    previous: &[BridgeSource],
+    current: &[BridgeSource],
+) -> bool {
+    current.iter().any(|audio| {
+        let BridgeSourceKind::Audio {
+            linked_video: Some(video_key),
+            ..
+        } = audio.kind
+        else {
+            return false;
+        };
+        let Some(video) = current.iter().find(|source| source.key == video_key) else {
+            return false;
+        };
+        let Some(previous_audio) = previous.iter().find(|source| source.key == audio.key) else {
+            return false;
+        };
+        let Some(previous_video) = previous.iter().find(|source| source.key == video.key) else {
+            return false;
+        };
+        let audio_changed = audio.decoder_reset_serial > previous_audio.decoder_reset_serial;
+        let video_changed = video.decoder_reset_serial > previous_video.decoder_reset_serial;
+        let group = audio_changed
+            .then_some(audio.causation_id)
+            .flatten()
+            .or_else(|| video_changed.then_some(video.causation_id).flatten());
+        group.is_some_and(|group| {
+            audio.causation_id != Some(group) || video.causation_id != Some(group)
+        })
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectionRetryDecision {
+    replace_session: bool,
+    delay: Duration,
+}
+
+/// Choose a bounded recovery escalation after a projection mutation failed.
+///
+/// Re-submitting one fresh snapshot is useful for a source-scoped recovery because the first
+/// attempt can have consumed a concurrent track-loss edge. Repeating that same in-place mutation
+/// indefinitely is not: rebuilds are stateful, so a hard error can leave the outer bridge partly
+/// reconciled. Escalate the second consecutive source-scoped failure to a fresh outer session and
+/// retain that decision until some projection applies successfully. `WouldBlock` gets a slightly
+/// larger allowance because it specifically means the outer presentation target is still moving.
+fn projection_retry_decision(
+    consecutive_failures: u32,
+    error_kind: io::ErrorKind,
+    source_scoped_recovery: bool,
+    already_replacing: bool,
+) -> ProjectionRetryDecision {
+    let replace_session = already_replacing
+        || if error_kind == io::ErrorKind::WouldBlock {
+            consecutive_failures >= 4
+        } else if source_scoped_recovery {
+            consecutive_failures >= 2
+        } else {
+            true
+        };
+    let exponent = consecutive_failures.saturating_sub(1).min(5);
+    let delay_ms = 10_u64.saturating_mul(1_u64 << exponent).min(250);
+    ProjectionRetryDecision {
+        replace_session,
+        delay: Duration::from_millis(delay_ms),
+    }
+}
+
+fn reconcile_requested_virtual_keyframes(
+    requested: &mut HashSet<BridgeSourceKey>,
+    needing_keyframes: &HashSet<BridgeSourceKey>,
+    producer_resets: &HashSet<BridgeSourceKey>,
+) {
+    requested.retain(|source| needing_keyframes.contains(source));
+    requested.extend(producer_resets.iter().copied());
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_bridge_worker(
     mut bridge: crate::bridge::OuterBridge,
@@ -983,7 +1121,7 @@ fn run_bridge_worker(
     let mut minimum_media_generation = HashMap::<BridgeSourceKey, u64>::new();
     let mut retained_rehydration = HashSet::<BridgeSourceKey>::new();
     let mut active_surfaces = Vec::new();
-    let mut active_sources = Vec::new();
+    let mut active_sources = Vec::<BridgeSource>::new();
     let mut active_nodes = Vec::new();
     let mut started_sources = HashSet::new();
     // A paused timed source normally rejects further media once it has started. Recovery is the
@@ -1000,9 +1138,18 @@ fn run_bridge_worker(
     // replacement track's only pre-roll grant. Keep that initial request damped until the
     // authoritative recovery PLAY completes.
     let mut recovery_handoffs = HashSet::<BridgeSourceKey>::new();
+    // A keyframe request read from the current outer track recovers that decoder in place. The
+    // virtual presenter exposes every pending request through `videos_needing_keyframes`, but
+    // rebuilding for this one would destroy the decoder that asked, replay the same retained
+    // keyframe, and turn lateness into an endless replacement loop.
+    let mut in_place_keyframe_recoveries = HashSet::<BridgeSourceKey>::new();
+    // A queued projection can predate the request above. Do not mistake that stale absence for the
+    // falling edge that completes recovery until a snapshot has first exposed the rising edge.
+    let mut observed_in_place_keyframe_recoveries = HashSet::<BridgeSourceKey>::new();
     let mut desynchronized_sources = HashSet::new();
     let mut force_sources = false;
     let mut force_replacement = false;
+    let mut consecutive_projection_failures = 0_u32;
     let mut deferred: Option<BridgeMedia> = None;
     loop {
         if stopped.load(Ordering::Acquire) {
@@ -1115,6 +1262,7 @@ fn run_bridge_worker(
                 .filter(|request| !recovery_handoffs.contains(&request.source))
                 .collect::<Vec<_>>();
             if !forwarded.is_empty() {
+                in_place_keyframe_recoveries.extend(forwarded.iter().map(|request| request.source));
                 let _ = client_writer.send(ClientMessage::BridgeNeedKeyframes(forwarded));
             }
         }
@@ -1125,6 +1273,8 @@ fn run_bridge_worker(
         let source_losses = bridge.take_source_losses();
         if !source_losses.is_empty() {
             for source in &source_losses {
+                in_place_keyframe_recoveries.remove(source);
+                observed_in_place_keyframe_recoveries.remove(source);
                 send_bridge_trace(
                     &client_writer,
                     bridge_instance_id,
@@ -1156,6 +1306,17 @@ fn run_bridge_worker(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(mut pending) = pending {
+            if grouped_discontinuity_is_incomplete(&active_sources, &pending.tracks) {
+                // Do not acknowledge this partial generation. The paired control mutation wakes
+                // the worker with a newer authoritative snapshot; acknowledging only that complete
+                // snapshot releases both exact decoder-reset serials together, including over a
+                // delayed vvssh hop.
+                continue;
+            }
+            if force_replacement {
+                in_place_keyframe_recoveries.clear();
+                observed_in_place_keyframe_recoveries.clear();
+            }
             // Ask the producer for the replacement decoder's keyframe before rebuilding that
             // decoder. The server processes this message before BridgeApplied on the same IPC
             // stream and keeps timed ingress parked until the latter, so an already-blocked old
@@ -1165,15 +1326,77 @@ fn run_bridge_worker(
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>();
+            let current_sources = pending
+                .tracks
+                .iter()
+                .map(|track| track.key)
+                .collect::<HashSet<_>>();
+            // ADVANCE_CHANNEL/FLUSH is Vivi's answer to an outer NEED_KEYFRAME as well as the
+            // mechanism used by a user seek. Only the former is armed above. Adopt its serial in
+            // the current physical track before comparing projections, so the response cannot be
+            // mistaken for another user seek and close media already queued to that track.
+            for source in &pending.tracks {
+                if !in_place_keyframe_recoveries.contains(&source.key) {
+                    continue;
+                }
+                let Some(active) = active_sources
+                    .iter_mut()
+                    .find(|active| active.key == source.key)
+                else {
+                    continue;
+                };
+                if active.kind != source.kind
+                    || active.live != source.live
+                    || source.decoder_reset_serial <= active.decoder_reset_serial
+                {
+                    continue;
+                }
+                if bridge
+                    .acknowledge_outer_requested_decoder_reset(
+                        source.key,
+                        source.decoder_reset_serial,
+                    )
+                    .is_ok()
+                {
+                    active.decoder_reset_serial = source.decoder_reset_serial;
+                    observed_in_place_keyframe_recoveries.insert(source.key);
+                }
+            }
+            let completed_in_place_keyframe_recoveries = reconcile_in_place_keyframe_recoveries(
+                &mut in_place_keyframe_recoveries,
+                &mut observed_in_place_keyframe_recoveries,
+                &current_sources,
+                &needing_virtual_keyframes,
+            );
+            let producer_resets = producer_decoder_resets(
+                &active_sources,
+                &pending.tracks,
+                &needing_virtual_keyframes,
+            );
             let newly_recovering_sources = needing_virtual_keyframes
                 .difference(&recovering_sources)
+                .filter(|source| !in_place_keyframe_recoveries.contains(source))
                 .copied()
                 .collect::<HashSet<_>>();
-            requested_virtual_keyframes.retain(|source| needing_virtual_keyframes.contains(source));
+            reconcile_requested_virtual_keyframes(
+                &mut requested_virtual_keyframes,
+                &needing_virtual_keyframes,
+                &producer_resets,
+            );
+            // A producer reset already has its replacement keyframe parked on the
+            // generation-aware projection gate. Remember that for the whole rising recovery
+            // edge, not only this serial-change snapshot: a later snapshot can still report the
+            // keyframe need after `active_sources` has adopted the serial. Sending reason 5 then
+            // makes Vivi abandon the healthy seek and rewind the same GOP a second time.
             let mut early_keyframes = pending
                 .videos_needing_keyframes
                 .iter()
                 .copied()
+                .filter(|source| !in_place_keyframe_recoveries.contains(source))
+                // A higher producer reset serial is the request's answer, not a transport loss.
+                // Rebuild the outer decoder below, but let the already-opening generation supply
+                // its keyframe instead of forcing Vivi to reset the same ordinary seek twice.
+                .filter(|source| !producer_resets.contains(source))
                 .filter(|source| requested_virtual_keyframes.insert(*source))
                 .map(|source| BridgeKeyframeRequest {
                     source,
@@ -1198,6 +1421,10 @@ fn run_bridge_worker(
                 .iter()
                 .map(|source| (source.producer, source.context, source.surface))
                 .collect::<HashSet<_>>();
+            let replacement_recovery_surfaces = needing_virtual_keyframes
+                .difference(&in_place_keyframe_recoveries)
+                .map(|source| (source.producer, source.context, source.surface))
+                .collect::<HashSet<_>>();
             // Recovery is surface-coherent: linked audio and every video follower belong to the
             // same handoff as the requested keyframe. Keep accepting their paused pre-roll after
             // the virtual presenter reports that the keyframe reached the outer track. That
@@ -1206,7 +1433,7 @@ fn run_bridge_worker(
             // packets. Dropping those packets creates a reference gap, so the physical decoder
             // asks for another keyframe and the bridge rebuilds the same tracks forever.
             recovery_handoffs.extend(pending.tracks.iter().filter_map(|source| {
-                (recovering_surfaces.contains(&(
+                (replacement_recovery_surfaces.contains(&(
                     source.key.producer,
                     source.key.context,
                     source.key.surface,
@@ -1217,7 +1444,7 @@ fn run_bridge_worker(
                 .then_some(source.key)
             }));
             for source in &mut pending.tracks {
-                if recovering_surfaces.contains(&(
+                if replacement_recovery_surfaces.contains(&(
                     source.key.producer,
                     source.key.context,
                     source.key.surface,
@@ -1276,15 +1503,28 @@ fn run_bridge_worker(
                 // retries that transaction in place; if the display remains unsettled through its
                 // bounded retry window, request a fresh authoritative projection without tearing
                 // down healthy sources or replacing the presenter session.
-                let same_session_retry =
-                    error.kind() == io::ErrorKind::WouldBlock || source_scoped_recovery;
-                force_sources = source_scoped_recovery || !same_session_retry;
-                force_replacement = !same_session_retry;
+                consecutive_projection_failures = consecutive_projection_failures.saturating_add(1);
+                let retry = projection_retry_decision(
+                    consecutive_projection_failures,
+                    error.kind(),
+                    source_scoped_recovery,
+                    force_replacement,
+                );
+                force_sources = true;
+                force_replacement = retry.replace_session;
+                log::warn!(
+                    "outer media projection failed on attempt {} (replace_session={}): {}",
+                    consecutive_projection_failures,
+                    retry.replace_session,
+                    error
+                );
                 let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
-                    reset_outer_session: !same_session_retry,
+                    reset_outer_session: retry.replace_session,
                 });
+                thread::sleep(retry.delay);
                 continue;
             }
+            consecutive_projection_failures = 0;
             let next_generation = bridge.diagnostic_instance_generation();
             if next_generation != diagnostic_generation {
                 diagnostic_generation = next_generation;
@@ -1405,6 +1645,11 @@ fn run_bridge_worker(
             active_surfaces = pending.surfaces;
             active_sources = pending.tracks;
             active_nodes = pending.nodes;
+            finish_in_place_keyframe_recoveries(
+                &mut in_place_keyframe_recoveries,
+                &mut observed_in_place_keyframe_recoveries,
+                &completed_in_place_keyframe_recoveries,
+            );
             recovering_sources = active_sources
                 .iter()
                 .filter(|source| {
@@ -2184,6 +2429,82 @@ mod tests {
     use crate::media::VirtualVivid;
     use image::ImageEncoder;
     use vivid_protocol::media::{self, AudioPacket, VideoPacket};
+
+    #[test]
+    fn in_place_keyframe_recovery_ignores_a_stale_falling_edge() {
+        let source = BridgeSourceKey {
+            producer: 3,
+            context: 1,
+            surface: 7,
+            track: 8,
+        };
+        let current = HashSet::from([source]);
+        let mut armed = HashSet::from([source]);
+        let mut observed = HashSet::new();
+
+        let completed = reconcile_in_place_keyframe_recoveries(
+            &mut armed,
+            &mut observed,
+            &current,
+            &HashSet::new(),
+        );
+        assert!(armed.contains(&source));
+        assert!(observed.is_empty());
+        assert!(completed.is_empty());
+
+        let completed = reconcile_in_place_keyframe_recoveries(
+            &mut armed,
+            &mut observed,
+            &current,
+            &HashSet::from([source]),
+        );
+        assert!(armed.contains(&source));
+        assert!(observed.contains(&source));
+        assert!(completed.is_empty());
+
+        let completed = reconcile_in_place_keyframe_recoveries(
+            &mut armed,
+            &mut observed,
+            &current,
+            &HashSet::new(),
+        );
+        assert!(armed.contains(&source));
+        assert!(observed.contains(&source));
+        assert_eq!(completed, HashSet::from([source]));
+        finish_in_place_keyframe_recoveries(&mut armed, &mut observed, &completed);
+        assert!(armed.is_empty());
+        assert!(observed.is_empty());
+    }
+
+    #[test]
+    fn projection_retry_escalates_and_stays_bounded() {
+        let first = projection_retry_decision(1, io::ErrorKind::InvalidData, true, false);
+        assert!(!first.replace_session);
+        assert_eq!(first.delay, Duration::from_millis(10));
+
+        let second = projection_retry_decision(2, io::ErrorKind::InvalidData, true, false);
+        assert!(second.replace_session);
+        assert_eq!(second.delay, Duration::from_millis(20));
+        assert!(
+            projection_retry_decision(1, io::ErrorKind::InvalidData, true, true).replace_session,
+            "a failed replacement fell back into the in-place retry loop"
+        );
+
+        for attempt in 1..4 {
+            assert!(
+                !projection_retry_decision(attempt, io::ErrorKind::WouldBlock, false, false)
+                    .replace_session
+            );
+        }
+        assert!(
+            projection_retry_decision(4, io::ErrorKind::WouldBlock, false, false).replace_session
+        );
+        assert_eq!(
+            projection_retry_decision(u32::MAX, io::ErrorKind::Other, false, true).delay,
+            Duration::from_millis(250),
+            "a persistent presenter error can still hot-spin"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -4150,7 +4471,7 @@ mod tests {
             generation: 0,
             virtual_revision: 12,
             surfaces: vec![test_surface(video_key)],
-            tracks: vec![resumed_video, quieter_audio],
+            tracks: vec![resumed_video.clone(), quieter_audio.clone()],
             nodes: Vec::new(),
             videos_needing_keyframes: Vec::new(),
         });
@@ -4169,6 +4490,103 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
+
+        // A lateness/decoder request comes from the still-live outer track. Forward it to the
+        // nested producer, but keep that exact outer video/audio pair: replacing it replays the
+        // same old keyframe and creates a self-sustaining recovery loop.
+        let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+        let current_outer_video = snapshot
+            .sources
+            .iter()
+            .find(|source| matches!(source.descriptor, crate::media::SourceDescriptor::Video(_)))
+            .unwrap()
+            .key;
+        let current_outer_audio = snapshot
+            .sources
+            .iter()
+            .find(|source| matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_)))
+            .unwrap()
+            .key;
+        let _ = presenter.request_keyframe(
+            current_outer_video,
+            None,
+            crate::bridge::KEYFRAME_REASON_DECODER_ERROR,
+        );
+        let requests = keyframe_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("outer decoder request was not forwarded");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].source, video_key);
+        assert_eq!(
+            requests[0].reason,
+            crate::bridge::KEYFRAME_REASON_DECODER_ERROR
+        );
+
+        // This projection was queued before the server processed BridgeNeedKeyframes. Its empty
+        // recovery set must not clear the in-place classification before the rising edge arrives.
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            virtual_revision: 13,
+            surfaces: vec![test_surface(video_key)],
+            tracks: vec![resumed_video.clone(), quieter_audio.clone()],
+            nodes: Vec::new(),
+            videos_needing_keyframes: Vec::new(),
+        });
+        loop {
+            let revision = applied_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stale pre-recovery projection was not acknowledged");
+            if revision == 13 {
+                break;
+            }
+        }
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            virtual_revision: 14,
+            surfaces: vec![test_surface(video_key)],
+            tracks: vec![resumed_video.clone(), quieter_audio.clone()],
+            nodes: Vec::new(),
+            videos_needing_keyframes: vec![video_key],
+        });
+        loop {
+            let revision = applied_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("in-place recovery projection was not acknowledged");
+            if revision == 14 {
+                break;
+            }
+        }
+
+        // Vivi answers NEED_KEYFRAME by advancing and flushing its channel. That increments the
+        // virtual decoder-reset serial on the same falling-edge snapshot that clears recovery.
+        // The outer decoder asked for this reset, so adopting the serial must not replace it.
+        let mut recovered_video = resumed_video;
+        recovered_video.decoder_reset_serial += 1;
+        worker.replace_snapshot(BridgeSnapshot {
+            generation: 0,
+            virtual_revision: 15,
+            surfaces: vec![test_surface(video_key)],
+            tracks: vec![recovered_video, quieter_audio],
+            nodes: Vec::new(),
+            videos_needing_keyframes: Vec::new(),
+        });
+        loop {
+            let revision = applied_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("in-place recovery falling edge was not acknowledged");
+            if revision == 15 {
+                break;
+            }
+        }
+        let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
+        assert!(snapshot.sources.iter().any(|source| {
+            matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
+                && source.key == current_outer_video
+        }));
+        assert!(snapshot.sources.iter().any(|source| {
+            matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_))
+                && source.key == current_outer_audio
+        }));
     }
 
     #[test]
@@ -5013,6 +5431,88 @@ mod tests {
         );
         assert!(source_is_playing(&after, video_key));
         assert!(source_is_playing(&after, audio_key));
+
+        let mut grouped = after.clone();
+        for serial in 2_u64..=17 {
+            let previous = grouped.clone();
+            let group = [u8::try_from(serial).unwrap(); 16];
+            let (first, second) = if serial % 2 == 0 {
+                (audio_key, video_key)
+            } else {
+                (video_key, audio_key)
+            };
+            let first_source = grouped
+                .iter_mut()
+                .find(|source| source.key == first)
+                .unwrap();
+            first_source.decoder_reset_serial = serial;
+            first_source.causation_id = Some(group);
+            assert!(
+                grouped_discontinuity_is_incomplete(&previous, &grouped),
+                "serial {serial} projected the first half of a linked discontinuity"
+            );
+
+            let second_source = grouped
+                .iter_mut()
+                .find(|source| source.key == second)
+                .unwrap();
+            second_source.decoder_reset_serial = serial;
+            second_source.causation_id = Some(group);
+            assert!(
+                !grouped_discontinuity_is_incomplete(&previous, &grouped),
+                "serial {serial} did not release the complete linked discontinuity"
+            );
+        }
+
+        let mut ungrouped_video_recovery = after.clone();
+        ungrouped_video_recovery
+            .iter_mut()
+            .find(|source| source.key == video_key)
+            .unwrap()
+            .decoder_reset_serial += 1;
+        assert!(
+            !grouped_discontinuity_is_incomplete(&after, &ungrouped_video_recovery),
+            "a track-scoped decoder recovery waited for unrelated linked audio"
+        );
+
+        let mut reset_video = after.clone();
+        reset_video
+            .iter_mut()
+            .find(|source| source.key == video_key)
+            .unwrap()
+            .decoder_reset_serial += 1;
+        let producer_resets =
+            producer_decoder_resets(&after, &reset_video, &HashSet::from([video_key]));
+        assert_eq!(
+            producer_resets,
+            HashSet::from([video_key]),
+            "a producer reset already has a new-generation keyframe in flight"
+        );
+        let mut requested = HashSet::new();
+        reconcile_requested_virtual_keyframes(
+            &mut requested,
+            &HashSet::from([video_key]),
+            &producer_resets,
+        );
+        assert!(requested.contains(&video_key));
+        reconcile_requested_virtual_keyframes(
+            &mut requested,
+            &HashSet::from([video_key]),
+            &HashSet::new(),
+        );
+        assert!(
+            !requested.insert(video_key),
+            "a later snapshot in the same recovery episode emitted a second request"
+        );
+        reconcile_requested_virtual_keyframes(&mut requested, &HashSet::new(), &HashSet::new());
+        assert!(
+            requested.is_empty(),
+            "the falling edge did not re-arm recovery"
+        );
+        assert!(
+            producer_decoder_resets(&after, &reset_video, &HashSet::new()).is_empty(),
+            "a serial change without a pending decoder request needs no recovery classification"
+        );
 
         let node = |x: i64| BridgeNode {
             producer: 3,

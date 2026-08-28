@@ -1592,6 +1592,9 @@ struct MediaProjectionKey {
 
 struct PendingMediaProjection {
     sources: HashSet<BridgeSourceKey>,
+    /// Decoder reset serials carried by this exact submitted snapshot. Source keys survive a seek,
+    /// so activating by key alone can release the new generation on an older apply acknowledgement.
+    decoder_reset_serials: HashMap<BridgeSourceKey, u64>,
     /// Previously presented retained sources for which a fresh outer track would be blank.
     retained_replay_candidates: HashSet<BridgeSourceKey>,
     retained_replays: HashSet<BridgeSourceKey>,
@@ -3161,7 +3164,8 @@ impl SessionActor {
                         retry_retained = !requests.is_empty();
                         self.retained_replay_requests.extend(requests);
                         self.record_projection_sources(&applied.sources, applied.gateway_revision);
-                        self.vivid.activate_bridge_projection(&applied.sources);
+                        self.vivid
+                            .activate_bridge_projection_at_resets(&applied.decoder_reset_serials);
                     }
                     self.check_automation_waiters();
                     if retry_retained {
@@ -13908,6 +13912,10 @@ impl SessionActor {
             .iter()
             .map(|source| source.key)
             .collect::<HashSet<_>>();
+        let projected_decoder_reset_serials = sources
+            .iter()
+            .map(|source| (source.key, source.decoder_reset_serial))
+            .collect::<HashMap<_, _>>();
         let retained_replay_candidates = snapshot
             .sources
             .iter()
@@ -13945,6 +13953,7 @@ impl SessionActor {
             projection_revision,
             PendingMediaProjection {
                 sources: projected_source_keys,
+                decoder_reset_serials: projected_decoder_reset_serials,
                 retained_replay_candidates,
                 retained_replays: HashSet::new(),
                 gateway_revision: projection_key.virtual_revision,
