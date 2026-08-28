@@ -947,14 +947,6 @@ fn pack_cell_size(display: crate::ipc::DisplayMetrics) -> u32 {
     u32::from(display.cell_width) | (u32::from(display.cell_height) << 16)
 }
 
-fn recovery_media_allowed_while_paused(
-    source: BridgeSourceKey,
-    recovering_sources: &HashSet<BridgeSourceKey>,
-    recovery_handoffs: &HashSet<BridgeSourceKey>,
-) -> bool {
-    recovering_sources.contains(&source) || recovery_handoffs.contains(&source)
-}
-
 fn apply_cell_size(display: &mut crate::ipc::DisplayMetrics, packed: u32) {
     display.cell_width = packed as u16;
     display.cell_height = (packed >> 16) as u16;
@@ -1517,22 +1509,10 @@ fn run_bridge_worker(
         // Timed media for a source that has not started is legitimate pre-roll. OuterBridge
         // acknowledges it after the outer presenter returns the corresponding ingress capacity,
         // replenishing the virtual presenter's initial grant so Vivi can supply enough linked
-        // audio and reordered video to issue PLAY. Only reject media for a source that had
-        // started and is now stopped.
-        if matches!(
-            media.record_type,
-            vivid_protocol::messages::VIDEO_PACKET | vivid_protocol::messages::AUDIO_PACKET
-        ) && !source_is_playing(&active_sources, media.source)
-            && started_sources.contains(&media.source)
-            && !recovery_media_allowed_while_paused(
-                media.source,
-                &recovering_sources,
-                &recovery_handoffs,
-            )
-        {
-            acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
-            continue;
-        }
+        // audio and reordered video to issue PLAY. Media a paused source may not deliver yet was
+        // never popped: `source_admits_media_now` leaves it queued rather than retiring it here,
+        // because a record dropped mid-stream is a reference gap and the recovery it earns costs
+        // the pane its outer tracks - and with them its surface slots - until playback resumes.
         let is_raster = media.record_type == vivid_protocol::messages::RASTER_FRAME;
         // Only the chunk carrying the frame header reveals the form, and the counters are applied
         // on the last chunk, so remember it across a fragmented body.
@@ -2510,34 +2490,6 @@ mod tests {
         assert!(!hydrates_retained_source(
             vivid_protocol::messages::VIDEO_PACKET
         ));
-    }
-
-    #[test]
-    fn paused_recovery_handoff_keeps_timed_followers_admissible_until_play() {
-        let video = BridgeSourceKey {
-            producer: 3,
-            context: 1,
-            surface: 7,
-            track: 8,
-        };
-        let audio = BridgeSourceKey { track: 7, ..video };
-        let current_recovery = HashSet::new();
-        let handoff = HashSet::from([video, audio]);
-
-        assert!(recovery_media_allowed_while_paused(
-            video,
-            &current_recovery,
-            &handoff,
-        ));
-        assert!(recovery_media_allowed_while_paused(
-            audio,
-            &current_recovery,
-            &handoff,
-        ));
-        assert!(
-            !recovery_media_allowed_while_paused(video, &current_recovery, &HashSet::new()),
-            "ordinary media on a previously started paused source must still be rejected"
-        );
     }
 
     #[test]
