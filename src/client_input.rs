@@ -922,6 +922,18 @@ mod tests {
     }
 
     #[test]
+    fn kitty_enter_events_are_forwarded_byte_exact() {
+        let mut parser = PrefixParser::default();
+        parser.set_keyboard_flags(31);
+        let events = b"\x1b[13;1u\x1b[13;1:2u\x1b[13;1:3u";
+        assert_eq!(
+            parser.feed(events),
+            [ParsedInput::Input(events.to_vec())],
+            "nested applications must receive Enter press, repeat, and release unchanged"
+        );
+    }
+
+    #[test]
     fn kitty_control_prefix_still_runs_vvmux_commands() {
         let mut parser = PrefixParser::default();
         parser.set_keyboard_flags(31);
