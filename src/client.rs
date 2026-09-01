@@ -444,6 +444,9 @@ pub fn attach(
         &client_config.keys.prefix,
         direct,
     );
+    parser.set_conpty_input_transport(
+        std::env::var("VIVID_ANCHOR_TRANSPORT").is_ok_and(|transport| transport == "conpty"),
+    );
     #[cfg(not(windows))]
     let mut last_display = display;
     let mut float_mode: Option<u64> = None;

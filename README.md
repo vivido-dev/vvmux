@@ -1074,6 +1074,10 @@ are capped at 1 MiB and the client emits OSC 52. Paste honors the focused
 application's bracketed-paste mode and neutralizes embedded bracketed-paste terminators.
 On Windows, the outer terminal's bracketed-paste mode follows the focused pane, so `Ctrl+V` from
 Windows Terminal or Vivido is delivered with bracket markers only when that pane requested them.
+When a remote vvmux attachment arrives through Vivido's ConPTY carrier, the foreground client also
+repairs ConPTY's missing F12 key-release report for a focused pane that requested Kitty key-event
+types. This keeps release-gated emergency shortcuts working without changing input for ordinary
+PTY attachments or applications that requested press events only.
 
 In floating move or resize mode, arrows step by one cell and Shift-Arrow steps by five. Enter
 commits and Escape restores the rectangle captured on entry. Zoom hides every other pane, including
