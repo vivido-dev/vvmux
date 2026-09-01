@@ -136,6 +136,10 @@ fn float_edit_sequence_prefix(sequence: &[u8]) -> bool {
 /// Kitty keyboard flag for reporting key release and repeat events, not only presses.
 const KITTY_REPORT_EVENT_TYPES: u8 = 2;
 
+/// ConPTY preserves the legacy F12 press but drops the Kitty release that follows it.
+const LEGACY_F12_PRESS: &[u8] = b"\x1b[24~";
+const KITTY_F12_RELEASE: &[u8] = b"\x1b[24;1:3~";
+
 /// The Kitty codepoint a plain command byte reports when it is released.
 ///
 /// A release report carries the unshifted key, so `prefix S` presses as `S` and releases as `s`.
@@ -157,6 +161,7 @@ pub(crate) struct PrefixParser {
     confirm_close: bool,
     mouse_coordinates: MouseCoordinates,
     keyboard_flags: u8,
+    conpty_input_transport: bool,
     /// Kitty key codepoints whose press was consumed as a vvmux command, so their release and
     /// repeat reports must not reach the pane. Keyed by codepoint alone: the modifier state at
     /// release can differ from the press (releasing Ctrl before the prefix key reports the same
@@ -201,6 +206,7 @@ impl PrefixParser {
             confirm_close: false,
             mouse_coordinates: MouseCoordinates::Cells,
             keyboard_flags: 0,
+            conpty_input_transport: false,
             suppressed_kitty_releases: HashSet::new(),
         }
     }
@@ -219,6 +225,15 @@ impl PrefixParser {
         if flags == 0 {
             self.suppressed_kitty_releases.clear();
         }
+    }
+
+    /// Record whether input reaches this foreground client through ConPTY.
+    ///
+    /// Pane environments cannot carry this attachment-local fact: the hidden server strips the
+    /// outer Vivid namespace, and pane producers need their own anchor transport. The foreground
+    /// client is therefore the boundary that repairs ConPTY's missing F12 release.
+    pub(crate) fn set_conpty_input_transport(&mut self, conpty: bool) {
+        self.conpty_input_transport = conpty;
     }
 
     pub(crate) fn set_plugin_bindings(&mut self, bindings: Vec<crate::ipc::PluginKeybinding>) {
@@ -373,7 +388,13 @@ impl PrefixParser {
                     {
                         let sequence = std::mem::take(&mut self.escape_sequence);
                         self.escape_since = None;
-                        if byte == b'u'
+                        if self.conpty_input_transport
+                            && self.reports_key_events()
+                            && sequence == LEGACY_F12_PRESS
+                        {
+                            ordinary.extend_from_slice(&sequence);
+                            ordinary.extend_from_slice(KITTY_F12_RELEASE);
+                        } else if byte == b'u'
                             && self.keyboard_flags != 0
                             && let Some(key) = parse_kitty_key(&sequence)
                         {
@@ -918,6 +939,36 @@ mod tests {
         assert_eq!(
             parser.feed(b"u\x1b[127;1:3u"),
             [ParsedInput::Input(b"\x1b[127;1u\x1b[127;1:3u".to_vec())]
+        );
+    }
+
+    #[test]
+    fn conpty_repairs_f12_release_only_when_the_pane_requested_key_events() {
+        let mut parser = PrefixParser::default();
+        parser.set_conpty_input_transport(true);
+        parser.set_keyboard_flags(31);
+        assert!(parser.feed(b"\x1b[24").is_empty());
+        assert_eq!(
+            parser.feed(b"~"),
+            [ParsedInput::Input(b"\x1b[24~\x1b[24;1:3~".to_vec())],
+            "the pane receives the preserved press followed by the missing release"
+        );
+
+        let mut byte_transparent = PrefixParser::default();
+        byte_transparent.set_keyboard_flags(31);
+        assert_eq!(
+            byte_transparent.feed(LEGACY_F12_PRESS),
+            [ParsedInput::Input(LEGACY_F12_PRESS.to_vec())],
+            "a byte-transparent attachment must not synthesize input"
+        );
+
+        let mut press_only = PrefixParser::default();
+        press_only.set_conpty_input_transport(true);
+        press_only.set_keyboard_flags(1);
+        assert_eq!(
+            press_only.feed(LEGACY_F12_PRESS),
+            [ParsedInput::Input(LEGACY_F12_PRESS.to_vec())],
+            "a pane that did not request release events keeps press-only input"
         );
     }
 
