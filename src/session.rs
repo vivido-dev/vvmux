@@ -12803,6 +12803,12 @@ impl SessionActor {
             ("VVMUX_TAB_ID".into(), tab_id.to_string()),
             ("VVMUX_PANE_ID".into(), pane_id.to_string()),
             ("VVMUX_BIN".into(), vvmux_bin),
+            // Ambient agent-mesh coordinates. Two strings, no dependency: `vvagent` in this pane
+            // derives its runtime instance from them instead of being told, so an agent started
+            // here can address agents in other sessions without vvmux linking the mesh at all.
+            // Everything else about the mesh — the store, activation, policy — lives outside.
+            ("AGENT_MESH_RUNTIME".into(), "vvmux".into()),
+            ("AGENT_MESH_INSTANCE".into(), self.name.clone()),
         ]);
         let vivid_capability = if spec.vivid_capability {
             environment.extend([
