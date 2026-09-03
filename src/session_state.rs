@@ -373,6 +373,10 @@ mod tests {
         tempfile::TempDir::new().unwrap()
     }
 
+    fn write_private(path: &Path, contents: impl AsRef<[u8]>) {
+        crate::runtime::write_private_atomic(path, contents.as_ref(), "test").unwrap();
+    }
+
     /// A two-pane, one-tab session: enough shape that a serialization bug shows up as a difference
     /// rather than as an empty document that happens to round-trip.
     fn sample() -> SessionSnapshot {
@@ -481,12 +485,7 @@ mod tests {
             ("wrong-shape.json", "[1,2,3]"),
         ] {
             let path = directory.path().join(name);
-            std::fs::write(&path, contents).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            }
+            write_private(&path, contents);
             let error = load_snapshot(&path).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{name}");
         }
@@ -499,16 +498,10 @@ mod tests {
         let directory = temporary_directory();
         let path = directory.path().join("session.json");
         let layout = serde_json::to_string(&sample().layout).unwrap();
-        std::fs::write(
+        write_private(
             &path,
             format!("{{\"schema\":{SNAPSHOT_SCHEMA},\"layout\":{layout}}}"),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        );
         let restored = load_snapshot(&path).unwrap().unwrap();
         assert_eq!(restored.extras.active_tab, 0);
         assert!(restored.extras.tabs.is_empty());
@@ -522,19 +515,13 @@ mod tests {
         let directory = temporary_directory();
         let path = directory.path().join("session.json");
         let layout = serde_json::to_string(&sample().layout).unwrap();
-        std::fs::write(
+        write_private(
             &path,
             format!(
                 "{{\"schema\":{SNAPSHOT_SCHEMA},\"layout\":{layout},\
                  \"extras\":{{\"active_tab\":0,\"tabs\":[],\"invented_later\":true}}}}"
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        );
         assert!(load_snapshot(&path).unwrap().is_some());
     }
 
@@ -557,12 +544,7 @@ mod tests {
     fn an_over_budget_file_is_refused_without_parsing() {
         let directory = temporary_directory();
         let path = directory.path().join("session.json");
-        std::fs::write(&path, "x".repeat(64)).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        write_private(&path, "x".repeat(64));
         let error = load::<SessionSnapshot>(&path, 16, "session snapshot").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(

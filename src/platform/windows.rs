@@ -1135,8 +1135,11 @@ unsafe impl Sync for OwnedHandle {}
 
 impl OwnedHandle {
     fn new(handle: HANDLE) -> io::Result<Self> {
-        require_handle(handle, "Windows returned an invalid handle")?;
-        Ok(Self(handle))
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(handle))
+        }
     }
 
     fn raw(&self) -> HANDLE {

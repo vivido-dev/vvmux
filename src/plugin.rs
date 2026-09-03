@@ -4206,10 +4206,14 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
             ),
             ("./local", ResolvedSource::Local("./local".into())),
             ("../local", ResolvedSource::Local("../local".into())),
-            ("/abs/local", ResolvedSource::Local("/abs/local".into())),
         ] {
             assert_eq!(resolve_source(input).unwrap(), expected, "{input}");
         }
+        #[cfg(unix)]
+        assert_eq!(
+            resolve_source("/abs/local").unwrap(),
+            ResolvedSource::Local("/abs/local".into())
+        );
         #[cfg(windows)]
         assert_eq!(
             resolve_source(r"C:\packages\hermes").unwrap(),

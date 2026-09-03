@@ -770,6 +770,10 @@ hold = true
     /// same weights, focus, and float geometry it was built from.
     #[test]
     fn rendered_layout_round_trips_through_the_parser() {
+        #[cfg(unix)]
+        let cwd = "/home/test/src/vvmux";
+        #[cfg(windows)]
+        let cwd = r"C:\Users\test\src\vvmux";
         let file = LayoutFile::from_tabs(vec![
             LayoutTab::new(
                 Some("dev".to_owned()),
@@ -778,7 +782,7 @@ hold = true
                     Axis::Vertical,
                     vec![30, 70],
                     vec![
-                        LayoutNode::leaf("p1".to_owned(), Some("~/src/vvmux".to_owned()), true),
+                        LayoutNode::leaf("p1".to_owned(), Some(cwd.to_owned()), true),
                         LayoutNode::leaf("p2".to_owned(), None, false),
                     ],
                 )),
@@ -811,10 +815,7 @@ hold = true
         let first = &plan.tabs[0];
         assert_eq!(first.name.as_deref(), Some("dev"));
         assert_eq!(first.focus_slot, Some(1));
-        assert_eq!(
-            first.spawns[0].cwd.as_deref(),
-            Some(Path::new("/home/test/src/vvmux"))
-        );
+        assert_eq!(first.spawns[0].cwd.as_deref(), Some(Path::new(cwd)));
         // A saved layout pins what it recorded rather than deferring to `[panes].transparent`, so
         // reopening it reproduces the pane the user actually saved.
         assert_eq!(first.spawns[0].transparent, Some(false));
