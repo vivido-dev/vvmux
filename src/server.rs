@@ -188,6 +188,17 @@ fn start_mesh_watcher(name: &str) {
         .name("agent-mesh".into())
         .spawn(move || {
             let program = std::env::var_os("AGENT_MESH_BIN").unwrap_or_else(|| "vvagent".into());
+            // A pane keeps its id when it is moved to another frame, but its `f` changes, and the
+            // environment a pane inherited at spawn cannot be edited afterwards. The watcher
+            // re-derives addresses from `layout`, which is already the authoritative view.
+            let reconcile = std::env::current_exe().ok().map(|exe| {
+                let executable = exe.to_string_lossy().into_owned();
+                #[cfg(windows)]
+                let executable = format!("\"{executable}\"");
+                #[cfg(unix)]
+                let executable = format!("'{}'", executable.replace('\'', "'\\''"));
+                format!("{executable} msg --target {name} layout")
+            });
             let mut command = std::process::Command::new(program);
             command
                 .args([
@@ -202,6 +213,9 @@ fn start_mesh_watcher(name: &str) {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
+            if let Some(reconcile) = &reconcile {
+                command.args(["--reconcile", reconcile]);
+            }
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;

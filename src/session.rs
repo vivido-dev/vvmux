@@ -12803,13 +12803,22 @@ impl SessionActor {
             ("VVMUX_TAB_ID".into(), tab_id.to_string()),
             ("VVMUX_PANE_ID".into(), pane_id.to_string()),
             ("VVMUX_BIN".into(), vvmux_bin),
-            // Ambient agent-mesh coordinates. Two strings, no dependency: `vvagent` in this pane
-            // derives its runtime instance from them instead of being told, so an agent started
-            // here can address agents in other sessions without vvmux linking the mesh at all.
-            // Everything else about the mesh — the store, activation, policy — lives outside.
+            // Ambient agent-mesh coordinates. Three strings, no dependency: `vvagent` in this
+            // pane derives its runtime instance and position from them instead of being told, so
+            // an agent started here can address agents in other sessions without vvmux linking the
+            // mesh at all. Everything else about the mesh — the store, activation, policy — lives
+            // outside.
+            //
+            // A session is its own runtime instance even when it runs inside a Vivida pane. Its
+            // panes must not carry the host's position: the session outlives the window that
+            // started it and can be reattached from another one, which would leave every address
+            // pointing at a window that is no longer presenting it.
             ("AGENT_MESH_RUNTIME".into(), "vvmux".into()),
             ("AGENT_MESH_INSTANCE".into(), self.name.clone()),
         ]);
+        if let Some(address) = mesh_address(tab_id, pane_id) {
+            environment.push(("AGENT_MESH_ADDRESS".into(), address));
+        }
         let vivid_capability = if spec.vivid_capability {
             environment.extend([
                 ("VIVID_ENDPOINT_CONTROL".into(), self.vivid.endpoint()),
@@ -17337,6 +17346,18 @@ fn extract_selection_row(
     Some(row)
 }
 
+/// This pane's agent-mesh position, `f<tab>p<pane>`, when both IDs can be address indices.
+///
+/// `f` is vvmux's tab — the addressing scheme calls it a frame so it cannot be confused with a
+/// Vivido or Vivida tab — and `p` is the pane. An address index is a one-based `u32`, so a session
+/// that somehow ran past `u32::MAX` tabs or panes publishes no position rather than one that cannot
+/// parse: an unparsable address fails `vvagent bind` outright, while none of it costs only the
+/// position.
+fn mesh_address(tab_id: u64, pane_id: PaneId) -> Option<String> {
+    let addressable = |id: u64| (1..=u64::from(u32::MAX)).contains(&id);
+    (addressable(tab_id) && addressable(pane_id)).then(|| format!("f{tab_id}p{pane_id}"))
+}
+
 fn extract_selection(terminal: &Terminal, start: (isize, usize), end: (isize, usize)) -> Vec<u8> {
     let (start, end) = if start <= end {
         (start, end)
@@ -17432,6 +17453,27 @@ fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pane_publishes_its_frame_and_pane_as_a_mesh_address() {
+        assert_eq!(mesh_address(1, 2).as_deref(), Some("f1p2"));
+        assert_eq!(mesh_address(3, 41).as_deref(), Some("f3p41"));
+    }
+
+    #[test]
+    fn an_id_that_cannot_be_an_address_index_publishes_no_address() {
+        // An address index is a one-based u32. Publishing one that cannot parse fails `vvagent
+        // bind` outright and takes the whole mailbox with it; publishing none costs the position
+        // and nothing else.
+        assert_eq!(mesh_address(0, 2), None);
+        assert_eq!(mesh_address(1, 0), None);
+        assert_eq!(mesh_address(u64::from(u32::MAX) + 1, 2), None);
+        assert_eq!(mesh_address(1, u64::from(u32::MAX) + 1), None);
+        assert_eq!(
+            mesh_address(u64::from(u32::MAX), 1).as_deref(),
+            Some("f4294967295p1")
+        );
+    }
 
     fn delayed(due: Instant, sequence: u64) -> DelayedInput {
         DelayedInput {
