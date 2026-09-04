@@ -130,6 +130,7 @@ fn run_inner(
         },
         (None, None) => (None, None, None),
     };
+    start_mesh_watcher(&name);
     let actor = session::start(session::SessionOptions {
         name,
         config,
@@ -175,6 +176,41 @@ fn run_inner(
     }
     paths.remove_instance(&registry);
     Ok(())
+}
+
+/// Provider control and SQLite stay in a child process, never on the session actor.
+fn start_mesh_watcher(name: &str) {
+    if std::env::var("AGENT_MESH_WATCH").as_deref() == Ok("off") {
+        return;
+    }
+    let name = name.to_owned();
+    let _ = thread::Builder::new()
+        .name("agent-mesh".into())
+        .spawn(move || {
+            let program = std::env::var_os("AGENT_MESH_BIN").unwrap_or_else(|| "vvagent".into());
+            let mut command = std::process::Command::new(program);
+            command
+                .args([
+                    "watch",
+                    "--runtime",
+                    "vvmux",
+                    "--instance",
+                    &name,
+                    "--parent-pid",
+                    &std::process::id().to_string(),
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000);
+            }
+            if let Ok(mut child) = command.spawn() {
+                let _ = child.wait();
+            }
+        });
 }
 
 /// Load a session snapshot and lower its shape, or report why it will not be used.
