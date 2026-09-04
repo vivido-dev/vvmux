@@ -1,0 +1,4 @@
+interface:
+  display_name: "vvmux"
+  short_description: "Drive panes and agents in a vvmux session"
+  default_prompt: "Use $vvmux to inspect and control another pane in this session."
