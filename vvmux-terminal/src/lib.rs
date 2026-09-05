@@ -989,14 +989,29 @@ impl Terminal {
         }
     }
 
+    /// The cell an erase writes: back-color-erase, which the `vvmux` terminfo advertises as `bce`.
+    ///
+    /// Every erase — ED, EL, ECH, ICH, DCH, and the blank rows a scroll feeds in — takes the
+    /// current SGR background and nothing else. Full-screen applications depend on this: vim opens
+    /// with `ESC[40m ESC[H ESC[2J` and never paints the rows it expects the erase to have filled,
+    /// so a blank that kept `TerminalColor::Default` would leave those cells showing the pane
+    /// background around text the application did paint.
+    ///
+    /// Only the background carries over. xterm erases with the color flags alone, so bold,
+    /// inverse, underline, strikeout and hyperlinks must not survive into a blank cell — an erase
+    /// under `ESC[7m` would otherwise lay down a run of solid inverse blocks.
     fn blank(&self) -> Cell {
         Cell {
-            ch: ' ',
-            combining: String::new(),
-            wide_continuation: false,
-            leading_wide_spacer: false,
-            tab_width: None,
-            ..self.template.clone()
+            background: self.template.background,
+            ..Cell::default()
+        }
+    }
+
+    /// Replace every cell of the active screen with `blank`, preserving the grid's shape.
+    fn fill_active_grid_blank(&mut self) {
+        let blank = self.blank();
+        for row in &mut self.grid {
+            row.fill(blank.clone());
         }
     }
 
@@ -1026,7 +1041,7 @@ impl Terminal {
     /// Blank the active screen without announcing `TerminalEvent::Clear`. A screen switch changes
     /// which anchors are visible but does not constitute an explicit clear of either anchor set.
     fn clear_active_grid(&mut self) {
-        self.grid = blank_grid(self.rows, self.cols);
+        self.fill_active_grid_blank();
         self.grid_wrapped.fill(false);
         self.damage();
     }
@@ -1334,7 +1349,7 @@ impl Handler for Terminal {
                 self.clear_row_range(self.cursor_row, 0, self.cursor_col + 1);
             }
             ClearMode::All => {
-                self.grid = blank_grid(self.rows, self.cols);
+                self.fill_active_grid_blank();
                 self.grid_wrapped.fill(false);
                 self.events.push(TerminalEvent::Clear {
                     alternate: self.alternate_screen,
@@ -2652,6 +2667,61 @@ mod tests {
             }
         )));
         assert_eq!(terminal.cursor(), (3, 4));
+    }
+
+    #[test]
+    fn erase_screen_fills_with_the_current_background() {
+        // vim's opening repaint: set the Normal background, home, ED 2, then paint only the rows
+        // it has content for. Row 2 is never written, so back-color-erase is the only thing that
+        // makes it match the rows that were.
+        let mut terminal = Terminal::new(3, 4, 10);
+        terminal.feed(b"\x1b[40m\x1b[H\x1b[2Jhi");
+
+        let cells = terminal.cells();
+        assert_eq!(
+            cells[0][2].background,
+            TerminalColor::Indexed(0),
+            "cells the erase covered past the painted text take the erase background"
+        );
+        assert_eq!(
+            cells[2][0].background,
+            TerminalColor::Indexed(0),
+            "a row the application never repaints must not fall back to the default background"
+        );
+        assert_eq!(cells[2][0].ch, ' ');
+    }
+
+    #[test]
+    fn erase_keeps_the_background_and_drops_every_other_attribute() {
+        // xterm erases with the color flags alone. An erase under reverse video must not lay down
+        // a run of solid inverse blocks, and a hyperlink must not extend across blank cells.
+        let mut terminal = Terminal::new(1, 6, 10);
+        terminal.feed(b"\x1b]8;;https://example.com\x07\x1b[1;4;7;41mabcdef");
+        terminal.feed(b"\x1b[1;3H\x1b[K");
+
+        let cells = terminal.cells();
+        assert_eq!(cells[0][0].ch, 'a', "the erase must stop at the cursor");
+        assert!(cells[0][0].inverse);
+        let blank = &cells[0][2];
+        assert_eq!(blank.background, TerminalColor::Indexed(1));
+        assert_eq!(blank.ch, ' ');
+        assert!(!blank.inverse);
+        assert!(!blank.bold);
+        assert!(!blank.underline);
+        assert_eq!(blank.foreground, TerminalColor::Default);
+        assert!(blank.hyperlink.is_none());
+    }
+
+    #[test]
+    fn alternate_screen_entry_clears_with_the_current_background() {
+        // DECSET 1049 clears the screen it switches to, and that clear is an erase like any other.
+        let mut terminal = Terminal::new(2, 4, 10);
+        terminal.feed(b"\x1b[44m\x1b[?1049h");
+        assert_eq!(terminal.cells()[1][3].background, TerminalColor::Indexed(4));
+
+        // Leaving restores the primary screen untouched by the alternate screen's background.
+        terminal.feed(b"\x1b[?1049l");
+        assert_eq!(terminal.cells()[1][3].background, TerminalColor::Default);
     }
 
     #[test]
