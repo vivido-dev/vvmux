@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -35,6 +36,9 @@ fn recursive_git_dependencies_and_bounded_workflows_execute_end_to_end() {
     let config_home = directory.path().join("config");
     private_directory(&runtime);
     private_directory(&config_home);
+    if !unix_sockets_available(&runtime) {
+        return;
+    }
 
     let repositories = directory.path().join("repositories");
     fs::create_dir(&repositories).unwrap();
@@ -782,6 +786,22 @@ fn command(binary: &str, runtime: &Path, config_home: &Path) -> Command {
 fn private_directory(path: &Path) {
     fs::create_dir_all(path).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn unix_sockets_available(runtime: &Path) -> bool {
+    let probe = runtime.join("socket-probe");
+    match UnixListener::bind(&probe) {
+        Ok(listener) => {
+            drop(listener);
+            fs::remove_file(probe).unwrap();
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping plugin workflow socket test: {error}");
+            false
+        }
+        Err(error) => panic!("could not probe Unix socket support: {error}"),
+    }
 }
 
 fn assert_success(output: &Output) {
