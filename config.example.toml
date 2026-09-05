@@ -7,6 +7,8 @@ prefix = "C-b"
 scrollback_lines = 10000
 status_visible = true
 mouse = true
+# Prepare a session microphone for new default-shell panes; local Vivido still requires opt-in.
+microphone = false
 render_interval_ms = 16
 
 # Deprecated: superseded by [theme], which accepts the same colors plus truecolor.

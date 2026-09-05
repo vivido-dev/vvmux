@@ -97,6 +97,7 @@ fn run() -> io::Result<()> {
         )?;
         let track = client.create_track(
             TrackConfiguration {
+                direction: Default::default(),
                 context_id: context,
                 surface_id,
                 track_id,

@@ -62,6 +62,8 @@ impl Default for Session {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct General {
+    /// Prepare a distinct remote microphone for newly spawned shell panes.
+    pub microphone: bool,
     pub prefix: String,
     pub shell: Option<PathBuf>,
     pub default_cwd: Option<PathBuf>,
@@ -280,6 +282,7 @@ impl Default for Panes {
 impl Default for General {
     fn default() -> Self {
         Self {
+            microphone: false,
             prefix: "C-b".into(),
             shell: None,
             default_cwd: None,

@@ -52,6 +52,7 @@ const STRUCTURED_RECORD: u16 = 1;
 const MEDIA_RECORD: u16 = 2;
 /// Terminal frame chunk: fixed binary header, then raw terminal bytes.
 const RENDER_RECORD: u16 = 3;
+const MICROPHONE_RECORD: u16 = 4;
 
 /// Byte payloads bypass JSON because `serde_json` has no byte representation: a `Vec<u8>` becomes a
 /// decimal number per byte, which measured at 3.57x for media and 3.29x for terminal frames, paid
@@ -1312,6 +1313,12 @@ pub struct MouseEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClientMessage {
+    Microphone {
+        bridge_instance_id: u64,
+        source: vivid_gateway::BridgeSourceKey,
+        generation: u64,
+        bytes: Vec<u8>,
+    },
     Attach {
         replace: bool,
         target: AttachmentTarget,
@@ -1450,6 +1457,7 @@ pub enum ServerMessage {
         bindings: Vec<PluginKeybinding>,
     },
     MediaSnapshot {
+        microphones: Vec<vivid_gateway::MicrophoneRequest>,
         revision: u64,
         surfaces: Vec<BridgeSurface>,
         tracks: Vec<BridgeSource>,
@@ -1585,6 +1593,24 @@ impl RecordReader {
         }
     }
 
+    pub fn recv_client(&mut self) -> io::Result<ClientMessage> {
+        let (kind, flags, body) = self.read_raw()?;
+        if flags != 0 {
+            return Err(invalid("unexpected client flags"));
+        }
+        match kind {
+            STRUCTURED_RECORD => {
+                let message = decode_structured(&body)?;
+                if matches!(message, ClientMessage::Microphone { .. }) {
+                    return Err(invalid("microphone payload requires binary framing"));
+                }
+                Ok(message)
+            }
+            MICROPHONE_RECORD => decode_microphone(&body),
+            _ => Err(invalid("unexpected client record")),
+        }
+    }
+
     pub fn read_raw(&mut self) -> io::Result<(u16, u16, Vec<u8>)> {
         let mut header = [0_u8; 16];
         self.stream.read_exact(&mut header)?;
@@ -1601,6 +1627,12 @@ impl RecordReader {
         if length > self.maximum_body {
             return Err(invalid("VVMX record body exceeds negotiated limit"));
         }
+        if record_type == MICROPHONE_RECORD
+            && length != 48
+            && length != 48 + vivid_protocol::audio_input::BODY_BYTES
+        {
+            return Err(invalid("invalid microphone record size"));
+        }
         let mut body = vec![0; length as usize];
         self.stream.read_exact(&mut body)?;
         self.expected_sequence = self.expected_sequence.wrapping_add(1);
@@ -1611,6 +1643,34 @@ impl RecordReader {
 }
 
 impl RecordWriter {
+    pub fn send_client(&mut self, message: &ClientMessage) -> io::Result<()> {
+        if let ClientMessage::Microphone {
+            bridge_instance_id,
+            source,
+            generation,
+            bytes,
+        } = message
+        {
+            if !bytes.is_empty() {
+                vivid_protocol::audio_input::InputPacket::decode(bytes)?;
+            }
+            let mut header = [0_u8; 48];
+            for (part, value) in header.chunks_exact_mut(8).zip([
+                *bridge_instance_id,
+                source.producer,
+                source.context,
+                source.surface,
+                source.track,
+                *generation,
+            ]) {
+                part.copy_from_slice(&value.to_be_bytes());
+            }
+            self.write_raw_parts(MICROPHONE_RECORD, 0, &[&header, bytes])
+        } else {
+            self.send(message)
+        }
+    }
+
     pub fn send<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
         let body = serde_json::to_vec(message).map_err(io::Error::other)?;
         self.write_raw(STRUCTURED_RECORD, 0, &body)
@@ -1938,6 +1998,37 @@ fn decode_preface(preface: &[u8; 12]) -> io::Result<(ChannelKind, u32)> {
     Ok((channel, maximum))
 }
 
+fn decode_microphone(body: &[u8]) -> io::Result<ClientMessage> {
+    if body.len() != 48 && body.len() != 48 + vivid_protocol::audio_input::BODY_BYTES as usize {
+        return Err(invalid("invalid microphone record size"));
+    }
+    let mut fields = [0_u64; 6];
+    for (field, bytes) in fields.iter_mut().zip(body[..48].chunks_exact(8)) {
+        *field = u64::from_be_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| invalid("invalid microphone identity"))?,
+        );
+        if *field == 0 {
+            return Err(invalid("zero microphone identity"));
+        }
+    }
+    if body.len() > 48 {
+        vivid_protocol::audio_input::InputPacket::decode(&body[48..])?;
+    }
+    Ok(ClientMessage::Microphone {
+        bridge_instance_id: fields[0],
+        source: vivid_gateway::BridgeSourceKey {
+            producer: fields[1],
+            context: fields[2],
+            surface: fields[3],
+            track: fields[4],
+        },
+        generation: fields[5],
+        bytes: body[48..].to_vec(),
+    })
+}
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -1945,6 +2036,52 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microphone_binary_identity_and_bounds() {
+        let mut body = Vec::new();
+        for id in [41_u64, 7, 9, 11, 13, 2] {
+            body.extend_from_slice(&id.to_be_bytes());
+        }
+        let packet = vivid_protocol::audio_input::InputPacket {
+            epoch: 1,
+            packet_id: 1,
+            pts_us: 0,
+            pcm: [3; vivid_protocol::audio_input::PCM_BYTES],
+        }
+        .encode()
+        .unwrap();
+        body.extend_from_slice(&packet);
+        let ClientMessage::Microphone {
+            bridge_instance_id,
+            source,
+            generation,
+            bytes,
+        } = decode_microphone(&body).unwrap()
+        else {
+            panic!("wrong record");
+        };
+        assert_eq!(bridge_instance_id, 41);
+        assert_eq!(
+            (
+                source.producer,
+                source.context,
+                source.surface,
+                source.track,
+                generation
+            ),
+            (7, 9, 11, 13, 2)
+        );
+        assert_eq!(bytes, packet);
+        assert!(decode_microphone(&body[..48]).is_ok());
+        assert!(decode_microphone(&body[..47]).is_err());
+        assert!(decode_microphone(&body[..body.len() - 1]).is_err());
+        body.push(0);
+        assert!(decode_microphone(&body).is_err());
+        body.truncate(48);
+        body[..8].fill(0);
+        assert!(decode_microphone(&body).is_err());
+    }
 
     #[test]
     fn attachment_targets_are_explicit_and_round_trip() {

@@ -97,6 +97,7 @@ fn run() -> io::Result<()> {
     let maximum_record_body = media::rgba8_raw_frame_body_len(1, 1).map_err(io::Error::other)?;
     let track = client.create_track(
         TrackConfiguration {
+            direction: Default::default(),
             context_id: context,
             surface_id,
             track_id,

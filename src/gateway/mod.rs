@@ -1155,6 +1155,7 @@ async fn handle_session_message(
         }
         ServerMessage::Pong => {}
         ServerMessage::MediaSnapshot {
+            microphones: _,
             revision,
             surfaces,
             tracks,
@@ -1168,6 +1169,7 @@ async fn handle_session_message(
                 ));
             };
             bridge.replace_snapshot(BridgeSnapshot {
+                microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: revision,
                 surfaces,

@@ -297,12 +297,21 @@ fn scrub_daemon_environment(
     command: &mut Command,
     environment: impl IntoIterator<Item = (OsString, OsString)>,
 ) {
+    let environment: Vec<_> = environment.into_iter().collect();
+    let microphone_prepared = environment.iter().any(|(key, _)| key == "VVMIC_PREPARED");
     for (key, _) in environment {
         let key_text = key.to_string_lossy();
         if key_text.starts_with("VIVID_")
+            || (microphone_prepared
+                && matches!(
+                    key_text.as_ref(),
+                    "PULSE_SOURCE" | "PULSE_SERVER" | "ALSA_CONFIG_PATH"
+                ))
             || matches!(
                 key_text.as_ref(),
                 "VIVIDO_SOCKET"
+                    | "VVMIC_PREPARED"
+                    | "VVMIC_LABEL"
                     | "VIVIDO_WINDOW_ID"
                     | "VIVIDO_SESSION"
                     | "TMUX"

@@ -1,5 +1,16 @@
 # vvmux architecture
 
+## Microphone uplink
+
+`audio-input-v1` is separate from playback projection. Prepared pane-local `vvmic` helpers own
+OS devices while the native foreground `OuterBridge` owns independently authenticated outer
+uplink tracks. VVMX binary record kind 4 maps the current bridge instance plus the complete
+producer/context/surface/track/generation tuple back to the inner presenter; no audio uses JSON or
+the PTY. Queues are bounded and detach revokes channels without killing devices. Selection is
+explicit in local Vivido, pinned independently of pane focus/visibility, and shown by the local
+MIC label and remote receiving-pane indicator. See [setup](../vvmic/README.md) and the
+[process overview](../docs/vvmux/architecture.md#microphone-input).
+
 ## Session actor and pending work
 
 The session actor is the single writer for terminal, layout, scene-projection, and automation

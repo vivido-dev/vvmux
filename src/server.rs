@@ -332,7 +332,7 @@ fn handle_client(stream: Transport, actor: ActorHandle) {
     };
     let cancel = reader.cancel_handle();
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
-    while let Ok(message) = reader.recv::<ClientMessage>() {
+    while let Ok(message) = reader.recv_client() {
         if actor
             .sender
             .send(ActorEvent::Client {

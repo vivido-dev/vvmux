@@ -246,6 +246,18 @@ fn spawn_command(
         .stderr(Stdio::from(slave_file));
     builder.env_remove("VIVID_ENDPOINT");
     builder.env_remove("VIVID_ENDPOINT_BULK");
+    builder.env_remove("VIVID_ENDPOINT_REALTIME");
+    if std::env::var_os("VVMIC_PREPARED").is_some() {
+        for name in [
+            "PULSE_SOURCE",
+            "PULSE_SERVER",
+            "ALSA_CONFIG_PATH",
+            "VVMIC_PREPARED",
+            "VVMIC_LABEL",
+        ] {
+            builder.env_remove(name);
+        }
+    }
     builder.env_remove("VIVID_ENDPOINT_CONTROL");
     builder.env_remove("VIVID_TOKEN");
     builder.env_remove("VIVID_ROOT_SECRET");

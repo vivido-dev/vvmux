@@ -283,6 +283,7 @@ pub fn attach(
                         let _ = plugin_keymap_sender.send(bindings);
                     }
                     ServerMessage::MediaSnapshot {
+                        microphones,
                         revision,
                         surfaces,
                         tracks,
@@ -291,6 +292,7 @@ pub fn attach(
                     } => {
                         if let Some(bridge) = &mut bridge {
                             bridge.replace_snapshot(BridgeSnapshot {
+                                microphones,
                                 generation: 0,
                                 virtual_revision: revision,
                                 surfaces,
@@ -691,6 +693,7 @@ impl Drop for ClientWorkers {
 }
 
 pub(crate) struct BridgeSnapshot {
+    pub(crate) microphones: Vec<vivid_gateway::MicrophoneRequest>,
     pub(crate) generation: u64,
     pub(crate) virtual_revision: u64,
     pub(crate) surfaces: Vec<BridgeSurface>,
@@ -1158,6 +1161,16 @@ fn run_bridge_worker(
         if stopped.load(Ordering::Acquire) {
             break;
         }
+        if let Ok(packets) = bridge.take_microphone_packets() {
+            for (source, generation, bytes) in packets {
+                let _ = client_writer.send(ClientMessage::Microphone {
+                    bridge_instance_id,
+                    source,
+                    generation,
+                    bytes,
+                });
+            }
+        }
         match bridge.service_session_events() {
             Ok(Some(display)) => {
                 if let Some(cell_size) = &presenter_cell_size {
@@ -1309,6 +1322,9 @@ fn run_bridge_worker(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(mut pending) = pending {
+            if let Err(error) = bridge.sync_microphones(&pending.microphones) {
+                log::warn!("microphone relay unavailable: {error}");
+            }
             if grouped_discontinuity_is_incomplete(&active_sources, &pending.tracks) {
                 // Do not acknowledge this partial generation. The paired control mutation wakes
                 // the worker with a newer authoritative snapshot; acknowledging only that complete
@@ -2231,7 +2247,7 @@ fn send_client(writer: &SharedWriter, message: &ClientMessage) -> io::Result<()>
     writer
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .send(message)
+        .send_client(message)
 }
 
 /// Write `parts` to the terminal as one uninterrupted unit: a single lock, a single flush, and no
@@ -3427,6 +3443,7 @@ mod tests {
             },
         };
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 1,
             surfaces: vec![test_surface(key)],
@@ -3560,6 +3577,7 @@ mod tests {
             },
         };
         let visible_snapshot = |virtual_revision| BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision,
             surfaces: vec![test_surface(key)],
@@ -3619,6 +3637,7 @@ mod tests {
         assert!(presenter.wait_for_retained_media(7, Duration::from_secs(2)));
 
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 2,
             surfaces: Vec::new(),
@@ -3831,6 +3850,7 @@ mod tests {
             track: 7,
         };
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 1,
             surfaces: vec![test_surface(key)],
@@ -4061,6 +4081,7 @@ mod tests {
             },
         };
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 1,
             surfaces: vec![test_surface(video_key)],
@@ -4145,6 +4166,7 @@ mod tests {
         );
         for virtual_revision in 2..=8 {
             worker.replace_snapshot(BridgeSnapshot {
+                microphones: Vec::new(),
                 generation: 0,
                 virtual_revision,
                 surfaces: vec![test_surface(video_key)],
@@ -4163,6 +4185,7 @@ mod tests {
         let mut playing_video = video_source;
         playing_video.playing = true;
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 9,
             surfaces: vec![test_surface(video_key)],
@@ -4299,6 +4322,7 @@ mod tests {
         let mut paused_video = playing_video.clone();
         paused_video.playing = false;
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 10,
             surfaces: vec![test_surface(video_key)],
@@ -4429,6 +4453,7 @@ mod tests {
         let mut resumed_video = playing_video;
         resumed_video.play_request.start_pts_us = 10_000_000;
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 11,
             surfaces: vec![test_surface(video_key)],
@@ -4471,6 +4496,7 @@ mod tests {
         let quieter_gain = vivid_sdk::AudioGain::from_percent(35).unwrap();
         quieter_audio.audio_gain = Some(quieter_gain.raw());
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 12,
             surfaces: vec![test_surface(video_key)],
@@ -4528,6 +4554,7 @@ mod tests {
         // This projection was queued before the server processed BridgeNeedKeyframes. Its empty
         // recovery set must not clear the in-place classification before the rising edge arrives.
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 13,
             surfaces: vec![test_surface(video_key)],
@@ -4544,6 +4571,7 @@ mod tests {
             }
         }
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 14,
             surfaces: vec![test_surface(video_key)],
@@ -4566,6 +4594,7 @@ mod tests {
         let mut recovered_video = resumed_video;
         recovered_video.decoder_reset_serial += 1;
         worker.replace_snapshot(BridgeSnapshot {
+            microphones: Vec::new(),
             generation: 0,
             virtual_revision: 15,
             surfaces: vec![test_surface(video_key)],
@@ -4795,6 +4824,7 @@ mod tests {
             // Tab 1 becomes visible with all three panes, but only pane 2 contributes media. Deliver
             // linked-audio pre-roll before the authoritative PLAY transition.
             worker.replace_snapshot(BridgeSnapshot {
+                microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: 1,
                 surfaces: vec![test_surface(video_key)],
@@ -4861,6 +4891,7 @@ mod tests {
 
             let initial_play_start = seen.len();
             worker.replace_snapshot(BridgeSnapshot {
+                microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: 2,
                 surfaces: vec![test_surface(video_key)],
@@ -4995,6 +5026,7 @@ mod tests {
             // Switching tabs atomically removes tab 1's video/audio projection and replaces it with
             // the image owned by pane 2 of tab 2.
             worker.replace_snapshot(BridgeSnapshot {
+                microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: 3,
                 surfaces: vec![test_surface(image_key)],
@@ -5053,6 +5085,7 @@ mod tests {
             // the applied acknowledgement, and the recreated attachment must request a keyframe.
             let return_start = seen.len();
             worker.replace_snapshot(BridgeSnapshot {
+                microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: 4,
                 surfaces: vec![test_surface(video_key)],
@@ -5176,6 +5209,7 @@ mod tests {
             };
             let recovery_play_start = seen.len();
             worker.replace_snapshot(BridgeSnapshot {
+                microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: 5,
                 surfaces: vec![test_surface(video_key)],

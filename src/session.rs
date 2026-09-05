@@ -1681,6 +1681,7 @@ struct SessionActor {
     pending_media_projections: BTreeMap<u64, PendingMediaProjection>,
     outer_virtual_revision: u64,
     bridge_instance_id: Option<u64>,
+    microphone_recipient: Option<(BridgeSourceKey, u64, PaneId, Instant)>,
     bridge_local_revision: u64,
     outer_projection_revision: u64,
     outer_apply_sequence: u64,
@@ -1923,6 +1924,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         pending_media_projections: BTreeMap::new(),
         outer_virtual_revision: 0,
         bridge_instance_id: None,
+        microphone_recipient: None,
         bridge_local_revision: 0,
         outer_projection_revision: 0,
         outer_apply_sequence: 0,
@@ -2223,6 +2225,8 @@ impl SessionActor {
                     self.clear_kitty_graphics();
                     self.reported_input_mode = None;
                     self.bridge_instance_id = None;
+                    self.vivid.revoke_microphones();
+                    self.microphone_recipient = None;
                     self.bridge_local_revision = 0;
                     self.pending_media_projections.clear();
                     self.retained_replay_requests.clear();
@@ -2817,6 +2821,8 @@ impl SessionActor {
                 self.client_focused = true;
                 self.bridge_metrics = crate::metrics::BridgeMetrics::default();
                 self.bridge_instance_id = None;
+                self.vivid.revoke_microphones();
+                self.microphone_recipient = None;
                 self.bridge_local_revision = 0;
                 self.outer_attachment_generations.clear();
                 self.retained_replay_requests.clear();
@@ -3055,6 +3061,47 @@ impl SessionActor {
                     }
                 }
             }
+            ClientMessage::Microphone {
+                bridge_instance_id,
+                source,
+                generation,
+                bytes,
+            } => {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    if bytes.is_empty() {
+                        let _ = self.vivid.queue_microphone(source, generation, &bytes);
+                        if self
+                            .microphone_recipient
+                            .is_some_and(|(key, epoch, _, _)| key == source && epoch == generation)
+                        {
+                            self.microphone_recipient = None;
+                            self.pending_render = true;
+                        }
+                    } else if let Some(request) =
+                        self.vivid
+                            .microphone_requests()
+                            .into_iter()
+                            .find(|request| {
+                                request.source == source && request.generation == generation
+                            })
+                    {
+                        if let Some((previous, epoch, _, _)) = self.microphone_recipient
+                            && (previous != source || epoch != generation)
+                        {
+                            let _ = self.vivid.queue_microphone(previous, epoch, &[]);
+                        }
+                        if self
+                            .vivid
+                            .queue_microphone(source, generation, &bytes)
+                            .unwrap_or(false)
+                        {
+                            self.microphone_recipient =
+                                Some((source, generation, request.pane, Instant::now()));
+                            self.pending_render = true;
+                        }
+                    }
+                }
+            }
             ClientMessage::BridgeMediaReleased { delivery_id } => {
                 if self.client_is(id) {
                     self.traced_recovery_deliveries.remove(&delivery_id);
@@ -3243,6 +3290,8 @@ impl SessionActor {
                     self.clear_kitty_graphics();
                     self.reported_input_mode = None;
                     self.bridge_instance_id = None;
+                    self.vivid.revoke_microphones();
+                    self.microphone_recipient = None;
                     self.bridge_local_revision = 0;
                     self.pending_media_projections.clear();
                     self.retained_replay_requests.clear();
@@ -12843,6 +12892,30 @@ impl SessionActor {
                 io::ErrorKind::InvalidInput,
                 "pane argv must contain a program",
             )),
+            None if self.config.general.microphone && vivid_capability && cfg!(unix) => {
+                environment.push((
+                    "VVMIC_LABEL".into(),
+                    format!("{} pane {}", self.name, pane_id),
+                ));
+                let mut arguments = vec![
+                    OsString::from("run"),
+                    OsString::from("--"),
+                    shell.as_os_str().to_owned(),
+                ];
+                if let Some(command) = &spec.command {
+                    arguments.extend(["-c".into(), command.clone()]);
+                } else {
+                    arguments.push("-l".into());
+                }
+                PtyProcess::spawn_argv(
+                    std::ffi::OsStr::new("vvmic"),
+                    &arguments,
+                    &cwd,
+                    80,
+                    22,
+                    &environment,
+                )
+            }
             None => PtyProcess::spawn(&shell, spec.command.as_deref(), &cwd, 80, 22, &environment),
         };
         let parts = match spawned {
@@ -13166,6 +13239,7 @@ impl SessionActor {
                 .push("notifications.sound_command".to_owned());
         }
         if next.general.shell != self.config.general.shell
+            || next.general.microphone != self.config.general.microphone
             || next.general.default_cwd != self.config.general.default_cwd
             || next.general.scrollback_lines != self.config.general.scrollback_lines
         {
@@ -13591,6 +13665,14 @@ impl SessionActor {
                         .map(|hovered| hyperlink_status_text(&hovered.link.uri, screen.columns))
                 })
                 .unwrap_or_else(|| tab_status_text(&self.tabs, self.active_tab, screen.columns));
+            let status = if let Some((_, _, pane, last_packet)) = self.microphone_recipient
+                && self.bridge_instance_id.is_some()
+                && last_packet.elapsed() <= Duration::from_millis(200)
+            {
+                format!("MIC pane {pane} | {status}")
+            } else {
+                status
+            };
             let style = theme.status();
             let row = screen.rows - 1;
             if theme.status_fill {
@@ -13947,6 +14029,7 @@ impl SessionActor {
         if crate::ipc::send(
             &writer,
             &ServerMessage::MediaSnapshot {
+                microphones: self.vivid.microphone_requests(),
                 revision: projection_revision,
                 surfaces,
                 tracks: sources,
