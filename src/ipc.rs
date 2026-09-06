@@ -1655,7 +1655,7 @@ impl RecordWriter {
                 vivid_protocol::audio_input::InputPacket::decode(bytes)?;
             }
             let mut header = [0_u8; 48];
-            for (part, value) in header.chunks_exact_mut(8).zip([
+            for (part, value) in header.as_chunks_mut::<8>().0.iter_mut().zip([
                 *bridge_instance_id,
                 source.producer,
                 source.context,
@@ -2003,12 +2003,8 @@ fn decode_microphone(body: &[u8]) -> io::Result<ClientMessage> {
         return Err(invalid("invalid microphone record size"));
     }
     let mut fields = [0_u64; 6];
-    for (field, bytes) in fields.iter_mut().zip(body[..48].chunks_exact(8)) {
-        *field = u64::from_be_bytes(
-            bytes
-                .try_into()
-                .map_err(|_| invalid("invalid microphone identity"))?,
-        );
+    for (field, bytes) in fields.iter_mut().zip(body[..48].as_chunks::<8>().0.iter()) {
+        *field = u64::from_be_bytes(*bytes);
         if *field == 0 {
             return Err(invalid("zero microphone identity"));
         }
