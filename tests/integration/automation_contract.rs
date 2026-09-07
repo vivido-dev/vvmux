@@ -187,6 +187,75 @@ fn private_directory(path: &Path) {
 }
 
 #[test]
+fn nonreading_client_cannot_block_session_automation() {
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fixture = Fixture::start("backpressure");
+    let socket = fs::read_dir(fixture.runtime.join("vvmux"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("session-")
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "sock")
+        })
+        .unwrap();
+    let mut stalled = UnixStream::connect(socket).unwrap();
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preface = *b"VVMX\0\x14\x01\0\0\x10\0\0";
+    stalled.write_all(&preface).unwrap();
+    stalled.read_exact(&mut preface).unwrap();
+    assert_eq!(&preface[..4], b"VVMX");
+    // Each Ping generates a Pong on the same actor. This exceeds the socket's capacity
+    // while this client deliberately never reads any responses.
+    let mut sender = stalled.try_clone().unwrap();
+    let flood = std::thread::spawn(move || {
+        for sequence in 0_u64..100_000 {
+            let mut record = Vec::with_capacity(22);
+            record.extend_from_slice(&sequence.to_be_bytes());
+            record.extend_from_slice(&1_u16.to_be_bytes());
+            record.extend_from_slice(&0_u16.to_be_bytes());
+            record.extend_from_slice(&6_u32.to_be_bytes());
+            record.extend_from_slice(b"\"Ping\"");
+            if sender.write_all(&record).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    let mut command = fixture.command();
+    command.args(["msg", "--target", &fixture.name, "capabilities"]);
+    let (done, completed) = mpsc::channel();
+    let inspect = std::thread::spawn(move || {
+        let _ = done.send(command.output());
+    });
+    let response = completed.recv_timeout(Duration::from_secs(3));
+    // Always unblock the old implementation before asserting, so failure cleans up.
+    let _ = stalled.shutdown(Shutdown::Both);
+    flood.join().unwrap();
+    inspect.join().unwrap();
+    let response = response
+        .expect("nonreading client blocked the session actor")
+        .unwrap();
+    assert!(
+        response.status.success(),
+        "{}",
+        String::from_utf8_lossy(&response.stderr)
+    );
+    assert!(serde_json::from_slice::<Value>(&response.stdout).unwrap()["methods"].is_array());
+}
+
+#[test]
 fn capabilities_classify_every_advertised_method() {
     let fixture = Fixture::start("capabilities");
     let capabilities = fixture.json(&["capabilities"]);

@@ -331,6 +331,14 @@ fn handle_client(stream: Transport, actor: ActorHandle) {
         return;
     };
     let cancel = reader.cancel_handle();
+    if writer
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .enable_queued_output()
+        .is_err()
+    {
+        return;
+    }
     let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     while let Ok(message) = reader.recv_client() {
         if actor
@@ -346,6 +354,7 @@ fn handle_client(stream: Transport, actor: ActorHandle) {
             break;
         }
     }
+    cancel.cancel();
     let _ = actor.sender.send(ActorEvent::Disconnected(id));
 }
 

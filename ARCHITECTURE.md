@@ -315,6 +315,21 @@ consumes marker-v3 anchors, and grants cumulative flow per track. The outer prod
 of its own identities and re-encodes portable media headers. Per-track bridge queues are
 independently bounded and scheduled fairly; no media writer runs on the session actor.
 
+Session-client VVMX output is admitted without blocking into an ordered per-connection writer
+queue, bounded to 128 MiB (including the in-flight write) and 1,024 chunks. Saturation or a
+partial record write cancels that connection; subsequent records cannot reuse the damaged
+stream. A successful actor send means queue admission, not delivery. Bridge shutdown cancels
+client IPC and outer SDK control/carrier I/O before joining the worker. Custom blocking
+connection factories provide route cancellation through `ConnectionFactory::cancel`.
+
+Bridge ingress admits only source tuples from the current authoritative snapshot. In addition
+to the per-track bound, it limits queued payload capacity to 64 MiB, 4,096 chunks, and 1,024
+sources. Snapshot replacement removes retired source queues. Pending rejected-delivery IDs
+are capped at 4,096; exceeding that bound cancels the route so recovery cannot grow without
+limit. The VVWS adapter retains structured server messages as bounded JSON and charges their
+allocated encoded capacity; binary render/media retain their direct path and capacity charge.
+Its client writer uses the same binary microphone encoder as the native client.
+
 Each outer track has its own blocking writer. Before timed PLAY, that writer reports a completed
 pre-roll record only after the outer presenter returns the record's ingress capacity; this keeps
 ACTIVATE_TRACK behind actual outer processing instead of a kernel socket write. Once atomic

@@ -716,13 +716,19 @@ pub(crate) struct BridgeMedia {
 #[derive(Clone)]
 pub(crate) struct BridgeClientSender(
     Arc<dyn Fn(ClientMessage) -> io::Result<()> + Send + Sync + 'static>,
+    Arc<dyn Fn() + Send + Sync>,
 );
 
 impl BridgeClientSender {
     pub(crate) fn new(
         send: impl Fn(ClientMessage) -> io::Result<()> + Send + Sync + 'static,
     ) -> Self {
-        Self(Arc::new(send))
+        Self(Arc::new(send), Arc::new(|| {}))
+    }
+
+    pub(crate) fn with_cancel(mut self, cancel: impl Fn() + Send + Sync + 'static) -> Self {
+        self.1 = Arc::new(cancel);
+        self
     }
 
     fn send(&self, message: ClientMessage) -> io::Result<()> {
@@ -730,7 +736,14 @@ impl BridgeClientSender {
     }
 }
 
+const BRIDGE_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const BRIDGE_QUEUE_SOURCES: usize = 1024;
+const BRIDGE_QUEUE_CHUNKS: usize = 4096;
+const BRIDGE_DROPPED_IDS: usize = 4096;
+
 pub(crate) struct BridgeWorker {
+    admitted_sources: HashSet<BridgeSourceKey>,
+    cancel: Arc<dyn Fn() + Send + Sync>,
     media: Arc<Mutex<TrackMediaQueues>>,
     media_wakeup: Option<mpsc::SyncSender<()>>,
     queue_records_per_track: usize,
@@ -746,6 +759,8 @@ pub(crate) struct BridgeWorker {
 
 #[derive(Default)]
 struct TrackMediaQueues {
+    bytes: usize,
+    chunks: usize,
     tracks: HashMap<BridgeSourceKey, VecDeque<BridgeMedia>>,
     ready: VecDeque<BridgeSourceKey>,
     ready_set: HashSet<BridgeSourceKey>,
@@ -754,10 +769,19 @@ struct TrackMediaQueues {
 impl TrackMediaQueues {
     fn push(&mut self, media: BridgeMedia, capacity: usize) -> Result<(), BridgeMedia> {
         let key = media.source;
+        if capacity == 0
+            || self.chunks >= BRIDGE_QUEUE_CHUNKS
+            || media.bytes.capacity() > BRIDGE_QUEUE_BYTES.saturating_sub(self.bytes)
+            || (!self.tracks.contains_key(&key) && self.tracks.len() >= BRIDGE_QUEUE_SOURCES)
+        {
+            return Err(media);
+        }
         let queue = self.tracks.entry(key).or_default();
         if queue.len() >= capacity {
             return Err(media);
         }
+        self.bytes += media.bytes.capacity();
+        self.chunks += 1;
         queue.push_back(media);
         if self.ready_set.insert(key) {
             self.ready.push_back(key);
@@ -786,6 +810,10 @@ impl TrackMediaQueues {
                 continue;
             };
             let media = queue.pop_front();
+            if let Some(media) = &media {
+                self.bytes -= media.bytes.capacity();
+                self.chunks -= 1;
+            }
             if queue.is_empty() {
                 self.tracks.remove(&key);
             } else {
@@ -809,9 +837,14 @@ impl BridgeWorker {
         queue_records: usize,
         presenter_cell_size: Arc<AtomicU32>,
     ) -> io::Result<Self> {
+        let cancel = client_writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel_handle();
         Self::spawn_inner(
             bridge,
-            BridgeClientSender::new(move |message| send_client(&client_writer, &message)),
+            BridgeClientSender::new(move |message| send_client(&client_writer, &message))
+                .with_cancel(move || cancel.cancel()),
             queue_records,
             Some(presenter_cell_size),
         )
@@ -831,6 +864,12 @@ impl BridgeWorker {
         queue_records: usize,
         presenter_cell_size: Option<Arc<AtomicU32>>,
     ) -> io::Result<Self> {
+        let bridge_cancel = bridge.cancel_handle();
+        let client_cancel = client_writer.1.clone();
+        let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            client_cancel();
+            bridge_cancel.cancel();
+        });
         let bridge_instance_id = new_bridge_instance_id()?;
         let media = Arc::new(Mutex::new(TrackMediaQueues::default()));
         let (media_wakeup, receiver) = mpsc::sync_channel(1);
@@ -860,6 +899,8 @@ impl BridgeWorker {
                 )
             })?;
         Ok(Self {
+            admitted_sources: HashSet::new(),
+            cancel,
             media,
             media_wakeup: Some(media_wakeup),
             queue_records_per_track: queue_records,
@@ -873,7 +914,28 @@ impl BridgeWorker {
     }
 
     pub(crate) fn replace_snapshot(&mut self, mut snapshot: BridgeSnapshot) {
-        self.generation = self.generation.wrapping_add(1);
+        let Some(generation) = self.generation.checked_add(1) else {
+            self.stopped.store(true, Ordering::Release);
+            (self.cancel)();
+            return;
+        };
+        if snapshot.tracks.len() > BRIDGE_QUEUE_SOURCES {
+            self.stopped.store(true, Ordering::Release);
+            (self.cancel)();
+            return;
+        }
+        self.generation = generation;
+        self.admitted_sources = snapshot.tracks.iter().map(|track| track.key).collect();
+        let mut retired = Vec::new();
+        {
+            let mut queues = self.media.lock().unwrap_or_else(|p| p.into_inner());
+            while let Some(media) = queues.pop_where(|key| !self.admitted_sources.contains(&key)) {
+                retired.push(media.delivery_id);
+            }
+        }
+        for delivery in retired {
+            self.mark_dropped(delivery);
+        }
         snapshot.generation = self.generation;
         *self
             .snapshot
@@ -884,6 +946,10 @@ impl BridgeWorker {
     pub(crate) fn queue_media(&mut self, mut media: BridgeMedia) -> bool {
         media.generation = self.generation;
         let delivery_id = media.delivery_id;
+        if self.stopped.load(Ordering::Acquire) || !self.admitted_sources.contains(&media.source) {
+            self.mark_dropped(delivery_id);
+            return false;
+        }
         let Some(wakeup) = &self.media_wakeup else {
             self.mark_dropped(delivery_id);
             return false;
@@ -904,21 +970,26 @@ impl BridgeWorker {
 
     fn mark_dropped(&self, delivery_id: u64) {
         self.queue_drops.fetch_add(1, Ordering::Relaxed);
-        self.dropped
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(delivery_id);
+        if delivery_id == 0 {
+            return;
+        }
+        let mut dropped = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
+        if dropped.len() >= BRIDGE_DROPPED_IDS && !dropped.contains(&delivery_id) {
+            drop(dropped);
+            self.stopped.store(true, Ordering::Release);
+            (self.cancel)();
+            return;
+        }
+        dropped.insert(delivery_id);
     }
 }
 
 impl Drop for BridgeWorker {
     fn drop(&mut self) {
-        // The bridge owns the outer Vivid connection on its worker thread. Merely dropping the
-        // queue sender lets the foreground process return while that thread is still unwinding;
-        // process teardown can then reset the Windows socket before OuterBridge sends GOODBYE.
-        // Stop and join so detach does not complete until the protocol session is closed cleanly.
+        // Cancellation must wake the current control request before we join.
         self.stopped.store(true, Ordering::Release);
         self.media_wakeup.take();
+        (self.cancel)();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -1823,10 +1894,8 @@ fn run_bridge_worker(
             }
             Ok(false) => {}
             Err(_) => {
-                dropped
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(media.delivery_id);
+                acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
+                force_sources = true;
             }
         }
     }
@@ -3125,6 +3194,16 @@ mod tests {
         let dropped = Arc::new(Mutex::new(HashSet::new()));
         let queue_drops = Arc::new(AtomicU64::new(0));
         let mut worker = BridgeWorker {
+            admitted_sources: [7, 8]
+                .into_iter()
+                .map(|track| BridgeSourceKey {
+                    producer: 3,
+                    context: 1,
+                    surface: 7,
+                    track,
+                })
+                .collect(),
+            cancel: Arc::new(|| {}),
             media: Arc::new(Mutex::new(TrackMediaQueues::default())),
             media_wakeup: Some(media_wakeup),
             queue_records_per_track: 1,
@@ -5666,4 +5745,6 @@ mod tests {
             "adding an image must not replay retained bodies for unchanged sources"
         );
     }
+
+    include!("client_audit_tests.rs");
 }

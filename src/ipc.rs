@@ -1,3 +1,5 @@
+#[path = "ipc_outbound.rs"]
+mod outbound;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -1521,6 +1523,8 @@ pub struct RecordReader {
 }
 
 pub struct RecordWriter {
+    failed: bool,
+    cancel: ConnectionCancel,
     stream: Box<dyn Write + Send>,
     next_sequence: u64,
     maximum_body: u32,
@@ -1551,10 +1555,12 @@ pub fn establish(
             stream: stream.reader,
             expected_sequence: 0,
             maximum_body: maximum,
-            cancel,
+            cancel: cancel.clone(),
             counters: counters.clone(),
         },
         Arc::new(Mutex::new(RecordWriter {
+            failed: false,
+            cancel: cancel.clone(),
             stream: stream.writer,
             next_sequence: 0,
             maximum_body: maximum,
@@ -1643,6 +1649,25 @@ impl RecordReader {
 }
 
 impl RecordWriter {
+    pub(crate) fn cancel_handle(&self) -> ConnectionCancel {
+        self.cancel.clone()
+    }
+
+    pub(crate) fn enable_queued_output(&mut self) -> io::Result<()> {
+        let stream = std::mem::replace(&mut self.stream, Box::new(io::sink()));
+        match outbound::Outbound::start(stream, self.cancel.clone()) {
+            Ok(output) => {
+                self.stream = Box::new(output);
+                Ok(())
+            }
+            Err(error) => {
+                self.failed = true;
+                self.cancel.cancel();
+                Err(error)
+            }
+        }
+    }
+
     pub fn send_client(&mut self, message: &ClientMessage) -> io::Result<()> {
         if let ClientMessage::Microphone {
             bridge_instance_id,
@@ -1691,9 +1716,19 @@ impl RecordWriter {
         flags: u16,
         parts: &[&[u8]],
     ) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "VVMX writer failed",
+            ));
+        }
         if flags & !0x0001 != 0 {
             return Err(invalid("VVMX record uses reserved flags"));
         }
+        let next = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid("VVMX write sequence exhausted"))?;
         let length = parts
             .iter()
             .try_fold(0_usize, |total, part| total.checked_add(part.len()))
@@ -1709,11 +1744,19 @@ impl RecordWriter {
         // The peer's socket buffer is the only backpressure this writer has, so the time spent
         // here is the time the caller's thread was unavailable for anything else.
         let blocked = BlockTimer::start();
-        self.stream.write_all(&header)?;
-        for part in parts {
-            self.stream.write_all(part)?;
+        let result = (|| {
+            self.stream.write_all(&header)?;
+            for part in parts {
+                self.stream.write_all(part)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failed = true;
+            self.cancel.cancel();
+            return Err(error);
         }
-        self.next_sequence = self.next_sequence.wrapping_add(1);
+        self.next_sequence = next;
         self.counters
             .record_write(header.len().saturating_add(length), blocked.elapsed());
         Ok(())
@@ -1769,6 +1812,8 @@ impl RecordWriter {
 #[cfg(test)]
 pub(crate) fn test_shared_writer(stream: Box<dyn Write + Send>) -> SharedWriter {
     Arc::new(Mutex::new(RecordWriter {
+        failed: false,
+        cancel: ConnectionCancel::inert(),
         stream,
         next_sequence: 0,
         maximum_body: CONTROL_MAX_BODY,
@@ -2216,6 +2261,8 @@ mod tests {
 
     fn test_writer(output: &SharedBytes, counters: &Arc<IpcCounters>) -> SharedWriter {
         Arc::new(Mutex::new(RecordWriter {
+            failed: false,
+            cancel: ConnectionCancel::inert(),
             stream: Box::new(output.clone()),
             next_sequence: 0,
             maximum_body: CONTROL_MAX_BODY,
@@ -2456,6 +2503,8 @@ mod tests {
 
         let output = SharedBytes::default();
         let writer = Arc::new(Mutex::new(RecordWriter {
+            failed: false,
+            cancel: ConnectionCancel::inert(),
             stream: Box::new(output.clone()),
             next_sequence: 0,
             maximum_body: CONTROL_MAX_BODY,

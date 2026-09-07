@@ -18,16 +18,18 @@ pub(crate) struct SessionAdapter {
 }
 
 pub(crate) struct QueuedServerMessage {
-    message: Option<ServerMessage>,
+    message: Option<StoredMessage>,
     size: usize,
     queued_bytes: Arc<AtomicUsize>,
 }
 
 impl QueuedServerMessage {
     pub(crate) fn take(&mut self) -> ServerMessage {
-        self.message
-            .take()
-            .expect("queued server message is present")
+        match self.message.take().expect("queued message is present") {
+            StoredMessage::Binary(message) => *message,
+            StoredMessage::Structured(bytes) => serde_json::from_slice(&bytes)
+                .expect("queue contains a locally serialized server message"),
+        }
     }
 }
 
@@ -115,7 +117,7 @@ impl SessionAdapter {
                     if writer_thread
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .send(&message)
+                        .send_client(&message)
                         .is_err()
                     {
                         break;
@@ -146,7 +148,14 @@ impl SessionAdapter {
                         reader_cancel.cancel();
                         break;
                     }
-                    let size = message_size(&message);
+                    let (message, size) = match store_message(message, outbound_queue_bytes) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            reader_overloaded.store(true, Ordering::Release);
+                            reader_cancel.cancel();
+                            break;
+                        }
+                    };
                     if !reserve_bytes(&reader_bytes, size, outbound_queue_bytes) {
                         reader_overloaded.store(true, Ordering::Release);
                         reader_cancel.cancel();
@@ -191,6 +200,7 @@ impl SessionAdapter {
     pub(crate) fn bridge_sender(&self) -> crate::client::BridgeClientSender {
         let writer = self.writer.clone();
         let cancel = self.cancel.clone();
+        let shutdown = cancel.clone();
         crate::client::BridgeClientSender::new(move |message| {
             writer.try_send(message).map_err(|error| {
                 cancel.cancel();
@@ -200,6 +210,7 @@ impl SessionAdapter {
                 )
             })
         })
+        .with_cancel(move || shutdown.cancel())
     }
 
     pub(crate) async fn recv(&mut self) -> Option<QueuedServerMessage> {
@@ -227,36 +238,58 @@ impl Drop for SessionAdapter {
     }
 }
 
-fn message_size(message: &ServerMessage) -> usize {
-    const OVERHEAD: usize = 256;
-    OVERHEAD
-        + match message {
-            ServerMessage::Render { bytes, .. } | ServerMessage::MediaRecord { bytes, .. } => {
-                bytes.len()
+enum StoredMessage {
+    Binary(Box<ServerMessage>),
+    Structured(Vec<u8>),
+}
+
+fn store_message(message: ServerMessage, maximum: usize) -> io::Result<(StoredMessage, usize)> {
+    let overhead = std::mem::size_of::<ServerMessage>() + 256;
+    if let ServerMessage::Render { bytes, .. } | ServerMessage::MediaRecord { bytes, .. } = &message
+    {
+        let size = overhead
+            .checked_add(bytes.capacity())
+            .filter(|size| *size <= maximum)
+            .ok_or_else(|| io::Error::other("gateway message exceeds queue budget"))?;
+        return Ok((StoredMessage::Binary(Box::new(message)), size));
+    }
+    struct Bounded {
+        bytes: Vec<u8>,
+        maximum: usize,
+    }
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let next = self
+                .bytes
+                .len()
+                .checked_add(bytes.len())
+                .filter(|next| *next <= self.maximum)
+                .ok_or_else(|| io::Error::other("gateway message exceeds queue budget"))?;
+            if next > self.bytes.capacity() {
+                let capacity = next
+                    .max(self.bytes.capacity().saturating_mul(2))
+                    .min(self.maximum);
+                self.bytes
+                    .try_reserve_exact(capacity - self.bytes.len())
+                    .map_err(io::Error::other)?;
             }
-            ServerMessage::Title(value)
-            | ServerMessage::Clipboard(value)
-            | ServerMessage::Status(value)
-            | ServerMessage::Error(value) => value.len(),
-            ServerMessage::Detached { reason } => reason.len(),
-            ServerMessage::Notify { title, body, .. } => {
-                title.len() + body.as_ref().map_or(0, String::len)
-            }
-            ServerMessage::PluginEvent { envelope, .. } => {
-                serde_json::to_vec(envelope).map_or(OVERHEAD, |body| body.len())
-            }
-            ServerMessage::MediaSnapshot {
-                surfaces,
-                tracks,
-                nodes,
-                ..
-            } => {
-                surfaces.len().saturating_mul(512)
-                    + tracks.len().saturating_mul(1024)
-                    + nodes.len().saturating_mul(256)
-            }
-            _ => 0,
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
         }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut encoded = Bounded {
+        bytes: Vec::new(),
+        maximum: maximum.saturating_sub(overhead),
+    };
+    serde_json::to_writer(&mut encoded, &message).map_err(io::Error::other)?;
+    let size = overhead
+        .checked_add(encoded.bytes.capacity())
+        .filter(|size| *size <= maximum)
+        .ok_or_else(|| io::Error::other("gateway message exceeds queue budget"))?;
+    Ok((StoredMessage::Structured(encoded.bytes), size))
 }
 
 fn reserve_bytes(used: &AtomicUsize, size: usize, maximum: usize) -> bool {
@@ -289,16 +322,15 @@ mod tests {
     }
 
     #[test]
-    fn message_size_counts_render_payloads() {
-        assert_eq!(
-            message_size(&ServerMessage::Render {
-                frame_id: 1,
-                session_sequence: 1,
-                full: true,
-                last: true,
-                bytes: vec![0; 10],
-            }),
-            266
-        );
+    fn automation_payload_is_charged_to_queue_bytes() {
+        let message = ServerMessage::Automation(crate::ipc::AutomationResponse::success(
+            1,
+            serde_json::Value::String("x".repeat(256 * 1024)),
+        ));
+        let (_, charged) = store_message(message, 512 * 1024).unwrap();
+        assert!(charged > 256 * 1024);
+        let used = AtomicUsize::new(0);
+        assert!(reserve_bytes(&used, charged, 512 * 1024));
+        assert!(!reserve_bytes(&used, charged, 512 * 1024));
     }
 }

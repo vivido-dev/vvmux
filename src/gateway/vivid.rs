@@ -199,6 +199,9 @@ impl VividBroker {
 }
 
 impl ConnectionFactory for VividBroker {
+    fn cancel(&self) {
+        self.close();
+    }
     fn open(&self, kind: ConnectionKind, _lane: Option<LaneClass>) -> io::Result<Connection> {
         if matches!(kind, ConnectionKind::Lane | ConnectionKind::FileTransfer) {
             return Err(io::Error::new(
