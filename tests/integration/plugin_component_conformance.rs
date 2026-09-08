@@ -86,6 +86,24 @@ fn rust_component_runs_the_public_abi_with_bounded_authority_and_recovery() {
         config_home: config_home.clone(),
     };
 
+    // The first invocation of any component pays a full Cranelift compile of the artifact, on a
+    // cold cache and at whatever speed the host is running at. That is host work under its own
+    // budget: charging it to the action would make this 150 ms action impossible to satisfy after
+    // every install or upgrade, however trivial its handler.
+    assert_eq!(
+        invoke(
+            binary,
+            &runtime,
+            &config_home,
+            &name,
+            "dev.component.one/echo-briefly",
+            r#"{"message":"cold"}"#,
+            false,
+        )["input"]["message"],
+        "cold",
+        "a cold start spent the action's deadline before the guest ran"
+    );
+
     let echo = invoke(
         binary,
         &runtime,
@@ -352,6 +370,34 @@ fn rust_component_runs_the_public_abi_with_bounded_authority_and_recovery() {
         "an invalid serialized cache must be rejected and rebuilt from the pinned artifact"
     );
     assert!(fs::metadata(cache).unwrap().len() > 1024);
+
+    // Cancellation and expiry are separate branches of the same epoch callback. A guest that never
+    // yields must still be killed by its declared deadline with nobody cancelling it, and the
+    // failure must say which budget ran out: the component is warm here, so the 200 ms belongs to
+    // the guest alone and cannot be spent by compiling or instantiating the artifact.
+    let expiring = invoke(
+        binary,
+        &runtime,
+        &config_home,
+        &name,
+        "dev.component.one/spin-briefly",
+        "{}",
+        true,
+    );
+    let expiring_job = expiring["job_id"].as_str().unwrap();
+    let expired = wait_for_job(
+        binary,
+        &runtime,
+        &config_home,
+        expiring_job,
+        "timed_out",
+        Duration::from_secs(10),
+    );
+    let reason = expired["stderr"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("timeout") && reason.contains("expired"),
+        "expiry did not say what ran out: {reason}"
+    );
 }
 
 fn build_component_fixture() -> PathBuf {
@@ -418,6 +464,10 @@ fn write_package(
         ("log-flood", "log-flood", 5_000),
         ("trap", "trap", 5_000),
         ("spin", "spin", 30_000),
+        // The same forever-loop handler under a budget short enough to prove expiry is enforced.
+        ("spin-briefly", "spin", 200),
+        // A trivial handler whose budget is far too small to have compiled the artifact.
+        ("echo-briefly", "echo", 150),
     ]
     .into_iter()
     .map(|(action, handler, timeout)| {

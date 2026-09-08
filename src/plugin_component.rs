@@ -32,6 +32,8 @@ const MAX_LOG_BYTES: usize = 256 * 1024;
 // supervisor can deliver a cancellation from another process.
 const FUEL_PER_CALL: u64 = 1_000_000_000;
 const EPOCH_TICK: Duration = Duration::from_millis(10);
+/// How long a component gets to run `shutdown` while its runtime is being dropped.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const CACHE_MAGIC: &[u8; 8] = b"VVCWASM1";
 const CACHE_KEY_VERSION: &str = "vvmux-component-cache-v1";
 
@@ -268,7 +270,7 @@ impl ComponentRuntime {
         };
         let mut store = Store::new(engine, state);
         store.limiter(|state| &mut state.limits);
-        configure_call(&mut store, deadline)?;
+        configure_call(&mut store, deadline, CallPhase::Startup)?;
         let guest = bindings::Plugin::instantiate(&mut store, &component, &linker)
             .map_err(component_error)?;
         let context = serde_json::to_vec(&serde_json::json!({
@@ -309,7 +311,7 @@ impl ComponentRuntime {
         }
         self.store.data_mut().cancel = cancel;
         self.store.data_mut().deadline = deadline;
-        configure_call(&mut self.store, deadline)?;
+        configure_call(&mut self.store, deadline, CallPhase::Invoke)?;
         let call = self.guest.vivido_vvmux_plugin_guest().call_invoke(
             &mut self.store,
             action,
@@ -367,7 +369,7 @@ impl ComponentRuntime {
         }
         self.store.data_mut().cancel = cancel;
         self.store.data_mut().deadline = deadline;
-        configure_call(&mut self.store, deadline)?;
+        configure_call(&mut self.store, deadline, CallPhase::Event)?;
         let call = self.guest.vivido_vvmux_plugin_guest().call_on_event(
             &mut self.store,
             name,
@@ -397,10 +399,10 @@ impl ComponentRuntime {
 
 impl Drop for ComponentRuntime {
     fn drop(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
         self.store.data_mut().cancel = Arc::new(AtomicBool::new(false));
         self.store.data_mut().deadline = deadline;
-        let _ = configure_call(&mut self.store, deadline);
+        let _ = configure_call(&mut self.store, deadline, CallPhase::Shutdown);
         let _ = self
             .guest
             .vivido_vvmux_plugin_guest()
@@ -408,7 +410,43 @@ impl Drop for ComponentRuntime {
     }
 }
 
-fn configure_call(store: &mut Store<ComponentState>, deadline: Instant) -> io::Result<()> {
+/// Which budget a call is spending, so an expiry says what ran out rather than only that something
+/// did. A bare "deadline expired" is the least informative answer this stack can give and made a
+/// load-induced failure expensive to trace back to its cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallPhase {
+    Startup,
+    Invoke,
+    Event,
+    Shutdown,
+}
+
+impl CallPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Invoke => "invoke",
+            Self::Event => "event",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+fn configure_call(
+    store: &mut Store<ComponentState>,
+    deadline: Instant,
+    phase: CallPhase,
+) -> io::Result<()> {
+    // Checked before anything is installed: a call this store will never make must not leave fuel
+    // and an epoch callback configured behind it.
+    let now = Instant::now();
+    if deadline <= now {
+        return Err(invalid(format!(
+            "timeout: component {} deadline expired {} ms before the call began",
+            phase.as_str(),
+            now.saturating_duration_since(deadline).as_millis()
+        )));
+    }
     store.set_fuel(FUEL_PER_CALL).map_err(component_error)?;
     store.set_epoch_deadline(1);
     store.epoch_deadline_callback(|context| {
@@ -419,9 +457,6 @@ fn configure_call(store: &mut Store<ComponentState>, deadline: Instant) -> io::R
             Ok(UpdateDeadline::Continue(1))
         }
     });
-    if deadline <= Instant::now() {
-        return Err(invalid("timeout: component deadline expired"));
-    }
     Ok(())
 }
 

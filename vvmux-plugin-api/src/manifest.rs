@@ -177,7 +177,24 @@ pub struct Runtime {
     /// Explicit filesystem capabilities for a WebAssembly component.
     #[serde(default)]
     pub preopens: Vec<ComponentPreopen>,
+    /// Wall-clock budget for cold-starting a component: reading the artifact, compiling it,
+    /// instantiating it, and running `initialize`.
+    ///
+    /// Separate from an action's `timeout_ms`, which bounds guest execution. Compilation is host
+    /// work whose cost depends on the machine and on whether the compiled artifact is cached, so
+    /// charging it to the guest's budget makes an honest component fail on a loaded host after
+    /// every install or upgrade. Capped far below the action ceiling because cold start is bounded
+    /// work: the bound has to stay real.
+    #[serde(default = "default_startup_timeout")]
+    pub startup_timeout_ms: u64,
 }
+
+fn default_startup_timeout() -> u64 {
+    30_000
+}
+
+/// Ceiling for [`Runtime::startup_timeout_ms`].
+pub const MAX_STARTUP_TIMEOUT_MS: u64 = 120_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -1231,8 +1248,14 @@ impl Runtime {
                         return invalid("component runtime contains a duplicate preopen");
                     }
                 }
+                if !(1..=MAX_STARTUP_TIMEOUT_MS).contains(&self.startup_timeout_ms) {
+                    return invalid("component runtime has an invalid startup timeout");
+                }
             }
             RuntimeKind::Process => {
+                if self.startup_timeout_ms != default_startup_timeout() {
+                    return invalid("startup_timeout_ms applies only to a component runtime");
+                }
                 if self.artifact.is_some() || self.command.is_none() || !self.preopens.is_empty() {
                     return invalid(
                         "process runtime requires command and forbids artifact and preopens",
@@ -1670,6 +1693,7 @@ mod tests {
                 command: Some(vec!["python".into(), "plugin.py".into()]),
                 activation: Activation::OnDemand,
                 preopens: Vec::new(),
+                startup_timeout_ms: default_startup_timeout(),
             }),
             actions: vec![Action {
                 id: "read".into(),
@@ -1829,6 +1853,7 @@ process = { executables = ["openclaw"] }
             command: None,
             activation: Activation::OnDemand,
             preopens: vec![ComponentPreopen::Package, ComponentPreopen::Data],
+            startup_timeout_ms: default_startup_timeout(),
         });
         manifest.validate().unwrap();
 
@@ -1860,6 +1885,65 @@ process = { executables = ["openclaw"] }
                 .to_string()
                 .contains("forbids")
         );
+    }
+
+    /// Compiling and instantiating a component is host work whose cost depends on the machine and
+    /// on whether the compiled artifact is cached. It gets a budget of its own so a loaded host
+    /// cannot spend an honest action's deadline before the guest starts, and that budget is capped
+    /// so declaring one does not become a way to opt out of being bounded.
+    #[test]
+    fn a_component_declares_a_capped_cold_start_budget() {
+        let component = |startup_timeout_ms| {
+            let mut manifest = valid_manifest();
+            manifest.runtime = Some(Runtime {
+                kind: RuntimeKind::Component,
+                artifact: Some("plugin.wasm".into()),
+                command: None,
+                activation: Activation::OnDemand,
+                preopens: Vec::new(),
+                startup_timeout_ms,
+            });
+            manifest
+        };
+
+        component(default_startup_timeout()).validate().unwrap();
+        component(1).validate().unwrap();
+        component(MAX_STARTUP_TIMEOUT_MS).validate().unwrap();
+        for rejected in [0, MAX_STARTUP_TIMEOUT_MS + 1] {
+            assert!(
+                component(rejected)
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid startup timeout"),
+                "{rejected} ms was accepted"
+            );
+        }
+
+        // A process runtime has no cold start to bound; silently ignoring the field would let a
+        // manifest declare a limit that never applies.
+        let mut process = valid_manifest();
+        process.runtime.as_mut().unwrap().startup_timeout_ms = 1_000;
+        assert!(
+            process
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("applies only to a component runtime")
+        );
+    }
+
+    /// Manifests written before the field existed keep parsing and get the default.
+    #[test]
+    fn an_omitted_cold_start_budget_defaults_rather_than_failing() {
+        let runtime: Runtime = toml::from_str(
+            r#"
+kind = "component"
+artifact = "plugin.wasm"
+"#,
+        )
+        .unwrap();
+        assert_eq!(runtime.startup_timeout_ms, default_startup_timeout());
     }
 
     #[test]

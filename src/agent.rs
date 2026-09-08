@@ -525,6 +525,14 @@ pub struct AgentRuntime {
     source: AgentSource,
     done: bool,
     identified_at: Instant,
+    /// When an integration last reported this agent, or `None` if none ever has.
+    ///
+    /// Distinct from `identified_at`, which the process-observation wipe path sets for itself and
+    /// which `report` deliberately leaves alone: a report does not claim the process changed. The
+    /// grace a report earns must therefore be measured from the report, not from whenever this
+    /// pane last saw a different foreground process — otherwise a pane older than [`STARTUP_GRACE`]
+    /// can never hold a report against the detector at all.
+    reported_at: Option<Instant>,
     /// When classification last ran for this identity, or `None` before it ever has.
     ///
     /// Distinguishes "the startup grace has ended" from "a status computed after it ended has
@@ -565,6 +573,7 @@ impl AgentRuntime {
             source: AgentSource::Screen,
             done: false,
             identified_at: Instant::now(),
+            reported_at: None,
             evaluated_at: None,
             pending_idle: None,
             report: None,
@@ -710,16 +719,55 @@ impl AgentRuntime {
             .then_some(IDLE_CONFIRMATION_RECHECK)
     }
 
+    /// Whether an integration's report is recent enough to outrank a scan that disagrees with it.
+    ///
+    /// A report exists precisely for the agents classification cannot see: ones behind a shell,
+    /// ssh, or a container. Failing to classify such a process is therefore not evidence against
+    /// the report, and must not be treated as any. The window is bounded so a report cannot hold
+    /// a pane forever — once it closes, the scanner is authoritative again.
+    fn report_outranks_scan(&self, now: Instant) -> bool {
+        self.reported_at
+            .is_some_and(|at| now.saturating_duration_since(at) < STARTUP_GRACE)
+            && (self.report.is_some() || self.session.is_some() || self.alias.is_some())
+    }
+
+    /// Clear everything that belonged to the agent that was here, keeping only `identity`, which
+    /// each caller sets to whatever is in front now.
+    fn forget_agent(&mut self) {
+        self.report = None;
+        self.report_sequences.clear();
+        self.reported_at = None;
+        self.session = None;
+        self.session_source = None;
+        self.metadata = AgentMetadata::default();
+        self.alias = None;
+        self.pending_idle = None;
+        self.done = false;
+        self.state = AgentState::Idle;
+        self.source = AgentSource::Screen;
+    }
+
     /// Returns true when stale OSC evidence must be discarded.
-    pub fn observe_process(&mut self, group: Option<u32>, identity: Option<AgentIdentity>) -> bool {
+    pub fn observe_process(
+        &mut self,
+        group: Option<u32>,
+        identity: Option<AgentIdentity>,
+        now: Instant,
+    ) -> bool {
         let changed_group = self.process_group != group;
         if changed_group {
+            // Measured from the later of the two, because either can be the moment this agent's
+            // identity was established: the detector setting it, or an integration reporting it.
+            let established_at = match self.reported_at {
+                Some(reported_at) => reported_at.max(self.identified_at),
+                None => self.identified_at,
+            };
             let startup_report_matches = self.process_group.is_none()
                 && (self.report.is_some() || self.session.is_some())
                 && identity.is_some()
                 && identity.as_ref().map(|value| &value.id)
                     == self.identity.as_ref().map(|value| &value.id)
-                && self.identified_at.elapsed() < STARTUP_GRACE;
+                && now.saturating_duration_since(established_at) < STARTUP_GRACE;
             if startup_report_matches {
                 // The report, session, metadata, and alias all survive here, and the alias for the
                 // same reason as the rest: this branch is the detector catching up to an agent that
@@ -730,52 +778,33 @@ impl AgentRuntime {
                 return false;
             }
             self.process_group = group;
-            self.report = None;
-            self.report_sequences.clear();
-            self.session = None;
-            self.session_source = None;
-            self.metadata = AgentMetadata::default();
-            self.alias = None;
-            self.pending_idle = None;
-            self.done = false;
+            self.forget_agent();
             self.identity = identity;
-            self.state = AgentState::Idle;
-            self.source = AgentSource::Screen;
-            self.identified_at = Instant::now();
+            self.identified_at = now;
             return true;
         }
         if let Some(identity) = identity {
             if self.identity.as_ref() != Some(&identity) {
-                self.report = None;
-                self.session = None;
-                self.session_source = None;
-                self.session_source = None;
-                self.metadata = AgentMetadata::default();
-                self.alias = None;
-                self.pending_idle = None;
-                self.done = false;
-                self.state = AgentState::Idle;
-                self.source = AgentSource::Screen;
-                self.identified_at = Instant::now();
+                // A positive classification of a different agent wins even over a fresh report:
+                // this is the one case where the scanner has seen something the report contradicts,
+                // rather than merely failing to see anything.
+                self.forget_agent();
+                self.identified_at = now;
             }
             self.identity = Some(identity);
-        } else if self.identity.is_some() {
-            self.report = None;
-            self.report_sequences.clear();
-            self.session = None;
-            self.session_source = None;
-            self.metadata = AgentMetadata::default();
-            self.alias = None;
-            self.pending_idle = None;
+        } else if self.identity.is_some() && !self.report_outranks_scan(now) {
+            self.forget_agent();
             self.identity = None;
-            self.done = false;
-            self.state = AgentState::Idle;
-            self.source = AgentSource::Screen;
         }
         false
     }
 
-    pub fn report(&mut self, report: AgentReport, visible: bool) -> Result<(), &'static str> {
+    pub fn report(
+        &mut self,
+        report: AgentReport,
+        visible: bool,
+        now: Instant,
+    ) -> Result<(), &'static str> {
         let AgentReport {
             identity,
             state,
@@ -802,6 +831,9 @@ impl AgentRuntime {
             return Err("reported agent does not match the pane foreground process");
         }
         self.identity = Some(identity);
+        // Not `identified_at`: this is a claim about who is running, not about the foreground
+        // process changing. `observe_process` reads this to know the claim is still fresh.
+        self.reported_at = Some(now);
         self.report_sequences.insert(source.clone(), sequence);
         // A state-only report from an integration that already sent its session identity must not
         // erase it: identity is reported once, state repeatedly.
@@ -1007,16 +1039,11 @@ impl AgentRuntime {
                 .is_none_or(|next| next != *current)
         });
         if stale {
-            self.report = None;
-            self.report_sequences.clear();
-            self.session = None;
-            self.session_source = None;
-            self.metadata = AgentMetadata::default();
-            self.pending_idle = None;
+            // The alias goes with the rest: a name belongs to an agent, and the provider that
+            // defined this one no longer exists. Leaving it would keep resolving the name to a pane
+            // whose every agent verb then fails with `agent_not_detected`.
+            self.forget_agent();
             self.identity = None;
-            self.done = false;
-            self.state = AgentState::Idle;
-            self.source = AgentSource::Screen;
         }
         stale
     }
@@ -2467,6 +2494,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     1,
                 ),
                 false,
+                Instant::now(),
             )
             .unwrap();
         retained_runtime
@@ -2478,6 +2506,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     1,
                 ),
                 false,
+                Instant::now(),
             )
             .unwrap();
 
@@ -2505,6 +2534,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                         1,
                     ),
                     false,
+                    Instant::now(),
                 )
                 .unwrap();
         }
@@ -2518,6 +2548,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     1
                 ),
                 false,
+                Instant::now(),
             ),
             Err("agent report source limit reached")
         );
@@ -2532,6 +2563,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     2,
                 ),
                 false,
+                Instant::now(),
             )
             .unwrap();
         assert_eq!(runtime.snapshot().unwrap().state, AgentState::Blocked);
@@ -2557,6 +2589,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     session: AgentSessionRef::new(Some("conversation-7".into()), None),
                 },
                 false,
+                Instant::now(),
             )
             .unwrap();
         assert_eq!(runtime.session().unwrap().id(), Some("conversation-7"));
@@ -2573,17 +2606,26 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     2,
                 ),
                 false,
+                Instant::now(),
             )
             .unwrap();
         assert_eq!(runtime.session().unwrap().id(), Some("conversation-7"));
 
         // An integration typically reports before the detector first observes the process, so the
         // startup-grace path must preserve the reference rather than treat it as stale evidence.
-        assert!(!runtime.observe_process(Some(40), Some(identity(&catalog, "codex"))));
+        assert!(!runtime.observe_process(
+            Some(40),
+            Some(identity(&catalog, "codex")),
+            Instant::now()
+        ));
         assert_eq!(runtime.session().unwrap().id(), Some("conversation-7"));
 
         // A different foreground process is a different conversation.
-        assert!(runtime.observe_process(Some(41), Some(identity(&catalog, "codex"))));
+        assert!(runtime.observe_process(
+            Some(41),
+            Some(identity(&catalog, "codex")),
+            Instant::now()
+        ));
         assert!(runtime.session().is_none());
         assert!(runtime.snapshot().unwrap().message.is_none());
     }
@@ -2620,6 +2662,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     4,
                 ),
                 false,
+                Instant::now(),
             ),
             Err("agent report sequence is stale")
         );
@@ -2654,9 +2697,17 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                 AgentSessionRef::new(Some("startup-session".into()), None).unwrap(),
             )
             .unwrap();
-        assert!(!startup.observe_process(Some(40), Some(identity(&catalog, "codex"))));
+        assert!(!startup.observe_process(
+            Some(40),
+            Some(identity(&catalog, "codex")),
+            Instant::now()
+        ));
         assert!(startup.session().is_some());
-        assert!(startup.observe_process(Some(41), Some(identity(&catalog, "codex"))));
+        assert!(startup.observe_process(
+            Some(41),
+            Some(identity(&catalog, "codex")),
+            Instant::now()
+        ));
         assert!(startup.session().is_none());
     }
 
@@ -2675,6 +2726,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     session: AgentSessionRef::new(None, Some("/tmp/codex/session.json".into())),
                 },
                 false,
+                Instant::now(),
             )
             .unwrap();
         let snapshot = runtime.snapshot().unwrap();
@@ -2702,17 +2754,18 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
             session,
         };
         assert_eq!(
-            runtime.report(report(Some("m".repeat(257)), None), false),
+            runtime.report(report(Some("m".repeat(257)), None), false, Instant::now()),
             Err("agent report message must contain 1..=256 bytes")
         );
         assert_eq!(
-            runtime.report(report(Some(String::new()), None), false),
+            runtime.report(report(Some(String::new()), None), false, Instant::now()),
             Err("agent report message must contain 1..=256 bytes")
         );
         assert_eq!(
             runtime.report(
                 report(None, AgentSessionRef::new(Some("s".repeat(257)), None)),
-                false
+                false,
+                Instant::now(),
             ),
             Err("agent session identity must contain 1..=256 bytes")
         );
@@ -2727,6 +2780,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     1,
                 ),
                 false,
+                Instant::now(),
             )
             .unwrap();
     }
@@ -2893,6 +2947,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     1,
                 ),
                 false,
+                Instant::now(),
             )
             .unwrap();
         let before = runtime.snapshot().unwrap();
@@ -2935,7 +2990,8 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         assert_eq!(
             runtime.report(
                 state_report(identity(&catalog, "codex"), AgentState::Working, "hook", 4),
-                false
+                false,
+                Instant::now(),
             ),
             Err("agent report sequence is stale")
         );
@@ -2943,14 +2999,23 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
             .report(
                 state_report(identity(&catalog, "codex"), AgentState::Working, "hook", 6),
                 false,
+                Instant::now(),
             )
             .unwrap();
         assert_eq!(runtime.metadata().tokens().count(), 1);
 
         // Annotations describe one agent, so they leave with it.
-        assert!(!runtime.observe_process(Some(70), Some(identity(&catalog, "codex"))));
+        assert!(!runtime.observe_process(
+            Some(70),
+            Some(identity(&catalog, "codex")),
+            Instant::now()
+        ));
         assert_eq!(runtime.metadata().tokens().count(), 1);
-        assert!(runtime.observe_process(Some(71), Some(identity(&catalog, "codex"))));
+        assert!(runtime.observe_process(
+            Some(71),
+            Some(identity(&catalog, "codex")),
+            Instant::now()
+        ));
         assert!(runtime.metadata().is_empty());
     }
 
@@ -3109,6 +3174,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     session: None,
                 },
                 false,
+                Instant::now(),
             )
             .unwrap();
 
@@ -3224,12 +3290,14 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     2,
                 ),
                 false,
+                Instant::now(),
             )
             .unwrap();
         second
             .report(
                 state_report(identity(&catalog, "opencode"), AgentState::Idle, "test", 2),
                 false,
+                Instant::now(),
             )
             .unwrap();
         assert!(
@@ -3241,7 +3309,8 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                         "test",
                         1
                     ),
-                    false
+                    false,
+                    Instant::now(),
                 )
                 .is_err()
         );
@@ -3320,11 +3389,20 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     1,
                 ),
                 false,
+                Instant::now(),
             )
             .unwrap();
-        assert!(!runtime.observe_process(Some(10), Some(identity(&catalog, "opencode"))));
+        assert!(!runtime.observe_process(
+            Some(10),
+            Some(identity(&catalog, "opencode")),
+            Instant::now()
+        ));
         assert_eq!(runtime.snapshot().unwrap().source, AgentSource::Report);
-        assert!(runtime.observe_process(Some(11), Some(identity(&catalog, "opencode"))));
+        assert!(runtime.observe_process(
+            Some(11),
+            Some(identity(&catalog, "opencode")),
+            Instant::now()
+        ));
         assert_eq!(runtime.snapshot().unwrap().source, AgentSource::Screen);
         assert!(
             runtime
@@ -3335,7 +3413,8 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                         "plugin",
                         2
                     ),
-                    false
+                    false,
+                    Instant::now(),
                 )
                 .is_err()
         );
@@ -3349,9 +3428,14 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
                     3,
                 ),
                 false,
+                Instant::now(),
             )
             .unwrap();
-        assert!(!runtime.observe_process(Some(11), None));
+        // A scan that cannot classify the process does not end a report that just arrived, but the
+        // grace it earns is a window: once it closes, the scanner is authoritative again.
+        assert!(!runtime.observe_process(Some(11), None, Instant::now()));
+        assert_eq!(runtime.snapshot().unwrap().source, AgentSource::Report);
+        assert!(!runtime.observe_process(Some(11), None, Instant::now() + STARTUP_GRACE));
         assert!(runtime.snapshot().is_none());
     }
 
@@ -3401,7 +3485,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         assert!(runtime.set_alias(Some(alias.clone())).is_err());
         assert!(runtime.alias().is_none());
 
-        runtime.observe_process(Some(7), Some(identity(&catalog, "claude")));
+        runtime.observe_process(Some(7), Some(identity(&catalog, "claude")), Instant::now());
         assert!(runtime.set_alias(Some(alias.clone())).unwrap());
         assert_eq!(runtime.alias(), Some(&alias));
         // Setting the same name again is not a change, so callers do not repaint for nothing.
@@ -3421,24 +3505,32 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
             (
                 "foreground group changed",
                 Box::new(|runtime: &mut AgentRuntime, catalog: &AgentCatalog| {
-                    runtime.observe_process(Some(9), Some(identity(catalog, "claude")));
+                    runtime.observe_process(
+                        Some(9),
+                        Some(identity(catalog, "claude")),
+                        Instant::now(),
+                    );
                 }) as Box<dyn Fn(&mut AgentRuntime, &AgentCatalog)>,
             ),
             (
                 "a different agent took the pane",
                 Box::new(|runtime: &mut AgentRuntime, catalog: &AgentCatalog| {
-                    runtime.observe_process(Some(7), Some(identity(catalog, "codex")));
+                    runtime.observe_process(
+                        Some(7),
+                        Some(identity(catalog, "codex")),
+                        Instant::now(),
+                    );
                 }),
             ),
             (
                 "the agent exited",
                 Box::new(|runtime: &mut AgentRuntime, _: &AgentCatalog| {
-                    runtime.observe_process(Some(7), None);
+                    runtime.observe_process(Some(7), None, Instant::now());
                 }),
             ),
         ] {
             let mut runtime = AgentRuntime::new();
-            runtime.observe_process(Some(7), Some(identity(&catalog, "claude")));
+            runtime.observe_process(Some(7), Some(identity(&catalog, "claude")), Instant::now());
             runtime.set_alias(Some(alias.clone())).unwrap();
             assert_eq!(runtime.alias(), Some(&alias), "{label}: setup");
 
@@ -3464,17 +3556,183 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
             .report(
                 state_report(identity(&catalog, "claude"), AgentState::Idle, "hook", 1),
                 false,
+                Instant::now(),
             )
             .unwrap();
         runtime.set_alias(Some(alias.clone())).unwrap();
 
         // The detector now sees the same agent for the first time.
-        assert!(!runtime.observe_process(Some(7), Some(identity(&catalog, "claude"))));
+        assert!(!runtime.observe_process(
+            Some(7),
+            Some(identity(&catalog, "claude")),
+            Instant::now()
+        ));
         assert_eq!(
             runtime.alias(),
             Some(&alias),
             "the alias was dropped by the detector catching up to its own agent"
         );
+    }
+
+    /// Everything an integration established, in one runtime, so a wipe is visible whichever
+    /// field it reaches first.
+    fn reported_runtime(catalog: &AgentCatalog, agent: &str, now: Instant) -> AgentRuntime {
+        let mut runtime = AgentRuntime::new();
+        // An already-running pane: the detector saw its shell long ago and classified nothing.
+        runtime.process_group = Some(4);
+        runtime.identified_at = now - STARTUP_GRACE * 10;
+        runtime
+            .report(
+                AgentReport {
+                    identity: identity(catalog, agent),
+                    state: AgentState::Working,
+                    source: "hook".into(),
+                    sequence: 1,
+                    message: Some("reading src/agent.rs".into()),
+                    session: AgentSessionRef::new(Some("conversation-9".into()), None),
+                },
+                false,
+                now,
+            )
+            .unwrap();
+        runtime
+            .report_metadata("hook", 2, token_patch(&[("cost", Some("3"))], None), now)
+            .unwrap();
+        runtime
+            .set_alias(Some(AgentAlias::new("reviewer").unwrap()))
+            .unwrap();
+        runtime
+    }
+
+    /// The scanner classifies foreground processes; `report-agent` exists for the agents it cannot
+    /// classify at all — ones behind a shell, ssh, or a container. "I could not identify this
+    /// process" is therefore not evidence against a report, and must not erase one. Which arrives
+    /// first is pure scheduling luck, so without this the whole report is lost on a busy machine.
+    #[test]
+    fn a_scan_that_cannot_classify_the_process_does_not_erase_a_fresh_report() {
+        let catalog = catalog();
+        let now = Instant::now();
+        let mut runtime = reported_runtime(&catalog, "claude", now);
+
+        // The detector's first answer for this pane, arriving after the report.
+        assert!(!runtime.observe_process(Some(4), None, now));
+        let snapshot = runtime.snapshot().expect("the reported agent was erased");
+        assert_eq!(snapshot.kind, id("claude"));
+        assert_eq!(snapshot.source, AgentSource::Report);
+        assert_eq!(snapshot.message.as_deref(), Some("reading src/agent.rs"));
+        assert_eq!(runtime.session().unwrap().id(), Some("conversation-9"));
+        assert_eq!(runtime.session_source(), Some("hook"));
+        assert_eq!(runtime.metadata().tokens().count(), 1);
+        assert_eq!(runtime.alias().map(AgentAlias::as_str), Some("reviewer"));
+
+        // The grace is a window, not immunity: an agent that stops reporting is eventually the
+        // scanner's to judge again.
+        assert!(!runtime.observe_process(Some(4), None, now + STARTUP_GRACE));
+        assert!(runtime.snapshot().is_none());
+        assert!(runtime.alias().is_none());
+    }
+
+    /// The narrow rule above must not weaken the broad one it sits beside: a different process in
+    /// front of the pane still ends the agent that was there, report or no report.
+    #[test]
+    fn a_new_foreground_process_still_ends_a_freshly_reported_agent() {
+        let catalog = catalog();
+        let now = Instant::now();
+        let mut runtime = reported_runtime(&catalog, "claude", now);
+
+        assert!(runtime.observe_process(Some(5), None, now));
+        assert!(runtime.snapshot().is_none());
+        assert!(runtime.session().is_none());
+        assert!(runtime.session_source().is_none());
+        assert_eq!(runtime.metadata().tokens().count(), 0);
+        assert!(runtime.alias().is_none());
+    }
+
+    /// The one case where the scanner has seen something rather than failed to see anything. A
+    /// positive classification contradicts the report, so it wins and the report's state goes with
+    /// it — a name given to `claude` must not survive onto `codex`.
+    #[test]
+    fn a_scan_that_finds_a_different_agent_overrides_a_fresh_report() {
+        let catalog = catalog();
+        let now = Instant::now();
+        let mut runtime = reported_runtime(&catalog, "claude", now);
+
+        assert!(!runtime.observe_process(Some(4), Some(identity(&catalog, "codex")), now));
+        assert_eq!(runtime.snapshot().unwrap().kind, id("codex"));
+        assert_eq!(runtime.snapshot().unwrap().source, AgentSource::Screen);
+        assert!(runtime.session().is_none());
+        assert!(runtime.alias().is_none());
+        // Cleared with the rest, so the next integration to report on this pane is not refused for
+        // reusing a sequence the previous agent had already spent.
+        assert!(
+            runtime
+                .report(
+                    state_report(identity(&catalog, "codex"), AgentState::Idle, "hook", 1),
+                    false,
+                    now,
+                )
+                .is_ok()
+        );
+    }
+
+    /// Process group IDs are per-machine and reused freely, so two panes routinely observe the same
+    /// number. Reconciliation for one must not reach the other.
+    #[test]
+    fn a_late_scan_for_one_pane_leaves_another_reporting_agent_intact() {
+        let catalog = catalog();
+        let now = Instant::now();
+        let mut first = reported_runtime(&catalog, "claude", now);
+        let second = reported_runtime(&catalog, "codex", now);
+
+        // Same group number, different pane. Only the first pane's scan is delivered.
+        assert!(!first.observe_process(Some(4), None, now + STARTUP_GRACE));
+        assert!(first.snapshot().is_none());
+
+        let untouched = second
+            .snapshot()
+            .expect("the other pane's agent was erased");
+        assert_eq!(untouched.kind, id("codex"));
+        assert_eq!(second.session().unwrap().id(), Some("conversation-9"));
+        assert_eq!(second.alias().map(AgentAlias::as_str), Some("reviewer"));
+    }
+
+    /// The grace a report earns is measured from the report. Measuring it from `identified_at`
+    /// instead means it can never fire on a pane that has been open longer than `STARTUP_GRACE` —
+    /// which is nearly every pane an integration reports into.
+    #[test]
+    fn a_report_earns_its_grace_on_a_long_running_pane() {
+        let catalog = catalog();
+        let now = Instant::now();
+        let mut runtime = reported_runtime(&catalog, "claude", now);
+        assert!(
+            now.saturating_duration_since(runtime.identified_at) > STARTUP_GRACE,
+            "the fixture must be a pane older than the grace for this to prove anything"
+        );
+
+        // The detector's first observation of the pane, which is what `startup_report_matches`
+        // guards: an unobserved group becoming a real one, agreeing with the report.
+        let mut unobserved = reported_runtime(&catalog, "claude", now);
+        unobserved.process_group = None;
+        assert!(!unobserved.observe_process(Some(4), Some(identity(&catalog, "claude")), now));
+        assert_eq!(unobserved.alias().map(AgentAlias::as_str), Some("reviewer"));
+
+        // And the same-group path, which is what a cache-miss rescan delivers.
+        assert!(!runtime.observe_process(Some(4), None, now));
+        assert_eq!(runtime.alias().map(AgentAlias::as_str), Some("reviewer"));
+    }
+
+    /// A name belongs to an agent, and this provider no longer defines one. Leaving the alias
+    /// behind keeps resolving it to a pane whose every agent verb then fails `agent_not_detected`.
+    #[test]
+    fn a_removed_provider_takes_the_name_with_it() {
+        let catalog = catalog();
+        let now = Instant::now();
+        let mut runtime = reported_runtime(&catalog, "claude", now);
+
+        assert!(runtime.reconcile_catalog(&custom_catalog()));
+        assert!(runtime.snapshot().is_none());
+        assert!(runtime.alias().is_none());
+        assert!(runtime.session().is_none());
     }
 
     /// A session reference names a conversation on the user's account, and this turns one into a
@@ -3576,7 +3834,7 @@ launch = { executable = "pathy", resume = ["--session", "{session_path}"] }
     fn a_session_reference_remembers_which_integration_reported_it() {
         let catalog = catalog();
         let mut runtime = AgentRuntime::new();
-        runtime.observe_process(Some(7), Some(identity(&catalog, "codex")));
+        runtime.observe_process(Some(7), Some(identity(&catalog, "codex")), Instant::now());
         runtime
             .report_session(
                 identity(&catalog, "codex"),
@@ -3588,7 +3846,7 @@ launch = { executable = "pathy", resume = ["--session", "{session_path}"] }
         assert_eq!(runtime.session_source(), Some("vvmux:codex"));
 
         // Cleared with the reference it describes, so a later agent cannot inherit its provenance.
-        runtime.observe_process(Some(9), Some(identity(&catalog, "codex")));
+        runtime.observe_process(Some(9), Some(identity(&catalog, "codex")), Instant::now());
         assert!(runtime.session().is_none());
         assert!(runtime.session_source().is_none());
     }
@@ -3600,7 +3858,7 @@ launch = { executable = "pathy", resume = ["--session", "{session_path}"] }
     fn renaming_an_agent_does_not_change_its_lifecycle_snapshot() {
         let catalog = catalog();
         let mut runtime = AgentRuntime::new();
-        runtime.observe_process(Some(7), Some(identity(&catalog, "claude")));
+        runtime.observe_process(Some(7), Some(identity(&catalog, "claude")), Instant::now());
 
         let before = runtime.snapshot().unwrap();
         runtime

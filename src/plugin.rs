@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use vvmux_plugin_api::{
     Activation, ErrorCode, Event, EventHook, FrameError, Hello, HostCallResult, Invocation,
     InvocationContext, LoadedManifest, NativeMessage, NativeReply, PROTOCOL_VERSION, Permission,
-    PluginError, RuntimeKind, read_frame, write_frame,
+    PluginError, Runtime, RuntimeKind, read_frame, write_frame,
 };
 
 const REGISTRY_SCHEMA: u16 = 2;
@@ -2570,7 +2570,6 @@ impl SessionPluginRuntime {
                             "runtime_unavailable: component plugin is in crash backoff",
                         ));
                     }
-                    let deadline = Instant::now() + timeout;
                     let mut component_context =
                         serde_json::to_value(&context).map_err(io::Error::other)?;
                     component_context["session"] = Value::String(self.session_name.clone());
@@ -2584,7 +2583,7 @@ impl SessionPluginRuntime {
                             &self.loaded.manifest.plugin.permissions,
                             &runtime.preopens,
                             cancel.clone(),
-                            deadline,
+                            Instant::now() + component_startup_timeout(runtime),
                         ) {
                             Ok(component) => self.component = Some(component),
                             Err(error) => {
@@ -2593,6 +2592,10 @@ impl SessionPluginRuntime {
                             }
                         }
                     }
+                    // Started, so the action's budget starts here. Compiling and instantiating the
+                    // artifact is host work under its own bound; charging it to the guest would
+                    // spend the whole action deadline before the guest ran a single instruction.
+                    let deadline = Instant::now() + timeout;
                     let result = self.component.as_mut().unwrap().invoke(
                         handler,
                         &input,
@@ -2658,7 +2661,7 @@ impl SessionPluginRuntime {
                 )?);
             }
             RuntimeKind::Component if self.component.is_none() => {
-                let deadline = Instant::now() + timeout;
+                let deadline = Instant::now() + component_startup_timeout(&runtime);
                 self.component = Some(crate::plugin_component::ComponentRuntime::start(
                     &self.loaded.root,
                     runtime.artifact.as_deref().unwrap(),
@@ -2730,6 +2733,7 @@ impl SessionPluginRuntime {
                 result
             }
             Some(RuntimeKind::Component) => {
+                // Activation has already started the component, so this budget is the guest's.
                 let deadline = Instant::now() + timeout;
                 let payload = serde_json::json!({
                     "event": event.name,
@@ -3188,6 +3192,12 @@ impl Drop for NativeService {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// The declared cold-start budget: reading, compiling and instantiating the artifact, and running
+/// `initialize`. Validated against [`vvmux_plugin_api::MAX_STARTUP_TIMEOUT_MS`] at load.
+fn component_startup_timeout(runtime: &Runtime) -> Duration {
+    Duration::from_millis(runtime.startup_timeout_ms)
 }
 
 pub(crate) fn random_id() -> io::Result<String> {

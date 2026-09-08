@@ -2308,7 +2308,7 @@ impl SessionActor {
                     );
                     if let Some(pane) = self.panes.get_mut(&pane_id) {
                         pane.exit_status = status;
-                        pane.agent.observe_process(None, None);
+                        pane.agent.observe_process(None, None, Instant::now());
                         pane.terminal.clear_agent_osc();
                         pane.terminal.feed(note.as_bytes());
                     }
@@ -2487,9 +2487,11 @@ impl SessionActor {
             ActorEvent::AgentProcesses(updates) => {
                 for update in updates {
                     if let Some(pane) = self.panes.get_mut(&update.pane_id)
-                        && pane
-                            .agent
-                            .observe_process(update.process_group, update.identity)
+                        && pane.agent.observe_process(
+                            update.process_group,
+                            update.identity,
+                            Instant::now(),
+                        )
                     {
                         pane.terminal.clear_agent_osc();
                     }
@@ -3636,6 +3638,7 @@ impl SessionActor {
                                         ),
                                     },
                                     visible,
+                                    Instant::now(),
                                 )
                             })
                     });
