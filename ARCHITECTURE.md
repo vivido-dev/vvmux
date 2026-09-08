@@ -337,3 +337,15 @@ activation and PLAY succeed, the writer stops adding that record-by-record barri
 outer channel's normal bounded flow window. Linked audio can then stay buffered at device rate
 without sharing a blocking write, decoder wait, or acknowledgement round trip with video. EOS is
 queued behind all earlier records for the same track.
+
+## Remote playback policy and position feedback
+
+Every Vivid-enabled pane receives `VIVID_AUDIO_FALLBACK=deny` along with its freshly scoped
+endpoint and root secret. This policy survives persistent sessions and reattach; it does not
+inherit the attaching client's outer credentials or depend on `VIVID_REMOTE` surviving scrubbing.
+A producer can explicitly opt into local-device fallback with `VIVID_AUDIO_FALLBACK=allow`.
+
+The presenting client forwards gateway `BridgePosition` observations to the daemon. The session
+actor admits them only from the active client and current bridge instance, then the SDK virtual
+presenter checks complete source ownership, decoder generation and playback request. Inner
+TRACK_STATUS thus reports physical clock/picture observations rather than media admission.

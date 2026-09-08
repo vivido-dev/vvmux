@@ -1383,9 +1383,18 @@ fn run_bridge_worker(
         }
         for (source, playback) in bridge.take_playback_states() {
             let _ = client_writer.send(ClientMessage::BridgePlaybackState {
+                bridge_instance_id,
+                decoder_reset_serial: playback.decoder_reset_serial,
                 source,
                 state: playback.state,
                 eos_state: playback.eos_state,
+            });
+        }
+        for (source, position) in bridge.take_positions() {
+            let _ = client_writer.send(ClientMessage::BridgePosition {
+                bridge_instance_id,
+                source,
+                position,
             });
         }
         let pending = snapshot

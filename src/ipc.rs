@@ -1389,7 +1389,14 @@ pub enum ClientMessage {
         bridge_instance_id: u64,
         event: crate::media_trace::BridgeMediaTraceEvent,
     },
+    BridgePosition {
+        bridge_instance_id: u64,
+        source: BridgeSourceKey,
+        position: vivid_sdk::presenter::BridgePositionSnapshot,
+    },
     BridgePlaybackState {
+        bridge_instance_id: u64,
+        decoder_reset_serial: u64,
         source: BridgeSourceKey,
         state: u64,
         eos_state: u64,

@@ -3250,19 +3250,31 @@ impl SessionActor {
                     }
                 }
             }
+            ClientMessage::BridgePosition {
+                bridge_instance_id,
+                source,
+                position,
+            } => {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    self.vivid.apply_outer_position(source, position);
+                }
+            }
             ClientMessage::BridgePlaybackState {
+                bridge_instance_id,
+                decoder_reset_serial,
                 source,
                 state,
                 eos_state,
             } => {
-                if self.client_is(id) {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
                     self.record_media_trace(
                         Some(source),
                         self.bridge_instance_id,
                         None,
                         MediaTraceKind::PlaybackState { state, eos_state },
                     );
-                    self.vivid.apply_outer_playback(source, state, eos_state);
+                    self.vivid
+                        .apply_outer_playback(source, decoder_reset_serial, state, eos_state);
                 }
             }
             ClientMessage::BridgeMetrics(metrics) => {
@@ -12871,6 +12883,8 @@ impl SessionActor {
         let vivid_capability = if spec.vivid_capability {
             environment.extend([
                 ("VIVID_ENDPOINT_CONTROL".into(), self.vivid.endpoint()),
+                // The daemon can be reattached remotely; pane audio belongs to the presenter.
+                ("VIVID_AUDIO_FALLBACK".into(), "deny".into()),
                 (
                     "VIVID_ROOT_SECRET".into(),
                     self.vivid.issue_pane_capability(pane_id)?,
