@@ -17,9 +17,9 @@ name = "vvmux_terminal"
 path = "vvmux-terminal/src/lib.rs"
 
 [dependencies]
-axum = { version = "0.8.4", features = ["ws"], optional = true }
+axum = { version = "0.8", features = ["ws"], optional = true }
 base64 = "0.23"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.4"
 hex = "0.4"
 url = { version = "2", default-features = false }
@@ -51,7 +51,7 @@ rpassword = { version = "7", optional = true }
 tokio-tungstenite = { version = "0.30", features = [
   "rustls-tls-native-roots",
 ], optional = true }
-wtransport = { version = "0.7.1", optional = true }
+wtransport = { version = "0.7", optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 toml = "1.1"
@@ -101,10 +101,10 @@ libc = "0.2"
 signal-hook = { version = "0.4", default-features = false, features = [
   "iterator",
 ] }
-ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = [
+windows-sys = { version = "0.61", features = [
   "Wdk_System_Threading",
   "Win32_Foundation",
   "Win32_Security",
