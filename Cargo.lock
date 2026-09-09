@@ -115,12 +115,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
-name = "arrayvec"
-version = "0.7.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
-
-[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3305,19 +3299,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
-name = "vte"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
-dependencies = [
- "arrayvec",
- "bitflags",
- "cursor-icon",
- "log",
- "memchr",
-]
-
-[[package]]
 name = "vvmux"
 version = "0.4.4"
 dependencies = [
@@ -3355,8 +3336,8 @@ dependencies = [
  "vivid_gateway",
  "vivid_protocol",
  "vivid_sdk",
- "vte",
  "vvmux-plugin-api",
+ "vvte",
  "wasmtime",
  "wasmtime-wasi",
  "wat",
@@ -3385,6 +3366,16 @@ dependencies = [
  "serde_json",
  "vvmux-plugin-api",
  "wit-bindgen",
+]
+
+[[package]]
+name = "vvte"
+version = "0.15.0"
+dependencies = [
+ "bitflags",
+ "cursor-icon",
+ "log",
+ "memchr",
 ]
 
 [[package]]

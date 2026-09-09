@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use base64::Engine;
 use unicode_width::UnicodeWidthChar;
-use vte::ansi::{
+use vvte::ansi::{
     Attr, ClearMode, Color, Handler, Hyperlink, KeyboardModes, KeyboardModesApplyBehavior,
     LineClearMode, NamedColor, PrivateMode, Processor, TabulationClearMode,
 };
@@ -646,9 +646,9 @@ impl Terminal {
     /// When a buffered synchronized update (DECSET 2026) has to be applied even though the ESU
     /// that would close it never arrived.
     ///
-    /// vte arms this deadline on BSU but never tests it: `StdSyncHandler::pending_timeout` only
+    /// vvte arms this deadline on BSU but never tests it: `StdSyncHandler::pending_timeout` only
     /// reports that a deadline exists. Unless the owner drives it, a pane that opens a synchronized
-    /// update and then stalls keeps buffering until it hits vte's 2 MiB ceiling, so the pane
+    /// update and then stalls keeps buffering until it hits vvte's 2 MiB ceiling, so the pane
     /// appears frozen.
     pub fn sync_flush_deadline(&self) -> Option<Instant> {
         self.processor.sync_timeout().sync_timeout()
@@ -1587,7 +1587,7 @@ impl Handler for Terminal {
             1006 => self.modes.sgr_mouse,
             1016 => self.modes.sgr_pixels,
             2004 => self.modes.bracketed_paste,
-            // vte buffers synchronized updates itself and the session applies the deadline, so
+            // vvte buffers synchronized updates itself and the session applies the deadline, so
             // support is real, but an update is never still open once a query is answered.
             2026 => false,
             _ => {
@@ -3035,11 +3035,65 @@ mod tests {
     }
 
     #[test]
-    fn stalled_synchronized_update_is_flushed_after_the_vte_timeout() {
+    fn rep_preserves_scalar_cells_scrolling_and_replies_across_fragments() {
+        for (input, expanded) in [
+            ("\x1b[99b", "".to_owned()),
+            ("a\x1b[b\x1b[0b\x1b[2b", "aaaaa".to_owned()),
+            ("a\x1b[31m\x1b[20b", format!("a\x1b[31m{}", "a".repeat(20))),
+            ("界\x1b[3b", "界界界界".to_owned()),
+        ] {
+            for sync in [false, true] {
+                let (begin, end) = if sync {
+                    ("\x1b[?2026h", "\x1b[?2026l")
+                } else {
+                    ("", "")
+                };
+                let input = format!("{begin}{input}{end}\x1b[6n");
+                let expanded = format!("{begin}{expanded}{end}\x1b[6n");
+                let mut expected = Terminal::new(2, 8, 10);
+                let initial_modes = expected.modes;
+                // Sync delimiters report unchanged mode snapshots at parser slice boundaries;
+                // damage is feed-scoped. Neither changes this fixture's terminal semantics.
+                let semantic_event = |event: &TerminalEvent| {
+                    !matches!(event, TerminalEvent::Damage)
+                        && !matches!(event, TerminalEvent::ModeChange(modes) if *modes == initial_modes)
+                };
+                let expected_events: Vec<_> = expected
+                    .feed(expanded.as_bytes())
+                    .into_iter()
+                    .filter(semantic_event)
+                    .collect();
+                let bytes = input.as_bytes();
+                let fragments = (0..=bytes.len())
+                    .map(|split| vec![&bytes[..split], &bytes[split..]])
+                    .chain(std::iter::once(bytes.chunks(1).collect()));
+                for chunks in fragments {
+                    let mut actual = Terminal::new(2, 8, 10);
+                    let events: Vec<_> = chunks
+                        .into_iter()
+                        .flat_map(|chunk| actual.feed(chunk))
+                        .filter(semantic_event)
+                        .collect();
+                    assert_eq!(actual.grid, expected.grid);
+                    assert_eq!(actual.grid_wrapped, expected.grid_wrapped);
+                    assert_eq!(actual.history, expected.history);
+                    assert_eq!(actual.history_wrapped, expected.history_wrapped);
+                    assert_eq!(actual.cursor(), expected.cursor());
+                    assert_eq!(actual.template, expected.template);
+                    assert_eq!(actual.modes, expected.modes);
+                    assert_eq!(events, expected_events);
+                    assert!(actual.sync_flush_deadline().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stalled_synchronized_update_is_flushed_after_the_parser_timeout() {
         let mut terminal = Terminal::new(2, 8, 0);
         terminal.feed(b"\x1b[?2026hburied");
 
-        // vte buffers everything after BSU, so nothing has reached the grid yet.
+        // vvte buffers everything after BSU, so nothing has reached the grid yet.
         assert_eq!(terminal.extract_rows(0, 1), "");
         assert!(
             terminal.sync_flush_deadline().is_some(),
@@ -3047,7 +3101,7 @@ mod tests {
         );
 
         // The pane never sends ESU. Without an owner applying the deadline it would stay frozen
-        // until vte's 2 MiB buffer ceiling forced the issue.
+        // until vvte's 2 MiB buffer ceiling forced the issue.
         terminal.flush_synchronized_update();
         assert_eq!(terminal.extract_rows(0, 1), "buried");
         assert!(terminal.sync_flush_deadline().is_none());

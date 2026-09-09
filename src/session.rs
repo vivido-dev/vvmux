@@ -2698,7 +2698,7 @@ impl SessionActor {
 
     /// Apply synchronized updates whose deadline has passed.
     ///
-    /// vte buffers everything between BSU and ESU but never enforces the deadline it arms, so a
+    /// vvte buffers everything between BSU and ESU but never enforces the deadline it arms, so a
     /// pane that opens DECSET 2026 and then stalls would look frozen until it produced two more
     /// megabytes of output.
     fn flush_expired_sync_updates(&mut self) {
