@@ -66,9 +66,12 @@ unicode-width = "0.2"
 vivid_gateway = { version = "1.5", path = "../vivid_gateway" }
 vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
-vvte = { version = "0.15.0", path = "../vvte", default-features = false, features = ["std", "ansi"] }
+vvte = { version = "0.15", path = "../vvte", default-features = false, features = [
+  "std",
+  "ansi",
+] }
 zeroize = { version = "1.9", features = ["serde"] }
-vvmux-plugin-api = { version = "0.5", path = "vvmux-plugin-api" }
+vvmux-plugin-api = { version = "0.5.2", path = "vvmux-plugin-api" }
 # Track the current wasmtime line rather than an older maintenance one: the sandbox and WASI
 # host surfaces are where security fixes land, and falling behind is how this pin previously
 # ended up on a release with open advisories. `wasmtime` and `wasmtime-wasi` are one versioned

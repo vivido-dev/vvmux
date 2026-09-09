@@ -19,6 +19,19 @@ tic -x -o "$HOME/.terminfo" terminfo/vvmux.info
 install target/release/vvmux "$HOME/.local/bin/vvmux"
 ```
 
+For crates.io releases, publish an updated plugin API before publishing vvmux:
+
+```sh
+cargo package -p vvmux-plugin-api -p vvmux
+cargo publish -p vvmux-plugin-api
+cargo publish -p vvmux --dry-run
+cargo publish -p vvmux
+```
+
+Packaging resolves path dependencies from crates.io. When vvmux uses new plugin API fields,
+bump the API crate version and vvmux's minimum dependency version together; a local workspace
+build alone cannot verify that the published API provides them.
+
 The primary Windows distribution is the signed Vivido Suite EXE/MSI. It installs `vvmux.exe`
 beside Vivido, Vivi, and vvssh below `%LOCALAPPDATA%\Programs\Vivido`, adds that directory to the
 user PATH, refuses upgrade or uninstall while a live session exists, and preserves
