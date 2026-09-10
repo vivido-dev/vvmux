@@ -39,5 +39,6 @@ mod windows_automation;
 mod windows_conpty_daemon;
 mod windows_ctrl_c;
 mod windows_ctrl_c_direct;
+mod windows_ctrl_c_support;
 mod windows_reattach;
 mod windows_resize;
