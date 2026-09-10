@@ -2146,6 +2146,34 @@ impl VividMarkerScanner {
             };
             let start = cursor + relative_start;
             push_bytes(&mut chunks, &self.pending[cursor..start]);
+            if envelope.payload_skip != 0 && !self.pending[start..].starts_with(envelope.prefix) {
+                if envelope.prefix.starts_with(&self.pending[start..]) {
+                    cursor = start;
+                    break;
+                }
+                push_bytes(&mut chunks, &self.pending[start..start + 1]);
+                cursor = start + 1;
+                continue;
+            }
+            #[cfg(windows)]
+            if envelope.payload_skip == 0 {
+                use vivid_protocol::anchor::conpty::{self, Scan};
+                match conpty::scan(&self.pending[start..]) {
+                    Scan::Complete { consumed, body } => {
+                        chunks.push(VividChunk::Marker(body));
+                        cursor = start + consumed;
+                    }
+                    Scan::Incomplete => {
+                        cursor = start;
+                        break;
+                    }
+                    Scan::Invalid => {
+                        push_bytes(&mut chunks, &self.pending[start..start + 1]);
+                        cursor = start + 1;
+                    }
+                }
+                continue;
+            }
             let search_start = start + envelope.prefix.len();
             let Some(relative_end) = find_bytes(&self.pending[search_start..], envelope.terminator)
             else {
@@ -2201,7 +2229,15 @@ fn find_envelope(haystack: &[u8]) -> Option<(usize, MarkerEnvelope)> {
     marker_envelopes()
         .iter()
         .filter_map(|envelope| {
-            find_bytes(haystack, envelope.prefix).map(|position| (position, *envelope))
+            // ConPTY can wrap even inside the prefix at a pane's right edge.
+            let prefix = if envelope.payload_skip == 0 {
+                &envelope.prefix[..1]
+            } else {
+                // Claim a fragmented APC introducer before its inner V can be mistaken
+                // for the beginning of a printable ConPTY candidate.
+                &envelope.prefix[..2]
+            };
+            find_bytes(haystack, prefix).map(|position| (position, *envelope))
         })
         .min_by_key(|(position, _)| *position)
 }
@@ -2559,6 +2595,87 @@ mod tests {
             );
             assert!(terminal.cells().iter().flatten().all(|cell| cell.ch == ' '));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_bottom_row_wraps_do_not_move_the_anchor_or_scroll_text() {
+        // Captured from a real 40-column ConPTY at the bottom of its 24-row viewport.
+        let wrapped = b"VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000\r\n\x1b[23;40H0000000003;0000000000000007;AAAAAAAAAAAAA\r\n\x1b[23;40HAAAAAAAAAA;VIVID-END";
+        for split in 0..=wrapped.len() {
+            let mut terminal = Terminal::new(24, 40, 100);
+            terminal.feed(b"kept\x1b[24;1H");
+            let mut events = terminal.feed(&wrapped[..split]);
+            events.extend(terminal.feed(&wrapped[split..]));
+            assert_eq!(terminal.cursor(), (23, 0));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                TerminalEvent::VividMarker {
+                    row: 23,
+                    column: 0,
+                    ..
+                }
+            )));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, TerminalEvent::GridScroll { .. }))
+            );
+            assert_eq!(terminal.cells()[0][0].ch, 'k');
+            assert!(terminal.cells()[23].iter().all(|cell| cell.ch == ' '));
+            // Only the producer's subsequent row reservation scrolls the anchor.
+            let events = terminal.feed(b"\r\n\r\n");
+            let scroll: i32 = events
+                .iter()
+                .filter_map(|event| match event {
+                    TerminalEvent::GridScroll { lines, .. } => Some(*lines),
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(scroll, 2);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_wrapped_prefix_suffix_and_malformed_text_are_fragment_safe() {
+        let marker = b"VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA;VIVID-END";
+        for insertion in 1..marker.len() {
+            let mut input = marker[..insertion].to_vec();
+            input.extend_from_slice(b"\r\n\x1b[23;40H");
+            input.push(marker[insertion - 1]);
+            input.extend_from_slice(&marker[insertion..]);
+            let mut terminal = Terminal::new(24, 40, 0);
+            let events: Vec<_> = input
+                .iter()
+                .flat_map(|byte| terminal.feed(&[*byte]))
+                .collect();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, TerminalEvent::VividMarker { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(terminal.cursor(), (0, 0));
+        }
+        let malformed = b"VIVID;3;A;short\r\n\x1b[23;40H;VIVID-END\x1b[2Jordinary";
+        let mut scanner = VividMarkerScanner::default();
+        let mut output = Vec::new();
+        for byte in malformed {
+            for chunk in scanner.push(&[*byte]) {
+                match chunk {
+                    VividChunk::Bytes(bytes) => output.extend(bytes),
+                    VividChunk::Marker(_) => panic!("malformed marker was consumed"),
+                }
+            }
+        }
+        for chunk in scanner.finish() {
+            if let VividChunk::Bytes(bytes) = chunk {
+                output.extend(bytes);
+            }
+        }
+        assert_eq!(output, malformed);
     }
 
     #[test]
