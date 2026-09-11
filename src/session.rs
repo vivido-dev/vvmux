@@ -1868,26 +1868,42 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         let _ = detector_sender.send(ActorEvent::AgentProcesses(updates));
     })?;
     let session_instance = crate::plugin::random_id()?;
-    let (plugin_supervisor, plugin_watch_shutdown) = if config.plugins.enabled {
-        let supervisor = crate::plugin_supervisor::PluginSupervisor::start(
-            name.clone(),
-            session_instance.clone(),
-            sender.clone(),
-        )?;
-        let watcher_shutdown = Arc::new(AtomicBool::new(false));
-        if let Err(error) = crate::config_watch::spawn_plugin_registry(
-            crate::plugin::registry_path()?,
-            sender.clone(),
-            watcher_shutdown.clone(),
-            plugin_reload_pending.clone(),
-        ) {
-            supervisor.shutdown();
-            return Err(error);
-        }
-        (Some(supervisor), Some(watcher_shutdown))
-    } else {
-        (None, None)
-    };
+    let (plugin_supervisor, plugin_watch_shutdown, agent_catalog_generation, agent_catalog) =
+        if config.plugins.enabled {
+            let (supervisor, agent_catalog_generation, agent_catalog) =
+                crate::plugin_supervisor::PluginSupervisor::start(
+                    name.clone(),
+                    session_instance.clone(),
+                    sender.clone(),
+                )?;
+            let watcher_shutdown = Arc::new(AtomicBool::new(false));
+            if let Err(error) = crate::config_watch::spawn_plugin_registry(
+                crate::plugin::registry_path()?,
+                sender.clone(),
+                watcher_shutdown.clone(),
+                plugin_reload_pending.clone(),
+            ) {
+                supervisor.shutdown();
+                return Err(error);
+            }
+            // The scan behind `agent_catalog` already ran before this session signaled ready, so
+            // the detector sees it from its first tick — a command that reports an agent must not
+            // race the async `AgentCatalogApplied` event to learn the kind it names is enabled.
+            agent_detector.replace_catalog(agent_catalog.clone());
+            (
+                Some(supervisor),
+                Some(watcher_shutdown),
+                agent_catalog_generation,
+                agent_catalog,
+            )
+        } else {
+            (
+                None,
+                None,
+                0,
+                Arc::new(crate::agent::AgentCatalog::default()),
+            )
+        };
     let mut actor = SessionActor {
         name,
         session_instance,
@@ -1948,8 +1964,8 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         close_pane_confirmation: None,
         save_layout_prompt: None,
         status_notice: None,
-        agent_catalog: Arc::new(crate::agent::AgentCatalog::default()),
-        agent_catalog_generation: 0,
+        agent_catalog,
+        agent_catalog_generation,
         plugin_registration_generation: 0,
         plugin_keybindings: Vec::new(),
         plugin_link_handlers: Vec::new(),
@@ -13143,12 +13159,13 @@ impl SessionActor {
         if self.plugin_supervisor.is_some() {
             return Ok(());
         }
-        let supervisor = crate::plugin_supervisor::PluginSupervisor::start(
-            self.name.clone(),
-            self.session_instance.clone(),
-            self.sender.clone(),
-        )
-        .map_err(|error| format!("could not start plugin supervisor: {error}"))?;
+        let (supervisor, agent_catalog_generation, agent_catalog) =
+            crate::plugin_supervisor::PluginSupervisor::start(
+                self.name.clone(),
+                self.session_instance.clone(),
+                self.sender.clone(),
+            )
+            .map_err(|error| format!("could not start plugin supervisor: {error}"))?;
         let watcher_shutdown = Arc::new(AtomicBool::new(false));
         if let Err(error) = crate::plugin::registry_path().and_then(|path| {
             crate::config_watch::spawn_plugin_registry(
@@ -13164,6 +13181,18 @@ impl SessionActor {
         }
         self.plugin_supervisor = Some(supervisor);
         self.plugin_watch_shutdown = Some(watcher_shutdown);
+        // Same reasoning as the initial startup scan: apply it now rather than waiting for the
+        // async `AgentCatalogApplied` event, so a command issued right after this reload sees the
+        // agents this scan found.
+        self.agent_catalog_generation = agent_catalog_generation;
+        self.agent_catalog = agent_catalog;
+        self.agent_detector
+            .replace_catalog(self.agent_catalog.clone());
+        for pane in self.panes.values_mut() {
+            if pane.agent.reconcile_catalog(&self.agent_catalog) {
+                pane.terminal.clear_agent_osc();
+            }
+        }
         Ok(())
     }
 

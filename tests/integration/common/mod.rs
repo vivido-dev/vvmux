@@ -601,7 +601,16 @@ async fn leg_upgrade(
 /// `XDG_STATE_HOME` is pinned for a second reason: without it, persisted session state falls back to
 /// `$HOME/.local/state`, and an integration test would write snapshots into the developer's real
 /// state directory.
+///
+/// A fresh `HOME` is also a fresh Ubuntu MOTD state: `/etc/profile.d/update-motd.sh` — sourced by
+/// the same login shell for the same reason as `~/.profile` — treats an absent `$HOME/.motd_shown`
+/// as "never shown" and runs every script under `/etc/update-motd.d` before the shell reaches its
+/// prompt. On a host with `landscape-common` installed that costs several hundred milliseconds a
+/// pane, long enough to race an immediate shell-availability check. `.hushlogin` is the same host
+/// behavior every real login already has the option to suppress, so creating it here keeps a pane's
+/// prompt timing independent of what happens to be installed on the machine running the test.
 pub fn vvmux_command(runtime: &std::path::Path) -> std::process::Command {
+    let _ = std::fs::File::create(runtime.join(".hushlogin"));
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vvmux"));
     command.env("XDG_RUNTIME_DIR", runtime);
     command.env("XDG_CONFIG_HOME", runtime);

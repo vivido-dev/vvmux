@@ -392,6 +392,7 @@ struct ManagerInputs {
     broker: HostBroker,
     reload_requested: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    initial_registry: AppliedRegistry,
 }
 
 struct AppliedRegistry {
@@ -400,6 +401,32 @@ struct AppliedRegistry {
     catalog: BTreeMap<String, Vec<Value>>,
     failures: BTreeMap<String, String>,
     agent_catalog: Arc<crate::agent::AgentCatalog>,
+}
+
+/// Scan the plugin registry once, folding a load failure into an empty catalog rather than
+/// propagating it: a session that cannot read its plugin directory still starts, just with nothing
+/// enabled.
+fn scan_registry() -> AppliedRegistry {
+    match crate::plugin::load_registry_candidate() {
+        Ok(candidate) => AppliedRegistry {
+            generation: candidate.generation,
+            plugins: candidate.plugins,
+            catalog: candidate.catalog,
+            failures: candidate.failed,
+            agent_catalog: candidate.agent_catalog,
+        },
+        Err(error) => {
+            let mut failures = BTreeMap::new();
+            failures.insert("registry".into(), error.to_string());
+            AppliedRegistry {
+                generation: 0,
+                plugins: BTreeMap::new(),
+                catalog: BTreeMap::new(),
+                failures,
+                agent_catalog: Arc::new(crate::agent::AgentCatalog::default()),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -649,11 +676,22 @@ enum WorkerMessage {
 }
 
 impl PluginSupervisor {
+    /// Start the plugin supervisor and report the agent catalog its startup scan found.
+    ///
+    /// The scan runs here, on the caller's thread, rather than after the manager thread spawns:
+    /// the caller is a session that has not signaled ready yet, and a client whose first command
+    /// arrives the instant it does must see the same enabled agents this scan found — not an empty
+    /// catalog left over until an `AgentCatalogApplied` event works its way through the manager
+    /// thread and the actor's queue. The manager thread gets the already-computed registry instead
+    /// of scanning it again, so the two never see different filesystem state.
     pub(crate) fn start(
         session_name: String,
         session_instance: String,
         actor: mpsc::SyncSender<ActorEvent>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<(Self, u64, Arc<crate::agent::AgentCatalog>)> {
+        let initial_registry = scan_registry();
+        let agent_catalog_generation = initial_registry.generation;
+        let agent_catalog = initial_registry.agent_catalog.clone();
         let (sender, receiver) = mpsc::sync_channel(COMMAND_QUEUE);
         let broker = HostBroker {
             actor: actor.clone(),
@@ -681,17 +719,22 @@ impl PluginSupervisor {
                     broker,
                     reload_requested: manager_reload_requested,
                     shutdown_requested: manager_shutdown_requested,
+                    initial_registry,
                 });
             })?;
-        Ok(Self {
-            sender,
-            next_job_id: Arc::new(AtomicU64::new(1)),
-            reload_requested,
-            shutdown_requested,
-            session_name,
-            session_instance,
-            event_gap,
-        })
+        Ok((
+            Self {
+                sender,
+                next_job_id: Arc::new(AtomicU64::new(1)),
+                reload_requested,
+                shutdown_requested,
+                session_name,
+                session_instance,
+                event_gap,
+            },
+            agent_catalog_generation,
+            agent_catalog,
+        ))
     }
 
     pub(crate) fn invoke_automation(
@@ -900,28 +943,12 @@ fn run_manager(inputs: ManagerInputs) {
         broker,
         reload_requested,
         shutdown_requested,
+        initial_registry,
     } = inputs;
-    let initial = crate::plugin::load_registry_candidate();
-    let mut registry = match initial {
-        Ok(candidate) => AppliedRegistry {
-            generation: candidate.generation,
-            plugins: candidate.plugins,
-            catalog: candidate.catalog,
-            failures: candidate.failed,
-            agent_catalog: candidate.agent_catalog,
-        },
-        Err(error) => {
-            let mut failures = BTreeMap::new();
-            failures.insert("registry".into(), error.to_string());
-            AppliedRegistry {
-                generation: 0,
-                plugins: BTreeMap::new(),
-                catalog: BTreeMap::new(),
-                failures,
-                agent_catalog: Arc::new(crate::agent::AgentCatalog::default()),
-            }
-        }
-    };
+    // Already scanned by `PluginSupervisor::start`, on the caller's thread, before the session
+    // signaled ready — this event just brings the actor's own state in line with what the caller
+    // already applied synchronously.
+    let mut registry = initial_registry;
     let _ = actor.send(ActorEvent::AgentCatalogApplied {
         generation: registry.generation,
         catalog: registry.agent_catalog.clone(),
