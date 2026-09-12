@@ -1,6 +1,6 @@
 [package]
 name = "vvmux"
-version = "0.4.4"
+version = "0.4.5"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.95"
@@ -71,7 +71,7 @@ vvte = { version = "0.15", path = "../vvte", default-features = false, features 
   "ansi",
 ] }
 zeroize = { version = "1.9", features = ["serde"] }
-vvmux-plugin-api = { version = "0.5.2", path = "vvmux-plugin-api" }
+vvmux-plugin-api = { version = "0.5.3", path = "vvmux-plugin-api" }
 # Track the current wasmtime line rather than an older maintenance one: the sandbox and WASI
 # host surfaces are where security fixes land, and falling behind is how this pin previously
 # ended up on a release with open advisories. `wasmtime` and `wasmtime-wasi` are one versioned
