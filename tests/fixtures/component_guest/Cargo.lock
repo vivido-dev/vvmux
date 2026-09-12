@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "vvmux-plugin-api"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "jsonschema",
  "regex",
