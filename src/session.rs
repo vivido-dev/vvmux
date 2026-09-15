@@ -1667,6 +1667,8 @@ struct SessionActor {
     search_pattern: Option<(String, SearchPattern)>,
     frame_id: u64,
     last_screen: Option<ScreenBuffer>,
+    /// Click targets from the last rendered status row, keyed by stable tab identity.
+    status_tab_targets: Vec<(std::ops::Range<usize>, u64)>,
     #[cfg(windows)]
     outer_bracketed_paste: Option<bool>,
     force_full: bool,
@@ -1929,6 +1931,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         search_pattern: None,
         frame_id: 0,
         last_screen: None,
+        status_tab_targets: Vec::new(),
         #[cfg(windows)]
         outer_bracketed_paste: None,
         force_full: true,
@@ -9683,6 +9686,25 @@ impl SessionActor {
         if self.tab_rename.is_some() || self.close_pane_confirmation.is_some() {
             return;
         }
+        if self.direct_pane().is_none()
+            && self.config.general.status_visible
+            && mouse.kind == MouseKind::Press
+            && mouse.button == 0
+            && self.last_screen.as_ref().is_some_and(|screen| {
+                screen.rows == display.rows
+                    && screen.columns == display.columns
+                    && mouse.y == screen.rows.saturating_sub(1)
+            })
+            && let Some(index) = self.status_tab_targets.iter().find_map(|(range, id)| {
+                range
+                    .contains(&usize::from(mouse.x))
+                    .then(|| self.tabs.iter().position(|tab| tab.id == *id))
+                    .flatten()
+            })
+        {
+            self.action(Action::SelectTab(index));
+            return;
+        }
         if self.handle_plugin_link_mouse(mouse) {
             return;
         }
@@ -13659,6 +13681,7 @@ impl SessionActor {
         } else if session_view && self.tab_navigator.is_some() {
             self.draw_tab_navigator(&mut screen, theme);
         }
+        self.status_tab_targets.clear();
         if session_view && self.config.general.status_visible && screen.rows > 0 {
             let rename_prompt = self.tab_rename.as_ref().and_then(|rename| {
                 self.tabs
@@ -13710,12 +13733,22 @@ impl SessionActor {
                         .as_ref()
                         .map(|hovered| hyperlink_status_text(&hovered.link.uri, screen.columns))
                 })
-                .unwrap_or_else(|| tab_status_text(&self.tabs, self.active_tab, screen.columns));
+                .unwrap_or_else(|| {
+                    let (text, targets) =
+                        tab_status_layout(&self.tabs, self.active_tab, screen.columns);
+                    self.status_tab_targets = targets;
+                    text
+                });
             let status = if let Some((_, _, pane, last_packet)) = self.microphone_recipient
                 && self.bridge_instance_id.is_some()
                 && last_packet.elapsed() <= Duration::from_millis(200)
             {
-                format!("MIC pane {pane} | {status}")
+                let prefix = format!("MIC pane {pane} | ");
+                for (range, _) in &mut self.status_tab_targets {
+                    range.start += prefix.len();
+                    range.end = (range.end + prefix.len()).min(usize::from(screen.columns));
+                }
+                format!("{prefix}{status}")
             } else {
                 status
             };
@@ -17106,10 +17139,19 @@ fn mouse_selection_runs(
     runs
 }
 
+#[cfg(test)]
 fn tab_status_text(tabs: &[Tab], active: usize, columns: u16) -> String {
+    tab_status_layout(tabs, active, columns).0
+}
+
+fn tab_status_layout(
+    tabs: &[Tab],
+    active: usize,
+    columns: u16,
+) -> (String, Vec<(std::ops::Range<usize>, u64)>) {
     let width = usize::from(columns);
     if width == 0 || tabs.is_empty() {
-        return String::new();
+        return (String::new(), Vec::new());
     }
     let active = active.min(tabs.len() - 1);
     let segments = tabs
@@ -17132,7 +17174,7 @@ fn tab_status_text(tabs: &[Tab], active: usize, columns: u16) -> String {
         .collect::<Vec<_>>();
     let all = render_tab_status_window(&segments, 0, segments.len());
     if all.chars().count() <= width {
-        return all;
+        return (all, tab_status_targets(tabs, &segments, 0, segments.len()));
     }
 
     let mut start = active;
@@ -17159,10 +17201,38 @@ fn tab_status_text(tabs: &[Tab], active: usize, columns: u16) -> String {
     }
     let visible = render_tab_status_window(&segments, start, end);
     if visible.chars().count() <= width {
-        visible
+        (visible, tab_status_targets(tabs, &segments, start, end))
     } else {
-        render_narrow_active_tab(&segments[active], start > 0, end < segments.len(), width)
+        let text =
+            render_narrow_active_tab(&segments[active], start > 0, end < segments.len(), width);
+        let prefix = if start > 0 { 3 } else { 1 };
+        let suffix = if end < segments.len() { 2 } else { 1 };
+        let end = text.chars().count().saturating_sub(suffix);
+        let targets = if prefix < end {
+            vec![(prefix..end, tabs[active].id)]
+        } else {
+            Vec::new()
+        };
+        (text, targets)
     }
+}
+
+// Status text is drawn one character per cell by ScreenBuffer::draw_text.
+fn tab_status_targets(
+    tabs: &[Tab],
+    segments: &[String],
+    start: usize,
+    end: usize,
+) -> Vec<(std::ops::Range<usize>, u64)> {
+    let mut column = if start > 0 { 3 } else { 1 };
+    (start..end)
+        .map(|index| {
+            let next = column + segments[index].chars().count();
+            let target = (column..next, tabs[index].id);
+            column = next + 1;
+            target
+        })
+        .collect()
 }
 
 fn render_tab_status_window(segments: &[String], start: usize, end: usize) -> String {
@@ -18871,6 +18941,31 @@ mod tests {
         assert!(status.contains('>'), "{status:?}");
         assert!(status.contains('[') && status.contains(']'), "{status:?}");
         assert!(status.chars().count() <= 14);
+    }
+
+    #[test]
+    fn status_click_targets_follow_visible_labels_and_stable_tab_ids() {
+        let tabs = [
+            status_tab(41, Some("dev work")),
+            status_tab(99, None),
+            status_tab(7, Some("logs")),
+        ];
+        let (text, targets) = tab_status_layout(&tabs, 1, 80);
+        assert_eq!(text, " 1:dev work [2] 3:logs ");
+        assert_eq!(targets, vec![(1..11, 41), (12..15, 99), (16..22, 7)]);
+        for width in 0..30 {
+            let (text, targets) = tab_status_layout(&tabs, 1, width);
+            let chars = text.chars().collect::<Vec<_>>();
+            for (range, id) in targets {
+                assert!(range.end <= usize::from(width));
+                assert!(range.end <= chars.len());
+                assert!(!chars[range.clone()].contains(&'<'));
+                assert!(!chars[range.clone()].contains(&'>'));
+                assert!(tabs.iter().any(|tab| tab.id == id));
+            }
+        }
+        let (_, targets) = tab_status_layout(&tabs, 1, 9);
+        assert_eq!(targets, vec![(3..6, 99)]);
     }
 
     #[test]

@@ -1228,7 +1228,8 @@ The status bar paints its background across the full width. Set `status_fill = f
 earlier behavior, where the background stopped where the text did.
 
 The ordinary status text is the complete numbered tab list: unnamed tabs appear as `1`, named tabs
-as `1:name`, and the active tab as `[1:name]`. On a narrow display the list windows around the active
+as `1:name`, and the active tab as `[1:name]`. Left-click a tab number or its label to switch
+to that tab. On a narrow display the list windows around the active
 tab and uses `<` / `>` overflow markers. Search, rename, and close-confirmation prompts temporarily
 replace that list.
 
