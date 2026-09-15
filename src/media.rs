@@ -28,7 +28,10 @@ pub struct VirtualVivid(vivid_gateway::VirtualVivid);
 impl VirtualVivid {
     #[allow(dead_code)]
     pub fn start(endpoint: VirtualPresenterEndpoint, config: MediaConfig) -> io::Result<Self> {
-        Self::start_with_events(endpoint, config, None)
+        // Terminate media at the runtime: no caller hosts a media-event consumer, so successful
+        // validation must return the ingress flow directly rather than park a delivery.
+        let listener = VirtualPresenterListener::bind(endpoint)?;
+        vivid_gateway::VirtualVivid::start_eventless(listener, config).map(Self)
     }
 
     pub fn start_with_events(
