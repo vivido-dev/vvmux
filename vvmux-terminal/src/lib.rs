@@ -720,6 +720,12 @@ impl Terminal {
         let status = match request {
             b"m" => sgr_status(&self.template),
             b"r" => format!("{};{}r", self.scroll_top + 1, self.scroll_bottom),
+            // DECSCUSR's omitted/zero value selects the terminal's default cursor style. Vvmux
+            // currently renders that default rather than retaining application-selected cursor
+            // shapes, so report the default honestly. Returning the generic negative DECRQSS
+            // reply here makes macOS Vim treat the response bytes as editing input during its
+            // startup probe, inserting a stray `}` into a new buffer.
+            b" q" => "0 q".to_owned(),
             b"\"p" => "62;1\"p".to_owned(),
             // Select Character Protection Attribute is not otherwise tracked, so characters are
             // always reported as erasable (the DEC default).
@@ -3086,7 +3092,7 @@ mod tests {
     }
 
     #[test]
-    fn decrqss_reports_sgr_scroll_region_and_refuses_unknown_requests() {
+    fn decrqss_reports_sgr_scroll_region_cursor_style_and_refuses_unknown_requests() {
         let mut terminal = Terminal::new(10, 20, 0);
         terminal.feed(b"\x1b[1;31m\x1b[3;7r");
         let replies = |events: Vec<TerminalEvent>| {
@@ -3106,6 +3112,10 @@ mod tests {
         assert_eq!(
             replies(terminal.feed(b"\x1bP$qr\x1b\\")),
             vec![b"\x1bP1$r3;7r\x1b\\".to_vec()]
+        );
+        assert_eq!(
+            replies(terminal.feed(b"\x1bP$q q\x1b\\")),
+            vec![b"\x1bP1$r0 q\x1b\\".to_vec()]
         );
         assert_eq!(
             replies(terminal.feed(b"\x1bP$qz\x1b\\")),
