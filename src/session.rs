@@ -51,6 +51,12 @@ use crate::session_state::{
 };
 
 const EVENT_QUEUE: usize = 1024;
+/// Maximum adjacent output bytes one actor turn parses for a pane.
+///
+/// PTYs may return a large write as many tiny reads. Combining only consecutive records for the
+/// same pane avoids repeating whole-grid and waiter bookkeeping while keeping a hard fairness
+/// boundary and preserving every intervening actor event.
+const PTY_OUTPUT_BATCH_BYTES: usize = 64 * 1024;
 /// Slots on the dedicated media-event receiver.
 ///
 /// Total queued media bytes are separately bounded by `media.ipc_queue_bytes`, so this only needs
@@ -2044,6 +2050,7 @@ impl SessionActor {
         media_receiver: mpsc::Receiver<crate::media::MediaEvent>,
     ) {
         let mut render_at = Instant::now();
+        let mut deferred_event = None;
         loop {
             // Re-read every iteration: a config reload must be able to retune the render cadence
             // without restarting the session.
@@ -2065,9 +2072,15 @@ impl SessionActor {
             if self.drain_media(&media_receiver) {
                 timeout = Duration::ZERO;
             }
-            match receiver.recv_timeout(timeout) {
+            let received = deferred_event
+                .take()
+                .map_or_else(|| receiver.recv_timeout(timeout), Ok);
+            match received {
                 Ok(event) => {
-                    self.actor_wakeups = self.actor_wakeups.saturating_add(1);
+                    let (event, deferred, consumed) =
+                        coalesce_ready_pty_output(event, &receiver, PTY_OUTPUT_BATCH_BYTES);
+                    deferred_event = deferred;
+                    self.actor_wakeups = self.actor_wakeups.saturating_add(consumed as u64);
                     if self.handle_event(event).is_err() {
                         self.force_full = true;
                     }
@@ -17189,6 +17202,41 @@ fn request_media_service(wakeup: &mpsc::SyncSender<ActorEvent>, pending: &Atomic
     }
 }
 
+/// Merge immediately ready output records only while they remain adjacent in actor-queue order.
+///
+/// The first different event is returned to the run loop rather than re-enqueued, so client input,
+/// detach, PTY exit, and other panes retain their exact position relative to the output bytes.
+fn coalesce_ready_pty_output(
+    event: ActorEvent,
+    receiver: &mpsc::Receiver<ActorEvent>,
+    maximum_bytes: usize,
+) -> (ActorEvent, Option<ActorEvent>, usize) {
+    let ActorEvent::PtyOutput(pane_id, mut bytes) = event else {
+        return (event, None, 1);
+    };
+    let mut consumed = 1;
+    let mut deferred = None;
+    while bytes.len() < maximum_bytes {
+        let Ok(next) = receiver.try_recv() else {
+            break;
+        };
+        match next {
+            ActorEvent::PtyOutput(next_pane, next_bytes)
+                if next_pane == pane_id
+                    && next_bytes.len() <= maximum_bytes.saturating_sub(bytes.len()) =>
+            {
+                bytes.extend_from_slice(&next_bytes);
+                consumed += 1;
+            }
+            other => {
+                deferred = Some(other);
+                break;
+            }
+        }
+    }
+    (ActorEvent::PtyOutput(pane_id, bytes), deferred, consumed)
+}
+
 /// Consume no more than `limit` ready items, returning whether the limit was reached.
 fn drain_ready_batch<T>(
     receiver: &mpsc::Receiver<T>,
@@ -18716,6 +18764,34 @@ mod tests {
         pending.store(false, Ordering::Release);
         request_media_service(&sender, &pending);
         assert!(matches!(receiver.try_recv(), Ok(ActorEvent::MediaReady)));
+    }
+
+    #[test]
+    fn pty_output_batching_preserves_intervening_actor_event_order() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        sender
+            .send(ActorEvent::PtyOutput(7, b"second".to_vec()))
+            .unwrap();
+        sender.send(ActorEvent::MediaReady).unwrap();
+        sender
+            .send(ActorEvent::PtyOutput(7, b"third".to_vec()))
+            .unwrap();
+
+        let (event, deferred, consumed) = coalesce_ready_pty_output(
+            ActorEvent::PtyOutput(7, b"first".to_vec()),
+            &receiver,
+            PTY_OUTPUT_BATCH_BYTES,
+        );
+        assert_eq!(consumed, 2);
+        assert!(matches!(
+            event,
+            ActorEvent::PtyOutput(7, bytes) if bytes == b"firstsecond"
+        ));
+        assert!(matches!(deferred, Some(ActorEvent::MediaReady)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ActorEvent::PtyOutput(7, bytes)) if bytes == b"third"
+        ));
     }
 
     #[test]
