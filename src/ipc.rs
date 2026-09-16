@@ -39,7 +39,7 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
 /// A wire change does not raise this constant: the maintainer bumps it manually, so leave it alone
 /// and keep the mixed-version rejection intact.
-pub const VERSION: u16 = 20;
+pub const VERSION: u16 = 21;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -1314,6 +1314,17 @@ pub struct MouseEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OverlayKeyInput {
+    pub start: usize,
+    pub end: usize,
+    pub physical: u32,
+    pub down: bool,
+    pub repeat: bool,
+    pub modifiers: u32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClientMessage {
     Microphone {
         bridge_instance_id: u64,
@@ -1332,6 +1343,27 @@ pub enum ClientMessage {
         outer: Option<OuterIdentity>,
     },
     Input(Vec<u8>),
+    KeyInput {
+        bytes: Vec<u8>,
+        keys: Vec<OverlayKeyInput>,
+    },
+    OverlayHostReply {
+        id: u64,
+        response: Result<Vec<u8>, String>,
+    },
+    OverlayInput {
+        bridge_instance_id: u64,
+        surface: BridgeSurfaceKey,
+        body: Vec<u8>,
+    },
+    OverlayEnvironment {
+        bridge_instance_id: u64,
+        body: Vec<u8>,
+    },
+    OverlayHostProfiles {
+        bridge_instance_id: u64,
+        profiles: Vec<String>,
+    },
     Mouse(MouseEvent),
     /// The client's host terminal gained or lost focus.
     ///
@@ -1435,6 +1467,7 @@ pub enum AttachmentTarget {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServerMessage {
+    OverlayHostRequest(vivid_sdk::presenter::OverlayHostRequest),
     Attached {
         session: String,
         text_only: bool,

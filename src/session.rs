@@ -2152,6 +2152,26 @@ impl SessionActor {
     fn sync_pending_media_projection(&mut self) {
         if self.media_projection_pending.swap(false, Ordering::AcqRel) {
             self.sync_media(false);
+            for request in self.vivid.take_overlay_host_requests() {
+                let id = request.id;
+                let sent = self
+                    .attached
+                    .as_ref()
+                    .filter(|client| client.vivid)
+                    .is_some_and(|client| {
+                        crate::ipc::send(
+                            &client.writer,
+                            &ServerMessage::OverlayHostRequest(request),
+                        )
+                        .is_ok()
+                    });
+                if !sent {
+                    self.vivid.complete_overlay_host_request(
+                        id,
+                        Err("no outer overlay host is attached".into()),
+                    );
+                }
+            }
         }
     }
 
@@ -2913,6 +2933,57 @@ impl SessionActor {
                     self.input(bytes);
                 }
             }
+            ClientMessage::KeyInput { bytes, keys } => {
+                if self.client_is(id) {
+                    let mut offset = 0;
+                    for key in &keys {
+                        if key.start < offset
+                            || key.end <= key.start
+                            || key.end > bytes.len()
+                            || key.text.len() > 4096
+                            || (!key.down && (!key.text.is_empty() || key.repeat))
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid key input range",
+                            ));
+                        }
+                        offset = key.end;
+                    }
+                    offset = 0;
+                    for key in keys {
+                        if key.start > offset {
+                            self.input(bytes[offset..key.start].to_vec());
+                        }
+                        let consumed = self.attached_focus_pane().is_some_and(|pane| {
+                            if !self.vivid.overlay_has_focus(pane) {
+                                return false;
+                            }
+                            let mut consumed = false;
+                            if key.physical != 0 {
+                                consumed = self.vivid.overlay_key_event(
+                                    pane,
+                                    key.physical,
+                                    key.down,
+                                    key.repeat,
+                                    key.modifiers,
+                                );
+                            }
+                            if !key.text.is_empty() {
+                                consumed |= self.vivid.overlay_text(pane, &key.text);
+                            }
+                            consumed
+                        });
+                        if !consumed {
+                            self.input(bytes[key.start..key.end].to_vec());
+                        }
+                        offset = key.end;
+                    }
+                    if offset < bytes.len() {
+                        self.input(bytes[offset..].to_vec());
+                    }
+                }
+            }
             ClientMessage::Mouse(mouse) => {
                 if self.client_is(id) {
                     self.mouse(mouse, false);
@@ -3269,6 +3340,57 @@ impl SessionActor {
                             event.kind,
                         );
                     }
+                }
+            }
+            ClientMessage::OverlayInput {
+                bridge_instance_id,
+                surface,
+                body,
+            } => {
+                if self.client_is(id)
+                    && self.bridge_instance_id == Some(bridge_instance_id)
+                    && self.vivid.relay_overlay_input(surface, &body)?
+                    && let Some(pane) = self.vivid.pane_for_overlay_surface(surface)
+                    && self.vivid.overlay_has_focus(pane)
+                    && self.attached_focus_pane() != Some(pane)
+                    && let Some(tab) = self.active_tab_mut()
+                    && tab.contains(pane)
+                {
+                    tab.set_focus(pane);
+                    self.projection_changed();
+                }
+            }
+            ClientMessage::OverlayHostProfiles {
+                bridge_instance_id,
+                profiles,
+            } => {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    self.vivid.set_overlay_host_profiles(&profiles);
+                }
+            }
+            ClientMessage::OverlayEnvironment {
+                bridge_instance_id,
+                body,
+            } => {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    let envelope = vivid_protocol::messages::decode_control(&body)?;
+                    let environment = vivid_protocol::overlay::wire::EnvironmentChanged::decode(
+                        0,
+                        &vivid_protocol::cbor::Value::Map(envelope.payload),
+                    )?;
+                    for pane in self.panes.keys() {
+                        self.vivid
+                            .set_overlay_environment(*pane, environment.environment.clone());
+                    }
+                }
+            }
+            ClientMessage::OverlayHostReply {
+                id: request_id,
+                response,
+            } => {
+                if self.client_is(id) {
+                    self.vivid
+                        .complete_overlay_host_request(request_id, response);
                 }
             }
             ClientMessage::BridgePosition {
@@ -13986,6 +14108,7 @@ impl SessionActor {
             .surfaces
             .iter()
             .map(|surface| BridgeSurface {
+                overlay_layouts: surface.overlay_layouts.clone(),
                 key: BridgeSurfaceKey {
                     producer: surface.producer,
                     context: surface.context,
@@ -14249,6 +14372,10 @@ impl SessionActor {
                         &body,
                     )
                 }),
+                crate::media::SourceDescriptor::VectorScene(_) => source
+                    .retained_vector
+                    .iter()
+                    .all(|(kind, body)| send_media_body(&writer, 0, source_key, *kind, body)),
                 _ => continue,
             };
             if !sent {
@@ -14525,13 +14652,20 @@ impl SessionActor {
     /// terminal. Without this hop, a nested application can request enhanced key events and pixel
     /// coordinates while the physical presenter continues sending legacy keys and cell positions.
     fn sync_client_input_mode(&mut self) {
-        let (keyboard_flags, sgr_pixels) = self
+        let (mut keyboard_flags, mut sgr_pixels) = self
             .attached_focus_pane()
             .and_then(|pane_id| self.panes.get(&pane_id))
             .map_or((0, false), |pane| {
                 let modes = pane.terminal.modes();
                 (modes.keyboard_flags, modes.sgr_pixels)
             });
+        if self
+            .attached_focus_pane()
+            .is_some_and(|pane| self.vivid.overlay_has_focus(pane))
+        {
+            keyboard_flags |= 1 | 2 | 8 | 16;
+            sgr_pixels = true;
+        }
         let input_mode = (keyboard_flags, sgr_pixels);
         if self.attached.is_none() || self.reported_input_mode == Some(input_mode) {
             return;
@@ -16813,6 +16947,17 @@ fn project_overlay_window(
         .saturating_mul(cell_height)
         .saturating_sub(window.height);
     BridgeOverlayWindow {
+        parent: window.parent,
+        min_width: window.min_width,
+        min_height: window.min_height,
+        offset_x: i64::from(content.x)
+            .saturating_mul(cell_width)
+            .saturating_add(window.x.clamp(0, slack_x.max(0)))
+            .saturating_sub(window.x),
+        offset_y: i64::from(content.y)
+            .saturating_mul(cell_height)
+            .saturating_add(window.y.clamp(0, slack_y.max(0)))
+            .saturating_sub(window.y),
         generation: window.generation,
         revision: window.revision,
         x: i64::from(content.x)
@@ -17820,6 +17965,9 @@ mod tests {
         height: i64,
     ) -> crate::media::SnapshotOverlayWindow {
         crate::media::SnapshotOverlayWindow {
+            parent: None,
+            min_width: 1,
+            min_height: 1,
             generation: 1,
             revision: 1,
             x,

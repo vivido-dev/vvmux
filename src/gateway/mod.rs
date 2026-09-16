@@ -1178,6 +1178,11 @@ async fn handle_session_message(
                 videos_needing_keyframes,
             });
         }
+        ServerMessage::OverlayHostRequest(request) => {
+            if let Some(bridge) = bridge.as_mut() {
+                bridge.queue_overlay_request(request);
+            }
+        }
         ServerMessage::MediaRecord {
             delivery_id,
             source,
@@ -1267,7 +1272,7 @@ fn dispatch_input(
 fn dispatch_parsed(adapter: &SessionAdapter, parsed: Vec<ParsedInput>) -> io::Result<()> {
     for command in parsed {
         let message = match command {
-            ParsedInput::Input(bytes) => ClientMessage::Input(bytes),
+            ParsedInput::Input(bytes) => crate::client_input::key_input_message(bytes),
             ParsedInput::Action(action) => ClientMessage::Action(action),
             ParsedInput::Mouse(mouse, _) => ClientMessage::Mouse(mouse),
             ParsedInput::Focus(focused) => ClientMessage::Focus(focused),

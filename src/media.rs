@@ -43,12 +43,13 @@ impl VirtualVivid {
         // Overlay hosting is advertised for every pane rather than gated per pane: one presenter
         // serves them all, and negotiation is producer-driven, so a plain shell that never asks
         // for the overlay profiles is unaffected by their being on offer.
-        vivid_gateway::VirtualVivid::start_configured(
+        let presenter = vivid_gateway::VirtualVivid::start_configured(
             listener,
             vivid_gateway::PresenterConfig::terminal_with_overlay(config),
             events,
-        )
-        .map(Self)
+        )?;
+        presenter.enable_overlay_host_relay();
+        Ok(Self(presenter))
     }
 }
 

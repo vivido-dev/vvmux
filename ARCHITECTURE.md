@@ -198,7 +198,7 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 20 is a hard cutover. In addition to complete track identity and binary media,
+Private VVMX version 21 is a hard cutover. In addition to complete track identity and binary media,
 it retains deterministic outer/rendered completion waits, stable tab-ID selection, correlated
 diagnostics, PTY-write reports, and process-anchored recovery traces. Its binary media header carries complete track identity
 and bounded binary render/media records,
@@ -228,8 +228,18 @@ checked pixel dimensions; Windows accepts the same internal call and continues u
 This is the sole scoped PTY media exception in vvmux and does not change the Vivid wire stack.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 20 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 21 → outer vvmux producer → Vivido
 ```
+
+
+Version 21 also carries bounded overlay host requests/replies and native input events. The inner
+presenter queues vector frames/assets as acknowledged media deliveries; retained rehydration
+uploads assets before the latest frame and reshapes retained text on the new physical host.
+Physical host services run on bounded request workers, with independent inner/outer layout and
+scene identities. Clipboard, accessibility and typography are only offered inward when accepted
+by that host. Pointer capture uses the interactive lane; its native pointer, key, text/IME,
+geometry and focus events return to the owning pane. Kitty key messages retain the original bytes
+alongside decoded physical keys so declined overlay input reaches the PTY unchanged.
 
 ## Plugin boundary
 

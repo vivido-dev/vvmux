@@ -20,6 +20,7 @@ mod gateway_ws;
 mod image_probe;
 mod mouse_selection;
 mod osc52_clipboard;
+mod overlay_python;
 mod plugin_component_conformance;
 mod plugin_events;
 mod plugin_host_calls;
