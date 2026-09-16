@@ -9,8 +9,8 @@ use crate::platform::{VirtualPresenterEndpoint, VirtualPresenterListener};
 pub use vivid_gateway::{
     AudioSourceConfig, ClipRect, KeyframeRequestOutcome, MediaEvent, NodeConfig,
     OuterMediaProjection, PlayRequest, ProducerId, ProjectionSnapshot, RetainedRaster, SceneNode,
-    SceneNodeConfig, SemanticDescriptor, SnapshotSource, SnapshotSurface, SourceDescriptor,
-    SourceKey,
+    SceneNodeConfig, SemanticDescriptor, SnapshotOverlayWindow, SnapshotSource, SnapshotSurface,
+    SourceDescriptor, SourceKey,
 };
 
 impl vivid_gateway::PresenterListener for VirtualPresenterListener {
@@ -40,7 +40,15 @@ impl VirtualVivid {
         events: Option<mpsc::SyncSender<MediaEvent>>,
     ) -> io::Result<Self> {
         let listener = VirtualPresenterListener::bind(endpoint)?;
-        vivid_gateway::VirtualVivid::start_with_events(listener, config, events).map(Self)
+        // Overlay hosting is advertised for every pane rather than gated per pane: one presenter
+        // serves them all, and negotiation is producer-driven, so a plain shell that never asks
+        // for the overlay profiles is unaffected by their being on offer.
+        vivid_gateway::VirtualVivid::start_configured(
+            listener,
+            vivid_gateway::PresenterConfig::terminal_with_overlay(config),
+            events,
+        )
+        .map(Self)
     }
 }
 

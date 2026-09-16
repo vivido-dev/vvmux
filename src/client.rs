@@ -2746,6 +2746,7 @@ mod tests {
                 context: key.context,
                 surface: key.surface,
             },
+            overlay_window: None,
             logical_width: 16,
             logical_height: 16,
             capture_policy: 0,

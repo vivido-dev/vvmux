@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[allow(unused_imports)]
 pub use vivid_gateway::{
-    BridgeClipRect, BridgeKeyframeRequest, BridgeNode, BridgePlayRequest, BridgeSource,
-    BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface, BridgeSurfaceKey,
-    DisplayMetrics, PaneMediaNodeStatus, PaneMediaStatus, PaneMediaSurfaceDescriptor,
-    PaneMediaSurfaceStatus, PaneMediaTrackStatus,
+    BridgeClipRect, BridgeKeyframeRequest, BridgeNode, BridgeOverlayWindow, BridgePlayRequest,
+    BridgeSource, BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface,
+    BridgeSurfaceKey, DisplayMetrics, PaneMediaNodeStatus, PaneMediaStatus,
+    PaneMediaSurfaceDescriptor, PaneMediaSurfaceStatus, PaneMediaTrackStatus,
 };
 
 use crate::metrics::{BlockTimer, IpcCounters};
