@@ -1,5 +1,20 @@
 # vvmux architecture
 
+## Held and synchronized timed playback
+
+`timed-media-sync-v1` is negotiated independently on terminating hops. Removing a timed surface
+from projection publishes an immediate control-plane hold. A bounded background worker pauses
+and queries the physical clock before retiring its tracks; replacement slot activation waits
+for that retirement. Abrupt loss retains the last physical observation as an estimate.
+Downstream holds are translated to the owning inner surface, with local and downstream hold
+reasons composed independently. VVMX version 22 carries hold feedback and PLAY correlation.
+
+Synchronized PLAY admits buffering without starting the clock. Bootstrap output readiness permits
+activation; target-picture readiness and audio prebuffer release physical playback together.
+Activated tracks use their bounded channel credit rather than a cumulative GOP packet ceiling.
+Neither withheld credit nor an elapsed media-write stopwatch proves session failure. vvssh remains
+an authenticated carrier with independent control, realtime, and bulk transport health.
+
 ## Microphone uplink
 
 `audio-input-v1` is separate from playback projection. Prepared pane-local `vvmic` helpers own

@@ -3415,6 +3415,25 @@ impl SessionActor {
                     self.vivid.apply_outer_position(source, position);
                 }
             }
+            ClientMessage::BridgeHold {
+                bridge_instance_id,
+                source,
+                hold,
+            } => {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    self.vivid.apply_downstream_hold(source, hold);
+                }
+            }
+            ClientMessage::BridgeIncompatiblePlayback {
+                bridge_instance_id,
+                source,
+                decoder_reset_serial,
+            } => {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    self.vivid
+                        .reject_incompatible_playback(source, decoder_reset_serial);
+                }
+            }
             ClientMessage::BridgePlaybackState {
                 bridge_instance_id,
                 decoder_reset_serial,
@@ -16731,6 +16750,7 @@ fn bridge_play_request(request: crate::media::PlayRequest) -> BridgePlayRequest 
         late_policy: request.late_policy,
         loop_count: request.loop_count,
         start_policy: request.start_policy,
+        hold_serial: request.hold_serial,
     }
 }
 

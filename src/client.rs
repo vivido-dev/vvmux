@@ -1445,6 +1445,20 @@ fn run_bridge_worker(
                 position,
             });
         }
+        for (source, hold) in bridge.take_playback_holds() {
+            let _ = client_writer.send(ClientMessage::BridgeHold {
+                bridge_instance_id,
+                source,
+                hold,
+            });
+        }
+        for (source, decoder_reset_serial) in bridge.take_source_errors() {
+            let _ = client_writer.send(ClientMessage::BridgeIncompatiblePlayback {
+                bridge_instance_id,
+                source,
+                decoder_reset_serial,
+            });
+        }
         let pending = snapshot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3054,6 +3068,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
 
@@ -3602,6 +3617,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let node = BridgeNode {
@@ -3736,6 +3752,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let node = BridgeNode {
@@ -3951,6 +3968,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         }
     }
@@ -4225,6 +4243,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let audio_source = BridgeSource {
@@ -4258,6 +4277,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         worker.replace_snapshot(BridgeSnapshot {
@@ -4881,6 +4901,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             };
             let video_source = |playing, play_request| BridgeSource {
                 decoder_reset_serial: 1,
@@ -5182,6 +5203,7 @@ mod tests {
                     late_policy: 1,
                     loop_count: 0,
                     start_policy: 1,
+                    hold_serial: None,
                 },
             };
             let image_node = BridgeNode {
@@ -5598,6 +5620,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let audio = BridgeSource {
@@ -5631,6 +5654,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let before = vec![video(false), audio.clone()];

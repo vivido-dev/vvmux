@@ -39,7 +39,7 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
 /// A wire change does not raise this constant: the maintainer bumps it manually, so leave it alone
 /// and keep the mixed-version rejection intact.
-pub const VERSION: u16 = 21;
+pub const VERSION: u16 = 22;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -1425,6 +1425,16 @@ pub enum ClientMessage {
         bridge_instance_id: u64,
         source: BridgeSourceKey,
         position: vivid_sdk::presenter::BridgePositionSnapshot,
+    },
+    BridgeHold {
+        bridge_instance_id: u64,
+        source: BridgeSourceKey,
+        hold: vivid_sdk::presenter::BridgeHoldSnapshot,
+    },
+    BridgeIncompatiblePlayback {
+        bridge_instance_id: u64,
+        source: BridgeSourceKey,
+        decoder_reset_serial: u64,
     },
     BridgePlaybackState {
         bridge_instance_id: u64,
