@@ -302,6 +302,11 @@ pub fn attach(
                             });
                         }
                     }
+                    ServerMessage::OverlayHostRequest(request) => {
+                        if let Some(bridge) = &mut bridge {
+                            bridge.queue_overlay_request(request);
+                        }
+                    }
                     ServerMessage::MediaRecord {
                         delivery_id,
                         source,
@@ -517,7 +522,7 @@ pub fn attach(
                 for command in parsed {
                     match command {
                         ParsedInput::Input(bytes) => {
-                            send_client(&writer, &ClientMessage::Input(bytes))?
+                            send_client(&writer, &crate::client_input::key_input_message(bytes))?
                         }
                         ParsedInput::Action(action) => {
                             send_client(&writer, &ClientMessage::Action(action))?
@@ -759,6 +764,7 @@ pub(crate) struct BridgeWorker {
 
 #[derive(Default)]
 struct TrackMediaQueues {
+    host_requests: VecDeque<vivid_sdk::presenter::OverlayHostRequest>,
     bytes: usize,
     chunks: usize,
     tracks: HashMap<BridgeSourceKey, VecDeque<BridgeMedia>>,
@@ -831,6 +837,20 @@ impl TrackMediaQueues {
 }
 
 impl BridgeWorker {
+    pub(crate) fn queue_overlay_request(
+        &mut self,
+        request: vivid_sdk::presenter::OverlayHostRequest,
+    ) {
+        let mut queues = self.media.lock().unwrap();
+        if queues.host_requests.len() >= 64 {
+            (self.cancel)();
+            return;
+        }
+        queues.host_requests.push_back(request);
+        if let Some(wakeup) = &self.media_wakeup {
+            let _ = wakeup.try_send(());
+        }
+    }
     fn spawn(
         bridge: crate::bridge::OuterBridge,
         client_writer: SharedWriter,
@@ -1190,6 +1210,10 @@ fn run_bridge_worker(
         MediaTraceKind::BridgeClientAttached { vivid: true },
     );
     let mut metrics = crate::metrics::BridgeMetrics::default();
+    let _ = client_writer.send(ClientMessage::OverlayHostProfiles {
+        bridge_instance_id,
+        profiles: bridge.overlay_host_profiles(),
+    });
     let mut metrics_reported_at = Instant::now();
     let mut traced_queue_drops = 0_u64;
     // Diagnostic only: which form the in-flight raster body for each source uses.
@@ -1241,6 +1265,30 @@ fn run_bridge_worker(
                     bytes,
                 });
             }
+        }
+        match bridge.take_overlay_input() {
+            Ok(events) => {
+                for (surface, body) in events {
+                    let _ = client_writer.send(ClientMessage::OverlayInput {
+                        bridge_instance_id,
+                        surface,
+                        body,
+                    });
+                }
+            }
+            Err(_) => {
+                force_sources = true;
+                force_replacement = true;
+                let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+                    reset_outer_session: true,
+                });
+            }
+        }
+        if let Some(body) = bridge.take_overlay_environment() {
+            let _ = client_writer.send(ClientMessage::OverlayEnvironment {
+                bridge_instance_id,
+                body,
+            });
         }
         match bridge.service_session_events() {
             Ok(Some(display)) => {
@@ -1395,6 +1443,20 @@ fn run_bridge_worker(
                 bridge_instance_id,
                 source,
                 position,
+            });
+        }
+        for (source, hold) in bridge.take_playback_holds() {
+            let _ = client_writer.send(ClientMessage::BridgeHold {
+                bridge_instance_id,
+                source,
+                hold,
+            });
+        }
+        for (source, decoder_reset_serial) in bridge.take_source_errors() {
+            let _ = client_writer.send(ClientMessage::BridgeIncompatiblePlayback {
+                bridge_instance_id,
+                source,
+                decoder_reset_serial,
             });
         }
         let pending = snapshot
@@ -1635,6 +1697,10 @@ fn run_bridge_worker(
                     None,
                     MediaTraceKind::BridgeClientAttached { vivid: true },
                 );
+                let _ = client_writer.send(ClientMessage::OverlayHostProfiles {
+                    bridge_instance_id,
+                    profiles: bridge.overlay_host_profiles(),
+                });
             }
             trace_projection_change(
                 &client_writer,
@@ -1655,7 +1721,9 @@ fn run_bridge_worker(
                     recreated.contains(&source.key)
                         && matches!(
                             source.kind,
-                            BridgeSourceKind::Raster { .. } | BridgeSourceKind::Image { .. }
+                            BridgeSourceKind::Raster { .. }
+                                | BridgeSourceKind::Image { .. }
+                                | BridgeSourceKind::VectorScene { .. }
                         )
                 })
                 .map(|source| source.key)
@@ -1685,7 +1753,9 @@ fn run_bridge_worker(
                     minimum_media_generation.insert(source.key, pending.generation);
                     if matches!(
                         source.kind,
-                        BridgeSourceKind::Raster { .. } | BridgeSourceKind::Image { .. }
+                        BridgeSourceKind::Raster { .. }
+                            | BridgeSourceKind::Image { .. }
+                            | BridgeSourceKind::VectorScene { .. }
                     ) {
                         retained_rehydration.insert(source.key);
                     } else {
@@ -1797,6 +1867,40 @@ fn run_bridge_worker(
             // producer is waiting on.
         }
 
+        for (id, response) in bridge.take_overlay_host_replies() {
+            let _ = client_writer.send(ClientMessage::OverlayHostReply {
+                id,
+                response: response.map_err(|error| error.to_string()),
+            });
+        }
+        let host_request = {
+            let mut queues = media_queues
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let index = queues.host_requests.iter().position(|request| {
+                bridge.can_service_overlay_host_request(request)
+                    && (request.record_type == vivid_protocol::messages::MEASURE_OVERLAY_TEXT_BATCH
+                        || (!queues
+                            .tracks
+                            .keys()
+                            .chain(deferred.iter().map(|media| &media.source))
+                            .any(|source| {
+                                source.producer == request.surface.producer
+                                    && source.context == request.surface.context
+                                    && source.surface == request.surface.surface
+                            })))
+            });
+            index.and_then(|index| queues.host_requests.remove(index))
+        };
+        if let Some(request) = host_request {
+            let id = request.id;
+            if let Err(error) = bridge.start_overlay_host_request(request) {
+                let _ = client_writer.send(ClientMessage::OverlayHostReply {
+                    id,
+                    response: Err(error.to_string()),
+                });
+            }
+        }
         if complete_dropped_deliveries(&client_writer, &dropped) {
             // Reconcile sources on the existing outer session. A record this client could not
             // queue says nothing about the outer session's identities, and replacing it would
@@ -2746,6 +2850,8 @@ mod tests {
                 context: key.context,
                 surface: key.surface,
             },
+            overlay_window: None,
+            overlay_layouts: Vec::new(),
             logical_width: 16,
             logical_height: 16,
             capture_policy: 0,
@@ -2962,6 +3068,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
 
@@ -3510,6 +3617,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let node = BridgeNode {
@@ -3644,6 +3752,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let node = BridgeNode {
@@ -3859,6 +3968,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         }
     }
@@ -4133,6 +4243,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let audio_source = BridgeSource {
@@ -4166,6 +4277,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         worker.replace_snapshot(BridgeSnapshot {
@@ -4789,6 +4901,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             };
             let video_source = |playing, play_request| BridgeSource {
                 decoder_reset_serial: 1,
@@ -5090,6 +5203,7 @@ mod tests {
                     late_policy: 1,
                     loop_count: 0,
                     start_policy: 1,
+                    hold_serial: None,
                 },
             };
             let image_node = BridgeNode {
@@ -5506,6 +5620,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let audio = BridgeSource {
@@ -5539,6 +5654,7 @@ mod tests {
                 late_policy: 1,
                 loop_count: 0,
                 start_policy: 1,
+                hold_serial: None,
             },
         };
         let before = vec![video(false), audio.clone()];

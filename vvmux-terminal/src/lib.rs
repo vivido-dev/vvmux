@@ -535,6 +535,13 @@ pub struct Terminal {
     cols: usize,
     grid: Vec<Vec<Cell>>,
     alternate_grid: Vec<Vec<Cell>>,
+    /// Whether each active-screen row contains a tab span.
+    ///
+    /// Printable input used to scan all columns for an intersecting tab on every character. Most
+    /// rows contain no tab, so retaining this bit turns that hot path into an O(1) check without
+    /// changing the cell representation or reconstructed text.
+    grid_has_tabs: Vec<bool>,
+    alternate_grid_has_tabs: Vec<bool>,
     grid_wrapped: Vec<bool>,
     alternate_grid_wrapped: Vec<bool>,
     history: VecDeque<Vec<Cell>>,
@@ -553,6 +560,7 @@ pub struct Terminal {
     template: Cell,
     processor: Processor,
     events: Vec<TerminalEvent>,
+    damaged: bool,
     modes: TerminalModes,
     title: Option<String>,
     alternate_screen: bool,
@@ -575,6 +583,8 @@ impl Terminal {
             cols,
             grid: blank_grid(rows, cols),
             alternate_grid: blank_grid(rows, cols),
+            grid_has_tabs: vec![false; rows],
+            alternate_grid_has_tabs: vec![false; rows],
             grid_wrapped: vec![false; rows],
             alternate_grid_wrapped: vec![false; rows],
             history: VecDeque::new(),
@@ -590,6 +600,7 @@ impl Terminal {
             template: Cell::default(),
             processor: Processor::new(),
             events: Vec::new(),
+            damaged: false,
             modes: TerminalModes {
                 cursor_visible: true,
                 ..TerminalModes::default()
@@ -608,6 +619,26 @@ impl Terminal {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<TerminalEvent> {
+        // Plain terminal output is overwhelmingly more common than any of the framed protocols
+        // intercepted below.  When every scanner is between packets and this chunk cannot begin
+        // one, pass it straight to vvte instead of copying it through three intermediate `Vec`s
+        // and examining every byte four extra times.
+        //
+        // ESC is the introducer for OSC, DCS, APC, and Kitty graphics on Unix.  ConPTY's printable
+        // marker starts with `V`, so Windows keeps that byte on the scanner path as well.  A scanner
+        // holding a partial packet always disables the fast path, preserving fragmented sequences.
+        let direct = matches!(self.agent_osc.state, OscState::Ground)
+            && self.kitty_scanner.pending.is_empty()
+            && matches!(self.dcs_scanner.state, DcsState::Ground)
+            && self.marker_scanner.pending.is_empty()
+            && !bytes.contains(&0x1b)
+            && (!cfg!(windows) || !bytes.contains(&b'V'));
+        if direct {
+            let mut processor = mem::take(&mut self.processor);
+            processor.advance(self, bytes);
+            self.processor = processor;
+            return self.finish_events(!bytes.is_empty());
+        }
         self.agent_osc.observe(bytes);
         let chunks = self.kitty_scanner.push(bytes);
         self.process_kitty_chunks(chunks, !bytes.is_empty(), false)
@@ -720,6 +751,12 @@ impl Terminal {
         let status = match request {
             b"m" => sgr_status(&self.template),
             b"r" => format!("{};{}r", self.scroll_top + 1, self.scroll_bottom),
+            // DECSCUSR's omitted/zero value selects the terminal's default cursor style. Vvmux
+            // currently renders that default rather than retaining application-selected cursor
+            // shapes, so report the default honestly. Returning the generic negative DECRQSS
+            // reply here makes macOS Vim treat the response bytes as editing input during its
+            // startup probe, inserting a stray `}` into a new buffer.
+            b" q" => "0 q".to_owned(),
             b"\"p" => "62;1\"p".to_owned(),
             // Select Character Protection Attribute is not otherwise tracked, so characters are
             // always reported as erasable (the DEC default).
@@ -795,14 +832,10 @@ impl Terminal {
     }
 
     fn finish_events(&mut self, damage: bool) -> Vec<TerminalEvent> {
-        if damage
-            && !self
-                .events
-                .iter()
-                .any(|event| matches!(event, TerminalEvent::Damage))
-        {
-            self.events.push(TerminalEvent::Damage);
+        if damage {
+            self.damage();
         }
+        self.damaged = false;
         mem::take(&mut self.events)
     }
 
@@ -813,6 +846,18 @@ impl Terminal {
         let region_was_full_screen = self.scroll_top == 0 && self.scroll_bottom == self.rows;
         resize_grid(&mut self.grid, rows, cols);
         resize_grid(&mut self.alternate_grid, rows, cols);
+        self.grid_has_tabs.resize(rows, false);
+        self.alternate_grid_has_tabs.resize(rows, false);
+        for (has_tabs, row) in self.grid_has_tabs.iter_mut().zip(&self.grid) {
+            *has_tabs = row.iter().any(|cell| cell.tab_width.is_some());
+        }
+        for (has_tabs, row) in self
+            .alternate_grid_has_tabs
+            .iter_mut()
+            .zip(&self.alternate_grid)
+        {
+            *has_tabs = row.iter().any(|cell| cell.tab_width.is_some());
+        }
         self.grid_wrapped.resize(rows, false);
         self.alternate_grid_wrapped.resize(rows, false);
         if self.tab_stops_customized {
@@ -835,7 +880,7 @@ impl Terminal {
             self.scroll_top = self.scroll_top.min(rows - 1);
             self.scroll_bottom = self.scroll_bottom.clamp(self.scroll_top + 1, rows);
         }
-        self.events.push(TerminalEvent::Damage);
+        self.damage();
     }
 
     pub fn rows(&self) -> usize {
@@ -980,12 +1025,9 @@ impl Terminal {
     }
 
     fn damage(&mut self) {
-        if !self
-            .events
-            .iter()
-            .any(|event| matches!(event, TerminalEvent::Damage))
-        {
+        if !self.damaged {
             self.events.push(TerminalEvent::Damage);
+            self.damaged = true;
         }
     }
 
@@ -1013,12 +1055,14 @@ impl Terminal {
         for row in &mut self.grid {
             row.fill(blank.clone());
         }
+        self.grid_has_tabs.fill(false);
     }
 
     /// Exchange the active and inactive screens. Grids, wrap flags, keyboard-mode stacks and DECSC
     /// slots all belong to a screen, so they move together.
     fn swap_screens(&mut self) {
         mem::swap(&mut self.grid, &mut self.alternate_grid);
+        mem::swap(&mut self.grid_has_tabs, &mut self.alternate_grid_has_tabs);
         mem::swap(&mut self.grid_wrapped, &mut self.alternate_grid_wrapped);
         mem::swap(
             &mut self.keyboard_mode_stack,
@@ -1061,6 +1105,7 @@ impl Terminal {
             self.scroll_top == 0 && self.scroll_bottom == self.rows && !self.alternate_screen;
         for _ in 0..count {
             let removed = self.grid.remove(self.scroll_top);
+            self.grid_has_tabs.remove(self.scroll_top);
             let removed_wrapped = self.grid_wrapped.remove(self.scroll_top);
             if pushed_to_history {
                 self.history.push_back(removed);
@@ -1072,6 +1117,7 @@ impl Terminal {
             }
             self.grid
                 .insert(self.scroll_bottom - 1, vec![self.blank(); self.cols]);
+            self.grid_has_tabs.insert(self.scroll_bottom - 1, false);
             self.grid_wrapped.insert(self.scroll_bottom - 1, false);
         }
         if count > 0 {
@@ -1090,9 +1136,11 @@ impl Terminal {
         let count = count.min(self.scroll_bottom.saturating_sub(self.scroll_top));
         for _ in 0..count {
             self.grid.remove(self.scroll_bottom - 1);
+            self.grid_has_tabs.remove(self.scroll_bottom - 1);
             self.grid_wrapped.remove(self.scroll_bottom - 1);
             self.grid
                 .insert(self.scroll_top, vec![self.blank(); self.cols]);
+            self.grid_has_tabs.insert(self.scroll_top, false);
             self.grid_wrapped.insert(self.scroll_top, false);
         }
         if count > 0 {
@@ -1118,13 +1166,16 @@ impl Terminal {
     fn clear_row_range(&mut self, row: usize, start: usize, end: usize) {
         let start = start.min(self.cols);
         let end = end.min(self.cols);
-        for column in 0..self.cols {
-            if let Some(width) = self.grid[row][column].tab_width {
-                let tab_end = column.saturating_add(usize::from(width));
-                if column < end && tab_end > start {
-                    self.grid[row][column].tab_width = None;
+        if self.grid_has_tabs[row] {
+            for column in 0..self.cols {
+                if let Some(width) = self.grid[row][column].tab_width {
+                    let tab_end = column.saturating_add(usize::from(width));
+                    if column < end && tab_end > start {
+                        self.grid[row][column].tab_width = None;
+                    }
                 }
             }
+            self.grid_has_tabs[row] = self.grid[row].iter().any(|cell| cell.tab_width.is_some());
         }
         let blank = self.blank();
         for cell in &mut self.grid[row][start..end] {
@@ -1134,6 +1185,9 @@ impl Terminal {
     }
 
     fn invalidate_tab_at(&mut self, row: usize, column: usize) {
+        if !self.grid_has_tabs[row] {
+            return;
+        }
         for start in 0..self.cols {
             if let Some(width) = self.grid[row][start].tab_width
                 && start <= column
@@ -1142,12 +1196,17 @@ impl Terminal {
                 self.grid[row][start].tab_width = None;
             }
         }
+        self.grid_has_tabs[row] = self.grid[row].iter().any(|cell| cell.tab_width.is_some());
     }
 }
 
 impl Handler for Terminal {
     fn input(&mut self, c: char) {
-        let width = c.width().unwrap_or(1);
+        let width = if c.is_ascii() {
+            1
+        } else {
+            c.width().unwrap_or(1)
+        };
         if width == 0 {
             let col = self.cursor_col.saturating_sub(1);
             self.grid[self.cursor_row][col].combining.push(c);
@@ -1172,12 +1231,12 @@ impl Handler for Terminal {
         if width == 2 {
             self.invalidate_tab_at(self.cursor_row, self.cursor_col + 1);
         }
-        let mut cell = self.template.clone();
+        let cell = &mut self.grid[self.cursor_row][self.cursor_col];
+        cell.clone_from(&self.template);
         cell.ch = c;
         cell.combining.clear();
         cell.wide_continuation = false;
         cell.leading_wide_spacer = false;
-        self.grid[self.cursor_row][self.cursor_col] = cell;
         self.cursor_col += 1;
         if width == 2 && self.cursor_col < self.cols {
             let mut spacer = self.blank();
@@ -1259,6 +1318,7 @@ impl Handler for Terminal {
                 .unwrap_or(self.cols - 1);
             if next > start {
                 self.grid[self.cursor_row][start].tab_width = u16::try_from(next - start).ok();
+                self.grid_has_tabs[self.cursor_row] = true;
             }
             self.cursor_col = next;
         }
@@ -1295,6 +1355,7 @@ impl Handler for Terminal {
         for cell in row.iter_mut() {
             cell.tab_width = None;
         }
+        self.grid_has_tabs[self.cursor_row] = false;
         for column in (self.cursor_col..self.cols - count).rev() {
             row[column + count] = row[column].clone();
         }
@@ -1309,6 +1370,7 @@ impl Handler for Terminal {
         for cell in row.iter_mut() {
             cell.tab_width = None;
         }
+        self.grid_has_tabs[self.cursor_row] = false;
         for column in self.cursor_col..self.cols - count {
             row[column] = row[column + count].clone();
         }
@@ -1439,6 +1501,8 @@ impl Handler for Terminal {
     fn reset_state(&mut self) {
         self.grid = blank_grid(self.rows, self.cols);
         self.alternate_grid = blank_grid(self.rows, self.cols);
+        self.grid_has_tabs.fill(false);
+        self.alternate_grid_has_tabs.fill(false);
         self.grid_wrapped.fill(false);
         self.alternate_grid_wrapped.fill(false);
         self.history.clear();
@@ -3086,7 +3150,7 @@ mod tests {
     }
 
     #[test]
-    fn decrqss_reports_sgr_scroll_region_and_refuses_unknown_requests() {
+    fn decrqss_reports_sgr_scroll_region_cursor_style_and_refuses_unknown_requests() {
         let mut terminal = Terminal::new(10, 20, 0);
         terminal.feed(b"\x1b[1;31m\x1b[3;7r");
         let replies = |events: Vec<TerminalEvent>| {
@@ -3106,6 +3170,10 @@ mod tests {
         assert_eq!(
             replies(terminal.feed(b"\x1bP$qr\x1b\\")),
             vec![b"\x1bP1$r3;7r\x1b\\".to_vec()]
+        );
+        assert_eq!(
+            replies(terminal.feed(b"\x1bP$q q\x1b\\")),
+            vec![b"\x1bP1$r0 q\x1b\\".to_vec()]
         );
         assert_eq!(
             replies(terminal.feed(b"\x1bP$qz\x1b\\")),

@@ -697,6 +697,163 @@ fn parse_kitty_key(sequence: &[u8]) -> Option<KittyKey> {
     })
 }
 
+/// Preserve terminal bytes alongside decoded enhanced-key reports. The actor gives a focused
+/// overlay first refusal; a declined report reaches the PTY byte-for-byte.
+pub(crate) fn key_input_message(bytes: Vec<u8>) -> crate::ipc::ClientMessage {
+    use crate::ipc::{ClientMessage, OverlayKeyInput};
+    use vivid_protocol::overlay::modifiers as mods;
+    let mut keys = Vec::new();
+    let mut start = 0;
+    while start + 2 < bytes.len() {
+        if bytes[start..].starts_with(b"\x1b[")
+            && let Some(length) = bytes[start + 2..]
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+        {
+            let end = start + 3 + length;
+            if let Some(key) = parse_kitty_key(&bytes[start..end]) {
+                let modifiers = if key.modifiers & 1 != 0 {
+                    mods::SHIFT
+                } else {
+                    0
+                } | if key.modifiers & 2 != 0 { mods::ALT } else { 0 }
+                    | if key.modifiers & 4 != 0 {
+                        mods::CONTROL
+                    } else {
+                        0
+                    }
+                    | if key.modifiers & 8 != 0 {
+                        mods::SUPER
+                    } else {
+                        0
+                    }
+                    | if key.modifiers & 64 != 0 {
+                        mods::CAPS_LOCK
+                    } else {
+                        0
+                    }
+                    | if key.modifiers & 128 != 0 {
+                        mods::NUM_LOCK
+                    } else {
+                        0
+                    };
+                let down = key.kind != KittyKeyKind::Release;
+                let sequence = std::str::from_utf8(&bytes[start + 2..end - 1]).unwrap_or("");
+                let associated = sequence.split(';').nth(2).and_then(|value| {
+                    value
+                        .split(':')
+                        .map(|value| value.parse::<u32>().ok().and_then(char::from_u32))
+                        .collect::<Option<String>>()
+                });
+                let text = if down && modifiers & (mods::CONTROL | mods::ALT | mods::SUPER) == 0 {
+                    associated.unwrap_or_else(|| {
+                        char::from_u32(
+                            key.shifted_codepoint
+                                .filter(|_| key.modifiers & 1 != 0)
+                                .unwrap_or(key.codepoint),
+                        )
+                        .filter(|character| {
+                            !character.is_control()
+                                && !(0xe000..=0xf8ff).contains(&(*character as u32))
+                        })
+                        .map_or_else(String::new, |character| character.to_string())
+                    })
+                } else {
+                    String::new()
+                };
+                let base = sequence
+                    .split(';')
+                    .next()
+                    .and_then(|value| value.split(':').nth(2))
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(key.codepoint);
+                keys.push(OverlayKeyInput {
+                    start,
+                    end,
+                    physical: hid_usage(base),
+                    down,
+                    repeat: key.kind == KittyKeyKind::Repeat,
+                    modifiers,
+                    text,
+                });
+                start = end;
+                continue;
+            }
+        }
+        start += 1;
+    }
+    if keys.is_empty() {
+        ClientMessage::Input(bytes)
+    } else {
+        ClientMessage::KeyInput { bytes, keys }
+    }
+}
+
+fn hid_usage(key: u32) -> u32 {
+    match key {
+        97..=122 => key - 97 + 4,
+        65..=90 => key - 65 + 4,
+        49..=57 => key - 49 + 30,
+        48 => 39,
+        13 => 40,
+        27 => 41,
+        127 | 8 => 42,
+        9 => 43,
+        32 => 44,
+        45 => 45,
+        61 => 46,
+        91 => 47,
+        93 => 48,
+        92 => 49,
+        59 => 51,
+        39 => 52,
+        96 => 53,
+        44 => 54,
+        46 => 55,
+        47 => 56,
+        57364..=57375 => key - 57364 + 58,
+        57348 => 73,
+        57349 => 76,
+        57350 => 80,
+        57351 => 79,
+        57352 => 82,
+        57353 => 81,
+        57354 => 75,
+        57355 => 78,
+        57356 => 74,
+        57357 => 77,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod overlay_key_tests {
+    use super::*;
+    #[test]
+    fn kitty_keys_keep_bytes_and_carry_physical_text_repeat_and_release() {
+        let bytes = b"before\x1b[97:65:113;2;65u\x1b[9;1:2u\x1b[9;1:3uafter".to_vec();
+        let crate::ipc::ClientMessage::KeyInput {
+            bytes: original,
+            keys,
+        } = key_input_message(bytes.clone())
+        else {
+            panic!("keys missing");
+        };
+        assert_eq!(original, bytes);
+        assert_eq!(keys.len(), 3);
+        assert_eq!((keys[0].physical, keys[0].text.as_str()), (20, "A"));
+        assert_eq!(keys[0].modifiers, vivid_protocol::overlay::modifiers::SHIFT);
+        assert_eq!(&original[keys[1].start..keys[1].end], b"\x1b[9;1:2u");
+        assert!(keys[1].repeat && keys[1].down);
+        assert!(!keys[2].down);
+        assert!(keys[2].text.is_empty());
+        assert!(matches!(
+            key_input_message(b"ordinary\x1b[broken".to_vec()),
+            crate::ipc::ClientMessage::Input(_)
+        ));
+    }
+}
+
 fn parse_sgr_mouse(sequence: &[u8]) -> Option<MouseEvent> {
     let text = std::str::from_utf8(sequence).ok()?;
     let release = text.ends_with('m');

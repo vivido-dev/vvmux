@@ -1,5 +1,20 @@
 # vvmux architecture
 
+## Held and synchronized timed playback
+
+`timed-media-sync-v1` is negotiated independently on terminating hops. Removing a timed surface
+from projection publishes an immediate control-plane hold. A bounded background worker pauses
+and queries the physical clock before retiring its tracks; replacement slot activation waits
+for that retirement. Abrupt loss retains the last physical observation as an estimate.
+Downstream holds are translated to the owning inner surface, with local and downstream hold
+reasons composed independently. VVMX version 22 carries hold feedback and PLAY correlation.
+
+Synchronized PLAY admits buffering without starting the clock. Bootstrap output readiness permits
+activation; target-picture readiness and audio prebuffer release physical playback together.
+Activated tracks use their bounded channel credit rather than a cumulative GOP packet ceiling.
+Neither withheld credit nor an elapsed media-write stopwatch proves session failure. vvssh remains
+an authenticated carrier with independent control, realtime, and bulk transport health.
+
 ## Microphone uplink
 
 `audio-input-v1` is separate from playback projection. Prepared pane-local `vvmic` helpers own
@@ -198,7 +213,7 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 20 is a hard cutover. In addition to complete track identity and binary media,
+Private VVMX version 21 is a hard cutover. In addition to complete track identity and binary media,
 it retains deterministic outer/rendered completion waits, stable tab-ID selection, correlated
 diagnostics, PTY-write reports, and process-anchored recovery traces. Its binary media header carries complete track identity
 and bounded binary render/media records,
@@ -228,8 +243,18 @@ checked pixel dimensions; Windows accepts the same internal call and continues u
 This is the sole scoped PTY media exception in vvmux and does not change the Vivid wire stack.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 20 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 21 → outer vvmux producer → Vivido
 ```
+
+
+Version 21 also carries bounded overlay host requests/replies and native input events. The inner
+presenter queues vector frames/assets as acknowledged media deliveries; retained rehydration
+uploads assets before the latest frame and reshapes retained text on the new physical host.
+Physical host services run on bounded request workers, with independent inner/outer layout and
+scene identities. Clipboard, accessibility and typography are only offered inward when accepted
+by that host. Pointer capture uses the interactive lane; its native pointer, key, text/IME,
+geometry and focus events return to the owning pane. Kitty key messages retain the original bytes
+alongside decoded physical keys so declined overlay input reaches the PTY unchanged.
 
 ## Plugin boundary
 

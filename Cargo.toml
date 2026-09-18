@@ -1,6 +1,6 @@
 [package]
 name = "vvmux"
-version = "0.4.5"
+version = "0.4.6"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
 rust-version = "1.95"
@@ -63,9 +63,9 @@ tokio = { version = "1", features = [
   "time",
 ], optional = true }
 unicode-width = "0.2"
-vivid_gateway = { version = "1.5", path = "../vivid_gateway" }
-vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
-vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
+vivid_gateway = { version = "1.5.9", path = "../vivid_gateway" }
+vivid_protocol = { version = "1.5.9", path = "../vivid_protocol" }
+vivid_sdk = { version = "1.5.8", path = "../vivid_sdk" }
 vvte = { version = "0.15", path = "../vvte", default-features = false, features = [
   "std",
   "ansi",

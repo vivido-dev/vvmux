@@ -7,39 +7,47 @@
 //! height. That routes through display re-normalization and a relayout, which is exactly the part
 //! of the reload path most likely to break.
 
+use crate::common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 struct SessionGuard {
-    binary: &'static str,
+    runtime: PathBuf,
     name: String,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let _ = Command::new(self.binary)
+        let _ = common::vvmux_command(&self.runtime)
             .args(["kill-session", "--target", &self.name])
             .output();
     }
 }
 
 struct Fixture {
-    binary: &'static str,
     name: String,
-    config: std::path::PathBuf,
-    _directory: tempfile::TempDir,
+    config: PathBuf,
     _guard: SessionGuard,
+    // Fields drop in declaration order. Keep the runtime directory alive until the guard has
+    // connected to and killed the detached session.
+    directory: tempfile::TempDir,
 }
 
 impl Fixture {
     fn start(label: &str) -> Self {
-        let binary = env!("CARGO_BIN_EXE_vvmux");
-        let directory = tempfile::tempdir().unwrap();
+        // Short `/tmp` root keeps the session socket inside `sun_path`; the isolated runtime and
+        // config homes keep a developer's own `startup.toml` and live sessions out of this test.
+        let directory = tempfile::Builder::new()
+            .prefix("vvc-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let shell = directory.path().join("fixture-shell");
         fs::write(
             &shell,
@@ -55,7 +63,7 @@ while IFS= read -r line; do :; done
         let name = format!("reload-{label}-{}", std::process::id());
         write_config(&config, &shell, "status_visible = true");
 
-        let created = Command::new(binary)
+        let created = common::vvmux_command(directory.path())
             .args([
                 "--config",
                 config.to_str().unwrap(),
@@ -67,17 +75,14 @@ while IFS= read -r line; do :; done
             .output()
             .unwrap();
         assert_success(&created);
-        let guard = SessionGuard {
-            binary,
-            name: name.clone(),
-        };
-
         let fixture = Fixture {
-            binary,
-            name,
+            name: name.clone(),
             config,
-            _directory: directory,
-            _guard: guard,
+            _guard: SessionGuard {
+                runtime: directory.path().to_path_buf(),
+                name,
+            },
+            directory,
         };
         fixture.wait_ready();
         fixture
@@ -97,7 +102,7 @@ while IFS= read -r line; do :; done
     }
 
     fn msg(&self, arguments: &[&str]) -> Output {
-        Command::new(self.binary)
+        common::vvmux_command(self.directory.path())
             .args(["msg", "--target", &self.name])
             .args(arguments)
             .output()
@@ -113,7 +118,7 @@ while IFS= read -r line; do :; done
     }
 
     fn rewrite(&self, general: &str) {
-        let shell = self._directory.path().join("fixture-shell");
+        let shell = self.directory.path().join("fixture-shell");
         write_config(&self.config, &shell, general);
     }
 }

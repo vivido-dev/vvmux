@@ -23,9 +23,9 @@ use crate::agent::{
 use crate::config::{Config, OpenMode};
 use crate::ipc::{
     Action, AttachmentTarget, AutomationCompletion, AutomationError, AutomationMethod,
-    AutomationRequest, AutomationResponse, Axis, BridgeClipRect, BridgeNode, BridgePlayRequest,
-    BridgeSource, BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface,
-    BridgeSurfaceKey, ClientMessage, Direction, DisplayMetrics, FloatingEditCommand,
+    AutomationRequest, AutomationResponse, Axis, BridgeClipRect, BridgeNode, BridgeOverlayWindow,
+    BridgePlayRequest, BridgeSource, BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind,
+    BridgeSurface, BridgeSurfaceKey, ClientMessage, Direction, DisplayMetrics, FloatingEditCommand,
     FloatingEditKind, MediaTrackIdentity, MediaTrackWaitCondition, MouseEvent, MouseKind,
     PluginEventEnvelope, ServerMessage, SharedWriter, TabSelector, TextSource,
 };
@@ -51,6 +51,12 @@ use crate::session_state::{
 };
 
 const EVENT_QUEUE: usize = 1024;
+/// Maximum adjacent output bytes one actor turn parses for a pane.
+///
+/// PTYs may return a large write as many tiny reads. Combining only consecutive records for the
+/// same pane avoids repeating whole-grid and waiter bookkeeping while keeping a hard fairness
+/// boundary and preserving every intervening actor event.
+const PTY_OUTPUT_BATCH_BYTES: usize = 64 * 1024;
 /// Slots on the dedicated media-event receiver.
 ///
 /// Total queued media bytes are separately bounded by `media.ipc_queue_bytes`, so this only needs
@@ -2044,6 +2050,7 @@ impl SessionActor {
         media_receiver: mpsc::Receiver<crate::media::MediaEvent>,
     ) {
         let mut render_at = Instant::now();
+        let mut deferred_event = None;
         loop {
             // Re-read every iteration: a config reload must be able to retune the render cadence
             // without restarting the session.
@@ -2065,9 +2072,15 @@ impl SessionActor {
             if self.drain_media(&media_receiver) {
                 timeout = Duration::ZERO;
             }
-            match receiver.recv_timeout(timeout) {
+            let received = deferred_event
+                .take()
+                .map_or_else(|| receiver.recv_timeout(timeout), Ok);
+            match received {
                 Ok(event) => {
-                    self.actor_wakeups = self.actor_wakeups.saturating_add(1);
+                    let (event, deferred, consumed) =
+                        coalesce_ready_pty_output(event, &receiver, PTY_OUTPUT_BATCH_BYTES);
+                    deferred_event = deferred;
+                    self.actor_wakeups = self.actor_wakeups.saturating_add(consumed as u64);
                     if self.handle_event(event).is_err() {
                         self.force_full = true;
                     }
@@ -2152,6 +2165,26 @@ impl SessionActor {
     fn sync_pending_media_projection(&mut self) {
         if self.media_projection_pending.swap(false, Ordering::AcqRel) {
             self.sync_media(false);
+            for request in self.vivid.take_overlay_host_requests() {
+                let id = request.id;
+                let sent = self
+                    .attached
+                    .as_ref()
+                    .filter(|client| client.vivid)
+                    .is_some_and(|client| {
+                        crate::ipc::send(
+                            &client.writer,
+                            &ServerMessage::OverlayHostRequest(request),
+                        )
+                        .is_ok()
+                    });
+                if !sent {
+                    self.vivid.complete_overlay_host_request(
+                        id,
+                        Err("no outer overlay host is attached".into()),
+                    );
+                }
+            }
         }
     }
 
@@ -2913,6 +2946,57 @@ impl SessionActor {
                     self.input(bytes);
                 }
             }
+            ClientMessage::KeyInput { bytes, keys } => {
+                if self.client_is(id) {
+                    let mut offset = 0;
+                    for key in &keys {
+                        if key.start < offset
+                            || key.end <= key.start
+                            || key.end > bytes.len()
+                            || key.text.len() > 4096
+                            || (!key.down && (!key.text.is_empty() || key.repeat))
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid key input range",
+                            ));
+                        }
+                        offset = key.end;
+                    }
+                    offset = 0;
+                    for key in keys {
+                        if key.start > offset {
+                            self.input(bytes[offset..key.start].to_vec());
+                        }
+                        let consumed = self.attached_focus_pane().is_some_and(|pane| {
+                            if !self.vivid.overlay_has_focus(pane) {
+                                return false;
+                            }
+                            let mut consumed = false;
+                            if key.physical != 0 {
+                                consumed = self.vivid.overlay_key_event(
+                                    pane,
+                                    key.physical,
+                                    key.down,
+                                    key.repeat,
+                                    key.modifiers,
+                                );
+                            }
+                            if !key.text.is_empty() {
+                                consumed |= self.vivid.overlay_text(pane, &key.text);
+                            }
+                            consumed
+                        });
+                        if !consumed {
+                            self.input(bytes[key.start..key.end].to_vec());
+                        }
+                        offset = key.end;
+                    }
+                    if offset < bytes.len() {
+                        self.input(bytes[offset..].to_vec());
+                    }
+                }
+            }
             ClientMessage::Mouse(mouse) => {
                 if self.client_is(id) {
                     self.mouse(mouse, false);
@@ -3271,6 +3355,57 @@ impl SessionActor {
                     }
                 }
             }
+            ClientMessage::OverlayInput {
+                bridge_instance_id,
+                surface,
+                body,
+            } => {
+                if self.client_is(id)
+                    && self.bridge_instance_id == Some(bridge_instance_id)
+                    && self.vivid.relay_overlay_input(surface, &body)?
+                    && let Some(pane) = self.vivid.pane_for_overlay_surface(surface)
+                    && self.vivid.overlay_has_focus(pane)
+                    && self.attached_focus_pane() != Some(pane)
+                    && let Some(tab) = self.active_tab_mut()
+                    && tab.contains(pane)
+                {
+                    tab.set_focus(pane);
+                    self.projection_changed();
+                }
+            }
+            ClientMessage::OverlayHostProfiles {
+                bridge_instance_id,
+                profiles,
+            } => {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    self.vivid.set_overlay_host_profiles(&profiles);
+                }
+            }
+            ClientMessage::OverlayEnvironment {
+                bridge_instance_id,
+                body,
+            } => {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    let envelope = vivid_protocol::messages::decode_control(&body)?;
+                    let environment = vivid_protocol::overlay::wire::EnvironmentChanged::decode(
+                        0,
+                        &vivid_protocol::cbor::Value::Map(envelope.payload),
+                    )?;
+                    for pane in self.panes.keys() {
+                        self.vivid
+                            .set_overlay_environment(*pane, environment.environment.clone());
+                    }
+                }
+            }
+            ClientMessage::OverlayHostReply {
+                id: request_id,
+                response,
+            } => {
+                if self.client_is(id) {
+                    self.vivid
+                        .complete_overlay_host_request(request_id, response);
+                }
+            }
             ClientMessage::BridgePosition {
                 bridge_instance_id,
                 source,
@@ -3278,6 +3413,25 @@ impl SessionActor {
             } => {
                 if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
                     self.vivid.apply_outer_position(source, position);
+                }
+            }
+            ClientMessage::BridgeHold {
+                bridge_instance_id,
+                source,
+                hold,
+            } => {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    self.vivid.apply_downstream_hold(source, hold);
+                }
+            }
+            ClientMessage::BridgeIncompatiblePlayback {
+                bridge_instance_id,
+                source,
+                decoder_reset_serial,
+            } => {
+                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    self.vivid
+                        .reject_incompatible_playback(source, decoder_reset_serial);
                 }
             }
             ClientMessage::BridgePlaybackState {
@@ -9873,6 +10027,9 @@ impl SessionActor {
             }
             return;
         }
+        if self.overlay_mouse(pane_id, mouse, pixels, content, display) {
+            return;
+        }
         let selection_gesture = self.panes.get(&pane_id).is_some_and(|pane| {
             starts_mouse_selection(mouse, pane.copy.is_some(), pane.terminal.modes())
         });
@@ -10094,6 +10251,45 @@ impl SessionActor {
         }
     }
 
+    /// Give a pane's overlay windows first refusal on a pointer event, in the pane-local logical
+    /// pixels their producer laid them out against.
+    ///
+    /// This follows the host's own rule rather than inventing one: the overlay consumes an event
+    /// that lands in one of its windows, and anything it does not take falls through to the pane
+    /// unchanged — selection, hyperlinks, application mouse reporting and copy-mode scrolling all
+    /// behave exactly as they do in a pane with no overlay.
+    fn overlay_mouse(
+        &mut self,
+        pane_id: PaneId,
+        mouse: MouseEvent,
+        pixels: Option<(u16, u16)>,
+        content: Rect,
+        display: DisplayMetrics,
+    ) -> bool {
+        let (x, y) = overlay_pointer_position(mouse, pixels, content, display);
+        let modifiers = overlay_modifiers(mouse);
+        let button = u16::from(mouse.button);
+        let consumed = match mouse.kind {
+            MouseKind::Move => self.vivid.overlay_pointer(pane_id, x, y, None, modifiers),
+            MouseKind::Press => {
+                self.vivid
+                    .overlay_pointer(pane_id, x, y, Some((button, true)), modifiers)
+            }
+            MouseKind::Release => {
+                self.vivid
+                    .overlay_pointer(pane_id, x, y, Some((button, false)), modifiers)
+            }
+            MouseKind::Wheel => {
+                // Report the same distance a wheel moves a pane locally. Button zero is the
+                // upward detent, and a positive delta scrolls content down.
+                let lines = 3. * f64::from(display.cell_height.max(1));
+                let dy = if mouse.button == 0 { -lines } else { lines };
+                self.vivid.overlay_wheel(pane_id, x, y, 0., dy, modifiers)
+            }
+        };
+        consumed.unwrap_or(false)
+    }
+
     /// Forward motion/release reports without changing pane focus. These used to return before
     /// application mouse handling, so even a pane in DEC 1003 mode could never hover, drag, or
     /// release a button.
@@ -10119,6 +10315,10 @@ impl SessionActor {
             return;
         }
         let pane_id = projection.pane_id;
+        if self.overlay_mouse(pane_id, mouse, pixels, content, display) {
+            self.set_hovered_link(None);
+            return;
+        }
         let Some(modes) = self.panes.get(&pane_id).map(|pane| pane.terminal.modes()) else {
             self.set_hovered_link(None);
             return;
@@ -10177,6 +10377,10 @@ impl SessionActor {
     ) {
         let content = self.content_area();
         if !content.contains(mouse.x, mouse.y) {
+            self.set_hovered_link(None);
+            return;
+        }
+        if self.overlay_mouse(pane_id, mouse, pixels, content, display) {
             self.set_hovered_link(None);
             return;
         }
@@ -13931,10 +14135,12 @@ impl SessionActor {
         let live_nodes = snapshot.live_nodes.iter().copied().collect::<HashSet<_>>();
         self.fragment_assignments
             .retain(|logical, _| live_nodes.contains(logical));
+        let display = self.layout_display();
         let surfaces = snapshot
             .surfaces
             .iter()
             .map(|surface| BridgeSurface {
+                overlay_layouts: surface.overlay_layouts.clone(),
                 key: BridgeSurfaceKey {
                     producer: surface.producer,
                     context: surface.context,
@@ -13950,6 +14156,12 @@ impl SessionActor {
                     semantic_availability: surface.semantic_descriptor.semantic_availability,
                     locator: surface.semantic_descriptor.locator.clone(),
                 },
+                overlay_window: surface.overlay_window.and_then(|window| {
+                    let projection = projections
+                        .iter()
+                        .find(|projection| projection.pane_id == surface.pane)?;
+                    Some(project_overlay_window(window, projection.content, display))
+                }),
             })
             .collect::<Vec<_>>();
         let sources = snapshot
@@ -14192,6 +14404,10 @@ impl SessionActor {
                         &body,
                     )
                 }),
+                crate::media::SourceDescriptor::VectorScene(_) => source
+                    .retained_vector
+                    .iter()
+                    .all(|(kind, body)| send_media_body(&writer, 0, source_key, *kind, body)),
                 _ => continue,
             };
             if !sent {
@@ -14411,12 +14627,14 @@ impl SessionActor {
             .flatten()
             .filter(|_| self.client_focused);
         let mut failures = Vec::new();
+        let mut moved = Vec::new();
         for (pane_id, pane) in &mut self.panes {
             let holds_focus = focused == Some(*pane_id);
             if pane.focus_reported == holds_focus {
                 continue;
             }
             pane.focus_reported = holds_focus;
+            moved.push((*pane_id, holds_focus));
             if !pane.terminal.modes().focus_reporting {
                 continue;
             }
@@ -14427,6 +14645,14 @@ impl SessionActor {
         }
         for (pane_id, failure) in failures {
             self.report_input_failure(pane_id, Some(failure));
+        }
+        // An overlay window draws itself differently when its pane is the one being typed into, so
+        // it hears about the same change the focus report carries — unconditionally, because an
+        // overlay producer never enables focus reporting on the PTY it is not reading. The host
+        // ignores a pane that does not own the focused window, so telling it about both sides of a
+        // move is what lets the losing pane's window go inactive.
+        for (pane_id, holds_focus) in moved {
+            self.vivid.set_overlay_pane_focus(pane_id, holds_focus);
         }
         let focus_state = (
             self.client_focused && self.attached.is_some(),
@@ -14458,13 +14684,20 @@ impl SessionActor {
     /// terminal. Without this hop, a nested application can request enhanced key events and pixel
     /// coordinates while the physical presenter continues sending legacy keys and cell positions.
     fn sync_client_input_mode(&mut self) {
-        let (keyboard_flags, sgr_pixels) = self
+        let (mut keyboard_flags, mut sgr_pixels) = self
             .attached_focus_pane()
             .and_then(|pane_id| self.panes.get(&pane_id))
             .map_or((0, false), |pane| {
                 let modes = pane.terminal.modes();
                 (modes.keyboard_flags, modes.sgr_pixels)
             });
+        if self
+            .attached_focus_pane()
+            .is_some_and(|pane| self.vivid.overlay_has_focus(pane))
+        {
+            keyboard_flags |= 1 | 2 | 8 | 16;
+            sgr_pixels = true;
+        }
         let input_mode = (keyboard_flags, sgr_pixels);
         if self.attached.is_none() || self.reported_input_mode == Some(input_mode) {
             return;
@@ -16517,6 +16750,7 @@ fn bridge_play_request(request: crate::media::PlayRequest) -> BridgePlayRequest 
         late_policy: request.late_policy,
         loop_count: request.loop_count,
         start_policy: request.start_policy,
+        hold_serial: request.hold_serial,
     }
 }
 
@@ -16673,6 +16907,105 @@ fn bridge_key(key: crate::media::SourceKey) -> BridgeSourceKey {
     key
 }
 
+fn overlay_modifiers(mouse: MouseEvent) -> u32 {
+    use vivid_protocol::overlay::modifiers;
+    let mut mask = 0;
+    if mouse.shift {
+        mask |= modifiers::SHIFT;
+    }
+    if mouse.ctrl {
+        mask |= modifiers::CONTROL;
+    }
+    if mouse.alt {
+        mask |= modifiers::ALT;
+    }
+    mask
+}
+
+/// A pointer position in the pane-local logical pixels an overlay window lays out against.
+///
+/// The outer terminal reports pixels when it can, which is what an overlay needs: a cell-resolution
+/// fallback lands in the middle of the cell, so a click still reaches whatever occupies it.
+fn overlay_pointer_position(
+    mouse: MouseEvent,
+    pixels: Option<(u16, u16)>,
+    content: Rect,
+    display: DisplayMetrics,
+) -> (f64, f64) {
+    let cell_width = u32::from(display.cell_width.max(1));
+    let cell_height = u32::from(display.cell_height.max(1));
+    match pixels {
+        Some((x, y)) => (
+            f64::from(u32::from(x).saturating_sub(u32::from(content.x).saturating_mul(cell_width))),
+            f64::from(
+                u32::from(y).saturating_sub(u32::from(content.y).saturating_mul(cell_height)),
+            ),
+        ),
+        None => (
+            f64::from(
+                u32::from(mouse.x.saturating_sub(content.x))
+                    .saturating_mul(cell_width)
+                    .saturating_add(cell_width / 2),
+            ),
+            f64::from(
+                u32::from(mouse.y.saturating_sub(content.y))
+                    .saturating_mul(cell_height)
+                    .saturating_add(cell_height / 2),
+            ),
+        ),
+    }
+}
+
+/// Place a pane-local overlay window in the outer terminal's pixel space.
+///
+/// A pane is its own coordinate space: its producer laid the window out against the pane's pixel
+/// rectangle, while the outer presenter places windows against the whole terminal. Both use the
+/// same cell size, so this is a translation by the pane's origin — a zoomed pane is already a
+/// larger projected rectangle rather than a scale factor.
+///
+/// `SET_OVERLAY_WINDOW` carries no clip, so a window that would overhang its pane is pulled back
+/// inside it, and one too large to fit at all is withheld: painting over a neighbouring pane is a
+/// worse failure than not painting.
+fn project_overlay_window(
+    window: crate::media::SnapshotOverlayWindow,
+    content: Rect,
+    display: DisplayMetrics,
+) -> BridgeOverlayWindow {
+    let cell_width = i64::from(display.cell_width.max(1));
+    let cell_height = i64::from(display.cell_height.max(1));
+    let slack_x = i64::from(content.width)
+        .saturating_mul(cell_width)
+        .saturating_sub(window.width);
+    let slack_y = i64::from(content.height)
+        .saturating_mul(cell_height)
+        .saturating_sub(window.height);
+    BridgeOverlayWindow {
+        parent: window.parent,
+        min_width: window.min_width,
+        min_height: window.min_height,
+        offset_x: i64::from(content.x)
+            .saturating_mul(cell_width)
+            .saturating_add(window.x.clamp(0, slack_x.max(0)))
+            .saturating_sub(window.x),
+        offset_y: i64::from(content.y)
+            .saturating_mul(cell_height)
+            .saturating_add(window.y.clamp(0, slack_y.max(0)))
+            .saturating_sub(window.y),
+        generation: window.generation,
+        revision: window.revision,
+        x: i64::from(content.x)
+            .saturating_mul(cell_width)
+            .saturating_add(window.x.clamp(0, slack_x.max(0))),
+        y: i64::from(content.y)
+            .saturating_mul(cell_height)
+            .saturating_add(window.y.clamp(0, slack_y.max(0))),
+        width: window.width,
+        height: window.height,
+        mode: window.mode,
+        visible: window.visible && slack_x >= 0 && slack_y >= 0,
+    }
+}
+
 fn bridge_source_kind(
     key: crate::media::SourceKey,
     descriptor: &crate::media::SourceDescriptor,
@@ -16730,6 +17063,11 @@ fn bridge_source_kind(
             bitrate: config.bitrate,
             max_access_unit_bytes: config.max_access_unit_bytes,
             codec_string: config.codec_string.clone(),
+        },
+        crate::media::SourceDescriptor::VectorScene(config) => BridgeSourceKind::VectorScene {
+            width: config.width,
+            height: config.height,
+            maximum_scene_bytes: config.maximum_scene_bytes,
         },
     }
 }
@@ -16882,6 +17220,41 @@ fn request_media_service(wakeup: &mpsc::SyncSender<ActorEvent>, pending: &Atomic
     if !pending.swap(true, Ordering::AcqRel) {
         let _ = wakeup.try_send(ActorEvent::MediaReady);
     }
+}
+
+/// Merge immediately ready output records only while they remain adjacent in actor-queue order.
+///
+/// The first different event is returned to the run loop rather than re-enqueued, so client input,
+/// detach, PTY exit, and other panes retain their exact position relative to the output bytes.
+fn coalesce_ready_pty_output(
+    event: ActorEvent,
+    receiver: &mpsc::Receiver<ActorEvent>,
+    maximum_bytes: usize,
+) -> (ActorEvent, Option<ActorEvent>, usize) {
+    let ActorEvent::PtyOutput(pane_id, mut bytes) = event else {
+        return (event, None, 1);
+    };
+    let mut consumed = 1;
+    let mut deferred = None;
+    while bytes.len() < maximum_bytes {
+        let Ok(next) = receiver.try_recv() else {
+            break;
+        };
+        match next {
+            ActorEvent::PtyOutput(next_pane, next_bytes)
+                if next_pane == pane_id
+                    && next_bytes.len() <= maximum_bytes.saturating_sub(bytes.len()) =>
+            {
+                bytes.extend_from_slice(&next_bytes);
+                consumed += 1;
+            }
+            other => {
+                deferred = Some(other);
+                break;
+            }
+        }
+    }
+    (ActorEvent::PtyOutput(pane_id, bytes), deferred, consumed)
 }
 
 /// Consume no more than `limit` ready items, returning whether the limit was reached.
@@ -17653,6 +18026,127 @@ fn prepend_bracketed_paste_transition(bytes: &mut Vec<u8>, transition: &[u8]) {
 mod tests {
     use super::*;
 
+    fn overlay_window(
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+    ) -> crate::media::SnapshotOverlayWindow {
+        crate::media::SnapshotOverlayWindow {
+            parent: None,
+            min_width: 1,
+            min_height: 1,
+            generation: 1,
+            revision: 1,
+            x,
+            y,
+            width,
+            height,
+            mode: 0,
+            visible: true,
+        }
+    }
+
+    fn metrics() -> DisplayMetrics {
+        DisplayMetrics {
+            columns: 100,
+            rows: 40,
+            cell_width: 8,
+            cell_height: 16,
+        }
+    }
+
+    #[test]
+    fn an_overlay_window_is_placed_at_its_pane_origin_in_the_outer_terminal() {
+        // A pane starting at cell (10, 4) with 8x16 cells begins at pixel (80, 64), so a window
+        // the producer put at pane-local (12, 20) belongs at (92, 84) on the outer terminal.
+        let pane = Rect {
+            x: 10,
+            y: 4,
+            width: 40,
+            height: 20,
+        };
+        let projected = project_overlay_window(overlay_window(12, 20, 240, 120), pane, metrics());
+        assert_eq!((projected.x, projected.y), (92, 84));
+        assert_eq!((projected.width, projected.height), (240, 120));
+        assert!(projected.visible);
+    }
+
+    #[test]
+    fn an_overlay_window_is_pulled_back_inside_its_pane_rather_than_over_a_neighbour() {
+        // The pane is 320x320 pixels and the window is 240x120, so its origin can reach 80x200.
+        let pane = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        let projected = project_overlay_window(overlay_window(300, 400, 240, 120), pane, metrics());
+        assert_eq!(
+            (projected.x, projected.y),
+            (80, 200),
+            "an overhanging window is moved, never resized: its producer laid out that size"
+        );
+        assert!(projected.visible);
+    }
+
+    #[test]
+    fn an_overlay_window_too_large_for_its_pane_is_withheld() {
+        // `SET_OVERLAY_WINDOW` has no clip, so the only alternative to withholding it is letting
+        // it paint across the panes beside it.
+        let pane = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 5,
+        };
+        let projected = project_overlay_window(overlay_window(0, 0, 240, 120), pane, metrics());
+        assert!(!projected.visible);
+    }
+
+    #[test]
+    fn a_window_its_producer_hid_stays_hidden_wherever_it_would_land() {
+        let pane = Rect {
+            x: 2,
+            y: 2,
+            width: 40,
+            height: 20,
+        };
+        let mut hidden = overlay_window(0, 0, 100, 50);
+        hidden.visible = false;
+        assert!(!project_overlay_window(hidden, pane, metrics()).visible);
+    }
+
+    #[test]
+    fn a_pointer_reaches_an_overlay_in_the_pane_local_pixels_it_laid_out_against() {
+        let pane = Rect {
+            x: 10,
+            y: 4,
+            width: 40,
+            height: 20,
+        };
+        let mouse = MouseEvent {
+            button: 0,
+            x: 12,
+            y: 6,
+            kind: MouseKind::Press,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        };
+        // The outer terminal reported an exact pixel inside that cell.
+        assert_eq!(
+            overlay_pointer_position(mouse, Some((100, 70)), pane, metrics()),
+            (20., 6.)
+        );
+        // Without pixel reporting the position is the middle of the cell, so a click still lands
+        // on whatever occupies it.
+        assert_eq!(
+            overlay_pointer_position(mouse, None, pane, metrics()),
+            (20., 40.)
+        );
+    }
+
     #[test]
     fn a_pane_publishes_its_frame_and_pane_as_a_mesh_address() {
         assert_eq!(mesh_address(1, 2).as_deref(), Some("f1p2"));
@@ -18290,6 +18784,34 @@ mod tests {
         pending.store(false, Ordering::Release);
         request_media_service(&sender, &pending);
         assert!(matches!(receiver.try_recv(), Ok(ActorEvent::MediaReady)));
+    }
+
+    #[test]
+    fn pty_output_batching_preserves_intervening_actor_event_order() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        sender
+            .send(ActorEvent::PtyOutput(7, b"second".to_vec()))
+            .unwrap();
+        sender.send(ActorEvent::MediaReady).unwrap();
+        sender
+            .send(ActorEvent::PtyOutput(7, b"third".to_vec()))
+            .unwrap();
+
+        let (event, deferred, consumed) = coalesce_ready_pty_output(
+            ActorEvent::PtyOutput(7, b"first".to_vec()),
+            &receiver,
+            PTY_OUTPUT_BATCH_BYTES,
+        );
+        assert_eq!(consumed, 2);
+        assert!(matches!(
+            event,
+            ActorEvent::PtyOutput(7, bytes) if bytes == b"firstsecond"
+        ));
+        assert!(matches!(deferred, Some(ActorEvent::MediaReady)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ActorEvent::PtyOutput(7, bytes)) if bytes == b"third"
+        ));
     }
 
     #[test]
