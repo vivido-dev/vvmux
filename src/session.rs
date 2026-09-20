@@ -77,6 +77,10 @@ const INPUT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_AUTOMATION_REQUESTS_PER_CLIENT: usize = 64;
 const MAX_AUTOMATION_WAITERS: usize = 256;
 const MAX_PENDING_ACTOR_WORK: usize = 256;
+/// Hard ceiling on live panes per session, enforced by every automation pane creator
+/// (`split`, `run` with placement, `new-tab`). Layout files keep their own lower
+/// [`crate::layout_file::MAX_LAYOUT_PANES`] fork bound.
+const MAX_SESSION_PANES: usize = 256;
 /// How long shape changes coalesce before a snapshot is written.
 ///
 /// Long enough that dragging a split or opening several panes is one write, short enough that a
@@ -4961,7 +4965,7 @@ impl SessionActor {
     /// The pane holding the agent named `alias`, if one does.
     ///
     /// A linear scan rather than a reverse index: a session holds at most
-    /// [`crate::layout_file::MAX_LAYOUT_PANES`] panes, and an index would be a second copy of state
+    /// [`MAX_SESSION_PANES`] panes, and an index would be a second copy of state
     /// that has to be invalidated everywhere an alias is cleared — including the process-exit paths
     /// inside `AgentRuntime`, which know nothing about the session. Scanning cannot go stale.
     fn pane_with_agent_alias(&self, alias: &crate::agent::AgentAlias) -> Option<PaneId> {
@@ -5262,6 +5266,17 @@ impl SessionActor {
         }
     }
 
+    /// Reject pane creation once the session holds [`MAX_SESSION_PANES`] live panes.
+    fn check_session_pane_cap(&self) -> Result<(), AutomationError> {
+        if self.panes.len() >= MAX_SESSION_PANES {
+            return Err(AutomationError::new(
+                "limit_exceeded",
+                format!("a session holds at most {MAX_SESSION_PANES} panes"),
+            ));
+        }
+        Ok(())
+    }
+
     fn automation_split(
         &mut self,
         pane_id: PaneId,
@@ -5272,6 +5287,7 @@ impl SessionActor {
             .iter()
             .position(|tab| tab.contains(pane_id))
             .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+        self.check_session_pane_cap()?;
         let tab_id = self.tabs[tab_index].id;
         let mut candidate = self.tabs[tab_index]
             .tree
@@ -5366,6 +5382,7 @@ impl SessionActor {
             .iter()
             .position(|tab| tab.contains(anchor))
             .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+        self.check_session_pane_cap()?;
         let new_pane_id = self.next_pane_id;
 
         let tab_id = match placement {
@@ -7275,6 +7292,7 @@ impl SessionActor {
                 format!("a session holds at most {MAX_LAYOUT_TABS} tabs"),
             ));
         }
+        self.check_session_pane_cap()?;
         self.new_tab()
             .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;
         let tab = self
@@ -12710,7 +12728,7 @@ impl SessionActor {
     /// The pane holding `name`, if one does.
     ///
     /// A linear scan for the same reason [`Self::pane_with_agent_alias`] uses one: a session holds
-    /// at most [`crate::layout_file::MAX_LAYOUT_PANES`] panes, and an index would be a second copy
+    /// at most [`MAX_SESSION_PANES`] panes, and an index would be a second copy
     /// of state to invalidate everywhere a name is cleared.
     fn pane_with_name(&self, name: &crate::layout::PaneName) -> Option<PaneId> {
         self.panes
