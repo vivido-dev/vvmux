@@ -903,7 +903,7 @@ focus = "shell"
 ```
 
 Splits may nest and contain 2–16 children. `sizes` are relative integer weights from 1 through
-1000; omitting them gives every child equal weight. A layout may contain up to 16 tabs and 64
+1000; omitting them gives every child equal weight. A layout may contain up to 64 tabs and 128
 panes total. Each pane label is tab-local and unique, and `focus` names one of those labels.
 Floating-only tabs are valid. `command` is one shell command line passed to `shell -c`, `cwd`
 accepts `~/`, and `hold = true` preserves command output after exit. If one pane cannot spawn, its

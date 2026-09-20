@@ -10,8 +10,8 @@ use crate::ipc::Axis;
 use crate::layout::{PaneId, TiledNode};
 use crate::session::PaneSpawn;
 
-pub const MAX_LAYOUT_TABS: usize = 16;
-pub const MAX_LAYOUT_PANES: usize = 64;
+pub const MAX_LAYOUT_TABS: usize = 64;
+pub const MAX_LAYOUT_PANES: usize = 128;
 const MAX_SPLIT_CHILDREN: usize = 16;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 /// The conventional startup layout, applied when a session is created without `--layout`.
@@ -717,23 +717,23 @@ hold = true
 
     #[test]
     fn pane_and_tab_caps_are_enforced() {
-        let too_many_tabs = (0..17)
+        let too_many_tabs = (0..65)
             .map(|index| format!("[[tabs]]\n[[tabs.floating]]\npane='p{index}'\n"))
             .collect::<String>();
         assert!(
             parse(&too_many_tabs)
                 .unwrap_err()
                 .to_string()
-                .contains("16 tabs")
+                .contains("64 tabs")
         );
 
-        let panes = (0..65)
+        let panes = (0..129)
             .map(|index| format!("[[tabs.floating]]\npane='p{index}'\n"))
             .collect::<String>();
         let error = parse(&format!("[[tabs]]\n{panes}"))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("64-pane"), "{error}");
+        assert!(error.contains("128-pane"), "{error}");
     }
 
     #[test]
