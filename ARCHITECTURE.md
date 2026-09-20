@@ -60,11 +60,13 @@ absorb acknowledgement jitter without borrowing capacity from video or another p
 replacement generation is re-granted that window on its handoff record instead, because the outer
 delivery that would earn it cannot complete until the PLAY the prebuffer gates.
 
-A paused timed outer track forwards one bounded pre-roll record at a time before PLAY, so the
-writer queue never holds more than one. Slot activation needs decoded output, and a decoder
-routinely wants several access units before it emits its first picture, so a blocked activation
-attempt is itself the evidence that admits one more record, up to the ceiling the track declared.
-Otherwise the allowance and the readiness it feeds wait on each other.
+A paused timed outer track keeps one writer handoff outstanding before activation and forwards
+within a finite 32-record bootstrap ceiling using the outer channel's authenticated credit.
+Completion of the socket write admits the next packet; it does not wait for returned capacity or
+a readiness query after every access unit. The background status observer checks output readiness
+without blocking media assembly or delivery, and activation still requires the presenter's
+authoritative output-ready milestone. This avoids multiplying SSH round trips by both the number
+of chunks in an image and the decoder's reorder/threading delay in packets.
 
 Ordinary timed audio/video packets update delivery and query status without advancing the virtual
 scene projection. PLAY, PAUSE, EOS, recovery edges, track lifecycle, and retained image/raster
@@ -355,11 +357,10 @@ limit. The VVWS adapter retains structured server messages as bounded JSON and c
 allocated encoded capacity; binary render/media retain their direct path and capacity charge.
 Its client writer uses the same binary microphone encoder as the native client.
 
-Each outer track has its own blocking writer. Before timed PLAY, that writer reports a completed
-pre-roll record only after the outer presenter returns the record's ingress capacity; this keeps
-ACTIVATE_TRACK behind actual outer processing instead of a kernel socket write. Once atomic
-activation and PLAY succeed, the writer stops adding that record-by-record barrier and uses the
-outer channel's normal bounded flow window. Linked audio can then stay buffered at device rate
+Each outer track has its own blocking writer. Timed pre-roll completion reports a successful
+socket write; the background readiness observer separately gates ACTIVATE_TRACK on actual
+decoded output. The outer channel's normal bounded flow window applies throughout. Linked audio
+can stay buffered at device rate
 without sharing a blocking write, decoder wait, or acknowledgement round trip with video. EOS is
 queued behind all earlier records for the same track.
 

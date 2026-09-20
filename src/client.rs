@@ -1955,7 +1955,7 @@ fn run_bridge_worker(
             continue;
         }
         // Timed media for a source that has not started is legitimate pre-roll. OuterBridge
-        // acknowledges it after the outer presenter returns the corresponding ingress capacity,
+        // acknowledges it after the outer socket write completes,
         // replenishing the virtual presenter's initial grant so Vivi can supply enough linked
         // audio and reordered video to issue PLAY. Media a paused source may not deliver yet was
         // never popped: `source_admits_media_now` leaves it queued rather than retiring it here,
@@ -4352,18 +4352,12 @@ mod tests {
             outer_audio.record_type,
             vivid_protocol::messages::AUDIO_PACKET
         );
-        assert!(
-            ack_receiver
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
-            "pre-PLAY delivery was acknowledged before outer ingress became reusable"
-        );
-        assert!(!presenter.complete_bridge_delivery(outer_audio.delivery_id, true));
         assert_eq!(
             ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
             (42, true),
-            "pre-PLAY media must replenish the virtual presenter's one-packet grant"
+            "the socket write must replenish pre-roll before returned outer credit"
         );
+        assert!(!presenter.complete_bridge_delivery(outer_audio.delivery_id, true));
         for virtual_revision in 2..=8 {
             worker.replace_snapshot(BridgeSnapshot {
                 microphones: Vec::new(),
@@ -4420,18 +4414,12 @@ mod tests {
             outer_video.record_type,
             vivid_protocol::messages::VIDEO_PACKET
         );
-        assert!(
-            ack_receiver
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
-            "opening video was acknowledged before outer ingress became reusable"
-        );
-        assert!(!presenter.complete_bridge_delivery(outer_video.delivery_id, true));
         assert_eq!(
             ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
             (43, true),
             "the first post-PLAY keyframe must reach the existing outer video source"
         );
+        assert!(!presenter.complete_bridge_delivery(outer_video.delivery_id, true));
         let deadline = Instant::now() + Duration::from_secs(1);
         let (initial_outer_video, initial_outer_audio) = loop {
             let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
@@ -4586,25 +4574,17 @@ mod tests {
             last: true,
             bytes: recovery_audio,
         }));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let outer_recovery_audio = loop {
-            if let Ok(media) = outer_media_receiver.try_recv() {
-                break media;
-            }
-            if let Ok(ack) = ack_receiver.try_recv() {
-                panic!(
-                    "replacement audio pre-roll was rejected before the outer presenter: {ack:?}"
-                );
-            }
-            assert!(
-                Instant::now() < deadline,
-                "replacement audio pre-roll never reached the outer presenter"
-            );
-            thread::sleep(Duration::from_millis(2));
-        };
+        let outer_recovery_audio = outer_media_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement audio pre-roll never reached the outer presenter");
         assert_eq!(
             outer_recovery_audio.record_type,
             vivid_protocol::messages::AUDIO_PACKET
+        );
+        assert_eq!(
+            ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (46, true),
+            "replacement audio must not wait for PLAY to acknowledge its socket write"
         );
 
         // Seeking pauses a source that has already played, then pre-rolls the replacement
@@ -4686,11 +4666,6 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert!(!presenter.complete_bridge_delivery(outer_recovery_audio.delivery_id, true));
-        assert_eq!(
-            ack_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            (46, true),
-            "PLAY did not release the linked audio record that established output readiness"
-        );
 
         let mut quieter_audio = audio_source;
         let quieter_gain = vivid_sdk::AudioGain::from_percent(35).unwrap();
@@ -5533,7 +5508,20 @@ mod tests {
                 },
             );
 
-            let restored = presenter.projection_snapshot(&HashSet::from([7]));
+            // A media ACK proves the write, not decoder readiness or PLAY. Wait for the
+            // independently observed physical activation before asserting its clock state.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let restored = loop {
+                let restored = presenter.projection_snapshot(&HashSet::from([7]));
+                if outer_video(&restored).is_some_and(|(_, playing)| playing) {
+                    break restored;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "recovered output never resumed playback"
+                );
+                thread::sleep(Duration::from_millis(2));
+            };
             assert_eq!(restored.nodes.len(), 1);
             assert!(outer_video(&restored).is_some_and(|(_, playing)| playing));
             let recovery_clocks = presenter.take_play_commands();
