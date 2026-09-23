@@ -867,6 +867,13 @@ impl ReadinessWriter {
         let file = handle
             .filter(|handle| *handle != 0 && *handle != INVALID_HANDLE_VALUE as usize)
             .map(|handle| unsafe { File::from_raw_handle(handle as RawHandle) });
+        // The launcher had to make the handle inheritable to get it here; clear that now. Every
+        // child the server spawns with inheritance on (the agent-mesh watcher, pane processes)
+        // would otherwise hold the write end open for the life of the session, and the launcher
+        // waits for EOF before it reads the result.
+        if let Some(file) = &file {
+            set_handle_inheritance(file.as_raw_handle() as HANDLE, false)?;
+        }
         Ok(Self { file })
     }
 
@@ -1804,7 +1811,29 @@ fn wide_nul(value: &[u16]) -> Vec<u16> {
 mod tests {
     use super::*;
 
+    use std::os::windows::io::IntoRawHandle;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn readiness_writer_stops_its_handle_from_leaking_into_server_children() {
+        let (reader, writer) = inheritable_pipe().unwrap();
+        let handle = writer.into_file().into_raw_handle() as usize;
+        let mut readiness = ReadinessWriter::from_metadata(Some(handle)).unwrap();
+
+        let mut flags = 0;
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::Foundation::GetHandleInformation(handle as HANDLE, &mut flags)
+            },
+            0
+        );
+        assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+
+        readiness.success().unwrap();
+        let mut bytes = Vec::new();
+        reader.into_file().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"OK\n");
+    }
 
     #[test]
     fn microsoft_quoting_handles_spaces_quotes_and_trailing_slashes() {
