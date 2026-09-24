@@ -11,7 +11,9 @@ use zeroize::Zeroizing;
 
 #[cfg(test)]
 use crate::client_input::parse_configured_action;
-use crate::client_input::{self, FloatEditScanner, MouseCoordinates, ParsedInput, PrefixParser};
+use crate::client_input::{
+    self, FloatEditScanner, MouseCoordinates, ParsedInput, PrefixParser, Win32InputDecoder,
+};
 #[cfg(test)]
 use crate::ipc::DisplayMetrics;
 #[cfg(test)]
@@ -458,6 +460,7 @@ pub fn attach(
     let mut last_display = display;
     let mut float_mode: Option<u64> = None;
     let mut float_scanner = FloatEditScanner::default();
+    let mut win32_input = Win32InputDecoder::default();
     let mut detach_requested_at: Option<Instant> = None;
     let result = (|| -> io::Result<()> {
         while !stopped.load(Ordering::Acquire) {
@@ -501,11 +504,12 @@ pub fn attach(
                     detach_requested_at = Some(Instant::now());
                     continue;
                 }
+                let input = win32_input.decode(&bytes[..read]);
                 let parsed = if let Some(mode_id) = float_mode {
                     // Scan edit keys before the ordinary prefix/mouse parser. In particular, that
                     // parser buffers ESC while deciding whether it begins SGR mouse input, which
                     // would otherwise make a bare Escape unable to cancel the modal edit.
-                    let (commands, forward) = float_scanner.scan(&bytes[..read]);
+                    let (commands, forward) = float_scanner.scan(&input);
                     for command in commands {
                         send_client(&writer, &ClientMessage::FloatingEdit { mode_id, command })?;
                         if matches!(
@@ -517,7 +521,7 @@ pub fn attach(
                     }
                     parser.feed(&forward)
                 } else {
-                    parser.feed(&bytes[..read])
+                    parser.feed(&input)
                 };
                 for command in parsed {
                     match command {

@@ -24,6 +24,226 @@ pub(crate) enum MouseCoordinates {
 /// insert mode only when the byte itself arrives, so an indefinite hold reads as a lost keypress.
 pub(crate) const ESCAPE_DELAY: Duration = Duration::from_millis(25);
 
+/// The longest win32-input-mode record: `ESC [` plus six five-digit fields, five separators, and
+/// the final `_`. Anything longer is not one and is passed through.
+const WIN32_INPUT_MAX: usize = 2 + 6 * 5 + 5 + 1;
+/// Bounds how many bytes one record's repeat count can expand to.
+const WIN32_INPUT_MAX_REPEAT: u16 = 64;
+
+const WIN32_RIGHT_ALT: u32 = 0x1;
+const WIN32_LEFT_ALT: u32 = 0x2;
+const WIN32_RIGHT_CTRL: u32 = 0x4;
+const WIN32_LEFT_CTRL: u32 = 0x8;
+const WIN32_SHIFT: u32 = 0x10;
+
+/// Translates Windows Terminal's win32-input-mode key records into ordinary terminal input.
+///
+/// A console can hand this client the host's raw `ESC [ Vk;Sc;Uc;Kd;Cs;Rc _` records instead of
+/// the VT bytes it asked for: every press, release, and bare modifier as its own record. Left
+/// alone they reach a pane's ConPTY, which decodes them itself, so keys still type but no prefix
+/// chord, prompt, or copy-mode key is ever recognized. Decoding here, before anything else reads
+/// the input, gives the rest of the client the same bytes a VT console would have produced.
+#[derive(Default)]
+pub(crate) struct Win32InputDecoder {
+    pending: Vec<u8>,
+    high_surrogate: Option<u16>,
+}
+
+impl Win32InputDecoder {
+    pub(crate) fn decode(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            if self.pending.is_empty() {
+                if byte == 0x1b {
+                    self.pending.push(byte);
+                } else {
+                    output.push(byte);
+                }
+                continue;
+            }
+            self.pending.push(byte);
+            let sequence = self.pending.as_slice();
+            if sequence.len() == 2 {
+                if byte != b'[' {
+                    self.flush_into(&mut output);
+                }
+                continue;
+            }
+            if byte == b'_' {
+                let sequence = std::mem::take(&mut self.pending);
+                match parse_win32_record(&sequence) {
+                    Some(record) => self.translate(record, &mut output),
+                    None => output.extend_from_slice(&sequence),
+                }
+            } else if !(byte.is_ascii_digit() || byte == b';') || sequence.len() >= WIN32_INPUT_MAX
+            {
+                self.flush_into(&mut output);
+            }
+        }
+        // A lone ESC or `ESC [` is left to the prefix parser, which owns the bare-Escape timing.
+        // Only a tail that is already recognizably a record waits for the rest of it.
+        if self.pending.len() <= 2 {
+            self.flush_into(&mut output);
+        }
+        output
+    }
+
+    fn flush_into(&mut self, output: &mut Vec<u8>) {
+        output.append(&mut self.pending);
+    }
+
+    fn translate(&mut self, record: Win32KeyRecord, output: &mut Vec<u8>) {
+        if !record.key_down {
+            return;
+        }
+        let alt = record.control_state & (WIN32_LEFT_ALT | WIN32_RIGHT_ALT) != 0;
+        let ctrl = record.control_state & (WIN32_LEFT_CTRL | WIN32_RIGHT_CTRL) != 0;
+        let shift = record.control_state & WIN32_SHIFT != 0;
+        let mut bytes = Vec::new();
+        match (record.virtual_key, record.unicode) {
+            // Terminals send DEL for Backspace; Ctrl+Backspace keeps the console's BS.
+            (0x08, _) => bytes.push(if ctrl { 0x08 } else { 0x7f }),
+            (0x09, _) if shift => bytes.extend_from_slice(b"\x1b[Z"),
+            (0x20, _) if ctrl => bytes.push(0),
+            (_, 0) => {
+                let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+                if let Some(sequence) = special_key_sequence(record.virtual_key, modifier) {
+                    for _ in 0..record.repeat {
+                        output.extend_from_slice(&sequence);
+                    }
+                }
+                // Bare modifiers and keys without a terminal encoding produce no input.
+                return;
+            }
+            (_, unit @ 0xd800..=0xdbff) => {
+                self.high_surrogate = Some(unit);
+                return;
+            }
+            (_, unit @ 0xdc00..=0xdfff) => {
+                let Some(high) = self.high_surrogate.take() else {
+                    return;
+                };
+                let Some(Ok(character)) = char::decode_utf16([high, unit]).next() else {
+                    return;
+                };
+                let mut buffer = [0; 4];
+                bytes.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            }
+            (_, unit) => {
+                let Some(character) = char::from_u32(unit.into()) else {
+                    return;
+                };
+                let mut buffer = [0; 4];
+                bytes.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            }
+        }
+        self.high_surrogate = None;
+        // Alt prefixes ESC as a VT console does; Ctrl+Alt is AltGr and already chose the text.
+        if alt && !ctrl {
+            bytes.insert(0, 0x1b);
+        }
+        for _ in 0..record.repeat {
+            output.extend_from_slice(&bytes);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Win32KeyRecord {
+    virtual_key: u16,
+    unicode: u16,
+    key_down: bool,
+    control_state: u32,
+    repeat: u16,
+}
+
+/// Parse `ESC [ Vk;Sc;Uc;Kd;Cs;Rc _`. Windows Terminal always sends all six fields, so a shorter
+/// `CSI … _` is some other sequence and is left alone. An empty field is zero. The scan code is
+/// not needed to reproduce what a VT console would send.
+fn parse_win32_record(sequence: &[u8]) -> Option<Win32KeyRecord> {
+    let body = sequence.strip_prefix(b"\x1b[")?.strip_suffix(b"_")?;
+    let mut fields = [0_u32; 6];
+    let mut count = 0;
+    for field in body.split(|byte| *byte == b';') {
+        let slot = fields.get_mut(count)?;
+        count += 1;
+        if field.is_empty() {
+            continue;
+        }
+        *slot = std::str::from_utf8(field).ok()?.parse().ok()?;
+    }
+    if count != fields.len() {
+        return None;
+    }
+    let [
+        virtual_key,
+        _scan_code,
+        unicode,
+        key_down,
+        control_state,
+        repeat,
+    ] = fields;
+    Some(Win32KeyRecord {
+        virtual_key: u16::try_from(virtual_key).ok()?,
+        unicode: u16::try_from(unicode).ok()?,
+        key_down: key_down != 0,
+        control_state,
+        repeat: u16::try_from(repeat)
+            .unwrap_or(u16::MAX)
+            .clamp(1, WIN32_INPUT_MAX_REPEAT),
+    })
+}
+
+/// The xterm encoding of a key that has no character, with `modifier` as xterm numbers it.
+fn special_key_sequence(virtual_key: u16, modifier: u8) -> Option<Vec<u8>> {
+    let letter = |final_byte: u8| {
+        if modifier == 1 {
+            vec![0x1b, b'[', final_byte]
+        } else {
+            format!("\x1b[1;{modifier}{}", char::from(final_byte)).into_bytes()
+        }
+    };
+    let function = |final_byte: u8| {
+        if modifier == 1 {
+            vec![0x1b, b'O', final_byte]
+        } else {
+            format!("\x1b[1;{modifier}{}", char::from(final_byte)).into_bytes()
+        }
+    };
+    let tilde = |number: u8| {
+        if modifier == 1 {
+            format!("\x1b[{number}~").into_bytes()
+        } else {
+            format!("\x1b[{number};{modifier}~").into_bytes()
+        }
+    };
+    Some(match virtual_key {
+        0x26 => letter(b'A'),
+        0x28 => letter(b'B'),
+        0x27 => letter(b'C'),
+        0x25 => letter(b'D'),
+        0x24 => letter(b'H'),
+        0x23 => letter(b'F'),
+        0x2d => tilde(2),
+        0x2e => tilde(3),
+        0x21 => tilde(5),
+        0x22 => tilde(6),
+        0x70 => function(b'P'),
+        0x71 => function(b'Q'),
+        0x72 => function(b'R'),
+        0x73 => function(b'S'),
+        0x74 => tilde(15),
+        0x75 => tilde(17),
+        0x76 => tilde(18),
+        0x77 => tilde(19),
+        0x78 => tilde(20),
+        0x79 => tilde(21),
+        0x7a => tilde(23),
+        0x7b => tilde(24),
+        _ => return None,
+    })
+}
+
 /// Fragment-safe parser for the intentionally tiny floating-edit key language. A leading ESC is
 /// held briefly so an arrow split across terminal reads is not mistaken for a bare Escape. Any
 /// byte sequence outside the language is returned to the normal prefix/mouse/input parser.
@@ -915,6 +1135,75 @@ fn prefix_sequence(sequence: &[u8]) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ctrl+B then `h`, exactly as Windows Terminal delivered them in win32-input-mode: bare Ctrl
+    /// presses, the chord's press and release, Ctrl's release, then `h` down and up.
+    const WIN32_PREFIX_H: &[u8] = b"\x1b[17;29;0;1;8;1_\x1b[66;48;2;1;8;1_\x1b[66;48;2;0;8;1_\
+\x1b[17;29;0;0;0;1_\x1b[72;35;104;1;0;1_\x1b[72;35;104;0;0;1_";
+
+    #[test]
+    fn win32_input_records_become_the_bytes_a_vt_console_sends() {
+        let mut decoder = Win32InputDecoder::default();
+        assert_eq!(decoder.decode(WIN32_PREFIX_H), b"\x02h");
+    }
+
+    #[test]
+    fn win32_input_prefix_chords_reach_the_prefix_parser() {
+        let mut decoder = Win32InputDecoder::default();
+        let mut parser = PrefixParser::new(0x02, &BTreeMap::new());
+        assert_eq!(
+            parser.feed(&decoder.decode(WIN32_PREFIX_H)),
+            vec![ParsedInput::Action(Action::Focus(Direction::Left))]
+        );
+    }
+
+    #[test]
+    fn win32_input_record_split_across_reads_is_reassembled() {
+        let mut decoder = Win32InputDecoder::default();
+        let (first, second) = WIN32_PREFIX_H.split_at(25);
+        let mut decoded = decoder.decode(first);
+        decoded.extend(decoder.decode(second));
+        assert_eq!(decoded, b"\x02h");
+    }
+
+    #[test]
+    fn win32_input_special_keys_use_xterm_encodings() {
+        let mut decoder = Win32InputDecoder::default();
+        // Up, Shift+Right, F1, Delete, Backspace, Shift+Tab, Enter, Escape.
+        let input = b"\x1b[38;72;0;1;0;1_\x1b[39;77;0;1;16;1_\x1b[112;59;0;1;0;1_\
+\x1b[46;83;0;1;256;1_\x1b[8;14;8;1;0;1_\x1b[9;15;9;1;16;1_\x1b[13;28;13;1;0;1_\
+\x1b[27;1;27;1;0;1_";
+        assert_eq!(
+            decoder.decode(input),
+            b"\x1b[A\x1b[1;2C\x1bOP\x1b[3~\x7f\x1b[Z\r\x1b"
+        );
+    }
+
+    #[test]
+    fn win32_input_alt_prefixes_escape_but_altgr_does_not() {
+        let mut decoder = Win32InputDecoder::default();
+        // Alt+x, then AltGr+Q producing `@` (reported as Right Alt with Left Ctrl).
+        let input = b"\x1b[88;45;120;1;2;1_\x1b[81;16;64;1;9;1_";
+        assert_eq!(decoder.decode(input), b"\x1bx@");
+    }
+
+    #[test]
+    fn win32_input_decodes_surrogate_pairs_and_bounds_repeats() {
+        let mut decoder = Win32InputDecoder::default();
+        let emoji = b"\x1b[0;0;55357;1;0;1_\x1b[0;0;56832;1;0;1_";
+        assert_eq!(decoder.decode(emoji), "\u{1f600}".as_bytes());
+        let repeated = decoder.decode(b"\x1b[65;30;97;1;0;65535_");
+        assert_eq!(repeated, vec![b'a'; usize::from(WIN32_INPUT_MAX_REPEAT)]);
+    }
+
+    #[test]
+    fn win32_input_leaves_other_input_untouched() {
+        let mut decoder = Win32InputDecoder::default();
+        let input = b"plain\x1b[A\x1b[<0;10;5M\x1b[1;2_x\x1b";
+        assert_eq!(decoder.decode(input), input);
+        // A lone ESC is never held here; the prefix parser owns bare-Escape timing.
+        assert_eq!(decoder.decode(b"\x1b"), b"\x1b");
+    }
 
     #[test]
     fn parser_preserves_literal_prefix_actions_and_mouse() {
