@@ -131,6 +131,46 @@ fn windows_session_exposes_structured_ai_automation() {
     );
 }
 
+/// Concurrent clients race for the session pipe's single listening instance. A client that loses
+/// that race sees ERROR_PIPE_BUSY and must wait for the next instance rather than fail.
+#[test]
+fn concurrent_clients_share_one_session_pipe() {
+    let binary = env!("CARGO_BIN_EXE_vvmux");
+    let name = format!(
+        "pipe-busy-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    assert_success(
+        &Command::new(binary)
+            .args(["new", "--session", &name, "--detached"])
+            .output()
+            .unwrap(),
+    );
+    let _guard = SessionGuard {
+        binary,
+        name: name.clone(),
+    };
+
+    std::thread::scope(|scope| {
+        let workers = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    for _ in 0..10 {
+                        assert_success(&message(binary, &name, &["session-inspect"]));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+}
+
 fn message(binary: &str, session: &str, arguments: &[&str]) -> Output {
     Command::new(binary)
         .args(["msg", "--target", session])

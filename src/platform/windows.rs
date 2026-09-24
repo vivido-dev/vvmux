@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{ConnectionCancel, Transport};
 use crate::ipc::DisplayMetrics;
@@ -48,9 +48,10 @@ pub fn open_external(uri: &str) -> io::Result<()> {
 }
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE,
-    ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED,
-    ERROR_SEM_TIMEOUT, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -558,23 +559,43 @@ impl SessionListener {
     }
 }
 
+const SESSION_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub fn connect_session(endpoint: &str) -> io::Result<Transport> {
     let endpoint = wide_string(endpoint)?;
-    if unsafe { WaitNamedPipeW(endpoint.as_ptr(), 3_000) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let handle = unsafe {
-        CreateFileW(
-            endpoint.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
-            ptr::null_mut(),
-        )
+    let deadline = Instant::now() + SESSION_CONNECT_TIMEOUT;
+    // A free instance reported by WaitNamedPipeW can be claimed by another client, or not yet be
+    // re-armed by the server, before CreateFileW opens it. That is ERROR_PIPE_BUSY, and the
+    // documented answer is to wait again rather than fail the command.
+    let handle = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait_ms = u32::try_from(remaining.as_millis())
+            .unwrap_or(u32::MAX)
+            .max(1);
+        if unsafe { WaitNamedPipeW(endpoint.as_ptr(), wait_ms) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let handle = unsafe {
+            CreateFileW(
+                endpoint.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                ptr::null_mut(),
+            )
+        };
+        match OwnedHandle::new(handle) {
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
+                    && Instant::now() < deadline =>
+            {
+                continue;
+            }
+            result => break result?,
+        }
     };
-    let handle = OwnedHandle::new(handle)?;
     require_pipe_server_owner(handle.raw())?;
     split_pipe(Arc::new(handle))
 }

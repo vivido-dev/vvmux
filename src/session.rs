@@ -13143,7 +13143,9 @@ impl SessionActor {
         if let Some(address) = mesh_address(tab_id, pane_id) {
             environment.push(("AGENT_MESH_ADDRESS".into(), address));
         }
-        let vivid_capability = if spec.vivid_capability {
+        let birth_metrics = if spec.vivid_capability {
+            let display = self.layout_display();
+            let cells = vivid_cell_size(display.cell_width, display.cell_height);
             environment.extend([
                 ("VIVID_ENDPOINT_CONTROL".into(), self.vivid.endpoint()),
                 // The daemon can be reattached remotely; pane audio belongs to the presenter.
@@ -13155,9 +13157,13 @@ impl SessionActor {
             ]);
             #[cfg(windows)]
             environment.push(("VIVID_ANCHOR_TRANSPORT".into(), "conpty".into()));
-            true
+            // Publish the birth geometry before the child runs. The next relayout replaces it,
+            // but a producer that connects first — or in a session no client has attached to,
+            // where no relayout comes — must find a presentation target rather than be refused.
+            self.vivid.update_metrics(pane_id, 80, 22, cells);
+            Some((80, 22, cells.0, cells.1))
         } else {
-            false
+            None
         };
         // Every failure past `issue_pane_capability` must revoke it: the capability is already
         // minted, and leaving it live would let a dead pane's secret authenticate.
@@ -13169,7 +13175,7 @@ impl SessionActor {
                 io::ErrorKind::InvalidInput,
                 "pane argv must contain a program",
             )),
-            None if self.config.general.microphone && vivid_capability && cfg!(unix) => {
+            None if self.config.general.microphone && birth_metrics.is_some() && cfg!(unix) => {
                 environment.push((
                     "VVMIC_LABEL".into(),
                     format!("{} pane {}", self.name, pane_id),
@@ -13198,7 +13204,7 @@ impl SessionActor {
         let parts = match spawned {
             Ok(parts) => parts,
             Err(error) => {
-                if vivid_capability {
+                if birth_metrics.is_some() {
                     self.vivid.revoke_pane(pane_id);
                 }
                 return Err(error);
@@ -13253,7 +13259,7 @@ impl SessionActor {
                 name: None,
                 copy: None,
                 mouse_selection: None,
-                vivid_metrics: None,
+                vivid_metrics: birth_metrics,
                 capture_scale: None,
                 transparent: spec.transparent.unwrap_or(self.config.panes.transparent),
                 hold_on_exit: spec.hold_on_exit,
@@ -13669,7 +13675,8 @@ impl SessionActor {
                 // change is a normal resize to the producer and reverts the same way.
                 let (cell_width, cell_height) =
                     scaled_cells(display.cell_width, display.cell_height, pane.capture_scale);
-                let metrics = (content.width, content.height, cell_width, cell_height);
+                let vivid_cells = vivid_cell_size(cell_width, cell_height);
+                let metrics = (content.width, content.height, vivid_cells.0, vivid_cells.1);
                 let dimensions_changed = pane.terminal.rows() != rows as usize
                     || pane.terminal.cols() != columns as usize;
                 let metrics_changed = pane.vivid_metrics != Some(metrics);
@@ -13709,7 +13716,7 @@ impl SessionActor {
                         projection.pane_id,
                         content.width,
                         content.height,
-                        (cell_width, cell_height),
+                        vivid_cells,
                     );
                     pane.vivid_metrics = Some(metrics);
                 }
@@ -15246,6 +15253,21 @@ fn last_meaningful_change(
                 .is_none_or(|rows| rows.iter().any(|row| *row < cutoff))
         })
         .map_or_else(oldest, |change| change.at)
+}
+
+/// Cell size assumed for Vivid metrics before any client has reported one.
+const PLACEHOLDER_CELL_SIZE: (u16, u16) = (10, 20);
+
+/// The cell size a pane advertises to its producer. A session started detached has never seen a
+/// display, and the presenter publishes no target for a zero cell, so a producer started there
+/// would be refused until someone attached. It is given the placeholder instead, and the first
+/// attach replaces it through the ordinary metrics path.
+fn vivid_cell_size(cell_width: u16, cell_height: u16) -> (u16, u16) {
+    if cell_width == 0 || cell_height == 0 {
+        PLACEHOLDER_CELL_SIZE
+    } else {
+        (cell_width, cell_height)
+    }
 }
 
 /// A pane's advertised cell size, raised while a scaled capture is in flight.
