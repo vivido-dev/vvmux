@@ -1277,6 +1277,8 @@ pub enum Action {
     ToggleAgentNavigator,
     /// Open the status-row prompt that writes the current layout to a startup layout file.
     BeginSaveLayout,
+    /// Move the tab list to the next view: bottom, top, left, right, hidden.
+    CycleTabView,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

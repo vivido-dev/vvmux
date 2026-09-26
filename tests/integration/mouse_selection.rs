@@ -77,7 +77,7 @@ done
     fs::write(
         &config,
         format!(
-            "[general]\nshell = \"{}\"\nrender_interval_ms = 1\nstatus_visible = false\n",
+            "[general]\nshell = \"{}\"\nrender_interval_ms = 1\ntab_view = \"hidden\"\n",
             shell.display()
         ),
     )

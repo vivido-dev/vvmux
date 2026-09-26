@@ -755,6 +755,7 @@ impl PrefixParser {
             b'm' => output.push(ParsedInput::Action(Action::EnterFloatingMoveMode)),
             b'r' => output.push(ParsedInput::Action(Action::EnterFloatingResizeMode)),
             b'a' => output.push(ParsedInput::Action(Action::ToggleAgentNavigator)),
+            b'T' => output.push(ParsedInput::Action(Action::CycleTabView)),
             b'd' => output.push(ParsedInput::Detach),
             b'[' => output.push(ParsedInput::Action(Action::EnterCopyMode)),
             b']' => output.push(ParsedInput::Action(Action::Paste)),
@@ -802,6 +803,7 @@ fn is_core_chord(byte: u8) -> bool {
             | b'm'
             | b'r'
             | b'a'
+            | b'T'
             | b'd'
             | b'['
             | b']'
@@ -844,6 +846,7 @@ pub(crate) fn parse_configured_action(action: &str) -> Option<Action> {
         "enter-floating-resize-mode" => Some(Action::EnterFloatingResizeMode),
         "agent-navigator" => Some(Action::ToggleAgentNavigator),
         "save-layout" => Some(Action::BeginSaveLayout),
+        "cycle-tab-view" => Some(Action::CycleTabView),
         _ => None,
     }
 }

@@ -2,8 +2,8 @@
 
 //! Live config reload, end to end against a real detached session.
 //!
-//! The observable proof that a reload took effect is pane geometry: toggling `status_visible`
-//! moves the status row in or out of the pane area, so `msg inspect` reports a different pane
+//! The observable proof that a reload took effect is pane geometry: changing `tab_view`
+//! moves the tab bar in or out of the pane area, so `msg inspect` reports a different pane
 //! height. That routes through display re-normalization and a relayout, which is exactly the part
 //! of the reload path most likely to break.
 
@@ -61,7 +61,7 @@ while IFS= read -r line; do :; done
 
         let config = directory.path().join("vvmux.toml");
         let name = format!("reload-{label}-{}", std::process::id());
-        write_config(&config, &shell, "status_visible = true");
+        write_config(&config, &shell, "tab_view = 'bottom'");
 
         let created = common::vvmux_command(directory.path())
             .args([
@@ -111,8 +111,12 @@ while IFS= read -r line; do :; done
 
     /// The focused pane's height, which shrinks by one row while the status bar is visible.
     fn pane_height(&self) -> u64 {
+        self.pane_geometry("height")
+    }
+
+    fn pane_geometry(&self, field: &str) -> u64 {
         let inspected = json(self.msg(&["inspect", "--pane-id", "1"]));
-        inspected["pane"]["geometry"]["height"]
+        inspected["pane"]["geometry"][field]
             .as_u64()
             .unwrap_or_else(|| panic!("no pane geometry in {inspected}"))
     }
@@ -150,7 +154,7 @@ fn an_explicit_reload_applies_a_changed_status_bar() {
 
     let with_status = fixture.pane_height();
 
-    fixture.rewrite("status_visible = false");
+    fixture.rewrite("tab_view = 'hidden'");
     let reloaded = json(fixture.msg(&["reload-config"]));
     assert_eq!(reloaded["reloaded"], true);
     assert!(reloaded["path"].as_str().unwrap().ends_with("vvmux.toml"));
@@ -160,6 +164,27 @@ fn an_explicit_reload_applies_a_changed_status_bar() {
         with_status + 1,
         "hiding the status bar must give its row back to the pane"
     );
+}
+
+#[test]
+fn a_sidebar_tab_view_takes_columns_instead_of_a_row() {
+    let fixture = Fixture::start("sidebar");
+    let (bar_width, bar_height) = (fixture.pane_geometry("width"), fixture.pane_height());
+
+    fixture.rewrite("tab_view = 'left'");
+    assert_eq!(json(fixture.msg(&["reload-config"]))["reloaded"], true);
+    let left_width = fixture.pane_geometry("width");
+    assert!(left_width < bar_width, "a sidebar must narrow the pane");
+    assert_eq!(fixture.pane_height(), bar_height + 1);
+    assert!(
+        fixture.pane_geometry("x") > 0,
+        "a left sidebar pushes the pane right"
+    );
+
+    fixture.rewrite("tab_view = 'right'");
+    assert_eq!(json(fixture.msg(&["reload-config"]))["reloaded"], true);
+    assert_eq!(fixture.pane_geometry("width"), left_width);
+    assert_eq!(fixture.pane_geometry("x"), 0);
 }
 
 #[test]
@@ -187,7 +212,7 @@ fn an_invalid_config_is_rejected_and_the_session_keeps_running() {
 fn a_media_change_is_reported_as_ignored_rather_than_applied() {
     let fixture = Fixture::start("media");
 
-    fixture.rewrite("status_visible = true\n\n[media]\nmax_sources = 7");
+    fixture.rewrite("tab_view = 'bottom'\n\n[media]\nmax_sources = 7");
     let reloaded = json(fixture.msg(&["reload-config"]));
 
     assert_eq!(reloaded["reloaded"], true);
@@ -206,7 +231,7 @@ fn a_media_change_is_reported_as_ignored_rather_than_applied() {
 fn a_server_change_is_reported_as_ignored_rather_than_adopted() {
     let fixture = Fixture::start("server");
 
-    fixture.rewrite("status_visible = true\n\n[server]\nmax_connections = 7");
+    fixture.rewrite("tab_view = 'bottom'\n\n[server]\nmax_connections = 7");
     let reloaded = json(fixture.msg(&["reload-config"]));
 
     assert!(
@@ -224,7 +249,7 @@ fn a_deferred_section_is_named_in_the_report() {
     let fixture = Fixture::start("deferred");
 
     fixture.rewrite(
-        "status_visible = true\nprefix = 'C-a'\nscrollback_lines = 4242\n\n[keys.prefix]\ng = 'new-tab'",
+        "tab_view = 'bottom'\nprefix = 'C-a'\nscrollback_lines = 4242\n\n[keys.prefix]\ng = 'new-tab'",
     );
     let reloaded = json(fixture.msg(&["reload-config"]));
 
@@ -254,7 +279,7 @@ fn the_watcher_notices_an_edit_without_being_asked() {
     let fixture = Fixture::start("watch");
     let with_status = fixture.pane_height();
 
-    fixture.rewrite("status_visible = false");
+    fixture.rewrite("tab_view = 'hidden'");
 
     // One poll interval plus one debounce interval, with generous slack for a loaded machine.
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -291,7 +316,7 @@ fn sigusr1_reloads_without_terminating_the_session() {
         .parse()
         .unwrap();
 
-    fixture.rewrite("status_visible = false");
+    fixture.rewrite("tab_view = 'hidden'");
     assert!(
         Command::new("kill")
             .args(["-USR1", &pid.to_string()])

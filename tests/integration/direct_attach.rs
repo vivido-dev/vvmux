@@ -52,7 +52,7 @@ while IFS= read -r line; do printf 'OUT pane=%s:%s\n' "$VVMUX_PANE_ID" "$line"; 
     fs::write(
         &config,
         format!(
-            "[general]\nshell = {:?}\nrender_interval_ms = 1\nstatus_visible = true\n",
+            "[general]\nshell = {:?}\nrender_interval_ms = 1\ntab_view = \"bottom\"\n",
             shell.to_str().unwrap()
         ),
     )

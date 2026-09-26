@@ -69,7 +69,8 @@ pub struct General {
     pub default_cwd: Option<PathBuf>,
     pub default_layout: Option<String>,
     pub scrollback_lines: usize,
-    pub status_visible: bool,
+    /// Where the tab list is drawn when a session starts; `cycle-tab-view` changes it at runtime.
+    pub tab_view: crate::tab_view::TabView,
     pub mouse: bool,
     pub render_interval_ms: u64,
 }
@@ -288,7 +289,7 @@ impl Default for General {
             default_cwd: None,
             default_layout: None,
             scrollback_lines: 10_000,
-            status_visible: true,
+            tab_view: crate::tab_view::TabView::Bottom,
             mouse: true,
             render_interval_ms: 16,
         }
@@ -730,6 +731,7 @@ mod tests {
             "enter-floating-resize-mode",
             "agent-navigator",
             "save-layout",
+            "cycle-tab-view",
         ];
         const DOCUMENTED_COPY_ACTIONS: &[&str] = &[
             "up",

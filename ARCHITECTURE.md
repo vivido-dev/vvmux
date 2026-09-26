@@ -175,9 +175,11 @@ running config untouched. `[media]` was moved into the running `VirtualVivid` at
 values are carried forward rather than swapped under live retained media and in-flight tracks.
 `general.prefix` and `[keys.prefix]` belong to the client's prefix parser, so new values are stored
 but reported as deferred. `[server]` belongs to a separate `vvmux serve` process, so the session
-carries its old values forward and reports an edit as ignored. Changing `general.status_visible`
-moves the status row in or out of the pane area, so the stored displays are re-normalized before
-anything derives geometry from them, followed by exactly one `relayout` for the whole change.
+carries its old values forward and reports an edit as ignored. Changing `general.tab_view`, or
+cycling the session's tab view, moves the tab bar or sidebar in or out of the pane area, so the
+stored displays are re-normalized before anything derives geometry from them, followed by exactly
+one `relayout` for the whole change. The pane area is not anchored at the origin: a top bar or left
+sidebar offsets it, and every pane, float, and media rectangle derives from it.
 
 Startup layouts are parsed and bounded in the foreground process before daemonization, then loaded
 again by the server and lowered to pane-slot plans before the session actor starts. The actor

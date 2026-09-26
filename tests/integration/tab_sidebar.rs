@@ -1,11 +1,10 @@
 #![cfg(unix)]
 
-//! The right-click pane menu, driven through a real attached client with raw SGR mouse bytes.
+//! The sidebar tab view, driven through a real attached client with raw SGR mouse bytes.
 //!
-//! Proves the menu opens on a right click in a pane that has not asked for mouse reports, that the
-//! opening click's own release does not choose anything, that the swap pair and the zoom item are
-//! named after the pane's context, and that each item — chosen by key or by clicking it — does
-//! what it says to the live layout.
+//! Proves the sidebar takes columns instead of a row, that a multi-pane tab's `+` expands it into
+//! its named panes, that clicking a pane switches to its tab and focuses it, that clicking a tab
+//! switches to it, and that `C-b T` moves the sidebar to the other side.
 
 use crate::common;
 
@@ -39,20 +38,12 @@ struct Client {
 }
 
 impl Client {
-    /// Right-click and release at a zero-based display cell, then wait for the menu to be drawn.
-    fn open_menu(&mut self, x: u16, y: u16) -> String {
-        let mark = self.transcript.len();
+    /// Left-click and release at a zero-based display cell.
+    fn click(&mut self, x: u16, y: u16) {
         let (column, row) = (x + 1, y + 1);
         self.input
-            .send(format!("\x1b[<2;{column};{row}M\x1b[<2;{column};{row}m").as_bytes())
+            .send(format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m").as_bytes())
             .unwrap();
-        assert!(
-            self.wait_for(mark, b"Kill", Duration::from_secs(15)),
-            "the pane menu was never drawn"
-        );
-        // Let the rest of the frame arrive so the labels below can be read from it.
-        self.drain_for(Duration::from_millis(300));
-        String::from_utf8_lossy(&self.transcript[mark..]).into_owned()
     }
 
     fn wait_for(&mut self, from: usize, needle: &[u8], timeout: Duration) -> bool {
@@ -89,15 +80,15 @@ impl Client {
 }
 
 #[test]
-fn right_click_pane_menu_splits_swaps_zooms_respawns_and_kills() {
+fn sidebar_expands_tabs_and_clicks_select_tabs_and_panes() {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_vvmux"));
     let directory = tempfile::Builder::new()
-        .prefix("vvm-")
+        .prefix("vvs-")
         .tempdir_in("/tmp")
         .unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let runtime = directory.path().to_path_buf();
-    // The fixture never enables mouse reporting, so a right click belongs to vvmux.
+    // The fixture never enables mouse reporting, so every click belongs to vvmux.
     let shell = directory.path().join("fixture-shell");
     fs::write(
         &shell,
@@ -109,13 +100,13 @@ fn right_click_pane_menu_splits_swaps_zooms_respawns_and_kills() {
     fs::write(
         &config,
         format!(
-            "[general]\nshell = \"{}\"\nrender_interval_ms = 1\ntab_view = \"hidden\"\n",
+            "[general]\nshell = \"{}\"\nrender_interval_ms = 1\ntab_view = \"left\"\n",
             shell.display()
         ),
     )
     .unwrap();
     let session = format!(
-        "menu-probe-{}-{}",
+        "sidebar-probe-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -136,6 +127,7 @@ fn right_click_pane_menu_splits_swaps_zooms_respawns_and_kills() {
             runtime.to_str().unwrap().to_owned(),
         ),
     ];
+    // 100 columns give a 24-column sidebar: text in columns 0..23, the separator in column 23.
     let parts = PtyProcess::spawn(
         std::ffi::OsStr::new("/bin/sh"),
         None,
@@ -178,70 +170,96 @@ fn right_click_pane_menu_splits_swaps_zooms_respawns_and_kills() {
     );
     wait_for_text(&runtime, &session, 1, "READY pane=1");
 
-    // A lone pane: splits, kill, respawn, and a zoom that has nothing to zoom over. No swap pair.
-    let menu = client.open_menu(10, 5);
-    assert!(menu.contains("Horizontal Split") && menu.contains("Vertical Split"));
+    let layout = layout_now(&runtime, &session);
+    assert_eq!(
+        layout["area"]["x"], 24,
+        "the left sidebar pushes panes right"
+    );
+    assert_eq!(layout["area"]["height"], 30, "a sidebar takes no row");
+
+    // Tab 1 holds panes 1 (named) and 2; tab 2 holds pane 3 and is active.
+    msg(
+        &runtime,
+        &session,
+        &["split", "horizontal", "--pane-id", "1"],
+    );
+    msg(
+        &runtime,
+        &session,
+        &["pane-rename", "--pane-id", "1", "--name", "editor"],
+    );
+    msg(&runtime, &session, &["new-tab", "--name", "logs"]);
+    wait_for_text(&runtime, &session, 3, "READY pane=3");
+    msg(&runtime, &session, &["focus", "--pane-id", "3"]);
+    let tab_ids: Vec<u64> = layout_now(&runtime, &session)["tabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tab| tab["tab_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(tab_ids.len(), 2);
+    wait_until(&runtime, &session, "tab 2 active", |layout| {
+        layout["active_tab_id"] == tab_ids[1]
+    });
+
+    // Let every frame from before the switch arrive, so the next one reflects only the click.
     assert!(
-        !menu.contains("Swap"),
-        "a lone pane has no swap pair: {menu}"
+        client.wait_for(0, b"2 logs", Duration::from_secs(15)),
+        "the sidebar never listed the named tab"
+    );
+    client.drain_for(Duration::from_millis(500));
+
+    // Row 0 is tab 1; its marker is the first cell.
+    let mark = client.transcript.len();
+    client.click(0, 0);
+    assert!(
+        client.wait_for(mark, b"editor", Duration::from_secs(15)),
+        "expanding the tab never listed its named pane"
     );
     assert_eq!(
-        pane_ids(&runtime, &session),
-        [1],
-        "the opening release chose nothing"
-    );
-    client.input.send(b"h").unwrap();
-    wait_for_panes(&runtime, &session, &[1, 2]);
-    let layout = layout_now(&runtime, &session);
-    assert!(
-        pane_x(&layout, 1) < pane_x(&layout, 2),
-        "h splits side by side"
+        layout_now(&runtime, &session)["active_tab_id"],
+        tab_ids[1],
+        "the marker expands without switching tabs"
     );
 
-    // Side by side, the pair is Left/Right. Click "Swap Right": the menu's top-left is the click,
-    // so its fifth entry row — after two splits, a rule, and Swap Left — is five rows below.
-    let menu = client.open_menu(10, 5);
-    assert!(menu.contains("Swap Left") && menu.contains("Swap Right"));
-    assert!(!menu.contains("Swap Up") && !menu.contains("Swap Down"));
-    client.input.send(b"\x1b[<0;13;11M\x1b[<0;13;11m").unwrap();
-    wait_until(&runtime, &session, "pane 1 moved right", |layout| {
-        pane_x(layout, 1) > pane_x(layout, 2)
+    // Rows: 0 tab 1, 1 pane 1 ("editor"), 2 pane 2, 3 tab 2.
+    client.click(6, 2);
+    wait_until(&runtime, &session, "pane 2 focused in tab 1", |layout| {
+        layout["active_tab_id"] == tab_ids[0] && layout["tabs"][0]["focused_pane_id"] == 2
     });
 
-    // Pane 1 is now on the right. Zoom it, and the same menu offers Unzoom.
-    let right = u16::try_from(pane_x(&layout_now(&runtime, &session), 1)).unwrap() + 10;
-    let menu = client.open_menu(right, 5);
-    assert!(menu.contains("Zoom") && !menu.contains("Unzoom"));
-    client.input.send(b"z").unwrap();
-    wait_until(&runtime, &session, "pane 1 zoomed", |layout| {
-        layout["tabs"][0]["zoomed_pane_id"] == 1
+    client.click(4, 3);
+    wait_until(&runtime, &session, "tab 2 selected by click", |layout| {
+        layout["active_tab_id"] == tab_ids[1]
     });
-    let menu = client.open_menu(10, 5);
-    assert!(
-        menu.contains("Unzoom"),
-        "a zoomed tab offers Unzoom: {menu}"
-    );
 
-    // Respawn replaces the process in the same slot: a new pane that keeps the zoom.
-    client.input.send(b"R").unwrap();
-    wait_for_panes(&runtime, &session, &[2, 3]);
-    wait_for_text(&runtime, &session, 3, "READY pane=3");
-    let layout = layout_now(&runtime, &session);
-    assert_eq!(layout["tabs"][0]["zoomed_pane_id"], 3);
-
-    // q closes the menu without acting; Kill then closes the pane.
-    client.open_menu(10, 5);
-    client.input.send(b"q").unwrap();
-    client.drain_for(Duration::from_millis(300));
-    assert_eq!(pane_ids(&runtime, &session), [2, 3]);
-    client.open_menu(10, 5);
-    client.input.send(b"X").unwrap();
-    wait_for_panes(&runtime, &session, &[2]);
+    // C-b T moves from left to right: the panes start at column 0 and keep their width.
+    client.input.send(b"\x02T").unwrap();
+    wait_until(&runtime, &session, "the right sidebar", |layout| {
+        layout["area"]["x"] == 0 && layout["area"]["width"] == 76
+    });
+    client.input.send(b"\x02T").unwrap();
+    wait_until(&runtime, &session, "the hidden tab list", |layout| {
+        layout["area"]["width"] == 100 && layout["area"]["height"] == 30
+    });
 
     drop(guard);
     control.terminate_blocking();
     drop(client);
     reader_thread.join().unwrap();
+}
+
+fn msg(runtime: &Path, session: &str, args: &[&str]) {
+    let output = common::vvmux_command(runtime)
+        .args(["msg", "--target", session])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "msg {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn layout_now(runtime: &Path, session: &str) -> Value {
@@ -257,27 +275,6 @@ fn layout_now(runtime: &Path, session: &str) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn pane_ids(runtime: &Path, session: &str) -> Vec<u64> {
-    let mut ids: Vec<u64> = layout_now(runtime, session)["tabs"][0]["panes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|pane| pane["pane_id"].as_u64().unwrap())
-        .collect();
-    ids.sort_unstable();
-    ids
-}
-
-fn pane_x(layout: &Value, pane_id: u64) -> u64 {
-    layout["tabs"][0]["panes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|pane| pane["pane_id"] == pane_id)
-        .and_then(|pane| pane["geometry"]["x"].as_u64())
-        .unwrap_or_else(|| panic!("pane {pane_id} missing from {layout}"))
-}
-
 fn wait_until(runtime: &Path, session: &str, what: &str, done: impl Fn(&Value) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -286,21 +283,6 @@ fn wait_until(runtime: &Path, session: &str, what: &str, done: impl Fn(&Value) -
             return;
         }
         assert!(Instant::now() < deadline, "{what} never happened: {layout}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn wait_for_panes(runtime: &Path, session: &str, expected: &[u64]) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let ids = pane_ids(runtime, session);
-        if ids == expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "panes stayed {ids:?}, expected {expected:?}"
-        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }

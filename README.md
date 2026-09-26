@@ -1063,6 +1063,7 @@ The prefix is `Ctrl-b`.
 | `Ctrl-b s` | Save the current layout, prefilled with `startup.toml` |
 | `Ctrl-b S` | Toggle synchronized input for the active tab |
 | `Ctrl-b a` | Open or close the AI-agent navigator |
+| `Ctrl-b T` | Cycle the tab list: bottom, top, left sidebar, right sidebar, hidden |
 | `Ctrl-b f` / `Ctrl-b F` | Create a floating pane / show or hide ordinary floats |
 | `Ctrl-b P` | Pin or unpin the focused floating pane |
 | `Ctrl-b m` / `Ctrl-b r` | Enter floating move / resize mode |
@@ -1078,6 +1079,18 @@ The tab navigator is the corresponding tab-scoped popup. Arrows or `j`/`k` selec
 the tab, and `q` or Escape closes it. Mouse wheel and row clicks are supported. Tab rename uses the
 status row, starts with the current name, commits with Enter, cancels with Escape, and clears the
 custom name when submitted empty.
+
+The tab list has five views, set at startup by `general.tab_view` (`"bottom"`, `"top"`, `"left"`,
+`"right"`, or `"hidden"`) and cycled by `Ctrl-b T` (`cycle-tab-view`). The view belongs to the
+session, so every attached client sees the same one. The bottom and top views are the one-row
+numbered bar. The left and right views are a sidebar of up to 24 columns, never more than a third
+of the host, that lists each tab by number and name as a rootless tree: a tab with more than one
+pane has a `+` marker, and clicking it lists the tab's tiled and floating panes by name, falling
+back to the terminal title and then the pane ID (`-` collapses it again). The active tab is
+highlighted and starts expanded. Clicking a tab switches to it; clicking a pane switches to its tab
+and focuses it. The mouse wheel scrolls a sidebar taller than the host. Prompts and notices use the
+sidebar's bottom row. The hidden view gives the panes the whole host and shows a prompt over the
+bottom row only while it is being typed.
 
 Copy mode accepts arrows, Page Up/Down, Space to start selection, Enter to copy, and `q` or Escape
 to cancel. `/` and `?` open forward and backward smart-case regular-expression search; `n` repeats
@@ -1195,7 +1208,7 @@ Not everything can change under a live session, and `msg reload-config` names wh
 | Section | On reload |
 |---|---|
 | `[theme]`, `[appearance]` | Applied immediately, with a full repaint |
-| `general.status_visible` | Applied; every pane is resized around the status row |
+| `general.tab_view` | Applied; the session switches to that view and every pane is resized around the tab list |
 | `general.render_interval_ms` | Applied on the next loop iteration |
 | `[floating]`, `[keys.copy]` | Applied the next time they are used |
 | `plugins.enabled` | Applied immediately; disabling stops plugin acceptance, runtimes, and registry watching |

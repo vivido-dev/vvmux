@@ -49,6 +49,7 @@ use crate::session_state::{
     FloatExtras, HistoryColor, HistoryRow, HistoryRun, HistoryStyle, PaneAgentExtras, PaneExtras,
     PaneHistory, SessionHistory, SessionSnapshot, SnapshotExtras, TabExtras, TabHistory,
 };
+use crate::tab_view::{SidebarLine, SidebarPane, SidebarTab, SidebarTarget, TabView};
 
 const EVENT_QUEUE: usize = 1024;
 /// Maximum adjacent output bytes one actor turn parses for a pane.
@@ -1730,6 +1731,15 @@ struct SessionActor {
     last_screen: Option<ScreenBuffer>,
     /// Click targets from the last rendered status row, keyed by stable tab identity.
     status_tab_targets: Vec<(std::ops::Range<usize>, u64)>,
+    /// Where the tab list is drawn. Session-wide, so every client sees the same view.
+    tab_view: TabView,
+    /// Sidebar expansion the user chose per tab ID. A tab without an entry is expanded exactly
+    /// while it is the active tab.
+    sidebar_expanded: HashMap<u64, bool>,
+    /// The first sidebar line drawn when the tree is taller than the host.
+    sidebar_scroll: usize,
+    /// Click targets from the last rendered sidebar, keyed by host row.
+    sidebar_targets: Vec<(u16, SidebarLine)>,
     #[cfg(windows)]
     outer_bracketed_paste: Option<bool>,
     force_full: bool,
@@ -1918,6 +1928,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
     // back up the media channel, and make ingest drop frames — starving media in one pane because
     // a different pane was busy. Media now has its own receiver that the actor drains first, and
     // only a coalescible wakeup crosses the shared queue.
+    let tab_view = config.general.tab_view;
     let last_display = normalized_display(
         DisplayMetrics {
             columns: 80,
@@ -1925,7 +1936,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
             cell_width: 0,
             cell_height: 0,
         },
-        config.general.status_visible,
+        tab_view,
     );
     let detector_sender = sender.clone();
     let agent_detector = crate::agent::start_detector(move |updates| {
@@ -1994,6 +2005,10 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         frame_id: 0,
         last_screen: None,
         status_tab_targets: Vec::new(),
+        tab_view,
+        sidebar_expanded: HashMap::new(),
+        sidebar_scroll: 0,
+        sidebar_targets: Vec::new(),
         #[cfg(windows)]
         outer_bracketed_paste: None,
         force_full: true,
@@ -2918,7 +2933,11 @@ impl SessionActor {
                 self.clear_kitty_graphics();
                 let display = normalized_display(
                     display,
-                    matches!(view, AttachmentView::Session) && self.config.general.status_visible,
+                    if matches!(view, AttachmentView::Session) {
+                        self.tab_view
+                    } else {
+                        TabView::Hidden
+                    },
                 );
                 self.last_display = display;
                 self.client_ipc = Some(
@@ -3083,7 +3102,11 @@ impl SessionActor {
                         .is_some_and(|client| matches!(client.view, AttachmentView::Session));
                     let display = normalized_display(
                         display,
-                        session_view && self.config.general.status_visible,
+                        if session_view {
+                            self.tab_view
+                        } else {
+                            TabView::Hidden
+                        },
                     );
                     // A client may re-send its display without changing it: browser presenters
                     // report every dimension probe, not only real resizes. Relaying a phantom
@@ -9918,15 +9941,28 @@ impl SessionActor {
         if self.tab_rename.is_some() || self.close_pane_confirmation.is_some() {
             return;
         }
+        let drawn_at_this_size = self
+            .last_screen
+            .as_ref()
+            .is_some_and(|screen| screen.rows == display.rows && screen.columns == display.columns);
         if self.direct_pane().is_none()
-            && self.config.general.status_visible
+            && drawn_at_this_size
+            && let Some(sidebar) = self
+                .tab_view
+                .sidebar_rect(display.columns, display.rows)
+                .filter(|rect| rect.contains(mouse.x, mouse.y))
+        {
+            // The sidebar is outside every pane, so nothing else can want this pointer event.
+            if matches!(mouse.kind, MouseKind::Press | MouseKind::Wheel) {
+                self.sidebar_mouse(mouse, sidebar);
+            }
+            return;
+        }
+        if self.direct_pane().is_none()
             && mouse.kind == MouseKind::Press
             && mouse.button == 0
-            && self.last_screen.as_ref().is_some_and(|screen| {
-                screen.rows == display.rows
-                    && screen.columns == display.columns
-                    && mouse.y == screen.rows.saturating_sub(1)
-            })
+            && drawn_at_this_size
+            && self.tab_view.bar_row(display.rows) == Some(mouse.y)
             && let Some(index) = self.status_tab_targets.iter().find_map(|(range, id)| {
                 range
                     .contains(&usize::from(mouse.x))
@@ -10853,6 +10889,7 @@ impl SessionActor {
             Action::EnterFloatingMoveMode => self.enter_float_mode(FloatingEditKind::Move),
             Action::EnterFloatingResizeMode => self.enter_float_mode(FloatingEditKind::Resize),
             Action::Plugin(reference) => self.start_plugin_action(reference),
+            Action::CycleTabView => self.set_tab_view(self.tab_view.next()),
             _ => {}
         }
     }
@@ -11661,6 +11698,154 @@ impl SessionActor {
             navigator.selected_index = index;
         }
         self.activate_tab_navigator();
+    }
+
+    fn sidebar_mouse(&mut self, mouse: MouseEvent, sidebar: Rect) {
+        if mouse.kind == MouseKind::Wheel {
+            // Clamped against the tree's height on the next draw.
+            self.sidebar_scroll = if mouse.button == 0 {
+                self.sidebar_scroll.saturating_sub(1)
+            } else {
+                self.sidebar_scroll.saturating_add(1)
+            };
+            self.schedule_render();
+            return;
+        }
+        if mouse.button != 0 {
+            return;
+        }
+        let Some(line) = self
+            .sidebar_targets
+            .iter()
+            .find(|(row, _)| *row == mouse.y)
+            .map(|(_, line)| line.clone())
+        else {
+            return;
+        };
+        let text_x = if self.tab_view == TabView::Left {
+            sidebar.x
+        } else {
+            sidebar.x + 1
+        };
+        // The `+`/`-` marker is the line's first cell.
+        if let Some(tab_id) = line.toggle.filter(|_| mouse.x == text_x) {
+            let expanded = self.sidebar_tab_expanded(tab_id);
+            self.sidebar_expanded.insert(tab_id, !expanded);
+            self.schedule_render();
+            return;
+        }
+        match line.target {
+            SidebarTarget::Tab(tab_id) => {
+                if let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
+                    self.action(Action::SelectTab(index));
+                }
+            }
+            SidebarTarget::Pane(pane_id) => {
+                // The pane may have closed since the sidebar was drawn; then there is nothing to do.
+                let _ = self.automation_focus(pane_id);
+            }
+        }
+    }
+
+    fn sidebar_tab_expanded(&self, tab_id: u64) -> bool {
+        self.sidebar_expanded
+            .get(&tab_id)
+            .copied()
+            .unwrap_or_else(|| self.active_tab().is_some_and(|active| active.id == tab_id))
+    }
+
+    /// The tabs as the sidebar lists them. A pane is labeled by its name, then its terminal title,
+    /// then its ID; a tab by its name, or only its number.
+    fn sidebar_tabs(&self) -> Vec<SidebarTab> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let active = index == self.active_tab;
+                let panes = sync_targets(tab, &|_| false)
+                    .into_iter()
+                    .filter_map(|pane_id| {
+                        let pane = self.panes.get(&pane_id)?;
+                        let label = pane
+                            .name
+                            .as_ref()
+                            .map(|name| single_line(name.as_str()))
+                            .or_else(|| pane.terminal.title().map(single_line))
+                            .filter(|label| !label.trim().is_empty())
+                            .unwrap_or_else(|| format!("pane {pane_id}"));
+                        Some(SidebarPane {
+                            id: pane_id,
+                            label,
+                            focused: active && tab.focused == pane_id,
+                        })
+                    })
+                    .collect();
+                SidebarTab {
+                    id: tab.id,
+                    label: tab.name.as_deref().map(single_line).unwrap_or_default(),
+                    active,
+                    expanded: self.sidebar_tab_expanded(tab.id),
+                    panes,
+                }
+            })
+            .collect()
+    }
+
+    /// Draw the sidebar tree, leaving the bottom row to `message` when there is one.
+    fn draw_sidebar(
+        &mut self,
+        screen: &mut ScreenBuffer,
+        theme: crate::theme::ResolvedTheme,
+        message: Option<&str>,
+    ) {
+        self.sidebar_targets.clear();
+        let (columns, rows) = (screen.columns, screen.rows);
+        let (Some(text_rect), Some(separator)) = (
+            self.tab_view.sidebar_text_rect(columns, rows),
+            self.tab_view.separator_column(columns, rows),
+        ) else {
+            return;
+        };
+        // Forget choices for tabs that have closed, so the map stays bounded by the live tabs.
+        let live: HashSet<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+        self.sidebar_expanded
+            .retain(|tab_id, _| live.contains(tab_id));
+        let style = theme.status();
+        let frame = theme.frame(false);
+        let blank = " ".repeat(usize::from(text_rect.width));
+        for y in 0..rows {
+            screen.draw_text(text_rect.x, y, &blank, style);
+            screen.draw_text(
+                separator,
+                y,
+                "│",
+                crate::screen::TextStyle {
+                    foreground: frame.border,
+                    background: frame.background,
+                },
+            );
+        }
+        let lines = crate::tab_view::sidebar_lines(&self.sidebar_tabs());
+        let height = usize::from(rows).saturating_sub(usize::from(message.is_some()));
+        self.sidebar_scroll =
+            crate::tab_view::clamp_scroll(self.sidebar_scroll, lines.len(), height);
+        let width = usize::from(text_rect.width);
+        for (offset, line) in lines
+            .into_iter()
+            .skip(self.sidebar_scroll)
+            .take(height)
+            .enumerate()
+        {
+            let y = offset as u16;
+            screen.draw_text(text_rect.x, y, &clip_chars(&line.text, width), style);
+            if line.highlight {
+                screen.invert(text_rect.x, y, text_rect.width);
+            }
+            self.sidebar_targets.push((y, line));
+        }
+        if let Some(message) = message {
+            screen.draw_text(text_rect.x, rows - 1, &clip_chars(message, width), style);
+        }
     }
 
     fn draw_tab_navigator(
@@ -14036,7 +14221,7 @@ impl SessionActor {
             }
         }
 
-        let status_changed = next.general.status_visible != self.config.general.status_visible;
+        let tab_view_changed = next.general.tab_view != self.config.general.tab_view;
         let snapshot_changed = next.session.auto_snapshot != self.config.session.auto_snapshot
             || next.session.pane_history != self.config.session.pane_history;
         self.config = next;
@@ -14047,22 +14232,9 @@ impl SessionActor {
             report.applied.push("session.auto_snapshot".into());
         }
 
-        if status_changed {
-            // The status row is outside the pane area, so the usable height just changed. The
-            // stored displays were normalized against the old setting and must be re-normalized
-            // before anything derives geometry from them.
-            let status_visible = self.config.general.status_visible;
-            self.last_display = normalized_display(self.last_display, status_visible);
-            if let Some(client) = &mut self.attached {
-                client.display = normalized_display(client.display, status_visible);
-            }
-            let area = self.content_area();
-            for tab in &mut self.tabs {
-                tab.floating.reproportion(area);
-            }
-            self.force_full = true;
-            // One relayout for the whole change: it resizes every PTY and schedules the render.
-            self.relayout();
+        if tab_view_changed && self.tab_view != self.config.general.tab_view {
+            // An edited `tab_view` is a request to switch now, whatever the session cycled to.
+            self.set_tab_view(self.config.general.tab_view);
         } else {
             // Colors can change without any geometry moving, and a cell whose only difference is
             // its color still diffs correctly; force_full is simply the cheapest way to be sure.
@@ -14379,7 +14551,13 @@ impl SessionActor {
             self.draw_pane_menu(&mut screen, theme);
         }
         self.status_tab_targets.clear();
-        if session_view && self.config.general.status_visible && screen.rows > 0 {
+        self.sidebar_targets.clear();
+        let view = if session_view {
+            self.tab_view
+        } else {
+            TabView::Hidden
+        };
+        if session_view && screen.rows > 0 {
             let rename_prompt = self.tab_rename.as_ref().and_then(|rename| {
                 self.tabs
                     .iter()
@@ -14413,14 +14591,14 @@ impl SessionActor {
                         })
                     })
             });
-            let prompt_active = rename_prompt.is_some()
-                || close_prompt.is_some()
-                || save_prompt.is_some()
-                || search_prompt.is_some();
-            let status = rename_prompt
+            let prompt = rename_prompt
                 .or(close_prompt)
                 .or(save_prompt)
-                .or(search_prompt)
+                .or(search_prompt);
+            let prompt_active = prompt.is_some();
+            let sidebar = view.sidebar_text_rect(screen.columns, screen.rows);
+            let message_width = sidebar.map_or(screen.columns, |rect| rect.width);
+            let message = prompt
                 .or_else(|| self.active_status_notice().map(ToOwned::to_owned))
                 // Below notices on purpose: a notice reports something the user cannot recover
                 // once it scrolls past, while the hover preview returns the moment they point at
@@ -14428,40 +14606,77 @@ impl SessionActor {
                 .or_else(|| {
                     self.hovered_link
                         .as_ref()
-                        .map(|hovered| hyperlink_status_text(&hovered.link.uri, screen.columns))
-                })
-                .unwrap_or_else(|| {
+                        .map(|hovered| hyperlink_status_text(&hovered.link.uri, message_width))
+                });
+            let mic_prefix = if let Some((_, _, pane, last_packet)) = self.microphone_recipient
+                && self.bridge_instance_id.is_some()
+                && last_packet.elapsed() <= Duration::from_millis(200)
+            {
+                Some(format!("MIC pane {pane} | "))
+            } else {
+                None
+            };
+            let style = theme.status();
+            let prompt_cursor =
+                self.agent_navigator.is_none() && self.tab_navigator.is_none() && prompt_active;
+            if let Some(row) = view.bar_row(screen.rows) {
+                let status = message.unwrap_or_else(|| {
                     let (text, targets) =
                         tab_status_layout(&self.tabs, self.active_tab, screen.columns);
                     self.status_tab_targets = targets;
                     text
                 });
-            let status = if let Some((_, _, pane, last_packet)) = self.microphone_recipient
-                && self.bridge_instance_id.is_some()
-                && last_packet.elapsed() <= Duration::from_millis(200)
-            {
-                let prefix = format!("MIC pane {pane} | ");
-                for (range, _) in &mut self.status_tab_targets {
-                    range.start += prefix.len();
-                    range.end = (range.end + prefix.len()).min(usize::from(screen.columns));
+                let status = if let Some(prefix) = mic_prefix {
+                    for (range, _) in &mut self.status_tab_targets {
+                        range.start += prefix.len();
+                        range.end = (range.end + prefix.len()).min(usize::from(screen.columns));
+                    }
+                    format!("{prefix}{status}")
+                } else {
+                    status
+                };
+                if theme.status_fill {
+                    // Paint the whole row first: a status background that stops where the text
+                    // does reads as a rendering bug rather than a bar.
+                    screen.fill_row(row, style);
                 }
-                format!("{prefix}{status}")
-            } else {
-                status
-            };
-            let style = theme.status();
-            let row = screen.rows - 1;
-            if theme.status_fill {
-                // Paint the whole row first: a status background that stops where the text does
-                // reads as a rendering bug rather than a bar.
+                screen.draw_text(0, row, &status, style);
+                if prompt_cursor {
+                    screen.cursor = Some((
+                        status.chars().count().min(usize::from(screen.columns - 1)) as u16,
+                        row,
+                    ));
+                }
+            } else if let Some(sidebar) = sidebar {
+                let message = match (mic_prefix, message) {
+                    (Some(prefix), Some(message)) => Some(format!("{prefix}{message}")),
+                    (Some(prefix), None) => Some(prefix.trim_end_matches(" | ").to_owned()),
+                    (None, message) => message,
+                };
+                // A prompt is being typed at its end, so a narrow sidebar shows its tail and
+                // keeps one cell for the cursor.
+                let message = message.map(|message| {
+                    if prompt_active {
+                        tail_chars(&message, usize::from(sidebar.width.saturating_sub(1)))
+                    } else {
+                        message
+                    }
+                });
+                self.draw_sidebar(&mut screen, theme, message.as_deref());
+                if prompt_cursor && let Some(message) = &message {
+                    screen.cursor =
+                        Some((sidebar.x + message.chars().count() as u16, screen.rows - 1));
+                }
+            } else if let Some(prompt) = message.filter(|_| prompt_active) {
+                // With no tab list there is no status row, but a prompt still has to be seen while
+                // it is typed: draw it over the bottom row until it closes.
+                let row = screen.rows - 1;
+                let prompt = tail_chars(&prompt, usize::from(screen.columns - 1));
                 screen.fill_row(row, style);
-            }
-            screen.draw_text(0, row, &status, style);
-            if self.agent_navigator.is_none() && self.tab_navigator.is_none() && prompt_active {
-                screen.cursor = Some((
-                    status.chars().count().min(usize::from(screen.columns - 1)) as u16,
-                    row,
-                ));
+                screen.draw_text(0, row, &prompt, style);
+                if prompt_cursor {
+                    screen.cursor = Some((prompt.chars().count() as u16, row));
+                }
             }
         }
         if !kitty_graphics {
@@ -15045,22 +15260,48 @@ impl SessionActor {
             .map_or(self.last_display, |client| client.display)
     }
 
-    fn content_area(&self) -> Rect {
-        let display = self.layout_display();
-        let status_visible = self
+    /// The tab view the attached client sees: a direct pane view has no tab list.
+    fn effective_tab_view(&self) -> TabView {
+        if self
             .attached
             .as_ref()
             .is_none_or(|client| matches!(client.view, AttachmentView::Session))
-            && self.config.general.status_visible;
-        Rect {
-            x: 0,
-            y: 0,
-            width: display.columns.max(1),
-            height: display
-                .rows
-                .saturating_sub(u16::from(status_visible))
-                .max(1),
+        {
+            self.tab_view
+        } else {
+            TabView::Hidden
         }
+    }
+
+    fn content_area(&self) -> Rect {
+        let display = self.layout_display();
+        self.effective_tab_view()
+            .content_area(display.columns, display.rows)
+    }
+
+    /// Switch the session's tab view. The tab list sits outside the pane area, so the usable
+    /// geometry changes with it.
+    fn set_tab_view(&mut self, view: TabView) {
+        if view == self.tab_view {
+            return;
+        }
+        self.tab_view = view;
+        self.sidebar_scroll = 0;
+        // The stored displays were normalized against the old view and must be re-normalized
+        // before anything derives geometry from them.
+        let effective = self.effective_tab_view();
+        self.last_display = normalized_display(self.last_display, effective);
+        if let Some(client) = &mut self.attached {
+            client.display = normalized_display(client.display, effective);
+        }
+        let area = self.content_area();
+        for tab in &mut self.tabs {
+            tab.floating.reproportion(area);
+        }
+        self.cancel_pointer_drag(true);
+        self.force_full = true;
+        // One relayout for the whole change: it resizes every PTY and schedules the render.
+        self.relayout();
     }
 
     /// Birth geometry for a float created at runtime: the configured default size, which then
@@ -17780,12 +18021,14 @@ fn drain_ready_batch<T>(
     true
 }
 
-fn normalized_display(display: DisplayMetrics, status_visible: bool) -> DisplayMetrics {
+fn normalized_display(display: DisplayMetrics, view: TabView) -> DisplayMetrics {
     DisplayMetrics {
+        // A sidebar takes at most a third of the columns, which still leaves the minimum 6-wide
+        // float representable.
         columns: display.columns.clamp(10, 1000),
-        // A visible status row is outside the pane area, so retain five host rows to leave the
+        // A tab bar row is outside the pane area, so retain an extra host row to leave the
         // minimum 6x4 float (4x2 content plus frame) representable.
-        rows: display.rows.clamp(if status_visible { 5 } else { 4 }, 500),
+        rows: display.rows.clamp(4 + view.bar_rows(), 500),
         ..display
     }
 }
@@ -18130,6 +18373,12 @@ fn render_tab_status_window(segments: &[String], start: usize, end: usize) -> St
 
 fn clip_chars(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
+}
+
+/// The last `width` characters of `text`.
+fn tail_chars(text: &str, width: usize) -> String {
+    let skip = text.chars().count().saturating_sub(width);
+    text.chars().skip(skip).collect()
 }
 
 fn render_narrow_active_tab(segment: &str, left: bool, right: bool, width: usize) -> String {
@@ -19905,9 +20154,9 @@ mod tests {
 
     #[test]
     fn display_is_bounded() {
-        let with_status = normalized_display(DisplayMetrics::default(), true);
+        let with_status = normalized_display(DisplayMetrics::default(), TabView::Bottom);
         assert_eq!((with_status.columns, with_status.rows), (10, 5));
-        let without_status = normalized_display(DisplayMetrics::default(), false);
+        let without_status = normalized_display(DisplayMetrics::default(), TabView::Hidden);
         assert_eq!((without_status.columns, without_status.rows), (10, 4));
     }
 

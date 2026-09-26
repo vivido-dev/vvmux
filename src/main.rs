@@ -33,6 +33,7 @@ mod search;
 mod server;
 mod session;
 mod session_state;
+mod tab_view;
 mod theme;
 mod update;
 

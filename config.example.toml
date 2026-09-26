@@ -5,7 +5,9 @@ prefix = "C-b"
 # Name under ~/.config/vvmux/layouts (the .toml suffix is optional), or a path.
 # default_layout = "dev"
 scrollback_lines = 10000
-status_visible = true
+# Where the tab list is drawn: "bottom", "top", "left", "right", or "hidden".
+# `cycle-tab-view` (Ctrl-b T) cycles through them at runtime.
+tab_view = "bottom"
 mouse = true
 # Prepare a session microphone for new default-shell panes; local Vivido still requires opt-in.
 microphone = false
@@ -174,6 +176,7 @@ P = "toggle-pane-pinned"
 t = "toggle-pane-transparency"
 m = "enter-floating-move-mode"
 r = "enter-floating-resize-mode"
+T = "cycle-tab-view"
 
 [keys.copy]
 PageUp = "page-up"

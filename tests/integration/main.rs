@@ -35,6 +35,7 @@ mod plugin_workflows;
 mod search;
 mod startup_layout;
 mod sync_input;
+mod tab_sidebar;
 mod tunnel_connect;
 mod unix_focus_reporting;
 mod unix_resize;

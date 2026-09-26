@@ -3179,6 +3179,7 @@ mod tests {
             (b"\x02a", Action::ToggleAgentNavigator),
             (b"\x02w", Action::ToggleTabNavigator),
             (b"\x02,", Action::BeginRenameTab),
+            (b"\x02T", Action::CycleTabView),
         ] {
             let commands = parser.feed(byte);
             assert_eq!(commands.len(), 1, "one action per chord");
