@@ -54,7 +54,7 @@ and `VIVID_ANCHOR_TRANSPORT=conpty`. Remote Unix applications may still need the
 ```text
 vvmux                              attach/create `default`
 vvmux new [-s NAME] [-d]           create a session
-vvmux attach [-d|--replace] [-t NAME] [--pane-id ID|--alias NAME]
+vvmux attach [-d] [-r] [--media|--no-media] [-t NAME] [--pane-id ID|--alias NAME]
 vvmux list [--json]                list live owner sessions
 vvmux doctor -t NAME --json        check registry, IPC, bridge, and queue health
 vvmux debug-bundle -t NAME ...     write an atomic diagnostic ZIP
@@ -72,11 +72,37 @@ vvmux serve [OPTIONS]              run the loopback VVWS/1 session gateway
 vvmux --config PATH ...            use an explicit strict TOML config
 ```
 
-Only one client can be attached to a session. `-d` (or `--replace`) sends a clean detach to the old
-client before the new client is admitted. With no `-t`, `vvmux attach -d` replaces the client on
-the `default` session. `--pane-id` and `--alias` attach that pane directly over the whole terminal:
-input and resize affect only it, the session chrome and ordinary prefix actions are absent, and
-`Ctrl+b q` returns to the shell.
+Several clients can be attached to one session at once, as in tmux. Every client sees the same
+tabs, layout, and focus, and any of them can type; `-r` (`--read-only`) attaches a watcher whose
+keys, mouse, and actions are ignored. `-d` (or `--replace`) cleanly detaches every other client
+first. With no `-t`, `vvmux attach -d` replaces the clients of the `default` session. Clients share
+one view: a direct pane attachment (below) cannot join a session that is attached as a whole, or the
+reverse, without `-d`. A session admits at most 16 clients.
+
+**Media reaches one client.** Vivid sources and Kitty graphics go only to the session's
+*presenter*; every other client receives terminal frames only, so a second attachment never
+doubles what a playing video costs. The first attached client that can show media — one inside
+Vivido, or a Kitty/Ghostty terminal — becomes the presenter, and later clients join as text
+viewers. `--media` takes the role at attach, and `Ctrl+b M` takes it from inside a running client;
+the previous presenter stays attached as a viewer and its outer window stops showing the media.
+`--no-media` never takes it. When the presenter detaches, the role stays vacant rather than moving
+to another client on its own, so a remote viewer never starts pulling video because someone else
+left: timed media pauses until a client claims it.
+
+Panes have one size, because each has one PTY. `general.window_size` chooses whose terminal they
+are laid out for: `latest` (the default: the client that last attached, resized, or typed),
+`smallest`, or `largest`. Read-only clients do not count while anyone else is attached. A client
+whose terminal differs sees the layout clipped or padded from its top-left corner, with its own tab
+list at its own edge; cell pixels always follow the presenter, because only it shows pixels. A menu
+or prompt belongs to the client that opened it: only that client sees and drives it, and another
+client's keys go straight to the focused pane meanwhile.
+
+`vvmux msg list-clients` reports each client, which one presents media, and the shared geometry;
+`vvmux msg detach-client --client-id ID` detaches one of them.
+
+`--pane-id` and `--alias` attach that pane directly over the whole terminal: input and resize
+affect only it, the session chrome and ordinary prefix actions are absent, and `Ctrl+b q` returns
+to the shell.
 
 ## Pane automation
 
@@ -266,7 +292,8 @@ entirely. They are stripped along with the whole `VIVID_*` namespace and an oute
 identity, so a pane agent cannot silently drive somebody else's terminal.
 
 The live answer comes from `session-inspect` instead, under `outer`: which Vivido window is
-presenting the session right now, its cell metrics, and `vivido_automation_reachable`. It is `null`
+presenting the session right now — with several clients attached, the media presenter's, else the
+most recently used one's — its cell metrics, and `vivido_automation_reachable`. It is `null`
 when nothing is attached, and `remote` is true when the client reached vvmux over `vvssh` — in which
 case the Vivido automation socket is on another machine and `vivido msg` is not a route that exists.
 `inspect` adds `outer_crop`, the pane's rectangle in that window's physical pixels, which is the
@@ -558,7 +585,8 @@ The session decides *whether* to notify; the foreground client decides *how*, be
 your real terminal — the hidden server never learns anything about it. Ghostty, iTerm2, WezTerm,
 and Vivido get OSC 9; kitty gets OSC 99; inside tmux the escape is wrapped for passthrough. A
 terminal vvmux does not recognize gets **no** escape rather than a stray one printed into your
-session, and a browser attach gets no notification at all. `done` is only ever derived when the
+session, and a browser attach gets no notification at all. With several clients attached, one
+notification goes to the media presenter's terminal, or else to the client used most recently. `done` is only ever derived when the
 pane was not visible, so neither default fires for an agent you are already watching, and
 `min_interval_ms` keeps a flapping agent from spamming the desktop. `sound_command` is run by the
 client, detached, with no stdio; because the client owns it, a live reload reports
@@ -988,8 +1016,10 @@ remote access. Possession of the bearer token is equivalent to shell access to e
 owned by that OS user. The raw token is printed once; only its hash is retained in an owner-only
 record.
 
-The gateway lists, creates, and exclusively attaches to sessions, and runs automation on them. It
-serves no HTML or JavaScript and does not expose session kill operations on the loopback listener.
+The gateway lists, creates, and attaches to sessions, and runs automation on them. A browser joins
+a session beside any other clients; `takeover` detaches them first. It presents media only if no
+other client does when it attaches, and loses the role if another client claims it. It serves no
+HTML or JavaScript and does not expose session kill operations on the loopback listener.
 
 Possession of the bearer token is equivalent to shell access, which is too much authority to hand an
 agent that only needs to drive automation. A **scoped token** carries less:
@@ -1067,7 +1097,8 @@ The prefix is `Ctrl-b`.
 | `Ctrl-b f` / `Ctrl-b F` | Create a floating pane / show or hide ordinary floats |
 | `Ctrl-b P` | Pin or unpin the focused floating pane |
 | `Ctrl-b m` / `Ctrl-b r` | Enter floating move / resize mode |
-| `Ctrl-b d` | Detach |
+| `Ctrl-b d` | Detach this client; other clients stay attached |
+| `Ctrl-b M` | Present media on this client, demoting the current presenter to a text viewer |
 | `Ctrl-b [` / `Ctrl-b ]` | Copy mode / paste copy buffer |
 
 The agent navigator includes detected agents from every tab and orders them blocked, done,
@@ -1209,6 +1240,7 @@ Not everything can change under a live session, and `msg reload-config` names wh
 |---|---|
 | `[theme]`, `[appearance]` | Applied immediately, with a full repaint |
 | `general.tab_view` | Applied; the session switches to that view and every pane is resized around the tab list |
+| `general.window_size` | Applied; the panes are laid out again for the client it now selects |
 | `general.render_interval_ms` | Applied on the next loop iteration |
 | `[floating]`, `[keys.copy]` | Applied the next time they are used |
 | `plugins.enabled` | Applied immediately; disabling stops plugin acceptance, runtimes, and registry watching |
@@ -1307,8 +1339,9 @@ animation commands, malformed packets, and more than 64 MiB of live transfer dat
 The native client advertises this exception only when the attaching terminal's exact `TERM` is
 `xterm-kitty` or `xterm-ghostty`; `TERM_PROGRAM` is never used as evidence. Hosted attachments,
 including Vivido, advertise no Kitty capability, and placeholder glyphs are suppressed there.
-Graphics bytes belong only to the current physical attachment and are discarded on detach rather
-than retained or replayed. Unix pane PTYs receive cell and pixel dimensions so applications can
+Graphics are media, so they reach only the session's presenter; every other client sees the
+placeholders suppressed. Graphics bytes belong only to the presenter's physical attachment and are
+discarded when it detaches or another client claims the role, rather than retained or replayed. Unix pane PTYs receive cell and pixel dimensions so applications can
 choose the correct image size. This behavior is private to vvmux and does not alter Vivid media or
 the public Vivid protocol.
 

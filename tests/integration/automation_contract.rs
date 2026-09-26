@@ -1338,10 +1338,12 @@ fn the_session_reports_the_presenting_window_or_says_there_is_none() {
         "a detached session claimed a presenting window: {}",
         inspected["outer"]
     );
-    assert!(
-        inspected["attachment"].is_null(),
+    assert_eq!(
+        inspected["clients"].as_array().map(Vec::len),
+        Some(0),
         "the fixture session is not attached"
     );
+    assert!(inspected["presenter_client_id"].is_null());
 
     // The per-pane crop is absent for the same reason: a rectangle in a window that is not there
     // would be confidently wrong.

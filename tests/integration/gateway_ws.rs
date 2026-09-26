@@ -751,11 +751,29 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
                 .into(),
             )
         };
+        // Without takeover a second browser joins as another client of the same session.
         takeover.send(attach(4, false)).await.unwrap();
         assert!(matches!(
             takeover.next().await.unwrap().unwrap(),
-            Message::Text(ref text) if text.contains("session_occupied")
+            Message::Text(ref text) if text.contains(r#""type":"attached""#)
         ));
+        takeover
+            .send(Message::Text(r#"{"type":"detach"}"#.into()))
+            .await
+            .unwrap();
+        let left = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(message) = takeover.next().await {
+                if matches!(message.unwrap(), Message::Text(ref text) if text.contains("detached"))
+                {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap();
+        assert!(left, "the joined browser did not detach");
+        // With takeover it detaches every other client first.
         takeover.send(attach(5, true)).await.unwrap();
         assert!(matches!(
             takeover.next().await.unwrap().unwrap(),
@@ -873,24 +891,16 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
             recovery.next().await.unwrap().unwrap(),
             Message::Text(ref text) if text.contains("hello")
         ));
-        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
-            for request_id in 100..300 {
-                recovery.send(attach(request_id, false)).await.unwrap();
-                match recovery.next().await.unwrap().unwrap() {
-                    Message::Text(text) if text.contains("session_occupied") => {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Message::Text(text) if text.contains(r#""type":"attached""#) => return true,
-                    other => panic!("unexpected recovery response: {other:?}"),
-                }
-            }
-            false
-        })
-        .await
-        .unwrap();
+        // A stalled client no longer holds the session: another one joins beside it at once.
+        recovery.send(attach(100, false)).await.unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(10), recovery.next())
+            .await
+            .expect("recovery attachment timed out")
+            .expect("recovery connection closed")
+            .unwrap();
         assert!(
-            recovered,
-            "a stalled WebSocket kept the session attachment occupied"
+            matches!(&recovered, Message::Text(text) if text.contains(r#""type":"attached""#)),
+            "a stalled WebSocket kept another client from attaching: {recovered:?}"
         );
         let recovery_init = tokio::time::timeout(Duration::from_secs(3), recovery.next())
             .await
@@ -903,22 +913,6 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
             .await
             .unwrap();
 
-        let stalled_closed = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(message) = takeover.next().await {
-                match message {
-                    Ok(Message::Close(frame)) => {
-                        return frame.is_some_and(|frame| u16::from(frame.code) == 1013);
-                    }
-                    Err(_) => return true,
-                    _ => {}
-                }
-                tokio::task::yield_now().await;
-            }
-            true
-        })
-        .await
-        .unwrap();
-        assert!(stalled_closed, "stalled WebSocket was not disconnected");
 
         recovery
             .send(Message::Text(r#"{"type":"detach"}"#.into()))

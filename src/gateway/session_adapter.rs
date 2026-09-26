@@ -87,10 +87,15 @@ impl SessionAdapter {
                     // A browser or tunnelled client is not hosted by a Vivido window, so there is
                     // no outer identity to publish and a pane agent must not be told there is one.
                     outer: None,
+                    // A browser presents media only when nobody else does: it cannot take the
+                    // role over later, and taking it at attach would silently move a video off
+                    // whoever is watching it.
+                    media: crate::ipc::MediaRequest::IfVacant,
+                    read_only: false,
                 })?;
             match reader.recv_server()? {
-                ServerMessage::Attached { session, text_only } => {
-                    Ok((reader, writer, session, text_only))
+                ServerMessage::Attached { session, presenter } => {
+                    Ok((reader, writer, session, !presenter))
                 }
                 ServerMessage::Error(message) => {
                     Err(io::Error::new(io::ErrorKind::PermissionDenied, message))

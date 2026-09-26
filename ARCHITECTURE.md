@@ -26,6 +26,32 @@ explicit in local Vivido, pinned independently of pane focus/visibility, and sho
 MIC label and remote receiving-pane indicator. See [setup](../vvmic/README.md) and the
 [process overview](../docs/vvmux/architecture.md#microphone-input).
 
+## Attached clients and the media presenter
+
+The actor keeps a bounded map of attached clients (`MAX_ATTACHED_CLIENTS`) that share one view.
+Everything describing what one terminal shows or has acknowledged lives on that client — its frame
+numbering and acknowledgement window, its diff base, its tab-list click targets, its reported input
+mode — so rendering is a per-client loop in which a client with a full backlog is skipped and
+stays pending while every other client is served. Composition runs once per client, bounded by the
+client limit, because the tab list sits at each terminal's own edge and transient UI is drawn only
+for the client that owns it.
+
+Media is not per client. One client, the presenter, owns the whole bridge-bound state — bridge
+instance, outer revisions and attachment generations, pending projections, retained replays,
+microphone recipient, Kitty transfers — and every bridge message is admitted only from it. A viewer
+never receives a media record, which is what keeps a second attachment from doubling the bandwidth
+of a playing video. The role moves only by an explicit claim or by the presenter leaving, which
+leaves it vacant rather than handing it on. Moving it runs the same reset a fresh attachment always
+did, so the new presenter starts from a parked projection exactly like a new client; the demoted
+client is told with `MediaRole` after its last media and releases its bridge without cancelling its
+session connection. `set_presenter` sends nothing to the promoted client and neither relayouts nor
+syncs, because an attach must put `Attached` on the stream before any projection.
+
+The layout display is derived, not reported: `general.window_size` picks columns and rows from the
+clients that can type, and cell pixels come from the presenter. Input from a client passes through
+`begin_client_input`, which refuses read-only clients, records the current client for routing, and
+assigns the owner of any transient UI the message opens. The owner is cleared once that UI closes.
+
 ## Session actor and pending work
 
 The session actor is the single writer for terminal, layout, scene-projection, and automation

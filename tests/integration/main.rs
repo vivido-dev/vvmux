@@ -20,6 +20,7 @@ mod direct_attach;
 mod gateway_ws;
 mod image_probe;
 mod mouse_selection;
+mod multi_client;
 mod osc52_clipboard;
 mod overlay_python;
 mod pane_menu;

@@ -402,6 +402,12 @@ pub enum AutomationMethod {
     Capabilities,
     ListPanes,
     SessionInspect,
+    /// Every attached client, which one presents media, and the geometry they share.
+    ListClients,
+    /// Detach one attached client, leaving every other client attached.
+    DetachClient {
+        client_id: u64,
+    },
     ListTabs,
     SelectTab {
         tab: TabSelector,
@@ -860,6 +866,7 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         capability("capabilities", Observe),
         capability("get_config", Observe),
         capability("layout", Observe),
+        capability("list_clients", Observe),
         capability("list_panes", Observe),
         capability("list_tabs", Observe),
         capability("resolve_pane", Observe),
@@ -898,6 +905,7 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         // Lifecycle rather than observe: starting one writes a file of everything the session
         // prints, which a read-only pass must not do on a caller's behalf.
         capability("record", Lifecycle),
+        capability("detach_client", Lifecycle),
         capability("split", Pane),
         capability("run", Pane),
         capability("close_pane", Pane),
@@ -945,6 +953,8 @@ impl AutomationMethod {
             Self::Capabilities => "capabilities",
             Self::ListPanes => "list_panes",
             Self::SessionInspect => "session_inspect",
+            Self::ListClients => "list_clients",
+            Self::DetachClient { .. } => "detach_client",
             Self::ListTabs => "list_tabs",
             Self::SelectTab { .. } => "select_tab",
             Self::Diagnose { .. } => "diagnose",
@@ -1337,6 +1347,7 @@ pub enum ClientMessage {
         bytes: Vec<u8>,
     },
     Attach {
+        /// Detach every other client before this one is admitted.
         replace: bool,
         target: AttachmentTarget,
         display: DisplayMetrics,
@@ -1345,7 +1356,13 @@ pub enum ClientMessage {
         kitty_graphics: bool,
         /// Which Vivido window is presenting this session, and nothing that could reach it.
         outer: Option<OuterIdentity>,
+        /// Whether this client should become the session's one media presenter.
+        media: MediaRequest,
+        /// Watch without typing: input, mouse, and actions from this client are ignored.
+        read_only: bool,
     },
+    /// Make this client the session's media presenter, demoting whichever client holds the role.
+    ClaimMedia,
     Input(Vec<u8>),
     KeyInput {
         bytes: Vec<u8>,
@@ -1467,6 +1484,23 @@ pub enum ClientMessage {
     PixelMouse(MouseEvent),
 }
 
+/// Whether an attaching client asks for the session's media.
+///
+/// Media — Vivid sources and Kitty graphics — reaches exactly one attached client, the presenter.
+/// Every other client receives terminal frames only, so a second attachment never doubles the
+/// bandwidth a playing video costs.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaRequest {
+    /// Take the role, demoting the current presenter to a text viewer.
+    Claim,
+    /// Take the role only while no client holds it.
+    #[default]
+    IfVacant,
+    /// Stay a text viewer.
+    Never,
+}
+
 /// Which session projection a foreground controller owns.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1484,7 +1518,15 @@ pub enum ServerMessage {
     OverlayHostRequest(vivid_sdk::presenter::OverlayHostRequest),
     Attached {
         session: String,
-        text_only: bool,
+        /// This client holds the media role. A viewer receives terminal frames only.
+        presenter: bool,
+    },
+    /// This client gained or lost the media role after it attached.
+    ///
+    /// Sent before any media for a new presenter, and after the last media for a demoted one, so
+    /// a client can connect or release its outer bridge at exactly this point in the stream.
+    MediaRole {
+        presenter: bool,
     },
     Render {
         frame_id: u64,

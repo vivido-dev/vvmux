@@ -11,6 +11,8 @@ pub(crate) enum ParsedInput {
     /// The host terminal gained or lost focus.
     Focus(bool),
     Detach,
+    /// Make this client the session's media presenter.
+    ClaimMedia,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,6 +718,7 @@ impl PrefixParser {
         if self.direct {
             match byte {
                 b'q' => output.push(ParsedInput::Detach),
+                b'M' => output.push(ParsedInput::ClaimMedia),
                 value if value == self.prefix_byte => {
                     output.push(ParsedInput::Input(literal.to_vec()));
                 }
@@ -757,6 +760,7 @@ impl PrefixParser {
             b'a' => output.push(ParsedInput::Action(Action::ToggleAgentNavigator)),
             b'T' => output.push(ParsedInput::Action(Action::CycleTabView)),
             b'd' => output.push(ParsedInput::Detach),
+            b'M' => output.push(ParsedInput::ClaimMedia),
             b'[' => output.push(ParsedInput::Action(Action::EnterCopyMode)),
             b']' => output.push(ParsedInput::Action(Action::Paste)),
             b'x' => {
@@ -805,6 +809,7 @@ fn is_core_chord(byte: u8) -> bool {
             | b'a'
             | b'T'
             | b'd'
+            | b'M'
             | b'['
             | b']'
             | b'x'

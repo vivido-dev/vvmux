@@ -276,6 +276,11 @@ pub(crate) enum ServerControl<'a> {
     Detached {
         reason: String,
     },
+    /// This attachment no longer presents media: another client claimed the role. The session
+    /// stays attached as text; the Vivid route is released.
+    MediaRole {
+        presenter: bool,
+    },
     Error {
         request_id: Option<u64>,
         code: &'static str,

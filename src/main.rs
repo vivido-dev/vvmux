@@ -97,9 +97,19 @@ enum Command {
         /// Attach directly to the pane whose live agent owns this alias.
         #[arg(long, conflicts_with = "pane_id")]
         alias: Option<crate::agent::AgentAlias>,
-        /// Detach the current client before attaching.
+        /// Detach every other client before attaching.
         #[arg(short = 'd', long)]
         replace: bool,
+        /// Present media here, demoting whichever client presents it now. Without this, the
+        /// first attached client that can show media presents it and the others see text.
+        #[arg(long, conflicts_with = "no_media")]
+        media: bool,
+        /// Attach as a text viewer even when no client presents media.
+        #[arg(long)]
+        no_media: bool,
+        /// Watch without sending input: keys, mouse, and actions from this client are ignored.
+        #[arg(short = 'r', long)]
+        read_only: bool,
     },
     /// List live sessions owned by this user.
     List {
@@ -337,7 +347,7 @@ fn run(cli: Cli) -> io::Result<()> {
     match cli.command.map(|command| *command) {
         None => client::attach(
             "default",
-            false,
+            client::JoinOptions::default(),
             true,
             ipc::AttachmentTarget::Session,
             cli.config.as_deref(),
@@ -355,7 +365,7 @@ fn run(cli: Cli) -> io::Result<()> {
             } else {
                 client::attach(
                     &session,
-                    false,
+                    client::JoinOptions::default(),
                     false,
                     ipc::AttachmentTarget::Session,
                     cli.config.as_deref(),
@@ -367,6 +377,9 @@ fn run(cli: Cli) -> io::Result<()> {
             pane_id,
             alias,
             replace,
+            media,
+            no_media,
+            read_only,
         }) => {
             runtime::validate_session_name(&target)?;
             let attachment = match (pane_id, alias) {
@@ -375,7 +388,16 @@ fn run(cli: Cli) -> io::Result<()> {
                 (None, None) => ipc::AttachmentTarget::Session,
                 (Some(_), Some(_)) => unreachable!("clap rejects conflicting attachment targets"),
             };
-            client::attach(&target, replace, false, attachment, cli.config.as_deref())
+            let join = client::JoinOptions {
+                replace,
+                media: match (media, no_media) {
+                    (true, _) => ipc::MediaRequest::Claim,
+                    (false, true) => ipc::MediaRequest::Never,
+                    (false, false) => ipc::MediaRequest::IfVacant,
+                },
+                read_only,
+            };
+            client::attach(&target, join, false, attachment, cli.config.as_deref())
         }
         Some(Command::List { json }) => list_sessions(json),
         Some(Command::Doctor { target, json }) => doctor(&target, json),
@@ -595,7 +617,7 @@ fn doctor(target: &str, json_output: bool) -> io::Result<()> {
     let registry = runtime::RuntimePaths::for_session(target)?.read_registry()?;
     let inspect =
         automation::request_json(target, ipc::AutomationMethod::SessionInspect, None, false)?;
-    let attached = !inspect["attachment"].is_null();
+    let clients = inspect["clients"].as_array().map_or(0, Vec::len);
     let pending_projections = inspect["pending"]["media_projections"]
         .as_u64()
         .unwrap_or(0);
@@ -606,7 +628,8 @@ fn doctor(target: &str, json_output: bool) -> io::Result<()> {
         "checks": {
             "registry_identity": "ok",
             "ipc_responsive": "ok",
-            "attached_client": attached,
+            "attached_client": clients > 0,
+            "attached_clients": clients,
             "pending_media_projections": pending_projections,
         },
         "registry": {
@@ -840,6 +863,7 @@ mod tests {
             pane_id,
             alias,
             replace,
+            ..
         } = *command
         else {
             panic!("parsed command was not attach");
@@ -848,6 +872,26 @@ mod tests {
         assert_eq!(pane_id, None);
         assert_eq!(alias, None);
         assert!(replace);
+    }
+
+    #[test]
+    fn attach_media_and_read_only_flags_parse_and_conflict() {
+        let cli = parse(["vvmux", "attach", "--media", "-r"]).unwrap();
+        let Some(command) = cli.command else {
+            panic!("attach command was not parsed");
+        };
+        let Command::Attach {
+            media,
+            no_media,
+            read_only,
+            ..
+        } = *command
+        else {
+            panic!("parsed command was not attach");
+        };
+        assert!(media && !no_media && read_only);
+        assert!(parse(["vvmux", "attach", "--no-media"]).is_ok());
+        assert!(parse(["vvmux", "attach", "--media", "--no-media"]).is_err());
     }
 
     #[test]

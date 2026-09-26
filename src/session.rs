@@ -141,6 +141,9 @@ const MAX_PENDING_MEDIA_PROJECTIONS: usize = 64;
 /// how far the server may run ahead of what the user can actually see. Media snapshots and media
 /// records are never gated by it: a slow terminal must not stall the projected scene.
 const MAX_UNACKNOWLEDGED_FRAMES: u64 = 8;
+/// Clients attached to one session at once. Each is composed and diffed separately every frame,
+/// so the bound is what keeps a render turn's cost fixed.
+const MAX_ATTACHED_CLIENTS: usize = 16;
 const KITTY_GRAPHICS_SESSION_BYTES: usize = 64 * 1024 * 1024;
 const AUTOMATION_RESPONSE_QUEUE: usize = 8;
 const SCREEN_CHANGE_HISTORY: usize = 1024;
@@ -533,22 +536,61 @@ impl ReloadReport {
     }
 }
 
+/// One attached terminal client.
+///
+/// Everything that describes what a particular terminal shows or has acknowledged lives here, so
+/// a slow or departing client never stalls or resets another. What the clients share — the view,
+/// the layout, the panes — stays on the actor.
 struct AttachedClient {
     id: u64,
     writer: SharedWriter,
+    /// This client's own terminal. The layout follows `general.window_size` across all clients;
+    /// a client whose terminal differs sees it clipped or padded, with its tab list at its edge.
     display: DisplayMetrics,
-    view: AttachmentView,
-    acknowledged_frame: u64,
     vivid: bool,
     kitty_graphics: bool,
+    read_only: bool,
+    /// Whether this client's host terminal holds focus. Assumed true at attach, because a client
+    /// attaches into a focused window.
+    focused: bool,
+    /// Session-wide ordinal of this client's last attach, resize, or input. `latest` sizing
+    /// follows the highest.
+    activity: u64,
+    /// Frames are numbered per client, so flow control counts only this client's backlog.
+    frame_id: u64,
+    acknowledged_frame: u64,
     rendered_session_sequence: u64,
     frame_sequences: VecDeque<(u64, u64)>,
-    /// Which Vivido window is presenting this session, as the client reported it.
+    /// The screen this client last received, which its next frame is diffed against.
+    last_screen: Option<ScreenBuffer>,
+    force_full: bool,
+    /// A change this client has not been sent yet. Held while its frame backlog is full, so a
+    /// slow client catches up once without delaying anyone else.
+    render_pending: bool,
+    /// Click targets from this client's last frame. Its tab list sits at its own terminal's edge,
+    /// so the targets differ between clients whose sizes differ.
+    status_tab_targets: Vec<(std::ops::Range<usize>, u64)>,
+    sidebar_targets: Vec<(u16, SidebarLine)>,
+    /// Last focused-pane keyboard and mouse coordinate modes sent to this host terminal.
+    reported_input_mode: Option<(u8, bool)>,
+    ipc: Arc<crate::metrics::IpcCounters>,
+    #[cfg(windows)]
+    outer_bracketed_paste: Option<bool>,
+    /// Which Vivido window hosts this client, as the client reported it.
     ///
-    /// Replaced wholesale on every attach, because a reattach can be a different window. Gone when
-    /// nothing is attached, which is itself the answer a pane agent needs: with no client there is
-    /// no window to address.
+    /// Replaced wholesale on every attach, because a reattach can be a different window.
     outer: Option<crate::ipc::OuterIdentity>,
+}
+
+impl AttachedClient {
+    /// Whether this client could present media at all: a Vivid bridge or a Kitty graphics host.
+    fn media_capable(&self) -> bool {
+        self.vivid || self.kitty_graphics
+    }
+
+    fn render_blocked(&self) -> bool {
+        self.frame_id.saturating_sub(self.acknowledged_frame) >= MAX_UNACKNOWLEDGED_FRAMES
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1605,6 +1647,9 @@ impl PointerDrag {
 #[derive(Debug, Clone, Copy)]
 struct FloatModal {
     mode_id: u64,
+    /// The client whose prefix parser is in edit mode; `None` when automation entered it, in
+    /// which case every client is told.
+    client: Option<u64>,
     pane: PaneId,
     kind: FloatingEditKind,
     original: Rect,
@@ -1716,20 +1761,38 @@ struct SessionActor {
     panes: BTreeMap<PaneId, Pane>,
     tabs: Vec<Tab>,
     active_tab: usize,
-    attached: Option<AttachedClient>,
-    /// Whether the attached client's host terminal currently holds focus. Assumed true until the
-    /// client reports otherwise, because a client attaches into a focused window.
-    client_focused: bool,
-    /// Last focused-pane keyboard and mouse coordinate modes sent to the attached host terminal.
-    reported_input_mode: Option<(u8, bool)>,
+    /// Every attached client, keyed by connection ID and bounded by `MAX_ATTACHED_CLIENTS`.
+    clients: BTreeMap<u64, AttachedClient>,
+    /// What every attached client shows: the session UI, or one pane over the whole terminal.
+    /// Shared, as a tmux session's current window is, and meaningful only while a client is
+    /// attached; an attach asking for a different view is refused rather than splitting geometry.
+    view: AttachmentView,
+    /// The one client that receives media — Vivid sources and Kitty graphics.
+    ///
+    /// Never reassigned implicitly. When the presenter detaches, media stays unpresented until a
+    /// client claims the role, so a remote text viewer never starts pulling video because
+    /// somebody else left.
+    presenter: Option<u64>,
+    /// The client whose message is being handled. Input routing, clipboard replies, and UI
+    /// ownership consult it; it is `None` for automation, PTY output, and timers.
+    current_client: Option<u64>,
+    /// The client that opened the transient UI — menus, prompts, float editing, pointer drags.
+    ///
+    /// That UI is drawn only on this client's terminal and consumes only its input. Another
+    /// client's keys go straight to the focused pane meanwhile, so one user's open menu never
+    /// freezes the other's shell. `None` with UI open means automation opened it for everyone.
+    ui_owner: Option<u64>,
+    client_activity: u64,
+    /// The display panes are laid out for, derived from the attached clients by
+    /// `general.window_size`. Kept across a detach so a relayout while nobody is attached does not
+    /// publish geometry no producer can honor.
     last_display: DisplayMetrics,
     next_pane_id: PaneId,
     next_tab_id: u64,
     copy_buffer: Vec<u8>,
     search_pattern: Option<(String, SearchPattern)>,
-    frame_id: u64,
-    last_screen: Option<ScreenBuffer>,
-    /// Click targets from the last rendered status row, keyed by stable tab identity.
+    /// Click targets from the status row being composed, keyed by stable tab identity. Moved to
+    /// the client the frame is for once composition finishes.
     status_tab_targets: Vec<(std::ops::Range<usize>, u64)>,
     /// Where the tab list is drawn. Session-wide, so every client sees the same view.
     tab_view: TabView,
@@ -1738,13 +1801,14 @@ struct SessionActor {
     sidebar_expanded: HashMap<u64, bool>,
     /// The first sidebar line drawn when the tree is taller than the host.
     sidebar_scroll: usize,
-    /// Click targets from the last rendered sidebar, keyed by host row.
+    /// Click targets from the sidebar being composed, keyed by host row. Moved to the client the
+    /// frame is for, like `status_tab_targets`.
     sidebar_targets: Vec<(u16, SidebarLine)>,
-    #[cfg(windows)]
-    outer_bracketed_paste: Option<bool>,
+    /// Every client needs a full repaint; folded into each client's own flag at the next render.
     force_full: bool,
+    /// Some client has a change it has not been sent.
     pending_render: bool,
-    /// Validated Kitty transfers live only for the current physical attachment.
+    /// Validated Kitty transfers live only for the current presenter's attachment.
     kitty_transfers: KittyTransferBuffer,
     layout_revision: u64,
     last_media_projection: Option<MediaProjectionKey>,
@@ -1835,8 +1899,8 @@ struct SessionActor {
     /// Latest foreground-bridge counter report. Diagnostic only; retained across a detach so
     /// `inspect-media` still describes the last live bridge.
     bridge_metrics: crate::metrics::BridgeMetrics,
-    /// Counters for the attached client's VVMX connection, retained across a detach for the same
-    /// reason. Replaced when a new client attaches.
+    /// Counters for the presenter's VVMX connection, retained across a detach for the same
+    /// reason. Replaced when another client takes the media role.
     client_ipc: Option<Arc<crate::metrics::IpcCounters>>,
 }
 
@@ -1994,23 +2058,22 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         panes: BTreeMap::new(),
         tabs: Vec::new(),
         active_tab: 0,
-        attached: None,
-        client_focused: true,
-        reported_input_mode: None,
+        clients: BTreeMap::new(),
+        view: AttachmentView::Session,
+        presenter: None,
+        current_client: None,
+        ui_owner: None,
+        client_activity: 0,
         last_display,
         next_pane_id: 1,
         next_tab_id: 1,
         copy_buffer: Vec::new(),
         search_pattern: None,
-        frame_id: 0,
-        last_screen: None,
         status_tab_targets: Vec::new(),
         tab_view,
         sidebar_expanded: HashMap::new(),
         sidebar_scroll: 0,
         sidebar_targets: Vec::new(),
-        #[cfg(windows)]
-        outer_bracketed_paste: None,
         force_full: true,
         pending_render: false,
         kitty_transfers: KittyTransferBuffer::default(),
@@ -2240,8 +2303,7 @@ impl SessionActor {
             for request in self.vivid.take_overlay_host_requests() {
                 let id = request.id;
                 let sent = self
-                    .attached
-                    .as_ref()
+                    .presenter_client()
                     .filter(|client| client.vivid)
                     .is_some_and(|client| {
                         crate::ipc::send(
@@ -2294,8 +2356,7 @@ impl SessionActor {
         // snapshot that is queued behind that media.
         self.sync_media_before_delivery(event.source);
         let sent = self
-            .attached
-            .as_ref()
+            .presenter_client()
             .filter(|client| client.vivid)
             .is_some_and(|client| {
                 send_media_body(
@@ -2314,6 +2375,8 @@ impl SessionActor {
     }
 
     fn handle_event(&mut self, event: ActorEvent) -> io::Result<()> {
+        // A failed client message returns early; never let its sender linger as the current one.
+        self.current_client = None;
         match event {
             ActorEvent::Client {
                 id,
@@ -2336,37 +2399,7 @@ impl SessionActor {
                     .retain(|_, pending| pending.reply.client_id != id);
                 self.plugin_event_subscriptions
                     .retain(|_, subscription| subscription.client_id != id);
-                if self.attached.as_ref().is_some_and(|client| client.id == id) {
-                    self.record_media_trace(
-                        None,
-                        self.bridge_instance_id,
-                        None,
-                        MediaTraceKind::BridgeClientDetached,
-                    );
-                    self.cancel_pointer_drag(true);
-                    self.invalidate_mouse_selection_state();
-                    self.attached = None;
-                    self.clear_kitty_graphics();
-                    self.reported_input_mode = None;
-                    self.bridge_instance_id = None;
-                    self.vivid.revoke_microphones();
-                    self.microphone_recipient = None;
-                    self.bridge_local_revision = 0;
-                    self.pending_media_projections.clear();
-                    self.retained_replay_requests.clear();
-                    self.retained_replay_inflight.clear();
-                    self.traced_recovery_deliveries.clear();
-                    self.record_projection_sources(&HashSet::new(), self.vivid.revision());
-                    self.last_screen = None;
-                    #[cfg(windows)]
-                    {
-                        self.outer_bracketed_paste = None;
-                    }
-                    self.force_full = true;
-                    self.end_float_mode(true);
-                    self.clear_transient_ui();
-                    self.vivid.deactivate_bridge();
-                }
+                self.detach_client(id, None);
             }
             ActorEvent::PtyOutput(pane_id, bytes) => {
                 // Recorded before the terminal consumes it: the point of the transcript is the
@@ -2636,6 +2669,10 @@ impl SessionActor {
         // all move focus, so reconcile once here rather than at each of those call sites.
         self.sync_pane_focus();
         self.sync_client_input_mode();
+        self.current_client = None;
+        if !self.owned_ui_active() {
+            self.ui_owner = None;
+        }
         Ok(())
     }
 
@@ -2759,16 +2796,11 @@ impl SessionActor {
                 changed_screen_sequence = Some(pane.screen_sequence);
                 self.session_sequence = self.session_sequence.wrapping_add(1);
             }
-            if let Some(client) = &self.attached {
-                if let Some(title) = title {
-                    let _ = crate::ipc::send(
-                        &client.writer,
-                        &ServerMessage::Title(format!("{title} — vvmux")),
-                    );
-                }
-                if bell {
-                    let _ = crate::ipc::send(&client.writer, &ServerMessage::Bell);
-                }
+            if let Some(title) = title {
+                self.send_to_clients(&ServerMessage::Title(format!("{title} — vvmux")));
+            }
+            if bell {
+                self.send_to_clients(&ServerMessage::Bell);
             }
             self.schedule_render();
         }
@@ -2843,9 +2875,9 @@ impl SessionActor {
     }
 
     fn handle_kitty_graphics(&mut self, pane_id: PaneId, command: KittyGraphicsCommand) {
+        // Graphics are media: only the presenter's terminal is offered them.
         let capable = self
-            .attached
-            .as_ref()
+            .presenter_client()
             .is_some_and(|client| client.kitty_graphics);
         match command {
             KittyGraphicsCommand::Query { image_id } => {
@@ -2883,6 +2915,8 @@ impl SessionActor {
                 vivid,
                 kitty_graphics,
                 outer,
+                media,
+                read_only,
             } => {
                 let view = match target {
                     AttachmentTarget::Session => AttachmentView::Session,
@@ -2907,30 +2941,44 @@ impl SessionActor {
                         AttachmentView::Pane(pane_id)
                     }
                 };
-                if let Some(old) = &self.attached {
-                    if !replace {
-                        return crate::ipc::send(
-                            &writer,
-                            &ServerMessage::Error("session already has an attached client".into()),
-                        );
-                    }
-                    let _ = crate::ipc::send(
-                        &old.writer,
-                        &ServerMessage::Detached {
-                            reason: "replaced by another client".into(),
-                        },
+                if self.clients.contains_key(&id) {
+                    return crate::ipc::send(
+                        &writer,
+                        &ServerMessage::Error("this connection is already attached".into()),
                     );
                 }
-                self.cancel_pointer_drag(true);
-                self.invalidate_mouse_selection_state();
-                self.end_float_mode(true);
-                self.clear_transient_ui();
-                // Even a clean client replacement owns a different physical presenter and fresh
-                // decoder/audio devices. Park timed ingress until that client applies its first
-                // authoritative projection.
-                self.vivid.deactivate_bridge();
-                self.pending_media_projections.clear();
-                self.clear_kitty_graphics();
+                // Clients share one view, as tmux clients share a session's current window: a
+                // pane has one PTY size, so two clients cannot each see it laid out differently.
+                if !replace && !self.clients.is_empty() && self.view != view {
+                    return crate::ipc::send(
+                        &writer,
+                        &ServerMessage::Error(
+                            "session already has an attached client showing a different view; \
+                             attach with -d to replace it"
+                                .into(),
+                        ),
+                    );
+                }
+                if replace {
+                    self.detach_all_clients("replaced by another client");
+                }
+                if self.clients.len() >= MAX_ATTACHED_CLIENTS {
+                    return crate::ipc::send(
+                        &writer,
+                        &ServerMessage::Error(format!(
+                            "session already has the maximum of {MAX_ATTACHED_CLIENTS} attached clients"
+                        )),
+                    );
+                }
+                let first = self.clients.is_empty();
+                if first {
+                    self.view = view;
+                    self.cancel_pointer_drag(true);
+                    self.invalidate_mouse_selection_state();
+                    self.end_float_mode(true);
+                    self.clear_transient_ui();
+                    self.ui_owner = None;
+                }
                 let display = normalized_display(
                     display,
                     if matches!(view, AttachmentView::Session) {
@@ -2939,91 +2987,116 @@ impl SessionActor {
                         TabView::Hidden
                     },
                 );
-                self.last_display = display;
-                self.client_ipc = Some(
-                    writer
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .counters(),
-                );
-                // A client attaches into a focused window, and the previous client's last
-                // reported blur says nothing about this one's.
-                self.client_focused = true;
-                self.bridge_metrics = crate::metrics::BridgeMetrics::default();
-                self.bridge_instance_id = None;
-                self.vivid.revoke_microphones();
-                self.microphone_recipient = None;
-                self.bridge_local_revision = 0;
-                self.outer_attachment_generations.clear();
-                self.retained_replay_requests.clear();
-                self.retained_replay_inflight.clear();
-                self.traced_recovery_deliveries.clear();
-                self.attached = Some(AttachedClient {
+                self.client_activity = self.client_activity.wrapping_add(1);
+                let ipc = writer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .counters();
+                self.clients.insert(
                     id,
-                    writer: writer.clone(),
-                    outer,
-                    display,
-                    view,
-                    // This client never received the session's historical frames. Start its
-                    // flow-control window at the current frame so the forced full repaint below
-                    // becomes its first outstanding frame instead of being suppressed as stale.
-                    acknowledged_frame: self.frame_id,
-                    vivid,
-                    kitty_graphics,
-                    rendered_session_sequence: 0,
-                    frame_sequences: VecDeque::new(),
-                });
-                self.reported_input_mode = None;
-                self.fragment_assignments.clear();
-                self.last_projection_warning = None;
-                // Detached tabs were laid out against the placeholder host, so floats authored
-                // by percentages re-proportion onto the attaching host — and any float keeps
-                // fitting — before the first text or media projection is published.
-                if matches!(view, AttachmentView::Session) {
-                    let area = self.content_area();
-                    for tab in &mut self.tabs {
-                        tab.floating.reproportion(area);
-                    }
-                } else if let AttachmentView::Pane(pane_id) = view
-                    && let Some(pane) = self.panes.get_mut(&pane_id)
-                {
-                    pane.copy = None;
+                    AttachedClient {
+                        id,
+                        writer: writer.clone(),
+                        display,
+                        vivid,
+                        kitty_graphics,
+                        read_only,
+                        focused: true,
+                        activity: self.client_activity,
+                        // This client never received the session's earlier frames; its first frame
+                        // is a forced full repaint.
+                        frame_id: 0,
+                        acknowledged_frame: 0,
+                        rendered_session_sequence: 0,
+                        frame_sequences: VecDeque::new(),
+                        last_screen: None,
+                        force_full: true,
+                        render_pending: true,
+                        status_tab_targets: Vec::new(),
+                        sidebar_targets: Vec::new(),
+                        reported_input_mode: None,
+                        ipc,
+                        #[cfg(windows)]
+                        outer_bracketed_paste: None,
+                        outer,
+                    },
+                );
+                // Media reaches one client. A second attachment is a text viewer unless it asks
+                // for the role, so attaching from elsewhere never duplicates a playing video.
+                let presents = (vivid || kitty_graphics)
+                    && match media {
+                        crate::ipc::MediaRequest::Claim => true,
+                        crate::ipc::MediaRequest::IfVacant => self.presenter.is_none(),
+                        crate::ipc::MediaRequest::Never => false,
+                    };
+                if presents {
+                    // Even a clean replacement owns a different physical presenter and fresh
+                    // decoder/audio devices. Timed ingress stays parked until this client applies
+                    // its first authoritative projection.
+                    self.set_presenter(Some(id));
                 }
                 crate::ipc::send(
                     &writer,
                     &ServerMessage::Attached {
                         session: self.name.clone(),
-                        text_only: !vivid,
+                        presenter: presents,
                     },
                 )?;
-                self.send_plugin_keymap();
-                self.last_screen = None;
-                #[cfg(windows)]
-                {
-                    self.outer_bracketed_paste = None;
+                let _ = crate::ipc::send(&writer, &self.plugin_keymap_message());
+                if first {
+                    // Detached tabs were laid out against the placeholder host, so floats authored
+                    // by percentages re-proportion onto the attaching host — and any float keeps
+                    // fitting — before the first text or media projection is published.
+                    self.last_display = self.policy_display().unwrap_or(display);
+                    if matches!(view, AttachmentView::Session) {
+                        let area = self.content_area();
+                        for tab in &mut self.tabs {
+                            tab.floating.reproportion(area);
+                        }
+                    } else if let AttachmentView::Pane(pane_id) = view
+                        && let Some(pane) = self.panes.get_mut(&pane_id)
+                    {
+                        pane.copy = None;
+                    }
+                    self.force_full = true;
+                    self.resize_all();
+                    // After the resize, never before: an agent reads its terminal size as it
+                    // starts, and one launched against the placeholder geometry would lay itself
+                    // out for a window that does not exist. This is also why a resume waits for an
+                    // attach at all.
+                    self.fire_pending_resumes(self.direct_pane());
+                } else {
+                    self.refresh_layout_display();
                 }
-                self.force_full = true;
-                self.record_media_trace(
-                    None,
-                    None,
-                    None,
-                    MediaTraceKind::BridgeClientAttached { vivid },
-                );
-                self.resize_all();
-                // After the resize, never before: an agent reads its terminal size as it starts,
-                // and one launched against the placeholder geometry would lay itself out for a
-                // window that does not exist. This is also why a resume waits for an attach at all.
-                self.fire_pending_resumes(self.direct_pane());
-                self.sync_media(true);
+                if presents {
+                    self.sync_media(true);
+                }
                 self.schedule_render();
             }
+            ClientMessage::ClaimMedia => {
+                let Some(client) = self.clients.get(&id) else {
+                    return Ok(());
+                };
+                if self.presenter == Some(id) {
+                    self.status_to(id, "this client already presents media");
+                } else if !client.media_capable() {
+                    self.status_to(id, "this terminal cannot present media");
+                } else {
+                    self.set_presenter(Some(id));
+                    crate::ipc::send(&writer, &ServerMessage::MediaRole { presenter: true })?;
+                    // Cell pixels follow the presenter.
+                    self.refresh_layout_display();
+                    self.sync_media(true);
+                    self.schedule_render();
+                }
+            }
             ClientMessage::Input(bytes) => {
-                if self.client_is(id) {
+                if self.begin_client_input(id, false) {
                     self.input(bytes);
                 }
             }
             ClientMessage::KeyInput { bytes, keys } => {
-                if self.client_is(id) {
+                if self.begin_client_input(id, false) {
                     let mut offset = 0;
                     for key in &keys {
                         if key.start < offset
@@ -3074,18 +3147,18 @@ impl SessionActor {
                 }
             }
             ClientMessage::Mouse(mouse) => {
-                if self.client_is(id) {
+                if self.begin_client_input(id, false) {
                     self.mouse(mouse, false);
                 }
             }
             ClientMessage::PixelMouse(mouse) => {
-                if self.client_is(id) {
+                if self.begin_client_input(id, false) {
                     self.mouse(mouse, true);
                 }
             }
             ClientMessage::Focus(focused) => {
-                if self.client_is(id) {
-                    self.client_focused = focused;
+                if let Some(client) = self.clients.get_mut(&id) {
+                    client.focused = focused;
                     if !focused {
                         // There is no pointer-leave report, so blur is the only signal that the
                         // pointer is gone. Without this a link stays marked as hovered while the
@@ -3095,14 +3168,10 @@ impl SessionActor {
                 }
             }
             ClientMessage::Resize(display) => {
-                if self.client_is(id) {
-                    let session_view = self
-                        .attached
-                        .as_ref()
-                        .is_some_and(|client| matches!(client.view, AttachmentView::Session));
+                if let Some(client) = self.clients.get(&id) {
                     let display = normalized_display(
                         display,
-                        if session_view {
+                        if self.direct_pane().is_none() {
                             self.tab_view
                         } else {
                             TabView::Hidden
@@ -3113,49 +3182,31 @@ impl SessionActor {
                     // resize would bump `layout_revision`, so `should_sync_media` would rebuild
                     // the outer Vivid session on each one and destroy media that is still being
                     // projected. Only a display that actually changed is a resize.
-                    let changed = is_display_change(
-                        self.attached.as_ref().map(|client| client.display),
-                        display,
-                    );
-                    if changed {
-                        self.cancel_pointer_drag(true);
-                        self.invalidate_mouse_selection_state();
-                        self.end_float_mode(true);
-                        self.clear_transient_ui();
-                        if let Some(client) = &mut self.attached {
+                    if is_display_change(Some(client.display), display) {
+                        self.client_activity = self.client_activity.wrapping_add(1);
+                        if let Some(client) = self.clients.get_mut(&id) {
                             client.display = display;
-                            self.last_display = client.display;
+                            client.activity = self.client_activity;
+                            client.force_full = true;
                         }
-                        if session_view {
-                            // Deterministic host-resize behavior: origin-ful floats re-proportion
-                            // to their percents, the rest clamp size before position, per float.
-                            let area = self.content_area();
-                            for tab in &mut self.tabs {
-                                tab.floating.reproportion(area);
-                            }
-                        }
-                        self.force_full = true;
-                        if session_view {
-                            self.relayout();
-                        } else {
-                            self.resize_all();
-                            self.sync_media(true);
-                            self.schedule_render();
-                        }
+                        // Whether the panes follow depends on `general.window_size`; this client
+                        // repaints at its new size either way.
+                        self.refresh_layout_display();
+                        self.schedule_render();
                     }
                 }
             }
             ClientMessage::Action(action) => {
-                if self.client_is(id) && self.direct_pane().is_none() {
+                if self.direct_pane().is_none() && self.begin_client_input(id, true) {
                     self.action(action);
                 }
             }
             ClientMessage::RenderAck(frame_id) => {
-                if let Some(client) = &mut self.attached
-                    && client.id == id
-                {
-                    if frame_id < client.acknowledged_frame || frame_id > self.frame_id {
-                        self.force_full = true;
+                if let Some(client) = self.clients.get_mut(&id) {
+                    if frame_id < client.acknowledged_frame || frame_id > client.frame_id {
+                        client.force_full = true;
+                        client.render_pending = true;
+                        self.pending_render = true;
                     } else {
                         client.acknowledged_frame = frame_id;
                         while let Some(&(sent_frame, sequence)) = client.frame_sequences.front() {
@@ -3166,24 +3217,25 @@ impl SessionActor {
                                 client.rendered_session_sequence.max(sequence);
                             client.frame_sequences.pop_front();
                         }
+                        // A change held back while this client's backlog was full is due now.
+                        self.pending_render |= client.render_pending && !client.render_blocked();
                     }
                 }
             }
             ClientMessage::RenderResync => {
-                if self.client_is(id) {
+                if let Some(client) = self.clients.get_mut(&id) {
                     // Treat the discarded backlog as acknowledged: those frames will never be
                     // displayed, and leaving them outstanding would stall the render gate.
-                    if let Some(client) = &mut self.attached {
-                        client.acknowledged_frame = self.frame_id;
-                        client.frame_sequences.clear();
-                    }
-                    self.force_full = true;
-                    self.last_screen = None;
-                    self.schedule_render();
+                    client.acknowledged_frame = client.frame_id;
+                    client.frame_sequences.clear();
+                    client.force_full = true;
+                    client.last_screen = None;
+                    client.render_pending = true;
+                    self.pending_render = true;
                 }
             }
             ClientMessage::BridgeNeedKeyframes(requests) => {
-                if self.client_is(id) {
+                if self.is_presenter(id) {
                     for request in requests {
                         self.record_media_trace(
                             Some(request.source),
@@ -3224,12 +3276,12 @@ impl SessionActor {
                 }
             }
             ClientMessage::BridgeNeedFullFrames(sources) => {
-                if self.client_is(id) {
+                if self.is_presenter(id) {
                     self.vivid.request_full_frames(&sources, 1);
                 }
             }
             ClientMessage::BridgeCapabilitiesChanged { reason_mask } => {
-                if self.client_is(id) {
+                if self.is_presenter(id) {
                     let _ = self.vivid.notify_capabilities_changed(reason_mask);
                 }
             }
@@ -3237,7 +3289,7 @@ impl SessionActor {
                 delivery_id,
                 delivered,
             } => {
-                if self.client_is(id) {
+                if self.is_presenter(id) {
                     self.record_delivery_result(delivery_id, delivered);
                     let resync = self.vivid.complete_bridge_delivery(delivery_id, delivered);
                     if resync {
@@ -3252,7 +3304,13 @@ impl SessionActor {
                 generation,
                 bytes,
             } => {
-                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                if self.is_presenter(id)
+                    && self
+                        .clients
+                        .get(&id)
+                        .is_some_and(|client| !client.read_only)
+                    && self.bridge_instance_id == Some(bridge_instance_id)
+                {
                     if bytes.is_empty() {
                         let _ = self.vivid.queue_microphone(source, generation, &bytes);
                         if self
@@ -3260,7 +3318,7 @@ impl SessionActor {
                             .is_some_and(|(key, epoch, _, _)| key == source && epoch == generation)
                         {
                             self.microphone_recipient = None;
-                            self.pending_render = true;
+                            self.schedule_render();
                         }
                     } else if let Some(request) =
                         self.vivid
@@ -3282,19 +3340,19 @@ impl SessionActor {
                         {
                             self.microphone_recipient =
                                 Some((source, generation, request.pane, Instant::now()));
-                            self.pending_render = true;
+                            self.schedule_render();
                         }
                     }
                 }
             }
             ClientMessage::BridgeMediaReleased { delivery_id } => {
-                if self.client_is(id) {
+                if self.is_presenter(id) {
                     self.traced_recovery_deliveries.remove(&delivery_id);
                     self.vivid.release_bridge_delivery(delivery_id);
                 }
             }
             ClientMessage::BridgeRetainedHydrated { source } => {
-                if self.client_is(id) {
+                if self.is_presenter(id) {
                     self.retained_replay_requests.remove(&source);
                     self.retained_replay_inflight.remove(&source);
                     self.vivid.complete_retained_hydration(source);
@@ -3303,7 +3361,7 @@ impl SessionActor {
             ClientMessage::BridgeSnapshotRetry {
                 reset_outer_session,
             } => {
-                if self.client_is(id) {
+                if self.is_presenter(id) {
                     self.record_media_trace(
                         None,
                         self.bridge_instance_id,
@@ -3335,7 +3393,7 @@ impl SessionActor {
                 recreated_retained_sources,
             } => {
                 let instance_changed = self.bridge_instance_id != Some(bridge_instance_id);
-                if self.client_is(id)
+                if self.is_presenter(id)
                     && bridge_apply_is_current(
                         self.bridge_instance_id,
                         self.outer_virtual_revision,
@@ -3413,7 +3471,7 @@ impl SessionActor {
                 bridge_instance_id,
                 event,
             } => {
-                if self.client_is(id) {
+                if self.is_presenter(id) {
                     if matches!(event.kind, MediaTraceKind::BridgeClientAttached { .. })
                         || self.bridge_instance_id.is_none()
                     {
@@ -3440,7 +3498,7 @@ impl SessionActor {
                 surface,
                 body,
             } => {
-                if self.client_is(id)
+                if self.is_presenter(id)
                     && self.bridge_instance_id == Some(bridge_instance_id)
                     && self.vivid.relay_overlay_input(surface, &body)?
                     && let Some(pane) = self.vivid.pane_for_overlay_surface(surface)
@@ -3457,7 +3515,7 @@ impl SessionActor {
                 bridge_instance_id,
                 profiles,
             } => {
-                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                if self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id) {
                     self.vivid.set_overlay_host_profiles(&profiles);
                 }
             }
@@ -3465,7 +3523,7 @@ impl SessionActor {
                 bridge_instance_id,
                 body,
             } => {
-                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                if self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id) {
                     let envelope = vivid_protocol::messages::decode_control(&body)?;
                     let environment = vivid_protocol::overlay::wire::EnvironmentChanged::decode(
                         0,
@@ -3481,7 +3539,7 @@ impl SessionActor {
                 id: request_id,
                 response,
             } => {
-                if self.client_is(id) {
+                if self.is_presenter(id) {
                     self.vivid
                         .complete_overlay_host_request(request_id, response);
                 }
@@ -3491,7 +3549,7 @@ impl SessionActor {
                 source,
                 position,
             } => {
-                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                if self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id) {
                     self.vivid.apply_outer_position(source, position);
                 }
             }
@@ -3500,7 +3558,7 @@ impl SessionActor {
                 source,
                 hold,
             } => {
-                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                if self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id) {
                     self.vivid.apply_downstream_hold(source, hold);
                 }
             }
@@ -3509,7 +3567,7 @@ impl SessionActor {
                 source,
                 decoder_reset_serial,
             } => {
-                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                if self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id) {
                     self.vivid
                         .reject_incompatible_playback(source, decoder_reset_serial);
                 }
@@ -3521,7 +3579,7 @@ impl SessionActor {
                 state,
                 eos_state,
             } => {
-                if self.client_is(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                if self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id) {
                     self.record_media_trace(
                         Some(source),
                         self.bridge_instance_id,
@@ -3533,60 +3591,23 @@ impl SessionActor {
                 }
             }
             ClientMessage::BridgeMetrics(metrics) => {
-                if self.client_is(id) {
+                if self.is_presenter(id) {
                     self.bridge_metrics = metrics;
                 }
             }
             ClientMessage::Detach => {
                 if self.client_is(id) {
-                    self.record_media_trace(
-                        None,
-                        self.bridge_instance_id,
-                        None,
-                        MediaTraceKind::BridgeClientDetached,
-                    );
-                    self.cancel_pointer_drag(true);
-                    self.invalidate_mouse_selection_state();
-                    crate::ipc::send(
-                        &writer,
-                        &ServerMessage::Detached {
-                            reason: "detached".into(),
-                        },
-                    )?;
-                    self.attached = None;
-                    self.clear_kitty_graphics();
-                    self.reported_input_mode = None;
-                    self.bridge_instance_id = None;
-                    self.vivid.revoke_microphones();
-                    self.microphone_recipient = None;
-                    self.bridge_local_revision = 0;
-                    self.pending_media_projections.clear();
-                    self.retained_replay_requests.clear();
-                    self.retained_replay_inflight.clear();
-                    self.traced_recovery_deliveries.clear();
-                    self.record_projection_sources(&HashSet::new(), self.vivid.revision());
-                    self.last_screen = None;
-                    #[cfg(windows)]
-                    {
-                        self.outer_bracketed_paste = None;
-                    }
-                    self.end_float_mode(true);
-                    self.vivid.deactivate_bridge();
+                    self.detach_client(id, Some("detached"));
                 }
             }
             ClientMessage::Kill => {
                 self.shutdown.store(true, Ordering::Release);
-                if let Some(client) = &self.attached {
-                    let _ = crate::ipc::send(
-                        &client.writer,
-                        &ServerMessage::Detached {
-                            reason: "session killed".into(),
-                        },
-                    );
-                }
+                self.send_to_clients(&ServerMessage::Detached {
+                    reason: "session killed".into(),
+                });
             }
             ClientMessage::FloatingEdit { mode_id, command } => {
-                if self.client_is(id) {
+                if self.begin_client_input(id, false) && self.ui_takes_current_input() {
                     self.float_edit(mode_id, command);
                 }
             }
@@ -3780,6 +3801,26 @@ impl SessionActor {
             }
             AutomationMethod::SessionInspect => {
                 self.reply_automation(target, self.automation_session_inspect());
+            }
+            AutomationMethod::ListClients => {
+                self.reply_automation(target, self.automation_list_clients());
+            }
+            AutomationMethod::DetachClient { client_id } => {
+                if self.client_is(client_id) {
+                    self.detach_client(client_id, Some("detached by another client"));
+                    self.reply_automation(
+                        target,
+                        serde_json::json!({"client_id": client_id, "detached": true}),
+                    );
+                } else {
+                    self.reply_automation_error(
+                        target,
+                        AutomationError::new(
+                            "client_not_found",
+                            format!("no attached client has ID {client_id}"),
+                        ),
+                    );
+                }
             }
             AutomationMethod::ListTabs => {
                 self.reply_automation(target, self.automation_tabs());
@@ -4915,7 +4956,7 @@ impl SessionActor {
                 after_session,
                 timeout_ms,
             } => {
-                if self.attached.is_none() {
+                if self.clients.is_empty() {
                     self.reply_automation_error(
                         target,
                         AutomationError::new("unsupported", "session has no attached client"),
@@ -4990,26 +5031,308 @@ impl SessionActor {
     }
 
     fn client_is(&self, id: u64) -> bool {
-        self.attached.as_ref().is_some_and(|client| client.id == id)
+        self.clients.contains_key(&id)
+    }
+
+    fn is_presenter(&self, id: u64) -> bool {
+        self.presenter == Some(id) && self.clients.contains_key(&id)
+    }
+
+    fn presenter_client(&self) -> Option<&AttachedClient> {
+        self.presenter.and_then(|id| self.clients.get(&id))
+    }
+
+    /// The client that most recently attached, resized, or sent input.
+    fn latest_client(&self) -> Option<&AttachedClient> {
+        self.clients.values().max_by_key(|client| client.activity)
+    }
+
+    /// The client whose acknowledgements automation waits on: the presenter, whose frames are the
+    /// ones a media-aware caller is waiting to see, else whoever is using the session.
+    fn witness_client(&self) -> Option<&AttachedClient> {
+        self.presenter_client().or_else(|| self.latest_client())
+    }
+
+    /// Whether anyone is looking: some attached client's host terminal holds focus.
+    fn any_client_focused(&self) -> bool {
+        self.clients.values().any(|client| client.focused)
+    }
+
+    fn send_to_clients(&self, message: &ServerMessage) {
+        for client in self.clients.values() {
+            let _ = crate::ipc::send(&client.writer, message);
+        }
+    }
+
+    /// A status line for one client, such as a refusal only that client's user asked for.
+    fn status_to(&self, id: u64, message: &str) {
+        if let Some(client) = self.clients.get(&id) {
+            let _ = crate::ipc::send(&client.writer, &ServerMessage::Status(message.into()));
+        }
     }
 
     fn send_plugin_keymap(&self) {
-        let Some(client) = &self.attached else {
-            return;
-        };
-        let _ = crate::ipc::send(
-            &client.writer,
-            &ServerMessage::PluginKeymap {
-                generation: self.plugin_registration_generation,
-                bindings: self.plugin_keybindings.clone(),
-            },
-        );
+        self.send_to_clients(&self.plugin_keymap_message());
     }
 
+    fn plugin_keymap_message(&self) -> ServerMessage {
+        ServerMessage::PluginKeymap {
+            generation: self.plugin_registration_generation,
+            bindings: self.plugin_keybindings.clone(),
+        }
+    }
+
+    /// The pane every client shows over its whole terminal, when the shared view is one pane.
     fn direct_pane(&self) -> Option<PaneId> {
-        match self.attached.as_ref().map(|client| client.view) {
-            Some(AttachmentView::Pane(pane_id)) => Some(pane_id),
-            Some(AttachmentView::Session) | None => None,
+        match (self.clients.is_empty(), self.view) {
+            (false, AttachmentView::Pane(pane_id)) => Some(pane_id),
+            _ => None,
+        }
+    }
+
+    /// UI that belongs to whichever client opened it: menus, prompts, float editing, and drags.
+    fn owned_ui_active(&self) -> bool {
+        self.transient_ui_active()
+            || self.float_modal.is_some()
+            || self.pointer_drag.is_some()
+            || self.mouse_selection_drag.is_some()
+    }
+
+    /// Whether the transient UI is drawn on this client's terminal.
+    fn ui_visible_to(&self, id: u64) -> bool {
+        self.ui_owner.is_none_or(|owner| owner == id)
+    }
+
+    /// Whether the message being handled may drive the transient UI. Another client's keys skip
+    /// it and reach the focused pane; its pointer events are dropped until the UI closes.
+    /// Automation, which has no client, drives it as it always did.
+    fn ui_takes_current_input(&self) -> bool {
+        self.current_client.is_none()
+            || self.ui_owner.is_none()
+            || self.ui_owner == self.current_client
+    }
+
+    /// Admit one input-bearing message from client `id`, or refuse it for a read-only client.
+    ///
+    /// Makes `id` the current client and, while no transient UI is open, its owner-to-be, so a
+    /// menu opened by this message belongs to this client. `supersede` is for deliberate
+    /// commands: they close another client's open UI instead of being refused behind it.
+    fn begin_client_input(&mut self, id: u64, supersede: bool) -> bool {
+        let Some(client) = self.clients.get_mut(&id) else {
+            return false;
+        };
+        if client.read_only {
+            return false;
+        }
+        self.client_activity = self.client_activity.wrapping_add(1);
+        client.activity = self.client_activity;
+        self.current_client = Some(id);
+        if supersede && self.ui_owner.is_some_and(|owner| owner != id) && self.owned_ui_active() {
+            self.cancel_pointer_drag(true);
+            self.mouse_selection_drag = None;
+            self.end_float_mode(true);
+            self.clear_transient_ui();
+            self.schedule_render();
+        }
+        if !self.owned_ui_active() {
+            self.ui_owner = Some(id);
+        }
+        // `latest` sizing follows whoever is typing.
+        if self.config.general.window_size == crate::config::WindowSize::Latest {
+            self.refresh_layout_display();
+        }
+        true
+    }
+
+    /// The display panes are laid out for, from the attached clients by `general.window_size`.
+    ///
+    /// Columns and rows follow the policy. Cell pixels follow the presenter, because only the
+    /// presenter shows pixels: a viewer's font must not resize a producer's output for a screen
+    /// that never displays it.
+    fn policy_display(&self) -> Option<DisplayMetrics> {
+        // A read-only watcher resizing its window must not re-lay out the panes under whoever is
+        // typing; it counts only while nobody else is attached.
+        let typists = self.clients.values().any(|client| !client.read_only);
+        let sizing = self
+            .clients
+            .values()
+            .filter(|client| !typists || !client.read_only)
+            .map(|client| (client.activity, client.display))
+            .collect::<Vec<_>>();
+        let latest = sizing.iter().max_by_key(|(activity, _)| *activity)?.1;
+        let (columns, rows) = match self.config.general.window_size {
+            crate::config::WindowSize::Latest => (latest.columns, latest.rows),
+            crate::config::WindowSize::Smallest => (
+                sizing.iter().map(|(_, display)| display.columns).min()?,
+                sizing.iter().map(|(_, display)| display.rows).min()?,
+            ),
+            crate::config::WindowSize::Largest => (
+                sizing.iter().map(|(_, display)| display.columns).max()?,
+                sizing.iter().map(|(_, display)| display.rows).max()?,
+            ),
+        };
+        let cells = self
+            .presenter_client()
+            .map_or(latest, |client| client.display);
+        Some(DisplayMetrics {
+            columns,
+            rows,
+            cell_width: cells.cell_width,
+            cell_height: cells.cell_height,
+        })
+    }
+
+    /// Re-derive the layout display and, when it moved, lay every pane out for it.
+    ///
+    /// Geometry-bound interaction — drags, float editing, pointer state — is cancelled, exactly as
+    /// a host resize always did. Returns whether the layout changed.
+    fn refresh_layout_display(&mut self) -> bool {
+        let Some(next) = self.policy_display() else {
+            return false;
+        };
+        if !is_display_change(Some(self.last_display), next) {
+            return false;
+        }
+        self.last_display = next;
+        self.cancel_pointer_drag(true);
+        self.invalidate_mouse_selection_state();
+        self.end_float_mode(true);
+        self.clear_transient_ui();
+        self.force_full = true;
+        if self.direct_pane().is_none() {
+            // Deterministic host-resize behavior: origin-ful floats re-proportion to their
+            // percents, the rest clamp size before position, per float.
+            let area = self.content_area();
+            for tab in &mut self.tabs {
+                tab.floating.reproportion(area);
+            }
+            self.relayout();
+        } else {
+            self.resize_all();
+            self.sync_media(true);
+            self.schedule_render();
+        }
+        true
+    }
+
+    /// Drop everything bound to the presenter's physical bridge.
+    ///
+    /// The next presenter owns a different outer presenter with fresh decoders and devices, so
+    /// nothing here may carry over. Timed ingress stays parked until a presenter applies its first
+    /// authoritative projection.
+    fn release_presentation(&mut self) {
+        self.vivid.deactivate_bridge();
+        self.vivid.revoke_microphones();
+        self.microphone_recipient = None;
+        self.bridge_instance_id = None;
+        self.bridge_local_revision = 0;
+        self.pending_media_projections.clear();
+        self.outer_attachment_generations.clear();
+        self.retained_replay_requests.clear();
+        self.retained_replay_inflight.clear();
+        self.traced_recovery_deliveries.clear();
+        self.fragment_assignments.clear();
+        self.last_projection_warning = None;
+        self.record_projection_sources(&HashSet::new(), self.vivid.revision());
+        // Kitty uploads belonged to the old presenter's terminal, and the new one's placeholder
+        // cells are blanked or not depending on what it can show.
+        self.clear_kitty_graphics();
+        self.force_full = true;
+    }
+
+    /// Move the media role. The demoted client is told after its last media and stays attached as
+    /// a text viewer; the caller tells a promoted client and publishes its first projection.
+    ///
+    /// Sends nothing to the promoted client, and neither relayouts nor syncs media: an attach
+    /// must put its reply on the stream before any projection.
+    fn set_presenter(&mut self, next: Option<u64>) {
+        if self.presenter == next {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.presenter, next);
+        if previous.is_some() {
+            self.record_media_trace(
+                None,
+                self.bridge_instance_id,
+                None,
+                MediaTraceKind::BridgeClientDetached,
+            );
+        }
+        self.release_presentation();
+        if let Some(previous) = previous.and_then(|id| self.clients.get(&id)) {
+            let _ = crate::ipc::send(
+                &previous.writer,
+                &ServerMessage::MediaRole { presenter: false },
+            );
+        }
+        if let Some(client) = next.and_then(|id| self.clients.get(&id)) {
+            let vivid = client.vivid;
+            self.client_ipc = Some(client.ipc.clone());
+            self.bridge_metrics = crate::metrics::BridgeMetrics::default();
+            self.record_media_trace(
+                None,
+                None,
+                None,
+                MediaTraceKind::BridgeClientAttached { vivid },
+            );
+        }
+    }
+
+    /// Detach one client. `reason` is sent first, for a client that is still listening.
+    ///
+    /// Every other client stays attached and keeps its render state; only what this client owned
+    /// — the media role, an open menu or drag — is released.
+    fn detach_client(&mut self, id: u64, reason: Option<&str>) {
+        let Some(client) = self.clients.remove(&id) else {
+            return;
+        };
+        if let Some(reason) = reason {
+            let _ = crate::ipc::send(
+                &client.writer,
+                &ServerMessage::Detached {
+                    reason: reason.into(),
+                },
+            );
+        }
+        if self.current_client == Some(id) {
+            self.current_client = None;
+        }
+        if self.ui_owner == Some(id) || self.clients.is_empty() {
+            self.cancel_pointer_drag(true);
+            self.invalidate_mouse_selection_state();
+            self.end_float_mode(true);
+            self.clear_transient_ui();
+            self.ui_owner = None;
+        }
+        if self.presenter == Some(id) {
+            self.set_presenter(None);
+            // The role is never handed on implicitly, so say where it went: nowhere, until one
+            // of these clients asks for it.
+            for client in self
+                .clients
+                .values()
+                .filter(|client| client.media_capable())
+            {
+                let _ = crate::ipc::send(
+                    &client.writer,
+                    &ServerMessage::Status(
+                        "the media presenter detached; prefix M presents media here".into(),
+                    ),
+                );
+            }
+        }
+        if self.clients.is_empty() {
+            self.force_full = true;
+        } else {
+            self.refresh_layout_display();
+            self.schedule_render();
+        }
+    }
+
+    fn detach_all_clients(&mut self, reason: &str) {
+        let ids = self.clients.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            self.detach_client(id, Some(reason));
         }
     }
 
@@ -5569,9 +5892,9 @@ impl SessionActor {
         };
         let supported = match level {
             AutomationCompletion::Outer => {
-                self.attached.as_ref().is_some_and(|client| client.vivid)
+                self.presenter_client().is_some_and(|client| client.vivid)
             }
-            AutomationCompletion::Rendered => self.attached.is_some(),
+            AutomationCompletion::Rendered => !self.clients.is_empty(),
         };
         if !supported {
             let message = match level {
@@ -6317,6 +6640,19 @@ impl SessionActor {
         }
     }
 
+    /// The client whose Vivido window a pane agent should address: the presenter's, because that
+    /// is where the pane's media is visible, else the window someone is using.
+    fn outer_identity_client(&self) -> Option<&AttachedClient> {
+        self.presenter_client()
+            .filter(|client| client.outer.is_some())
+            .or_else(|| {
+                self.clients
+                    .values()
+                    .filter(|client| client.outer.is_some())
+                    .max_by_key(|client| client.activity)
+            })
+    }
+
     /// Who is presenting this session, and how to address them.
     ///
     /// Never carries the outer Vivid endpoint or root secret; those stay in the foreground client
@@ -6324,8 +6660,7 @@ impl SessionActor {
     /// ever holding "how to reach it".
     fn outer_identity_json(&self) -> serde_json::Value {
         let Some(outer) = self
-            .attached
-            .as_ref()
+            .outer_identity_client()
             .and_then(|client| client.outer.as_ref())
         else {
             return serde_json::Value::Null;
@@ -6350,8 +6685,7 @@ impl SessionActor {
     /// guessed cell size would be confidently wrong.
     fn pane_outer_crop_json(&self, pane_id: PaneId) -> serde_json::Value {
         let Some(outer) = self
-            .attached
-            .as_ref()
+            .outer_identity_client()
             .and_then(|client| client.outer.as_ref())
         else {
             return serde_json::Value::Null;
@@ -6415,7 +6749,7 @@ impl SessionActor {
                 "another scaled capture is still running in this session",
             ));
         }
-        if self.attached.is_some() && !force {
+        if !self.clients.is_empty() && !force {
             return Err(AutomationError::new(
                 "capture_would_disturb_client",
                 "a scaled capture resizes the pane in view of the attached client; pass --force to allow it",
@@ -7462,19 +7796,53 @@ impl SessionActor {
         })
     }
 
+    /// Every attached client in connection order. Carries nothing that could reach a client's
+    /// host: no outer endpoint, no token.
+    fn clients_json(&self) -> Vec<serde_json::Value> {
+        self.clients
+            .values()
+            .map(|client| {
+                serde_json::json!({
+                    "client_id": client.id,
+                    "presenter": self.presenter == Some(client.id),
+                    "read_only": client.read_only,
+                    "vivid_capable": client.vivid,
+                    "kitty_graphics": client.kitty_graphics,
+                    "focused": client.focused,
+                    "remote": client.outer.as_ref().is_some_and(|outer| outer.remote),
+                    "columns": client.display.columns,
+                    "rows": client.display.rows,
+                    "acknowledged_frame": client.acknowledged_frame,
+                    "rendered_session_sequence": client.rendered_session_sequence,
+                    "pending_frame_acknowledgements": client.frame_sequences.len(),
+                })
+            })
+            .collect()
+    }
+
+    fn automation_list_clients(&self) -> serde_json::Value {
+        let layout = self.layout_display();
+        serde_json::json!({
+            "session": self.name,
+            "clients": self.clients_json(),
+            "presenter_client_id": self.presenter,
+            "window_size": self.config.general.window_size,
+            "view": match self.direct_pane() {
+                Some(pane_id) => serde_json::json!({"kind": "pane", "pane_id": pane_id}),
+                None => serde_json::json!({"kind": "session"}),
+            },
+            "layout": {"columns": layout.columns, "rows": layout.rows},
+        })
+    }
+
     fn automation_session_inspect(&self) -> serde_json::Value {
         let queue = self.relay_metrics();
         serde_json::json!({
             "schema_version": 1,
             "session": self.name,
             "session_instance": self.session_instance,
-            "attachment": self.attached.as_ref().map(|client| serde_json::json!({
-                "client_id": client.id,
-                "vivid_capable": client.vivid,
-                "acknowledged_frame": client.acknowledged_frame,
-                "rendered_session_sequence": client.rendered_session_sequence,
-                "pending_frame_acknowledgements": client.frame_sequences.len(),
-            })),
+            "clients": self.clients_json(),
+            "presenter_client_id": self.presenter,
             // Null with nothing attached, which is the honest answer: with no client there is no
             // window presenting this session and nothing for a pane agent to address.
             "outer": self.outer_identity_json(),
@@ -8930,7 +9298,7 @@ impl SessionActor {
             } => {
                 let ready = match level {
                     AutomationCompletion::Outer => {
-                        if self.attached.as_ref().is_none_or(|client| !client.vivid) {
+                        if self.presenter_client().is_none_or(|client| !client.vivid) {
                             return Some(Err(AutomationError::new(
                                 "missing_attachment",
                                 "foreground Vivid bridge detached while waiting",
@@ -8939,7 +9307,7 @@ impl SessionActor {
                         self.outer_projection_revision > *after_outer
                     }
                     AutomationCompletion::Rendered => {
-                        let Some(client) = self.attached.as_ref() else {
+                        let Some(client) = self.witness_client() else {
                             return Some(Err(AutomationError::new(
                                 "missing_attachment",
                                 "terminal client detached while waiting for render",
@@ -9011,7 +9379,7 @@ impl SessionActor {
                 })
             }
             AutomationWaitKind::Rendered { after_session } => {
-                let Some(client) = self.attached.as_ref() else {
+                let Some(client) = self.witness_client() else {
                     return Some(Err(AutomationError::new(
                         "unsupported",
                         "attached client disconnected while waiting for render",
@@ -9329,7 +9697,7 @@ impl SessionActor {
                             return None;
                         }
                         if let Some(after_session) = rendered_after_session {
-                            let Some(client) = self.attached.as_ref() else {
+                            let Some(client) = self.witness_client() else {
                                 return Some(Err(AutomationError::new(
                                     "unsupported",
                                     "no attached client can acknowledge a render",
@@ -9389,8 +9757,7 @@ impl SessionActor {
     }
 
     fn rendered_session_sequence(&self) -> u64 {
-        self.attached
-            .as_ref()
+        self.witness_client()
             .map_or(0, |client| client.rendered_session_sequence)
     }
 
@@ -9436,7 +9803,7 @@ impl SessionActor {
     }
 
     fn evaluate_agent_states(&mut self) {
-        let visible = if self.attached.is_some() && self.client_focused {
+        let visible = if self.any_client_focused() {
             let area = self.content_area();
             self.attached_projections(area)
                 .into_iter()
@@ -9518,7 +9885,9 @@ impl SessionActor {
         let Some(kind) = notification_kind(agent.status, settings) else {
             return;
         };
-        let Some(client) = self.attached.as_ref() else {
+        // One desktop notification, not one per attached terminal: the presenter's host, else
+        // whoever is using the session.
+        let Some(writer) = self.witness_client().map(|client| client.writer.clone()) else {
             return;
         };
         let now = Instant::now();
@@ -9539,7 +9908,7 @@ impl SessionActor {
             .clone()
             .unwrap_or_else(|| format!("pane {pane_id}"));
         let _ = crate::ipc::send(
-            &client.writer,
+            &writer,
             &ServerMessage::Notify {
                 kind,
                 title: bounded_notification_text(&title),
@@ -9592,31 +9961,34 @@ impl SessionActor {
             self.report_input_failure(pane_id, failure);
             return;
         }
-        if self.agent_navigator.is_some() {
+        // Keys from a client that does not own the open menu or prompt skip it and reach the
+        // focused pane, and leave the owner's pointer state alone.
+        let owns_ui = self.ui_takes_current_input();
+        if owns_ui && self.agent_navigator.is_some() {
             self.agent_navigator_input(&key_presses(&bytes));
             return;
         }
-        if self.tab_navigator.is_some() {
+        if owns_ui && self.tab_navigator.is_some() {
             self.tab_navigator_input(&key_presses(&bytes));
             return;
         }
-        if self.pane_menu.is_some() {
+        if owns_ui && self.pane_menu.is_some() {
             self.pane_menu_input(&key_presses(&bytes));
             return;
         }
-        if self.tab_rename.is_some() {
+        if owns_ui && self.tab_rename.is_some() {
             self.tab_rename_input(&key_presses(&bytes));
             return;
         }
-        if self.close_pane_confirmation.is_some() {
+        if owns_ui && self.close_pane_confirmation.is_some() {
             self.close_pane_confirmation_input(&key_presses(&bytes));
             return;
         }
-        if self.save_layout_prompt.is_some() {
+        if owns_ui && self.save_layout_prompt.is_some() {
             self.save_layout_prompt_input(&key_presses(&bytes));
             return;
         }
-        if self.invalidate_mouse_selection_state() {
+        if owns_ui && self.invalidate_mouse_selection_state() {
             self.schedule_render();
         }
         let Some(pane_id) = self.active_tab().map(|tab| tab.focused) else {
@@ -9871,13 +10243,29 @@ impl SessionActor {
         self.schedule_render();
     }
 
-    /// Adopt `bytes` as the copy buffer and mirror it to the attached client's clipboard.
+    /// Adopt `bytes` as the copy buffer and mirror it to the clipboard of whoever copied it.
     fn set_copy_buffer(&mut self, bytes: Vec<u8>) {
         self.copy_buffer = bytes;
         self.copy_buffer.truncate(COPY_BUFFER_LIMIT);
-        let clipboard = String::from_utf8_lossy(&self.copy_buffer).into_owned();
-        if let Some(client) = &self.attached {
-            let _ = crate::ipc::send(&client.writer, &ServerMessage::Clipboard(clipboard));
+        self.mirror_copy_buffer();
+    }
+
+    /// Send the copy buffer to host clipboards.
+    ///
+    /// A copy a user made goes to that user's terminal. A program's OSC 52 store has no such
+    /// user, so it goes to every client that can type — a read-only watcher's clipboard is not
+    /// the session's to write.
+    fn mirror_copy_buffer(&self) {
+        let message = ServerMessage::Clipboard(String::from_utf8_lossy(&self.copy_buffer).into());
+        match self.current_client.and_then(|id| self.clients.get(&id)) {
+            Some(client) => {
+                let _ = crate::ipc::send(&client.writer, &message);
+            }
+            None => {
+                for client in self.clients.values().filter(|client| !client.read_only) {
+                    let _ = crate::ipc::send(&client.writer, &message);
+                }
+            }
         }
     }
 
@@ -9891,7 +10279,7 @@ impl SessionActor {
         if !clipboard_store_allowed(
             self.config.clipboard.osc52,
             focused,
-            self.attached.is_some(),
+            !self.clients.is_empty(),
             selection,
         ) {
             return;
@@ -9909,7 +10297,7 @@ impl SessionActor {
     ) {
         if !self.config.clipboard.osc52.allows_load()
             || !focused
-            || self.attached.is_none()
+            || self.clients.is_empty()
             || !is_supported_clipboard_selection(selection)
         {
             return;
@@ -9921,10 +10309,38 @@ impl SessionActor {
     }
 
     fn mouse(&mut self, mut mouse: MouseEvent, pixel_coordinates: bool) {
-        let display = self.layout_display();
+        // Panes are laid out for the layout display, anchored at the origin, so a cell means the
+        // same pane on every client. The tab list, though, sits at the edge of the terminal the
+        // event came from, and pixels are that terminal's pixels. Automation uses the witness.
+        let (host, drawn_at_this_size, status_targets, sidebar_targets) = match self
+            .current_client
+            .and_then(|id| self.clients.get(&id))
+            .or_else(|| self.witness_client())
+        {
+            Some(client) => (
+                client.display,
+                client.last_screen.as_ref().is_some_and(|screen| {
+                    screen.rows == client.display.rows && screen.columns == client.display.columns
+                }),
+                client.status_tab_targets.clone(),
+                client.sidebar_targets.clone(),
+            ),
+            None => (self.layout_display(), false, Vec::new(), Vec::new()),
+        };
+        self.status_tab_targets = status_targets;
+        self.sidebar_targets = sidebar_targets;
+        let display = DisplayMetrics {
+            cell_width: host.cell_width,
+            cell_height: host.cell_height,
+            ..self.layout_display()
+        };
         let pixels = pixel_coordinates.then_some((mouse.x, mouse.y));
         if pixel_coordinates {
-            mouse = pixel_mouse_to_cells(mouse, display);
+            mouse = pixel_mouse_to_cells(mouse, host);
+        }
+        // Another client's menu, prompt, or drag is not this pointer's to drive or cancel.
+        if self.owned_ui_active() && !self.ui_takes_current_input() {
+            return;
         }
         if self.agent_navigator.is_some() {
             self.agent_navigator_mouse(mouse);
@@ -9941,15 +10357,11 @@ impl SessionActor {
         if self.tab_rename.is_some() || self.close_pane_confirmation.is_some() {
             return;
         }
-        let drawn_at_this_size = self
-            .last_screen
-            .as_ref()
-            .is_some_and(|screen| screen.rows == display.rows && screen.columns == display.columns);
         if self.direct_pane().is_none()
             && drawn_at_this_size
             && let Some(sidebar) = self
                 .tab_view
-                .sidebar_rect(display.columns, display.rows)
+                .sidebar_rect(host.columns, host.rows)
                 .filter(|rect| rect.contains(mouse.x, mouse.y))
         {
             // The sidebar is outside every pane, so nothing else can want this pointer event.
@@ -9962,7 +10374,7 @@ impl SessionActor {
             && mouse.kind == MouseKind::Press
             && mouse.button == 0
             && drawn_at_this_size
-            && self.tab_view.bar_row(display.rows) == Some(mouse.y)
+            && self.tab_view.bar_row(host.rows) == Some(mouse.y)
             && let Some(index) = self.status_tab_targets.iter().find_map(|(range, id)| {
                 range
                     .contains(&usize::from(mouse.x))
@@ -12673,21 +13085,20 @@ impl SessionActor {
         let mode_id = self.next_float_mode;
         self.float_modal = Some(FloatModal {
             mode_id,
+            client: self.current_client,
             pane,
             kind,
             original,
             origin,
         });
-        if let Some(client) = &self.attached {
-            let _ = crate::ipc::send(
-                &client.writer,
-                &ServerMessage::FloatingEditMode {
-                    mode_id,
-                    pane: Some(pane),
-                    kind: Some(kind),
-                },
-            );
-        }
+        self.send_float_mode(
+            self.current_client,
+            ServerMessage::FloatingEditMode {
+                mode_id,
+                pane: Some(pane),
+                kind: Some(kind),
+            },
+        );
     }
 
     /// End the active float-edit mode. `restore` puts the captured entry rectangle and birth
@@ -12719,15 +13130,24 @@ impl SessionActor {
                 self.relayout();
             }
         }
-        if let Some(client) = &self.attached {
-            let _ = crate::ipc::send(
-                &client.writer,
-                &ServerMessage::FloatingEditMode {
-                    mode_id: modal.mode_id,
-                    pane: None,
-                    kind: None,
-                },
-            );
+        self.send_float_mode(
+            modal.client,
+            ServerMessage::FloatingEditMode {
+                mode_id: modal.mode_id,
+                pane: None,
+                kind: None,
+            },
+        );
+    }
+
+    fn send_float_mode(&self, client: Option<u64>, message: ServerMessage) {
+        match client {
+            Some(id) => {
+                if let Some(client) = self.clients.get(&id) {
+                    let _ = crate::ipc::send(&client.writer, &message);
+                }
+            }
+            None => self.send_to_clients(&message),
         }
     }
 
@@ -13914,20 +14334,7 @@ impl SessionActor {
     /// `close_pane` collapses the slot, `respawn_pane` has already handed it to a new pane.
     fn release_pane(&mut self, pane_id: PaneId) {
         if self.direct_pane() == Some(pane_id) {
-            if let Some(client) = &self.attached {
-                let _ = crate::ipc::send(
-                    &client.writer,
-                    &ServerMessage::Detached {
-                        reason: format!("directly attached pane {pane_id} closed"),
-                    },
-                );
-            }
-            self.attached = None;
-            self.clear_kitty_graphics();
-            self.reported_input_mode = None;
-            self.last_screen = None;
-            self.pending_media_projections.clear();
-            self.vivid.deactivate_bridge();
+            self.detach_all_clients(&format!("directly attached pane {pane_id} closed"));
         }
         // A lease on a pane that no longer exists would keep refusing requests for a pane nobody
         // can reach, until it expired.
@@ -14222,6 +14629,7 @@ impl SessionActor {
         }
 
         let tab_view_changed = next.general.tab_view != self.config.general.tab_view;
+        let window_size_changed = next.general.window_size != self.config.general.window_size;
         let snapshot_changed = next.session.auto_snapshot != self.config.session.auto_snapshot
             || next.session.pane_history != self.config.session.pane_history;
         self.config = next;
@@ -14230,6 +14638,10 @@ impl SessionActor {
         if snapshot_changed {
             self.apply_snapshot_setting();
             report.applied.push("session.auto_snapshot".into());
+        }
+        if window_size_changed {
+            self.refresh_layout_display();
+            report.applied.push("general.window_size".into());
         }
 
         if tab_view_changed && self.tab_view != self.config.general.tab_view {
@@ -14373,29 +14785,122 @@ impl SessionActor {
 
     fn render(&mut self) {
         self.flush_plugin_state_events();
-        // Frames the client has queued but not yet displayed. Producing more of them cannot make
-        // the terminal any more current, and the extra bytes compete with media on the same
-        // connection, so hold off and keep the render pending.
-        if let Some(client) = &self.attached
-            && self.frame_id.saturating_sub(client.acknowledged_frame) >= MAX_UNACKNOWLEDGED_FRAMES
-        {
-            self.pending_render = true;
-            return;
+        if std::mem::take(&mut self.force_full) {
+            for client in self.clients.values_mut() {
+                client.force_full = true;
+            }
         }
-        self.pending_render = false;
-        let Some(client) = &self.attached else {
+        // A client whose frames are queued but not yet displayed keeps its change pending:
+        // producing more cannot make that terminal any more current, and the extra bytes compete
+        // with media on the same connection. Every other client is rendered regardless, so one
+        // slow remote viewer never holds back the rest.
+        let due = self
+            .clients
+            .values()
+            .filter(|client| client.render_pending && !client.render_blocked())
+            .map(|client| client.id)
+            .collect::<Vec<_>>();
+        if !due.is_empty() {
+            // Put the media projection on the ordered presenter stream before the terminal frame
+            // that exposes the new tab. The client can then reconcile the retained scene
+            // concurrently with terminal painting instead of always showing pane text first and
+            // the image later.
+            self.sync_media(false);
+        }
+        for id in due {
+            self.render_client(id);
+        }
+        // A blocked client waits for its acknowledgement, which re-arms the render; it must not
+        // keep the loop waking at the render interval while a stalled terminal reads nothing.
+        self.pending_render = self
+            .clients
+            .values()
+            .any(|client| client.render_pending && !client.render_blocked());
+    }
+
+    /// Compose, diff, and send one client's frame.
+    fn render_client(&mut self, id: u64) {
+        let Some(client) = self.clients.get(&id) else {
             return;
         };
-        let theme = self.config.resolved_theme();
         let display = client.display;
-        let session_view = matches!(client.view, AttachmentView::Session);
-        let writer = client.writer.clone();
-        let kitty_graphics = client.kitty_graphics;
+        // Graphics bytes reach only the presenter; every other terminal gets blanked placeholders.
+        let kitty_graphics = client.kitty_graphics && self.presenter == Some(id);
+        let with_ui = self.ui_visible_to(id);
+        let mut screen = self.compose_screen(display, with_ui);
+        let status_tab_targets = std::mem::take(&mut self.status_tab_targets);
+        let sidebar_targets = std::mem::take(&mut self.sidebar_targets);
+        if !kitty_graphics {
+            screen.suppress_kitty_placeholders();
+        }
+        let mut kitty_prefix = if kitty_graphics {
+            self.kitty_transfers.drain_pending()
+        } else {
+            Vec::new()
+        };
         #[cfg(windows)]
         let focused_bracketed_paste = self
             .attached_focus_pane()
             .and_then(|pane_id| self.panes.get(&pane_id))
             .is_some_and(|pane| pane.terminal.modes().bracketed_paste);
+        let session_sequence = self.session_sequence;
+        let Some(client) = self.clients.get_mut(&id) else {
+            return;
+        };
+        let frame_full = client.force_full || !kitty_prefix.is_empty();
+        client.frame_id = client.frame_id.wrapping_add(1);
+        // Mutated only by the Windows bracketed-paste prepend below.
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut bytes = ansi_diff(client.last_screen.as_ref(), &screen, frame_full);
+        if !kitty_prefix.is_empty() {
+            kitty_prefix.extend_from_slice(&bytes);
+            bytes = kitty_prefix;
+        }
+        #[cfg(windows)]
+        let bracketed_paste_transition =
+            bracketed_paste_transition(client.outer_bracketed_paste, focused_bracketed_paste);
+        #[cfg(windows)]
+        if let Some(transition) = bracketed_paste_transition {
+            prepend_bracketed_paste_transition(&mut bytes, transition);
+        }
+        let sent = crate::ipc::send_render_record(
+            &client.writer,
+            client.frame_id,
+            session_sequence,
+            frame_full,
+            &bytes,
+        )
+        .is_ok();
+        if !sent {
+            // Dropping the client here is the only signal it gets, so say why. Previously a
+            // failed frame silently detached the session while the client kept running against a
+            // frozen outer scene, which is indistinguishable from a hang.
+            self.detach_client(id, Some("frame delivery failed"));
+            return;
+        }
+        client.last_screen = Some(screen);
+        client.force_full = false;
+        client.render_pending = false;
+        client.status_tab_targets = status_tab_targets;
+        client.sidebar_targets = sidebar_targets;
+        client
+            .frame_sequences
+            .push_back((client.frame_id, session_sequence));
+        while client.frame_sequences.len() > 1024 {
+            client.frame_sequences.pop_front();
+        }
+        #[cfg(windows)]
+        if bracketed_paste_transition.is_some() {
+            client.outer_bracketed_paste = Some(focused_bracketed_paste);
+        }
+    }
+
+    /// Draw the session as one client sees it: the shared layout at its origin, and the tab list
+    /// and prompts at the edges of this client's own terminal. `with_ui` draws the transient UI,
+    /// which only its owner sees.
+    fn compose_screen(&mut self, display: DisplayMetrics, with_ui: bool) -> ScreenBuffer {
+        let theme = self.config.resolved_theme();
+        let session_view = self.direct_pane().is_none();
         let mut screen = ScreenBuffer::new(display.columns, display.rows);
         let area = self.content_area();
         let projections = self.attached_projections(area);
@@ -14543,11 +15048,11 @@ impl SessionActor {
                     .then_some((x, y))
             });
         }
-        if session_view && self.agent_navigator.is_some() {
+        if with_ui && session_view && self.agent_navigator.is_some() {
             self.draw_agent_navigator(&mut screen, theme);
-        } else if session_view && self.tab_navigator.is_some() {
+        } else if with_ui && session_view && self.tab_navigator.is_some() {
             self.draw_tab_navigator(&mut screen, theme);
-        } else if session_view && self.pane_menu.is_some() {
+        } else if with_ui && session_view && self.pane_menu.is_some() {
             self.draw_pane_menu(&mut screen, theme);
         }
         self.status_tab_targets.clear();
@@ -14558,18 +15063,24 @@ impl SessionActor {
             TabView::Hidden
         };
         if session_view && screen.rows > 0 {
-            let rename_prompt = self.tab_rename.as_ref().and_then(|rename| {
-                self.tabs
-                    .iter()
-                    .position(|tab| tab.id == rename.tab_id)
-                    .map(|index| format!("rename tab {}: {}", index + 1, rename.value))
-            });
+            let rename_prompt = self
+                .tab_rename
+                .as_ref()
+                .filter(|_| with_ui)
+                .and_then(|rename| {
+                    self.tabs
+                        .iter()
+                        .position(|tab| tab.id == rename.tab_id)
+                        .map(|index| format!("rename tab {}: {}", index + 1, rename.value))
+                });
             let close_prompt = self
                 .close_pane_confirmation
+                .filter(|_| with_ui)
                 .map(|confirmation| format!("kill pane {}? (y/n)", confirmation.pane_id));
             let save_prompt = self
                 .save_layout_prompt
                 .as_ref()
+                .filter(|_| with_ui)
                 .map(|prompt| match &prompt.stage {
                     SaveLayoutStage::Editing { value } => format!("save layout: {value}"),
                     SaveLayoutStage::Confirm { path } => {
@@ -14617,8 +15128,9 @@ impl SessionActor {
                 None
             };
             let style = theme.status();
-            let prompt_cursor =
-                self.agent_navigator.is_none() && self.tab_navigator.is_none() && prompt_active;
+            let prompt_cursor = !(with_ui
+                && (self.agent_navigator.is_some() || self.tab_navigator.is_some()))
+                && prompt_active;
             if let Some(row) = view.bar_row(screen.rows) {
                 let status = message.unwrap_or_else(|| {
                     let (text, targets) =
@@ -14679,76 +15191,7 @@ impl SessionActor {
                 }
             }
         }
-        if !kitty_graphics {
-            screen.suppress_kitty_placeholders();
-        }
-        let mut kitty_prefix = if kitty_graphics {
-            self.kitty_transfers.drain_pending()
-        } else {
-            Vec::new()
-        };
-        let frame_full = self.force_full || !kitty_prefix.is_empty();
-        self.frame_id = self.frame_id.wrapping_add(1);
-        // Mutated only by the Windows bracketed-paste prepend below.
-        #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut bytes = ansi_diff(self.last_screen.as_ref(), &screen, frame_full);
-        if !kitty_prefix.is_empty() {
-            kitty_prefix.extend_from_slice(&bytes);
-            bytes = kitty_prefix;
-        }
-        #[cfg(windows)]
-        let bracketed_paste_transition =
-            bracketed_paste_transition(self.outer_bracketed_paste, focused_bracketed_paste);
-        #[cfg(windows)]
-        if let Some(transition) = bracketed_paste_transition {
-            prepend_bracketed_paste_transition(&mut bytes, transition);
-        }
-        // Put the media projection on the ordered client stream before the terminal frame that
-        // exposes the new tab. The client can then reconcile the retained scene concurrently
-        // with terminal painting instead of always showing pane text first and the image later.
-        self.sync_media(false);
-        let sent = crate::ipc::send_render_record(
-            &writer,
-            self.frame_id,
-            self.session_sequence,
-            frame_full,
-            &bytes,
-        )
-        .is_ok();
-        if !sent {
-            // Dropping the client here is the only signal it gets, so say why. Previously a
-            // failed frame silently detached the session while the client kept running against a
-            // frozen outer scene, which is indistinguishable from a hang.
-            let _ = crate::ipc::send(
-                &writer,
-                &ServerMessage::Detached {
-                    reason: "frame delivery failed".into(),
-                },
-            );
-            self.attached = None;
-            self.clear_kitty_graphics();
-            self.reported_input_mode = None;
-            self.last_screen = None;
-            #[cfg(windows)]
-            {
-                self.outer_bracketed_paste = None;
-            }
-        } else {
-            self.last_screen = Some(screen);
-            if let Some(client) = &mut self.attached {
-                client
-                    .frame_sequences
-                    .push_back((self.frame_id, self.session_sequence));
-                while client.frame_sequences.len() > 1024 {
-                    client.frame_sequences.pop_front();
-                }
-            }
-            #[cfg(windows)]
-            if bracketed_paste_transition.is_some() {
-                self.outer_bracketed_paste = Some(focused_bracketed_paste);
-            }
-        }
-        self.force_full = false;
+        screen
     }
 
     fn sync_media(&mut self, force: bool) {
@@ -14775,7 +15218,9 @@ impl SessionActor {
             );
             self.schedule_render();
         }
-        let Some(client) = &self.attached else {
+        // Only the presenter's bridge carries media; with no presenter, timed ingress parks
+        // exactly as it does with nobody attached.
+        let Some(client) = self.presenter_client() else {
             self.pending_media_projections.clear();
             self.retained_replay_requests.clear();
             self.retained_replay_inflight.clear();
@@ -15138,6 +15583,9 @@ impl SessionActor {
 
     fn schedule_render(&mut self) {
         self.pending_render = true;
+        for client in self.clients.values_mut() {
+            client.render_pending = true;
+        }
     }
 
     /// Session-scoped relay counters for the media diagnostic surfaces.
@@ -15255,18 +15703,12 @@ impl SessionActor {
     /// then publish real metrics again on reattach, resizing every live source twice for a host
     /// that never changed.
     fn layout_display(&self) -> DisplayMetrics {
-        self.attached
-            .as_ref()
-            .map_or(self.last_display, |client| client.display)
+        self.last_display
     }
 
     /// The tab view the attached client sees: a direct pane view has no tab list.
     fn effective_tab_view(&self) -> TabView {
-        if self
-            .attached
-            .as_ref()
-            .is_none_or(|client| matches!(client.view, AttachmentView::Session))
-        {
+        if self.direct_pane().is_none() {
             self.tab_view
         } else {
             TabView::Hidden
@@ -15291,7 +15733,7 @@ impl SessionActor {
         // before anything derives geometry from them.
         let effective = self.effective_tab_view();
         self.last_display = normalized_display(self.last_display, effective);
-        if let Some(client) = &mut self.attached {
+        for client in self.clients.values_mut() {
             client.display = normalized_display(client.display, effective);
         }
         let area = self.content_area();
@@ -15322,7 +15764,7 @@ impl SessionActor {
     }
 
     fn pane_is_visibly_present(&self, pane_id: PaneId) -> bool {
-        if self.attached.is_none() || !self.client_focused {
+        if !self.any_client_focused() {
             return false;
         }
         let area = self.content_area();
@@ -15332,9 +15774,7 @@ impl SessionActor {
     }
 
     fn status(&self, message: &str) {
-        if let Some(client) = &self.attached {
-            let _ = crate::ipc::send(&client.writer, &ServerMessage::Status(message.into()));
-        }
+        self.send_to_clients(&ServerMessage::Status(message.into()));
     }
 
     fn send_pane_input(&mut self, pane_id: PaneId, bytes: &[u8]) {
@@ -15354,12 +15794,10 @@ impl SessionActor {
     /// hears about focus only when it asked to and only when its own state changed, so an
     /// unrelated pane's program sees nothing at all.
     fn sync_pane_focus(&mut self) {
-        let focused = self
-            .attached
-            .is_some()
-            .then(|| self.attached_focus_pane())
-            .flatten()
-            .filter(|_| self.client_focused);
+        // A pane holds focus while any client's host terminal does: the view, and so the focused
+        // pane, is shared.
+        let client_focused = self.any_client_focused();
+        let focused = self.attached_focus_pane().filter(|_| client_focused);
         let mut failures = Vec::new();
         let mut moved = Vec::new();
         for (pane_id, pane) in &mut self.panes {
@@ -15389,7 +15827,7 @@ impl SessionActor {
             self.vivid.set_overlay_pane_focus(pane_id, holds_focus);
         }
         let focus_state = (
-            self.client_focused && self.attached.is_some(),
+            client_focused,
             focused.and_then(|pane_id| {
                 self.tabs
                     .iter()
@@ -15433,11 +15871,12 @@ impl SessionActor {
             sgr_pixels = true;
         }
         let input_mode = (keyboard_flags, sgr_pixels);
-        if self.attached.is_none() || self.reported_input_mode == Some(input_mode) {
-            return;
-        }
-        self.reported_input_mode = Some(input_mode);
-        if let Some(client) = &self.attached {
+        // Each host terminal is told once; a newly attached one has been told nothing yet.
+        for client in self.clients.values_mut() {
+            if client.reported_input_mode == Some(input_mode) {
+                continue;
+            }
+            client.reported_input_mode = Some(input_mode);
             let _ = crate::ipc::send(
                 &client.writer,
                 &ServerMessage::InputMode {
@@ -15554,6 +15993,7 @@ impl SessionActor {
         }
 
         let mut search_not_found = false;
+        let mut copied = false;
         let Some(pane) = self.panes.get_mut(&pane_id) else {
             return;
         };
@@ -15661,11 +16101,8 @@ impl SessionActor {
                 let start = copy.selection_start.unwrap_or((-(copy.offset as isize), 0));
                 self.copy_buffer = extract_selection(&pane.terminal, start, end);
                 self.copy_buffer.truncate(COPY_BUFFER_LIMIT);
-                let clipboard = String::from_utf8_lossy(&self.copy_buffer).into_owned();
                 pane.copy = None;
-                if let Some(client) = &self.attached {
-                    let _ = crate::ipc::send(&client.writer, &ServerMessage::Clipboard(clipboard));
-                }
+                copied = true;
             }
             _ => {}
         }
@@ -15679,6 +16116,9 @@ impl SessionActor {
             refresh_copy_matches(pane, pattern);
         }
         let _ = pane;
+        if copied {
+            self.mirror_copy_buffer();
+        }
         if search_not_found {
             self.status("search pattern not found");
         }
@@ -16002,6 +16442,8 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
         AutomationMethod::Capabilities
             | AutomationMethod::ListPanes
             | AutomationMethod::SessionInspect
+            | AutomationMethod::ListClients
+            | AutomationMethod::DetachClient { .. }
             | AutomationMethod::ListTabs
             | AutomationMethod::SelectTab { .. }
             | AutomationMethod::Diagnose { .. }
@@ -16463,6 +16905,7 @@ pub(crate) const AUTOMATION_ERROR_CODES: &[&str] = &[
     "capture_would_disturb_client",
     "capture_write_failed",
     "cell_metrics_unknown",
+    "client_not_found",
     "dependency_failed",
     "duplicate_request_id",
     "empty_agent_prompt",

@@ -255,6 +255,13 @@ pub enum MsgCommand {
     ListPanes,
     /// Inspect attachment, active selection, revisions, pending work, bridge, and queues.
     SessionInspect,
+    /// List attached clients, which one presents media, and the geometry they share.
+    ListClients,
+    /// Detach one attached client by the ID `list-clients` reports.
+    DetachClient {
+        #[arg(long)]
+        client_id: u64,
+    },
     /// List tabs with stable IDs in display order.
     ListTabs,
     /// Select a tab by its stable ID or name.
@@ -1327,6 +1334,13 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
         ),
         MsgCommand::ListPanes => (AutomationMethod::ListPanes, None, false, Output::Json),
         MsgCommand::SessionInspect => (AutomationMethod::SessionInspect, None, false, Output::Json),
+        MsgCommand::ListClients => (AutomationMethod::ListClients, None, false, Output::Json),
+        MsgCommand::DetachClient { client_id } => (
+            AutomationMethod::DetachClient { client_id },
+            None,
+            false,
+            Output::Json,
+        ),
         MsgCommand::ListTabs => (AutomationMethod::ListTabs, None, false, Output::Json),
         MsgCommand::SelectTab { tab, wait, timeout } => (
             AutomationMethod::SelectTab {

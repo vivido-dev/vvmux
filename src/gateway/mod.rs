@@ -869,7 +869,10 @@ async fn handle_socket_message(
                         .await
                         {
                             Ok((adapter, attached_name, text_only)) => {
-                                let browser_bridge = if vivid {
+                                // Only the session's media presenter gets a bridge. A viewer's
+                                // Vivid route stays unused, so a second attachment never pulls a
+                                // second copy of a playing video.
+                                let browser_bridge = if vivid && !text_only {
                                     let root_secret = broker.root_secret();
                                     let connection_factory: Arc<
                                         dyn crate::bridge::ConnectionFactory,
@@ -1154,6 +1157,22 @@ async fn handle_session_message(
             release_bridge(bridge);
         }
         ServerMessage::Pong => {}
+        ServerMessage::MediaRole { presenter: false } => {
+            // Another client claimed the media role. Everything queued before this was meant for
+            // the browser's bridge; nothing after it is. Tell the browser before its Vivid route
+            // closes, so it reads the closure as a demotion rather than a failure; the session
+            // connection stays up.
+            send_control(writer, &ServerControl::MediaRole { presenter: false })?;
+            if let Some(worker) = bridge.take() {
+                tokio::task::spawn_blocking(move || worker.release());
+            }
+        }
+        ServerMessage::MediaRole { presenter: true } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session promoted a browser attachment that never claimed media",
+            ));
+        }
         ServerMessage::MediaSnapshot {
             microphones: _,
             revision,
@@ -1277,6 +1296,9 @@ fn dispatch_parsed(adapter: &SessionAdapter, parsed: Vec<ParsedInput>) -> io::Re
             ParsedInput::Mouse(mouse, _) => ClientMessage::Mouse(mouse),
             ParsedInput::Focus(focused) => ClientMessage::Focus(focused),
             ParsedInput::Detach => ClientMessage::Detach,
+            // A browser's Vivid route is opened alongside its attach request, so it presents
+            // media only if it was granted the role then; it cannot take it over mid-session.
+            ParsedInput::ClaimMedia => continue,
         };
         adapter.send(message)?;
     }

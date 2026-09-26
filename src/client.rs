@@ -112,9 +112,31 @@ impl RenderAssembler {
     }
 }
 
+/// How a client joins a session that other clients may already be attached to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JoinOptions {
+    /// Detach every other client first.
+    pub replace: bool,
+    /// Whether to take the session's one media role.
+    pub media: crate::ipc::MediaRequest,
+    /// Watch without sending input.
+    pub read_only: bool,
+}
+
+/// The outer Vivid capability this client was started with.
+///
+/// Held in the foreground only, and only so the bridge can be connected again when this client
+/// is promoted to presenter after attaching as a viewer.
+struct OuterCredentials {
+    control: String,
+    realtime: Option<String>,
+    bulk: Option<String>,
+    root_secret: Zeroizing<String>,
+}
+
 pub fn attach(
     name: &str,
-    replace: bool,
+    join: JoinOptions,
     create: bool,
     target: crate::ipc::AttachmentTarget,
     config_path: Option<&Path>,
@@ -132,11 +154,19 @@ pub fn attach(
 
     // Keep outer credentials exclusively in the foreground process. Zeroizing guarantees root
     // secret bytes are overwritten when the Vivid bridge or this text-only client closes.
-    let outer_endpoint = std::env::var("VIVID_ENDPOINT_CONTROL").ok();
-    let outer_realtime_endpoint = std::env::var("VIVID_ENDPOINT_REALTIME").ok();
-    let outer_bulk_endpoint = std::env::var("VIVID_ENDPOINT_BULK").ok();
-    let outer_root_secret = std::env::var("VIVID_ROOT_SECRET").ok().map(Zeroizing::new);
-    let vivid = outer_endpoint.is_some() && outer_root_secret.is_some();
+    let outer = match (
+        std::env::var("VIVID_ENDPOINT_CONTROL").ok(),
+        std::env::var("VIVID_ROOT_SECRET").ok().map(Zeroizing::new),
+    ) {
+        (Some(control), Some(root_secret)) => Some(OuterCredentials {
+            control,
+            realtime: std::env::var("VIVID_ENDPOINT_REALTIME").ok(),
+            bulk: std::env::var("VIVID_ENDPOINT_BULK").ok(),
+            root_secret,
+        }),
+        _ => None,
+    };
+    let vivid = outer.is_some();
     let host_term = std::env::var_os("TERM");
     let kitty_graphics = host_supports_kitty_graphics(host_term.as_deref());
     // Negotiate the attachment before entering raw/alternate-screen mode. A rejected attach must
@@ -144,10 +174,10 @@ pub fn attach(
     // caller's Vivido window, and the later terminal teardown would hide the server's diagnostic.
     let display = crate::platform::current_display_metrics()?;
     let presenter_cell_size = Arc::new(AtomicU32::new(pack_cell_size(display)));
-    let text_only = request_attachment(
+    let presenter = request_attachment(
         &mut reader,
         &writer,
-        replace,
+        join,
         target.clone(),
         display,
         vivid,
@@ -168,8 +198,8 @@ pub fn attach(
     let output = terminal.output()?;
     let output = Arc::new(Mutex::new(output));
     let output_thread = TerminalOutput::spawn(output, writer.clone())?;
-    if text_only {
-        write_title(&output_thread, "vvmux (text-only media fallback)");
+    if !(vivid && presenter) {
+        write_media_role_title(&output_thread, vivid, presenter);
     }
     let bridge_display = display;
     let bridge_cell_size = presenter_cell_size.clone();
@@ -178,48 +208,53 @@ pub fn attach(
     let reader_thread = thread::Builder::new()
         .name("vvmux-render".into())
         .spawn(move || {
-            let mut bridge = match (outer_endpoint, outer_root_secret) {
-                (Some(endpoint), Some(root_secret)) => {
-                    match crate::bridge::OuterBridge::connect_native(
-                        endpoint,
-                        outer_realtime_endpoint,
-                        outer_bulk_endpoint,
-                        root_secret,
-                        bridge_display,
-                    ) {
-                        Ok(bridge) => {
-                            let presenter_display = bridge.display_metrics();
-                            bridge_cell_size
-                                .store(pack_cell_size(presenter_display), Ordering::Release);
-                            if presenter_display != bridge_display {
-                                let _ = send_client(
-                                    &read_writer,
-                                    &ClientMessage::Resize(presenter_display),
-                                );
-                            }
-                            match BridgeWorker::spawn(
-                                bridge,
-                                read_writer.clone(),
-                                bridge_queue_records,
-                                bridge_cell_size.clone(),
-                            ) {
-                                Ok(worker) => Some(worker),
-                                Err(error) => {
-                                    write_title(
-                                        &output_thread,
-                                        &format!("vvmux media disabled: {error}"),
-                                    );
-                                    None
-                                }
-                            }
+            // Connected only while this client presents media. A viewer holds no outer bridge,
+            // so a second attachment costs its outer presenter nothing.
+            let connect_bridge = |display: crate::ipc::DisplayMetrics| {
+                let outer = outer.as_ref()?;
+                match crate::bridge::OuterBridge::connect_native(
+                    outer.control.clone(),
+                    outer.realtime.clone(),
+                    outer.bulk.clone(),
+                    outer.root_secret.clone(),
+                    display,
+                ) {
+                    Ok(bridge) => {
+                        let presenter_display = bridge.display_metrics();
+                        bridge_cell_size
+                            .store(pack_cell_size(presenter_display), Ordering::Release);
+                        if presenter_display != display {
+                            let _ = send_client(
+                                &read_writer,
+                                &ClientMessage::Resize(presenter_display),
+                            );
                         }
-                        Err(error) => {
-                            write_title(&output_thread, &format!("vvmux media disabled: {error}"));
-                            None
+                        match BridgeWorker::spawn(
+                            bridge,
+                            read_writer.clone(),
+                            bridge_queue_records,
+                            bridge_cell_size.clone(),
+                        ) {
+                            Ok(worker) => Some(worker),
+                            Err(error) => {
+                                write_title(
+                                    &output_thread,
+                                    &format!("vvmux media disabled: {error}"),
+                                );
+                                None
+                            }
                         }
                     }
+                    Err(error) => {
+                        write_title(&output_thread, &format!("vvmux media disabled: {error}"));
+                        None
+                    }
                 }
-                _ => None,
+            };
+            let mut bridge = if presenter {
+                connect_bridge(bridge_display)
+            } else {
+                None
             };
             let mut render_assembler = RenderAssembler::new(MAX_ATOMIC_RENDER_BYTES);
             while let Ok(message) = reader.recv_server() {
@@ -355,6 +390,24 @@ pub fn attach(
                             MouseCoordinates::Cells
                         };
                         let _ = input_mode_sender.send((keyboard_flags, coordinates));
+                    }
+                    ServerMessage::MediaRole { presenter } => {
+                        // Ordered with the media stream: everything before a demotion was meant
+                        // for the old bridge, and a promotion precedes the first new snapshot.
+                        if presenter {
+                            if bridge.is_none() {
+                                let mut display = crate::platform::current_display_metrics()
+                                    .unwrap_or(bridge_display);
+                                apply_cell_size(
+                                    &mut display,
+                                    bridge_cell_size.load(Ordering::Acquire),
+                                );
+                                bridge = connect_bridge(display);
+                            }
+                        } else if let Some(worker) = bridge.take() {
+                            worker.release();
+                        }
+                        write_media_role_title(&output_thread, vivid, presenter);
                     }
                     ServerMessage::Detached { .. } | ServerMessage::Error(_) => break,
                     ServerMessage::Pong => {}
@@ -541,6 +594,9 @@ pub fn attach(
                         ParsedInput::Focus(focused) => {
                             send_client(&writer, &ClientMessage::Focus(focused))?
                         }
+                        ParsedInput::ClaimMedia => {
+                            send_client(&writer, &ClientMessage::ClaimMedia)?
+                        }
                         ParsedInput::Detach => {
                             send_client(&writer, &ClientMessage::Detach)?;
                             // Keep the reader alive until the session actor acknowledges Detach.
@@ -632,7 +688,7 @@ fn outer_identity(
 fn request_attachment(
     reader: &mut crate::ipc::RecordReader,
     writer: &SharedWriter,
-    replace: bool,
+    join: JoinOptions,
     target: crate::ipc::AttachmentTarget,
     display: crate::ipc::DisplayMetrics,
     vivid: bool,
@@ -642,16 +698,18 @@ fn request_attachment(
     send_client(
         writer,
         &ClientMessage::Attach {
-            replace,
+            replace: join.replace,
             target,
             display,
             vivid,
             kitty_graphics,
             outer,
+            media: join.media,
+            read_only: join.read_only,
         },
     )?;
     match reader.recv_server()? {
-        ServerMessage::Attached { text_only, .. } => Ok(text_only),
+        ServerMessage::Attached { presenter, .. } => Ok(presenter),
         ServerMessage::Error(message) => {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
         }
@@ -752,7 +810,11 @@ const BRIDGE_DROPPED_IDS: usize = 4096;
 
 pub(crate) struct BridgeWorker {
     admitted_sources: HashSet<BridgeSourceKey>,
+    /// Ends the outer bridge and the client's session connection together: a failed bridge is
+    /// fatal to its client.
     cancel: Arc<dyn Fn() + Send + Sync>,
+    /// Ends the outer bridge alone, for a client that stays attached after losing the media role.
+    release_bridge: Arc<dyn Fn() + Send + Sync>,
     media: Arc<Mutex<TrackMediaQueues>>,
     media_wakeup: Option<mpsc::SyncSender<()>>,
     queue_records_per_track: usize,
@@ -890,6 +952,8 @@ impl BridgeWorker {
     ) -> io::Result<Self> {
         let bridge_cancel = bridge.cancel_handle();
         let client_cancel = client_writer.1.clone();
+        let release_cancel = bridge_cancel.clone();
+        let release_bridge: Arc<dyn Fn() + Send + Sync> = Arc::new(move || release_cancel.cancel());
         let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             client_cancel();
             bridge_cancel.cancel();
@@ -925,6 +989,7 @@ impl BridgeWorker {
         Ok(Self {
             admitted_sources: HashSet::new(),
             cancel,
+            release_bridge,
             media,
             media_wakeup: Some(media_wakeup),
             queue_records_per_track: queue_records,
@@ -1008,15 +1073,32 @@ impl BridgeWorker {
     }
 }
 
-impl Drop for BridgeWorker {
-    fn drop(&mut self) {
+impl BridgeWorker {
+    /// Stop presenting while keeping the session connection: the media role moved to another
+    /// client. The outer session closes, so the outer presenter drops everything it was showing.
+    pub(crate) fn release(mut self) {
+        self.stop(false);
+    }
+
+    fn stop(&mut self, end_client: bool) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
         // Cancellation must wake the current control request before we join.
         self.stopped.store(true, Ordering::Release);
         self.media_wakeup.take();
-        (self.cancel)();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if end_client {
+            (self.cancel)();
+        } else {
+            (self.release_bridge)();
         }
+        let _ = thread.join();
+    }
+}
+
+impl Drop for BridgeWorker {
+    fn drop(&mut self) {
+        self.stop(true);
     }
 }
 
@@ -2453,6 +2535,16 @@ fn write_output(output: &Arc<Mutex<Box<dyn Write + Send>>>, parts: &[&[u8]]) -> 
 const SYNC_UPDATE_BEGIN: &[u8] = b"\x1b[?2026h";
 const SYNC_UPDATE_END: &[u8] = b"\x1b[?2026l";
 
+/// Say in the title bar why this terminal shows no media, when it shows none.
+fn write_media_role_title(output: &TerminalOutput, vivid: bool, presenter: bool) {
+    let title = match (vivid, presenter) {
+        (false, _) => "vvmux (text-only media fallback)",
+        (true, false) => "vvmux (text viewer: another client presents media; prefix M claims it)",
+        (true, true) => "vvmux (presenting media)",
+    };
+    write_title(output, title);
+}
+
 fn write_title(output: &TerminalOutput, title: &str) {
     let sanitized = title.replace(['\x07', '\x1b'], "");
     output.enqueue_control(format!("\x1b]2;{sanitized}\x1b\\").into_bytes());
@@ -2917,7 +3009,7 @@ mod tests {
         let error = request_attachment(
             &mut reader,
             &writer,
-            false,
+            JoinOptions::default(),
             crate::ipc::AttachmentTarget::Session,
             crate::ipc::DisplayMetrics {
                 columns: 80,
@@ -3325,6 +3417,7 @@ mod tests {
                 })
                 .collect(),
             cancel: Arc::new(|| {}),
+            release_bridge: Arc::new(|| {}),
             media: Arc::new(Mutex::new(TrackMediaQueues::default())),
             media_wakeup: Some(media_wakeup),
             queue_records_per_track: 1,

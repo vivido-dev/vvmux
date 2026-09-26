@@ -31,6 +31,8 @@ vvmux list --json
 vvmux doctor --target SESSION --json
 vvmux msg capabilities
 vvmux msg session-inspect
+vvmux msg list-clients
+vvmux msg detach-client --client-id 4
 vvmux msg list-tabs
 vvmux msg list-panes
 vvmux msg layout
@@ -59,7 +61,9 @@ IDs. `visible` is about projection: every pane of a detached session reports `fa
 limits}`. Everything about the pane is under `pane`: `screen_sequence` and `output_offset`, the
 `agent` block, `pending_resume`, `process` and `process_state`, `screen` (`primary` or `alternate`),
 `retained_output_from_offset`, `media`, `plugin`, and `outer_crop`. `session-inspect` carries
-attachment, revisions, queues, bridge state, and the `outer` block.
+the attached clients and which one presents media, revisions, queues, bridge state, and the `outer`
+block. `list-clients` reports just the clients, the media presenter, and the shared layout size;
+`detach-client` detaches one by its `client_id` and leaves the others attached.
 
 ## Routing to a pane
 

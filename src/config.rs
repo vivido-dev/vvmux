@@ -71,8 +71,26 @@ pub struct General {
     pub scrollback_lines: usize,
     /// Where the tab list is drawn when a session starts; `cycle-tab-view` changes it at runtime.
     pub tab_view: crate::tab_view::TabView,
+    /// Which attached client's terminal size the panes are laid out for.
+    pub window_size: WindowSize,
     pub mouse: bool,
     pub render_interval_ms: u64,
+}
+
+/// How a session sizes its panes when its attached clients have different terminal sizes.
+///
+/// Panes have one size, because each has one PTY. Clients whose terminal differs from it see the
+/// layout clipped or padded, with their own tab list at their own edge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowSize {
+    /// Follow the client that most recently attached, resized, or sent input.
+    #[default]
+    Latest,
+    /// Fit the smallest client in each dimension, so no client has anything clipped.
+    Smallest,
+    /// Fit the largest client in each dimension; smaller clients see the top-left corner.
+    Largest,
 }
 
 /// The deprecated color section, superseded by `[theme]`.
@@ -290,6 +308,7 @@ impl Default for General {
             default_layout: None,
             scrollback_lines: 10_000,
             tab_view: crate::tab_view::TabView::Bottom,
+            window_size: WindowSize::Latest,
             mouse: true,
             render_interval_ms: 16,
         }

@@ -214,8 +214,8 @@ reconstruct them.**
 
 Before reaching for `vivido msg`, check whether `capture-media` already answers the question; it
 needs no Vivido at all. When the terminal text itself must be in the picture, read
-`session-inspect`'s `outer` block: it names the Vivido window presenting the session now, is `null`
-when nothing is attached, and has `remote: true` when the client arrived over `vvssh`, in which case
+`session-inspect`'s `outer` block: it names the Vivido window presenting the session now — the
+media presenter's when several clients are attached — is `null` when nothing is attached, and has `remote: true` when the client arrived over `vvssh`, in which case
 that route does not exist. `inspect`'s `pane.outer_crop` is the pane's rectangle in that window's
 pixels.
 
