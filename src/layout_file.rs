@@ -625,14 +625,14 @@ mod tests {
 name = "dev"
 focus = "shell"
 [tabs.layout]
-split = "vertical"
+split = "horizontal"
 sizes = [30, 70]
 [[tabs.layout.children]]
 pane = "editor"
 command = "nvim ."
 cwd = "~/src/vvmux"
 [[tabs.layout.children]]
-split = "horizontal"
+split = "vertical"
 sizes = [60, 40]
 [[tabs.layout.children.children]]
 pane = "shell"
@@ -669,11 +669,11 @@ hold = true
     fn validation_errors_name_the_problem() {
         let cases = [
             (
-                "[[tabs]]\n[tabs.layout]\nsplit='vertical'\nsizes=[1]\n[[tabs.layout.children]]\npane='a'\n[[tabs.layout.children]]\npane='b'",
+                "[[tabs]]\n[tabs.layout]\nsplit='horizontal'\nsizes=[1]\n[[tabs.layout.children]]\npane='a'\n[[tabs.layout.children]]\npane='b'",
                 "sizes",
             ),
             (
-                "[[tabs]]\n[tabs.layout]\npane='a'\nsplit='vertical'",
+                "[[tabs]]\n[tabs.layout]\npane='a'\nsplit='horizontal'",
                 "exactly one",
             ),
             (
@@ -681,7 +681,7 @@ hold = true
                 "unknown",
             ),
             (
-                "[[tabs]]\n[tabs.layout]\nsplit='vertical'\n[[tabs.layout.children]]\npane='a'\n[[tabs.layout.children]]\npane='a'",
+                "[[tabs]]\n[tabs.layout]\nsplit='horizontal'\n[[tabs.layout.children]]\npane='a'\n[[tabs.layout.children]]\npane='a'",
                 "duplicate",
             ),
             (
@@ -689,7 +689,7 @@ hold = true
                 "missing",
             ),
             (
-                "[[tabs]]\n[tabs.layout]\nsplit='vertical'\n[[tabs.layout.children]]\npane='a'",
+                "[[tabs]]\n[tabs.layout]\nsplit='horizontal'\n[[tabs.layout.children]]\npane='a'",
                 "between 2",
             ),
             ("[[tabs]]", "contains no panes"),
@@ -779,7 +779,7 @@ hold = true
                 Some("dev".to_owned()),
                 Some("p2".to_owned()),
                 Some(LayoutNode::split(
-                    Axis::Vertical,
+                    Axis::Horizontal,
                     vec![30, 70],
                     vec![
                         LayoutNode::leaf("p1".to_owned(), Some(cwd.to_owned()), true),
@@ -792,7 +792,7 @@ hold = true
                 None,
                 Some("p2".to_owned()),
                 Some(LayoutNode::split(
-                    Axis::Horizontal,
+                    Axis::Vertical,
                     vec![1, 3],
                     vec![
                         LayoutNode::leaf("p1".to_owned(), None, false),
@@ -880,7 +880,7 @@ pane = "p1"
             r#"
 [[tabs]]
 [tabs.layout]
-split = "vertical"
+split = "horizontal"
 opaque = true
 
 [[tabs.layout.children]]
@@ -928,7 +928,7 @@ pane = "p2"
             None,
             None,
             Some(LayoutNode::split(
-                Axis::Vertical,
+                Axis::Horizontal,
                 vec![1, 1],
                 vec![
                     LayoutNode::leaf("p1".to_owned(), Some("/tmp".to_owned()), false),

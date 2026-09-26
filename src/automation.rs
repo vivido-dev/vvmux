@@ -674,7 +674,7 @@ pub enum MsgCommand {
         #[arg(long, value_enum, default_value_t = RunPlacementArg::Split)]
         placement: RunPlacementArg,
         /// Split direction, when `--placement split`.
-        #[arg(long, value_enum, default_value_t = SplitAxis::Vertical)]
+        #[arg(long, value_enum, default_value_t = SplitAxis::Horizontal)]
         axis: SplitAxis,
         #[arg(long)]
         cwd: Option<PathBuf>,

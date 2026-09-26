@@ -6649,8 +6649,8 @@ impl SessionActor {
             self.tabs[tab_index].floating.clear_origin(pane_id);
         } else {
             for (requested, axis, name) in [
-                (columns, Axis::Vertical, "columns"),
-                (rows, Axis::Horizontal, "rows"),
+                (columns, Axis::Horizontal, "columns"),
+                (rows, Axis::Vertical, "rows"),
             ] {
                 let Some(requested) = requested else { continue };
                 // The frame again: the tree divides outer rectangles, the caller means content.
@@ -6774,14 +6774,13 @@ impl SessionActor {
                                 .or_else(|| tree.pane_ids().into_iter().next());
                             match anchor {
                                 Some(anchor) => {
-                                    tree.split(anchor, pane_id, Axis::Vertical, area).map_err(
-                                        |_| {
+                                    tree.split(anchor, pane_id, Axis::Horizontal, area)
+                                        .map_err(|_| {
                                             AutomationError::new(
                                                 "invalid_state",
                                                 "no room to tile this pane",
                                             )
-                                        },
-                                    )?;
+                                        })?;
                                     tree
                                 }
                                 None => TiledNode::leaf(pane_id),
@@ -6861,7 +6860,7 @@ impl SessionActor {
                     .or_else(|| tree.pane_ids().into_iter().next());
                 match anchor {
                     Some(anchor) => {
-                        tree.split(anchor, pane_id, Axis::Vertical, area)
+                        tree.split(anchor, pane_id, Axis::Horizontal, area)
                             .map_err(|_| {
                                 AutomationError::new(
                                     "invalid_state",
@@ -10009,11 +10008,11 @@ impl SessionActor {
             && (on_vertical || on_horizontal)
         {
             let axis = if on_vertical {
-                Axis::Vertical
-            } else {
                 Axis::Horizontal
+            } else {
+                Axis::Vertical
             };
-            let boundary = if axis == Axis::Vertical {
+            let boundary = if axis == Axis::Horizontal {
                 mouse.x
             } else {
                 mouse.y
@@ -10510,8 +10509,8 @@ impl SessionActor {
                 ..
             } => {
                 let current = match axis {
-                    Axis::Vertical => mouse.x,
-                    Axis::Horizontal => mouse.y,
+                    Axis::Horizontal => mouse.x,
+                    Axis::Vertical => mouse.y,
                 };
                 let mut changed = false;
                 while *last < current {
@@ -10647,14 +10646,14 @@ impl SessionActor {
         let candidate = geometry
             .iter()
             .find_map(|(pane, rect)| match (axis, positive) {
-                (Axis::Vertical, true) if rect.x + rect.width == boundary => {
+                (Axis::Horizontal, true) if rect.x + rect.width == boundary => {
                     Some((*pane, Direction::Right))
                 }
-                (Axis::Vertical, false) if rect.x == boundary => Some((*pane, Direction::Left)),
-                (Axis::Horizontal, true) if rect.y + rect.height == boundary => {
+                (Axis::Horizontal, false) if rect.x == boundary => Some((*pane, Direction::Left)),
+                (Axis::Vertical, true) if rect.y + rect.height == boundary => {
                     Some((*pane, Direction::Down))
                 }
-                (Axis::Horizontal, false) if rect.y == boundary => Some((*pane, Direction::Up)),
+                (Axis::Vertical, false) if rect.y == boundary => Some((*pane, Direction::Up)),
                 _ => None,
             });
         candidate.is_some_and(|(pane, direction)| tree.resize(pane, direction, area))
@@ -10930,7 +10929,7 @@ impl SessionActor {
                 };
                 let placement = match launch.pane.placement {
                     vvmux_plugin_api::Placement::Split => crate::ipc::RunPlacement::Split {
-                        axis: crate::ipc::Axis::Vertical,
+                        axis: crate::ipc::Axis::Horizontal,
                     },
                     vvmux_plugin_api::Placement::Float => crate::ipc::RunPlacement::Float,
                     vvmux_plugin_api::Placement::Tab => crate::ipc::RunPlacement::Tab,
@@ -19429,7 +19428,8 @@ mod tests {
             height: 23,
         };
         let mut tree = TiledNode::leaf(1);
-        tree.split(1, 2, crate::ipc::Axis::Vertical, area).unwrap();
+        tree.split(1, 2, crate::ipc::Axis::Horizontal, area)
+            .unwrap();
         let mut floating = FloatingLayer::default();
         floating.insert(10, area, FloatOrigin::sized(60, 60));
         floating.insert(11, area, FloatOrigin::sized(40, 40));

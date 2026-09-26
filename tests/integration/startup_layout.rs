@@ -322,13 +322,13 @@ fn nested_layout_starts_named_tab_with_weighted_tiled_panes() {
 name = "dev"
 focus = "shell"
 [tabs.layout]
-split = "vertical"
+split = "horizontal"
 sizes = [30, 70]
 [[tabs.layout.children]]
 pane = "editor"
 command = "printf 'PANE editor\n'; sleep 30"
 [[tabs.layout.children]]
-split = "horizontal"
+split = "vertical"
 sizes = [60, 40]
 [[tabs.layout.children.children]]
 pane = "shell"
@@ -430,7 +430,7 @@ fn partial_failure_is_owner_scoped_and_the_other_session_keeps_updating() {
         r#"
 [[tabs]]
 [tabs.layout]
-split = "vertical"
+split = "horizontal"
 [[tabs.layout.children]]
 pane = "one"
 command = "printf 'OWNER_B one\n'; sleep 30"
@@ -451,7 +451,7 @@ command = "printf 'OWNER_B two\n'; sleep 30"
             r#"
 [[tabs]]
 [tabs.layout]
-split = "vertical"
+split = "horizontal"
 [[tabs.layout.children]]
 pane = "broken"
 cwd = {}
@@ -527,7 +527,7 @@ fn four_pane_stack_starts_before_a_real_display_is_attached() {
         .collect::<String>();
     let layout = fixture.write_layout(
         "stack.toml",
-        &format!("[[tabs]]\n[tabs.layout]\nsplit='horizontal'\nsizes=[1,1,1,1]\n{children}"),
+        &format!("[[tabs]]\n[tabs.layout]\nsplit='vertical'\nsizes=[1,1,1,1]\n{children}"),
     );
     assert_success(&fixture.start(&layout));
     assert_eq!(fixture.panes().len(), 4);
@@ -630,7 +630,7 @@ fn startup_toml_applies_to_a_session_created_without_a_layout() {
 name = "left-right"
 focus = "right"
 [tabs.layout]
-split = "vertical"
+split = "horizontal"
 sizes = [40, 60]
 [[tabs.layout.children]]
 pane = "left"
@@ -642,7 +642,7 @@ command = "printf 'STARTUP right\n'; sleep 30"
 [[tabs]]
 name = "top-bottom"
 [tabs.layout]
-split = "horizontal"
+split = "vertical"
 [[tabs.layout.children]]
 pane = "top"
 command = "printf 'STARTUP top\n'; sleep 30"
@@ -696,7 +696,7 @@ fn startup_toml_outranks_the_default_layout_but_not_an_explicit_one() {
 #[test]
 fn invalid_startup_toml_warns_and_falls_back_to_one_shell() {
     let fixture = Fixture::new("startup-invalid");
-    fixture.write_startup_layout("[[tabs]]\n[tabs.layout]\npane='a'\nsplit='vertical'\n");
+    fixture.write_startup_layout("[[tabs]]\n[tabs.layout]\npane='a'\nsplit='horizontal'\n");
 
     let created = fixture.start_without_layout();
     assert_success(&created);
@@ -712,7 +712,7 @@ fn a_saved_layout_reproduces_the_live_tabs_and_panes() {
     let source = Fixture::new("save");
     assert_success(&source.start_without_layout());
     assert_eq!(
-        json(source.msg(&["split", "vertical", "--pane-id", "1"]))["new_pane_id"],
+        json(source.msg(&["split", "horizontal", "--pane-id", "1"]))["new_pane_id"],
         2
     );
     assert_success(&source.msg(&["action", "new-tab"]));
@@ -730,7 +730,7 @@ fn a_saved_layout_reproduces_the_live_tabs_and_panes() {
     // unchanged, and the next ordinary mutation still lands.
     assert_eq!(pane_identity(&source.panes()), pane_identity(&before));
     assert_eq!(
-        json(source.msg(&["split", "vertical", "--pane-id", "1"]))["new_pane_id"],
+        json(source.msg(&["split", "horizontal", "--pane-id", "1"]))["new_pane_id"],
         4
     );
 
@@ -770,7 +770,7 @@ fn a_failed_save_reports_the_error_and_leaves_the_session_intact() {
 
     assert_eq!(pane_identity(&fixture.panes()), pane_identity(&before));
     assert_eq!(
-        json(fixture.msg(&["split", "vertical", "--pane-id", "1"]))["new_pane_id"],
+        json(fixture.msg(&["split", "horizontal", "--pane-id", "1"]))["new_pane_id"],
         2
     );
 }
@@ -826,8 +826,8 @@ fn a_session_restores_the_shape_it_had_when_its_server_restarts() {
 
     // A shape nothing would produce by default: an uneven split, a nested one, a second tab, and a
     // zoomed pane that is not the one focus would land on.
-    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
     assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
     assert_success(&fixture.msg(&["action", "new-tab"]));
     for pane in 1..=4 {
         fixture.wait_text(pane, &format!("READY pane={pane}"));
@@ -913,7 +913,7 @@ fn an_explicit_layout_outranks_a_snapshot() {
     let fixture = Fixture::new("precedence");
     assert_success(&fixture.start_without_layout());
     fixture.wait_text(1, "READY pane=1");
-    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
     fixture.wait_text(2, "READY pane=2");
     fixture.kill();
 
@@ -935,7 +935,7 @@ fn turning_snapshots_off_discards_the_one_on_disk() {
     let fixture = Fixture::new("optout");
     assert_success(&fixture.start_without_layout());
     fixture.wait_text(1, "READY pane=1");
-    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
     fixture.wait_text(2, "READY pane=2");
     let path = PathBuf::from(json(fixture.msg(&["snapshot"]))["path"].as_str().unwrap());
     fixture.kill();
@@ -1287,7 +1287,7 @@ fn a_resuming_pane_gets_no_history_replay_but_its_neighbour_does() {
 
     assert_success(&fixture.start_without_layout());
     fixture.wait_text(1, "READY pane=1");
-    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
     fixture.wait_text(2, "READY pane=2");
 
     // Both panes scroll, so both have history worth replaying; only one has an agent.
@@ -1337,8 +1337,8 @@ fn pane_names_survive_a_restart_that_reassigns_pane_ids() {
     let fixture = Fixture::new("pane-names");
     assert_success(&fixture.start_without_layout());
     fixture.wait_text(1, "READY pane=1 tab=1");
-    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
     assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
     for pane in 1..=3 {
         fixture.wait_text(pane, &format!("READY pane={pane}"));
     }
@@ -1379,7 +1379,7 @@ fn a_pane_name_is_unique_and_releasable() {
     let fixture = Fixture::new("pane-name-unique");
     assert_success(&fixture.start_without_layout());
     fixture.wait_text(1, "READY pane=1 tab=1");
-    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
     fixture.wait_text(2, "READY pane=2");
 
     assert_success(&fixture.msg(&["pane-rename", "--pane-id", "1", "--name", "editor"]));
@@ -1410,8 +1410,8 @@ fn layout_describes_the_tree_and_resolve_pane_agrees_with_focus() {
     assert_success(&fixture.start_without_layout());
     fixture.wait_text(1, "READY pane=1 tab=1");
     // 1 on the left; 2 above 3 on the right.
-    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
-    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "2"]));
+    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "2"]));
     for pane in 1..=3 {
         fixture.wait_text(pane, &format!("READY pane={pane}"));
     }
@@ -1474,7 +1474,7 @@ fn activate_pane_reveals_without_taking_focus() {
     let fixture = Fixture::new("activate");
     assert_success(&fixture.start_without_layout());
     fixture.wait_text(1, "READY pane=1 tab=1");
-    assert_success(&fixture.msg(&["split", "vertical", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
     fixture.wait_text(2, "READY pane=2");
     assert_success(&fixture.msg(&["action", "new-tab"]));
     fixture.wait_text(3, "READY pane=3");

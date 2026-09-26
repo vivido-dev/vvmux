@@ -597,7 +597,7 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
                 "--target",
                 &session,
                 "split",
-                "vertical",
+                "horizontal",
                 "--pane-id",
                 "1",
             ])

@@ -55,7 +55,7 @@ fn attached_split_panes_relayout_without_followup_input() {
     let split = command(
         &executable,
         &session,
-        &["split", "vertical", "--pane-id", "1"],
+        &["split", "horizontal", "--pane-id", "1"],
     );
     assert_success(&split);
     let initial = wait_for_width(&executable, &session, 1, |width| width < 60)

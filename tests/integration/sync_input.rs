@@ -86,7 +86,7 @@ done
     }
 
     fn split(&self) -> u64 {
-        let opened = json(self.msg(&["split", "vertical", "--pane-id", "1"]));
+        let opened = json(self.msg(&["split", "horizontal", "--pane-id", "1"]));
         let pane = opened["new_pane_id"].as_u64().unwrap();
         self.wait_ready(pane);
         pane

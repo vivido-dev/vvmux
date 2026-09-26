@@ -144,7 +144,7 @@ done
     assert_success(&command(
         &runtime,
         &session,
-        &["split", "vertical", "--pane-id", "1"],
+        &["split", "horizontal", "--pane-id", "1"],
     ));
     wait_for_text(&runtime, &session, 2, "READY pane=2");
 

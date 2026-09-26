@@ -183,7 +183,7 @@ vvmux msg run-plan --file work.json --dry-run     # report what would run, conne
 {
   "version": 1,
   "steps": [
-    {"id": "split", "method": "split", "params": {"axis": "Vertical"}, "pane_id": 1,
+    {"id": "split", "method": "split", "params": {"axis": "Horizontal"}, "pane_id": 1,
      "bind": {"right": "/new_pane_id"}},
     {"id": "name", "method": "pane_rename", "pane_id": {"$ref": "right"},
      "params": {"name": "worker"}},
@@ -290,9 +290,9 @@ handles from one this release added, and a real event name from a typo.
 ```sh
 export VVMUX_SESSION=agent
 
-right=$(vvmux msg split vertical --pane-id 1 | jq -r .new_pane_id)
-bottom_left=$(vvmux msg split horizontal --pane-id 1 | jq -r .new_pane_id)
-bottom_right=$(vvmux msg split horizontal --pane-id "$right" | jq -r .new_pane_id)
+right=$(vvmux msg split horizontal --pane-id 1 | jq -r .new_pane_id)
+bottom_left=$(vvmux msg split vertical --pane-id 1 | jq -r .new_pane_id)
+bottom_right=$(vvmux msg split vertical --pane-id "$right" | jq -r .new_pane_id)
 
 vvmux msg typing --pane-id "$right" 'echo hello from top-right'
 vvmux msg key --pane-id "$right" Enter
@@ -337,8 +337,8 @@ inspect [--pane-id ID]
 inspect-media [--pane-id ID]
 trace-media [--after SEQ] [--limit N] [--follow] [--producer-id ID --context-id ID --surface-id ID --track-id ID] [--category CATEGORY] [--recovery-only] [--timeout DURATION] [--pane-id ID]
 save-layout [--path NAME|PATH]
-split vertical|horizontal [--pane-id ID]
-run COMMAND [--placement split|float|tab] [--axis vertical|horizontal] [--cwd DIR] [--hold] [--no-focus] [--pane-id ID]
+split horizontal|vertical [--pane-id ID]
+run COMMAND [--placement split|float|tab] [--axis horizontal|vertical] [--cwd DIR] [--hold] [--no-focus] [--pane-id ID]
 focus [--pane-id ID] [--wait outer|rendered] [--timeout DURATION]
 close-pane --pane-id ID
 mouse move|click|double-click|down|up|drag|scroll|path (--cell-column N --cell-row N | --x PX --y PX | --relative-x F --relative-y F) [--point COL,ROW]... [--button left|middle|right] [--route application|mux] [--mods Shift,Alt,Ctrl] [--scroll N] [--pane-id ID]
@@ -882,7 +882,7 @@ name = "dev"
 focus = "shell"
 
   [tabs.layout]
-  split = "vertical"
+  split = "horizontal"
   sizes = [30, 70]
 
     [[tabs.layout.children]]
@@ -1331,8 +1331,8 @@ the newest 200 detached completions and at most 256 KiB each of result/error log
 survives the invoking CLI client, while synchronous work remains client-scoped.
 
 `vvmux plugin pane open ID/PANE --target SESSION` resolves the pane from that session's applied
-registry generation and starts its exact argv in a real PTY. Manifest placement selects a vertical
-split, float, or named tab. Plugin panes default to held exit and exclusion from synchronized
+registry generation and starts its exact argv in a real PTY. Manifest placement selects a
+side-by-side split, float, or named tab. Plugin panes default to held exit and exclusion from synchronized
 keyboard and paste fan-out; `accept_sync_input = true` opts in. `pane.create` authorizes opening,
 while `media.produce` controls whether the process receives a fresh pane-scoped Vivid capability.
 Held crashes show a core-authored plugin/entrypoint/exit diagnostic. Close, plugin disable/removal,

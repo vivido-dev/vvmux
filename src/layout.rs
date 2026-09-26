@@ -834,7 +834,7 @@ impl TiledNode {
                 first_weight,
                 second_weight,
             } => match axis {
-                Axis::Vertical => {
+                Axis::Horizontal => {
                     let first_width = divide_span(area.width, *first_weight, *second_weight);
                     first.place(
                         Rect {
@@ -852,7 +852,7 @@ impl TiledNode {
                         output,
                     );
                 }
-                Axis::Horizontal => {
+                Axis::Vertical => {
                     let first_height = divide_span(area.height, *first_weight, *second_weight);
                     first.place(
                         Rect {
@@ -919,23 +919,23 @@ impl TiledNode {
         if contains && !*changed {
             let compatible = matches!(
                 (*axis, direction),
-                (Axis::Vertical, Direction::Left | Direction::Right)
-                    | (Axis::Horizontal, Direction::Up | Direction::Down)
+                (Axis::Horizontal, Direction::Left | Direction::Right)
+                    | (Axis::Vertical, Direction::Up | Direction::Down)
             );
             if compatible {
                 let first_size = match *axis {
-                    Axis::Vertical => first_area.width,
-                    Axis::Horizontal => first_area.height,
+                    Axis::Horizontal => first_area.width,
+                    Axis::Vertical => first_area.height,
                 };
                 let minimum = match *axis {
-                    Axis::Vertical => MIN_CONTENT_COLUMNS + FRAME_COLUMNS,
-                    Axis::Horizontal => MIN_CONTENT_ROWS + FRAME_ROWS,
+                    Axis::Horizontal => MIN_CONTENT_COLUMNS + FRAME_COLUMNS,
+                    Axis::Vertical => MIN_CONTENT_ROWS + FRAME_ROWS,
                 };
                 let delta = match (*axis, in_first, direction) {
-                    (Axis::Vertical, true, Direction::Right)
-                    | (Axis::Horizontal, true, Direction::Down) => 1,
-                    (Axis::Vertical, false, Direction::Left)
-                    | (Axis::Horizontal, false, Direction::Up) => -1,
+                    (Axis::Horizontal, true, Direction::Right)
+                    | (Axis::Vertical, true, Direction::Down) => 1,
+                    (Axis::Horizontal, false, Direction::Left)
+                    | (Axis::Vertical, false, Direction::Up) => -1,
                     _ => 0,
                 };
                 let next = i32::from(first_size) + delta;
@@ -968,7 +968,7 @@ fn divide_span(total: u16, first_weight: u32, second_weight: u32) -> u16 {
 
 fn split_areas(area: Rect, axis: Axis, first_weight: u32, second_weight: u32) -> (Rect, Rect, u16) {
     match axis {
-        Axis::Vertical => {
+        Axis::Horizontal => {
             let first_size = divide_span(area.width, first_weight, second_weight);
             (
                 Rect {
@@ -983,7 +983,7 @@ fn split_areas(area: Rect, axis: Axis, first_weight: u32, second_weight: u32) ->
                 area.width,
             )
         }
-        Axis::Horizontal => {
+        Axis::Vertical => {
             let first_size = divide_span(area.height, first_weight, second_weight);
             (
                 Rect {
@@ -1030,8 +1030,8 @@ mod tests {
     #[test]
     fn split_close_and_zoom_source_tree_are_stable() {
         let mut tree = TiledNode::leaf(1);
-        tree.split(1, 2, Axis::Vertical, area()).unwrap();
-        tree.split(2, 3, Axis::Horizontal, area()).unwrap();
+        tree.split(1, 2, Axis::Horizontal, area()).unwrap();
+        tree.split(2, 3, Axis::Vertical, area()).unwrap();
         assert_eq!(tree.pane_ids(), [1, 2, 3]);
         let before = tree.clone();
         assert!(matches!(
@@ -1046,11 +1046,11 @@ mod tests {
     #[test]
     fn horizontal_focus_stays_with_bottom_siblings_in_a_t_layout() {
         let tree = TiledNode::from_children(
-            Axis::Horizontal,
+            Axis::Vertical,
             vec![
                 TiledNode::leaf(1),
                 TiledNode::from_children(
-                    Axis::Vertical,
+                    Axis::Horizontal,
                     vec![TiledNode::leaf(2), TiledNode::leaf(3)],
                     &[1, 1],
                 ),
@@ -1073,7 +1073,7 @@ mod tests {
     #[test]
     fn weighted_children_preserve_requested_proportions() {
         let tree = TiledNode::from_children(
-            Axis::Vertical,
+            Axis::Horizontal,
             vec![TiledNode::leaf(1), TiledNode::leaf(2)],
             &[30, 70],
         );
@@ -1090,7 +1090,7 @@ mod tests {
     #[test]
     fn four_way_stack_builds_at_startup_display() {
         let tree = TiledNode::from_children(
-            Axis::Horizontal,
+            Axis::Vertical,
             (1..=4).map(TiledNode::leaf).collect(),
             &[1, 1, 1, 1],
         );
@@ -1112,9 +1112,9 @@ mod tests {
                 sizes.push(1 + state % 1000);
             }
             let axis = if state & 1 == 0 {
-                Axis::Vertical
-            } else {
                 Axis::Horizontal
+            } else {
+                Axis::Vertical
             };
             let area = Rect {
                 x: (state >> 24) as u16,
@@ -1206,7 +1206,7 @@ mod tests {
             tree.split(
                 1,
                 2,
-                Axis::Vertical,
+                Axis::Horizontal,
                 Rect {
                     x: 0,
                     y: 0,
@@ -1224,8 +1224,8 @@ mod tests {
     #[test]
     fn every_pane_keeps_a_placement_in_an_area_too_small_to_divide() {
         let mut tree = TiledNode::leaf(1);
-        tree.split(1, 2, Axis::Vertical, area()).unwrap();
-        tree.split(2, 3, Axis::Horizontal, area()).unwrap();
+        tree.split(1, 2, Axis::Horizontal, area()).unwrap();
+        tree.split(2, 3, Axis::Vertical, area()).unwrap();
         for (width, height) in [(10, 4), (4, 2), (3, 1), (1, 1), (1, 0), (0, 0)] {
             let host = Rect {
                 x: 0,
@@ -1252,7 +1252,7 @@ mod tests {
     #[test]
     fn resize_moves_one_cell_and_preserves_area() {
         let mut tree = TiledNode::leaf(1);
-        tree.split(1, 2, Axis::Vertical, area()).unwrap();
+        tree.split(1, 2, Axis::Horizontal, area()).unwrap();
         let before = tree.geometry(area())[&1].width;
         assert!(tree.resize(1, Direction::Right, area()));
         let geometry = tree.geometry(area());

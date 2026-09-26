@@ -1207,6 +1207,8 @@ impl ChannelKind {
     }
 }
 
+/// Split direction, named after how the panes are laid out, as tmux names `-h` and `-v`:
+/// `Horizontal` puts them side by side, `Vertical` stacks them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub enum Axis {
     Vertical,

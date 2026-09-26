@@ -734,8 +734,8 @@ impl PrefixParser {
         }
         match byte {
             value if value == self.prefix_byte => output.push(ParsedInput::Input(literal.to_vec())),
-            b'%' => output.push(ParsedInput::Action(Action::Split(Axis::Vertical))),
-            b'"' => output.push(ParsedInput::Action(Action::Split(Axis::Horizontal))),
+            b'%' => output.push(ParsedInput::Action(Action::Split(Axis::Horizontal))),
+            b'"' => output.push(ParsedInput::Action(Action::Split(Axis::Vertical))),
             b'c' => output.push(ParsedInput::Action(Action::NewTab)),
             b'n' => output.push(ParsedInput::Action(Action::NextTab)),
             b'p' => output.push(ParsedInput::Action(Action::PreviousTab)),
@@ -1213,7 +1213,7 @@ mod tests {
         assert!(matches!(&commands[1], ParsedInput::Input(bytes) if bytes == b"\x02"));
         assert_eq!(
             commands[2],
-            ParsedInput::Action(Action::Split(Axis::Vertical))
+            ParsedInput::Action(Action::Split(Axis::Horizontal))
         );
         assert!(matches!(&commands[3], ParsedInput::Input(bytes) if bytes == b"z"));
         assert_eq!(

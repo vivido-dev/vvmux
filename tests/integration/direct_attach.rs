@@ -86,7 +86,7 @@ while IFS= read -r line; do printf 'OUT pane=%s:%s\n' "$VVMUX_PANE_ID" "$line"; 
                 "-t",
                 &session,
                 "split",
-                "vertical",
+                "horizontal",
                 "--pane-id",
                 "1",
             ])

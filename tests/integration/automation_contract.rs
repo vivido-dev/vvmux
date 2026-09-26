@@ -513,7 +513,7 @@ fn mouse_encodes_pane_local_cells_for_a_pane_that_is_not_visible() {
     let fixture = Fixture::start("mouse");
     assert!(
         fixture
-            .msg(&["split", "vertical", "--pane-id", "1"])
+            .msg(&["split", "horizontal", "--pane-id", "1"])
             .status
             .success()
     );
@@ -631,7 +631,7 @@ fn set_flag_is_idempotent_and_reports_whether_anything_changed() {
     let fixture = Fixture::start("set-flag");
     assert!(
         fixture
-            .msg(&["split", "vertical", "--pane-id", "1"])
+            .msg(&["split", "horizontal", "--pane-id", "1"])
             .status
             .success()
     );
@@ -680,7 +680,7 @@ fn resize_pane_sets_an_exact_size_and_move_pane_relocates_without_respawning() {
     let fixture = Fixture::start("resize-move");
     assert!(
         fixture
-            .msg(&["split", "vertical", "--pane-id", "1"])
+            .msg(&["split", "horizontal", "--pane-id", "1"])
             .status
             .success()
     );
@@ -729,7 +729,7 @@ fn resize_pane_sets_an_exact_size_and_move_pane_relocates_without_respawning() {
     // A swap trades tree positions and leaves both panes alive.
     assert!(
         fixture
-            .msg(&["split", "vertical", "--pane-id", "1"])
+            .msg(&["split", "horizontal", "--pane-id", "1"])
             .status
             .success()
     );
@@ -753,7 +753,7 @@ fn run_plan_binds_results_between_steps_and_verifies_them() {
         r#"{
   "version": 1,
   "steps": [
-    {"id": "split", "method": "split", "params": {"axis": "Vertical"}, "pane_id": 1,
+    {"id": "split", "method": "split", "params": {"axis": "Horizontal"}, "pane_id": 1,
      "bind": {"right": "/new_pane_id"}},
     {"id": "name", "method": "pane_rename", "pane_id": {"$ref": "right"},
      "params": {"name": "worker"}},
@@ -807,7 +807,7 @@ fn run_plan_preflight_skips_mutations_and_validation_rejects_a_plan_whole() {
   "version": 1,
   "steps": [
     {"id": "look", "method": "list_panes"},
-    {"id": "change", "method": "split", "params": {"axis": "Vertical"}, "pane_id": 1}
+    {"id": "change", "method": "split", "params": {"axis": "Horizontal"}, "pane_id": 1}
   ]
 }"#,
     )
@@ -925,7 +925,7 @@ fn expectations_reject_stale_actions_and_idempotency_keys_apply_once() {
         "--idempotency-key",
         "k1",
         "split",
-        "vertical",
+        "horizontal",
         "--pane-id",
         "1",
     ]);
@@ -933,7 +933,7 @@ fn expectations_reject_stale_actions_and_idempotency_keys_apply_once() {
         "--idempotency-key",
         "k1",
         "split",
-        "vertical",
+        "horizontal",
         "--pane-id",
         "1",
     ]);
@@ -1058,7 +1058,7 @@ fn capture_reveals_waits_and_reads_in_one_request() {
     let fixture = Fixture::start("capture");
     assert!(
         fixture
-            .msg(&["split", "vertical", "--pane-id", "1"])
+            .msg(&["split", "horizontal", "--pane-id", "1"])
             .status
             .success()
     );
@@ -1121,7 +1121,7 @@ fn a_lease_excludes_other_automation_without_locking_anyone_out() {
     let fixture = Fixture::start("lease");
     assert!(
         fixture
-            .msg(&["split", "vertical", "--pane-id", "1"])
+            .msg(&["split", "horizontal", "--pane-id", "1"])
             .status
             .success()
     );
@@ -1273,7 +1273,7 @@ fn a_recording_replays_output_and_never_stores_what_was_typed() {
     );
     assert!(
         fixture
-            .msg(&["split", "vertical", "--pane-id", "1"])
+            .msg(&["split", "horizontal", "--pane-id", "1"])
             .status
             .success()
     );

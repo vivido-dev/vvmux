@@ -134,12 +134,12 @@ done
     assert_success(&command(
         &runtime,
         &session,
-        &["split", "vertical", "--pane-id", "1"],
+        &["split", "horizontal", "--pane-id", "1"],
     ));
     assert_success(&command(
         &runtime,
         &session,
-        &["split", "horizontal", "--pane-id", "2"],
+        &["split", "vertical", "--pane-id", "2"],
     ));
     assert_eq!(
         wait_for_panes(&runtime, &session, 3),

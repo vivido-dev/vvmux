@@ -196,7 +196,8 @@ vvmux msg sync-input --on --pane-id 3
 vvmux msg save-layout --name work
 ```
 
-`split` takes its axis positionally (`vertical` or `horizontal`) and does not change the active tab.
+`split` takes its axis positionally (`horizontal` puts the new pane beside, `vertical` below, as tmux
+`-h`/`-v` do) and does not change the active tab.
 `set-flag` takes `zoom`, `pinned`, `transparent`, `copy-mode`, `floats-visible`, or `sync-input`,
 with `--on`/`--off` — always prefer it to `action toggle-*`, which cannot be replayed. Creation
 replies carry the new IDs; rediscover with `layout` rather than predicting them.

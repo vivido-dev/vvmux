@@ -3002,7 +3002,7 @@ mod tests {
         assert!(matches!(&commands[1], ParsedInput::Input(bytes) if bytes == b"\x02"));
         assert!(matches!(
             commands[2],
-            ParsedInput::Action(Action::Split(Axis::Vertical))
+            ParsedInput::Action(Action::Split(Axis::Horizontal))
         ));
         assert!(matches!(&commands[3], ParsedInput::Input(bytes) if bytes == b"z"));
     }
@@ -4846,9 +4846,9 @@ mod tests {
             };
             let three_pane_tab = |panes: [u64; 3]| {
                 let mut tree = crate::layout::TiledNode::leaf(panes[0]);
-                tree.split(panes[0], panes[1], crate::ipc::Axis::Vertical, tab_area)
+                tree.split(panes[0], panes[1], crate::ipc::Axis::Horizontal, tab_area)
                     .unwrap();
-                tree.split(panes[1], panes[2], crate::ipc::Axis::Horizontal, tab_area)
+                tree.split(panes[1], panes[2], crate::ipc::Axis::Vertical, tab_area)
                     .unwrap();
                 tree
             };

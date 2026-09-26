@@ -184,7 +184,7 @@ Resize and detach:
 Mux actions use a nested tagged object:
 
 ```json
-{"type":"action","action":{"name":"split","axis":"vertical"}}
+{"type":"action","action":{"name":"split","axis":"horizontal"}}
 {"type":"action","action":{"name":"focus","direction":"left"}}
 {"type":"action","action":{"name":"select_tab","index":2}}
 ```
@@ -192,8 +192,8 @@ Mux actions use a nested tagged object:
 Action names are `split`, `focus`, `resize`, `new_tab`, `next_tab`, `previous_tab`, `select_tab`,
 `close_pane`, `toggle_zoom`, `toggle_sync_input`, `enter_copy_mode`, `copy_input`, `paste`, `new_floating_pane`,
 `toggle_floating_panes`, `toggle_pane_pinned`, `enter_floating_move_mode`, and
-`enter_floating_resize_mode`. Axes are `horizontal` or `vertical`; directions are `left`, `right`,
-`up`, or `down`. `copy_input` carries a JSON byte array named `bytes`.
+`enter_floating_resize_mode`. Axes are `horizontal` (new pane beside, like tmux `-h`) or
+`vertical` (new pane below, like tmux `-v`); directions are `left`, `right`, `up`, or `down`. `copy_input` carries a JSON byte array named `bytes`.
 
 Raw terminal input is passed through the same prefix, mouse, close-confirmation, and floating-edit
 state machine as the native vvmux client, so normal `Ctrl-b` bindings work without action frames.

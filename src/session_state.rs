@@ -384,7 +384,7 @@ mod tests {
             Some("work".to_owned()),
             Some("left".to_owned()),
             Some(LayoutNode::split(
-                crate::ipc::Axis::Vertical,
+                crate::ipc::Axis::Horizontal,
                 vec![600, 400],
                 vec![
                     LayoutNode::leaf("left".to_owned(), Some("/tmp".to_owned()), false),

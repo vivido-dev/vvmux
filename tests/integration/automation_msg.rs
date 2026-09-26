@@ -81,19 +81,19 @@ done
     let right = json(command(
         &runtime,
         &name,
-        &["split", "vertical", "--pane-id", "1"],
+        &["split", "horizontal", "--pane-id", "1"],
     ));
     assert_eq!(right["new_pane_id"], 2);
     let bottom_left = json(command(
         &runtime,
         &name,
-        &["split", "horizontal", "--pane-id", "1"],
+        &["split", "vertical", "--pane-id", "1"],
     ));
     assert_eq!(bottom_left["new_pane_id"], 3);
     let bottom_right = json(command(
         &runtime,
         &name,
-        &["split", "horizontal", "--pane-id", "2"],
+        &["split", "vertical", "--pane-id", "2"],
     ));
     assert_eq!(bottom_right["new_pane_id"], 4);
 
@@ -1590,7 +1590,7 @@ done
         name: name.clone(),
     };
     wait_text(&runtime, &name, 1, "READY pane=1");
-    assert_success(&command(&runtime, &name, &["split", "vertical"]));
+    assert_success(&command(&runtime, &name, &["split", "horizontal"]));
     wait_text(&runtime, &name, 2, "READY pane=2");
 
     // Two panes, each reporting a different agent, so every assertion below can tell "the right
@@ -1616,7 +1616,7 @@ done
     }
 
     // A pane with no agent cannot be named: the alias would belong to whatever ran there next.
-    assert_success(&command(&runtime, &name, &["split", "horizontal"]));
+    assert_success(&command(&runtime, &name, &["split", "vertical"]));
     wait_text(&runtime, &name, 3, "READY pane=3");
     assert_eq!(
         error_code(command(
