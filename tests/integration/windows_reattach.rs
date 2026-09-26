@@ -35,6 +35,17 @@ fn detach_then_immediate_reattach_repaints_the_session() {
         .any(|(name, _)| name == "VIVID_ENDPOINT_CONTROL");
 
     let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.toml");
+    // The test waits for cmd's prompt; do not inherit the user's shell or plugin configuration.
+    std::fs::write(
+        &config,
+        format!(
+            "[general]\nshell = {}\n[plugins]\nenabled = false\n",
+            serde_json::to_string(&shell.to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
     let parts = PtyProcess::spawn(&shell, None, cwd, 100, 30, &vivid_environment).unwrap();
     let control = parts.control.clone();
     let mut reader = parts.reader;
@@ -58,7 +69,14 @@ fn detach_then_immediate_reattach_repaints_the_session() {
     ));
     parts
         .input
-        .send(format!("\"{}\" new -s {session}\r\n", executable.display()).as_bytes())
+        .send(
+            format!(
+                "\"{}\" --config \"{}\" new -s {session}\r\n",
+                executable.display(),
+                config.display()
+            )
+            .as_bytes(),
+        )
         .unwrap();
     assert!(
         wait_for_after(
@@ -74,13 +92,17 @@ fn detach_then_immediate_reattach_repaints_the_session() {
 
     let second_tab_start = transcript.len();
     parts.input.send(b"\x02c").unwrap();
-    assert!(wait_for_after(
-        &receiver,
-        &mut transcript,
-        b">",
-        second_tab_start,
-        Duration::from_secs(10)
-    ));
+    assert!(
+        wait_for_after(
+            &receiver,
+            &mut transcript,
+            b">",
+            second_tab_start,
+            Duration::from_secs(10)
+        ),
+        "new tab did not show a prompt:\n{:?}",
+        String::from_utf8_lossy(&transcript)
+    );
     let first_tab_return = transcript.len();
     parts.input.send(b"\x02p").unwrap();
     assert!(wait_for_after(
@@ -162,7 +184,14 @@ fn detach_then_immediate_reattach_repaints_the_session() {
     let reattach_start = transcript.len();
     parts
         .input
-        .send(format!("\"{}\" attach -t {session}\r\n", executable.display()).as_bytes())
+        .send(
+            format!(
+                "\"{}\" --config \"{}\" attach -t {session}\r\n",
+                executable.display(),
+                config.display()
+            )
+            .as_bytes(),
+        )
         .unwrap();
     assert!(wait_for_after(
         &receiver,

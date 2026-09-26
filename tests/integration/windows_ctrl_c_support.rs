@@ -23,6 +23,12 @@ pub struct Console {
 
 impl Console {
     pub fn spawn(cwd: &Path) -> Self {
+        // A launcher that started this test binary with CREATE_NEW_PROCESS_GROUP leaves Ctrl+C
+        // disabled, and the ConPTY shell would inherit that. The vvmux server clears it in
+        // prepare_server_process; do the same here so the direct test measures ConPTY alone.
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0);
+        }
         let shell =
             std::env::var_os("COMSPEC").unwrap_or_else(|| "C:\\Windows\\System32\\cmd.exe".into());
         let parts = PtyProcess::spawn_argv(
