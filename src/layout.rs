@@ -315,6 +315,17 @@ impl FloatingLayer {
         self.ordinary_visible = true;
     }
 
+    /// Give a float's slot — rectangle, layer position, origin, and pin — to another pane ID.
+    pub fn replace(&mut self, old: PaneId, new: PaneId) -> bool {
+        match self.panes.iter_mut().find(|float| float.pane_id == old) {
+            Some(float) => {
+                float.pane_id = new;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn remove(&mut self, pane: PaneId) -> bool {
         let before = self.panes.len();
         self.panes.retain(|float| float.pane_id != pane);
@@ -622,6 +633,30 @@ impl TiledNode {
         self.find_split_path(pane, &mut path).then_some(path)
     }
 
+    /// The axis of the split that directly holds `pane`, or `None` when the pane is the root or
+    /// absent. The pane's sibling always lies along this axis, so it names the directions in
+    /// which the pane has an immediate neighbour.
+    pub fn parent_axis(&self, pane: PaneId) -> Option<Axis> {
+        match self {
+            Self::Leaf(_) => None,
+            Self::Split {
+                axis,
+                first,
+                second,
+                ..
+            } => {
+                let direct = [first, second]
+                    .iter()
+                    .any(|child| matches!(***child, Self::Leaf(id) if id == pane));
+                if direct {
+                    Some(*axis)
+                } else {
+                    first.parent_axis(pane).or_else(|| second.parent_axis(pane))
+                }
+            }
+        }
+    }
+
     fn find_split_path(&self, pane: PaneId, path: &mut Vec<u16>) -> bool {
         match self {
             Self::Leaf(id) => *id == pane,
@@ -760,6 +795,16 @@ impl TiledNode {
             return false;
         }
         self.rename_leaf(first, second);
+        true
+    }
+
+    /// Put `new` in the leaf that holds `old`, leaving the tree's shape and weights alone.
+    /// Returns `false` unless `old` is a leaf of this tree and `new` is not already one.
+    pub fn rename_pane(&mut self, old: PaneId, new: PaneId) -> bool {
+        if old == new || !self.contains(old) || self.contains(new) {
+            return false;
+        }
+        self.rename_leaf(old, new);
         true
     }
 
@@ -1808,5 +1853,53 @@ mod tests {
             assert_floating_invariants(&layer, area);
         }
         assert!(next_pane > 100, "operation mix exercised inserts");
+    }
+
+    #[test]
+    fn parent_axis_names_the_split_that_directly_holds_a_pane() {
+        // 1 | (2 / 3)
+        let tree = TiledNode::branch(
+            Axis::Horizontal,
+            TiledNode::leaf(1),
+            TiledNode::branch(Axis::Vertical, TiledNode::leaf(2), TiledNode::leaf(3), 1, 1),
+            1,
+            1,
+        );
+        assert_eq!(tree.parent_axis(1), Some(Axis::Horizontal));
+        assert_eq!(tree.parent_axis(2), Some(Axis::Vertical));
+        assert_eq!(tree.parent_axis(3), Some(Axis::Vertical));
+        assert_eq!(tree.parent_axis(4), None);
+        assert_eq!(TiledNode::leaf(1).parent_axis(1), None);
+    }
+
+    #[test]
+    fn rename_pane_keeps_shape_and_refuses_duplicates() {
+        let mut tree = TiledNode::branch(
+            Axis::Horizontal,
+            TiledNode::leaf(1),
+            TiledNode::leaf(2),
+            3,
+            1,
+        );
+        let before = tree.geometry(area());
+        assert!(!tree.rename_pane(1, 2), "the new ID is already a leaf");
+        assert!(!tree.rename_pane(9, 5), "the old ID is not a leaf");
+        assert!(tree.rename_pane(1, 5));
+        let after = tree.geometry(area());
+        assert_eq!(after.get(&5), before.get(&1));
+        assert_eq!(after.get(&2), before.get(&2));
+        assert!(!tree.contains(1));
+    }
+
+    #[test]
+    fn floating_replace_keeps_the_slot() {
+        let mut layer = FloatingLayer::default();
+        layer.insert(1, area(), FloatOrigin::sized(50, 50));
+        layer.insert(2, area(), FloatOrigin::sized(50, 50));
+        let rect = layer.get(1).unwrap().rect;
+        assert!(layer.replace(1, 7));
+        assert!(!layer.replace(1, 8));
+        assert_eq!(layer.pane_ids(), vec![7, 2]);
+        assert_eq!(layer.get(7).unwrap().rect, rect);
     }
 }

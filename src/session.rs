@@ -770,6 +770,9 @@ struct Pane {
     last_screen_change: Instant,
     screen_changes: VecDeque<ScreenChange>,
     role: PaneRole,
+    /// How this pane's process was started, with its working directory resolved, so a respawn
+    /// runs the same command in the same place.
+    spawn: PaneSpawn,
 }
 
 #[derive(Debug, Clone)]
@@ -1192,6 +1195,54 @@ struct TabNavigator {
     selected: Option<u64>,
     selected_index: usize,
     scroll: usize,
+}
+
+/// The right-click pane menu, anchored where it was opened and bound to one pane.
+///
+/// Only the target and the pointer state are stored. The entries are rebuilt from live state
+/// whenever they are drawn or used, so a label such as Zoom/Unzoom never goes stale and a pane
+/// that closes underneath the menu closes the menu too.
+#[derive(Debug, Clone, Copy)]
+struct PaneMenu {
+    tab_id: u64,
+    pane_id: PaneId,
+    /// The cell the menu was opened from. The button release that ends the opening click lands
+    /// here and must not choose an item; a release anywhere else is a press-drag-release choice.
+    origin: (u16, u16),
+    selected: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneMenuCommand {
+    Split(Axis),
+    Swap(Direction),
+    Kill,
+    Respawn,
+    ToggleZoom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneMenuEntry {
+    Separator,
+    Item {
+        label: &'static str,
+        key: u8,
+        command: PaneMenuCommand,
+        enabled: bool,
+    },
+}
+
+impl PaneMenuEntry {
+    fn enabled_command(self) -> Option<PaneMenuCommand> {
+        match self {
+            Self::Item {
+                command,
+                enabled: true,
+                ..
+            } => Some(command),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1716,6 +1767,7 @@ struct SessionActor {
     float_modal: Option<FloatModal>,
     agent_navigator: Option<AgentNavigator>,
     tab_navigator: Option<TabNavigator>,
+    pane_menu: Option<PaneMenu>,
     tab_rename: Option<TabRename>,
     close_pane_confirmation: Option<ClosePaneConfirmation>,
     save_layout_prompt: Option<SaveLayoutPrompt>,
@@ -1973,6 +2025,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         float_modal: None,
         agent_navigator: None,
         tab_navigator: None,
+        pane_menu: None,
         tab_rename: None,
         close_pane_confirmation: None,
         save_layout_prompt: None,
@@ -9524,6 +9577,10 @@ impl SessionActor {
             self.tab_navigator_input(&key_presses(&bytes));
             return;
         }
+        if self.pane_menu.is_some() {
+            self.pane_menu_input(&key_presses(&bytes));
+            return;
+        }
         if self.tab_rename.is_some() {
             self.tab_rename_input(&key_presses(&bytes));
             return;
@@ -9854,6 +9911,10 @@ impl SessionActor {
             self.tab_navigator_mouse(mouse);
             return;
         }
+        if self.pane_menu.is_some() {
+            self.pane_menu_mouse(mouse);
+            return;
+        }
         if self.tab_rename.is_some() || self.close_pane_confirmation.is_some() {
             return;
         }
@@ -10032,12 +10093,17 @@ impl SessionActor {
             return;
         }
 
+        let right_press = mouse.kind == MouseKind::Press && mouse.button == 2;
         let content = rect.content();
         if mouse.x < content.x
             || mouse.x >= content.x + content.width
             || mouse.y < content.y
             || mouse.y >= content.y + content.height
         {
+            if right_press {
+                self.open_pane_menu(tab_id, pane_id, (mouse.x, mouse.y));
+                return;
+            }
             self.schedule_render();
             if mouse.kind == MouseKind::Press && mouse.button == 0 {
                 self.mouse_click_tracker = None;
@@ -10045,6 +10111,18 @@ impl SessionActor {
             return;
         }
         if self.overlay_mouse(pane_id, mouse, pixels, content, display) {
+            return;
+        }
+        // As in tmux, a right click belongs to an application that asked for mouse clicks, and
+        // Shift takes it back for the menu.
+        if right_press
+            && (mouse.shift
+                || self
+                    .panes
+                    .get(&pane_id)
+                    .is_some_and(|pane| !pane.terminal.modes().mouse_clicks))
+        {
+            self.open_pane_menu(tab_id, pane_id, (mouse.x, mouse.y));
             return;
         }
         let selection_gesture = self.panes.get(&pane_id).is_some_and(|pane| {
@@ -11122,6 +11200,7 @@ impl SessionActor {
     fn transient_ui_active(&self) -> bool {
         self.agent_navigator.is_some()
             || self.tab_navigator.is_some()
+            || self.pane_menu.is_some()
             || self.tab_rename.is_some()
             || self.close_pane_confirmation.is_some()
             || self.save_layout_prompt.is_some()
@@ -11131,6 +11210,7 @@ impl SessionActor {
         let active = self.transient_ui_active();
         self.agent_navigator = None;
         self.tab_navigator = None;
+        self.pane_menu = None;
         self.tab_rename = None;
         self.close_pane_confirmation = None;
         self.save_layout_prompt = None;
@@ -11639,6 +11719,318 @@ impl SessionActor {
             screen.draw_text(rect.x + 1, y, &text, style);
             if self.tab_navigator.and_then(|navigator| navigator.selected) == Some(row.tab_id) {
                 screen.invert(rect.x + 1, y, rect.width.saturating_sub(2));
+            }
+        }
+        screen.cursor = None;
+    }
+
+    fn open_pane_menu(&mut self, tab_id: u64, pane_id: PaneId, origin: (u16, u16)) {
+        self.clear_transient_ui();
+        self.mouse_click_tracker = None;
+        let menu = PaneMenu {
+            tab_id,
+            pane_id,
+            origin,
+            selected: None,
+        };
+        // A display too small to hold the menu leaves the click as an ordinary focus change.
+        if self.pane_menu_layout(menu).is_some() {
+            self.pane_menu = Some(menu);
+        }
+        self.force_full = true;
+        self.schedule_render();
+    }
+
+    fn close_pane_menu(&mut self) {
+        self.pane_menu = None;
+        self.force_full = true;
+        self.schedule_render();
+    }
+
+    /// The menu for `menu.pane_id` as it stands now, or `None` once the pane or its tab is gone
+    /// or no longer shown.
+    ///
+    /// Items follow tmux's pane menu. Splitting and swapping are for tiled panes only, and the
+    /// swap pair is named after the split that holds the pane: a pane beside its sibling swaps
+    /// left and right, one stacked with it swaps up and down.
+    fn pane_menu_entries(&self, menu: PaneMenu) -> Option<Vec<PaneMenuEntry>> {
+        let item = |label, key, command, enabled| PaneMenuEntry::Item {
+            label,
+            key,
+            command,
+            enabled,
+        };
+        let pane_id = menu.pane_id;
+        let tab = self.active_tab().filter(|tab| tab.id == menu.tab_id)?;
+        let pane = self.panes.get(&pane_id).filter(|_| tab.contains(pane_id))?;
+        let mut entries = Vec::new();
+        if let Some(tree) = tab.tree.as_ref().filter(|tree| tree.contains(pane_id)) {
+            entries.push(item(
+                "Horizontal Split",
+                b'h',
+                PaneMenuCommand::Split(Axis::Horizontal),
+                true,
+            ));
+            entries.push(item(
+                "Vertical Split",
+                b'v',
+                PaneMenuCommand::Split(Axis::Vertical),
+                true,
+            ));
+            if let Some(axis) = tree.parent_axis(pane_id) {
+                let projections = tiled_projections(tab, self.content_area());
+                let pair = match axis {
+                    Axis::Horizontal => [
+                        ("Swap Left", b'l', Direction::Left),
+                        ("Swap Right", b'r', Direction::Right),
+                    ],
+                    Axis::Vertical => [
+                        ("Swap Up", b'u', Direction::Up),
+                        ("Swap Down", b'd', Direction::Down),
+                    ],
+                };
+                entries.push(PaneMenuEntry::Separator);
+                for (label, key, direction) in pair {
+                    let enabled = directional_focus(&projections, pane_id, direction).is_some();
+                    entries.push(item(label, key, PaneMenuCommand::Swap(direction), enabled));
+                }
+            }
+            entries.push(PaneMenuEntry::Separator);
+        }
+        entries.push(item("Kill", b'X', PaneMenuCommand::Kill, true));
+        entries.push(item(
+            "Respawn",
+            b'R',
+            PaneMenuCommand::Respawn,
+            matches!(pane.role, PaneRole::Core),
+        ));
+        let pane_count =
+            tab.tree.as_ref().map_or(0, |tree| tree.pane_ids().len()) + tab.floating.panes().len();
+        entries.push(if tab.zoomed.is_some() {
+            item("Unzoom", b'z', PaneMenuCommand::ToggleZoom, true)
+        } else {
+            item("Zoom", b'z', PaneMenuCommand::ToggleZoom, pane_count > 1)
+        });
+        Some(entries)
+    }
+
+    fn pane_menu_layout(&self, menu: PaneMenu) -> Option<(Rect, Vec<PaneMenuEntry>)> {
+        let entries = self.pane_menu_entries(menu)?;
+        let rect = pane_menu_rect(
+            self.content_area(),
+            menu.origin,
+            &entries,
+            &pane_menu_title(menu.pane_id),
+        )?;
+        Some((rect, entries))
+    }
+
+    fn pane_menu_input(&mut self, bytes: &[u8]) {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Some(menu) = self.pane_menu else {
+                return;
+            };
+            let Some(entries) = self.pane_menu_entries(menu) else {
+                self.close_pane_menu();
+                return;
+            };
+            let input = &bytes[offset..];
+            if let Some(index) = entries.iter().position(|entry| {
+                matches!(entry, PaneMenuEntry::Item { key, enabled: true, .. } if *key == input[0])
+            }) {
+                self.activate_pane_menu(index);
+                return;
+            }
+            let (consumed, key) = decode_agent_navigator_key(input);
+            offset += consumed.max(1);
+            match key {
+                Some(AgentNavigatorKey::Up) => self.move_pane_menu(&entries, false),
+                Some(AgentNavigatorKey::Down) => self.move_pane_menu(&entries, true),
+                Some(AgentNavigatorKey::Home | AgentNavigatorKey::PageUp) => {
+                    self.select_pane_menu(first_enabled(&entries, (0..entries.len()).collect()));
+                }
+                Some(AgentNavigatorKey::End | AgentNavigatorKey::PageDown) => {
+                    self.select_pane_menu(first_enabled(
+                        &entries,
+                        (0..entries.len()).rev().collect(),
+                    ));
+                }
+                Some(AgentNavigatorKey::Activate) => {
+                    if let Some(index) = menu.selected {
+                        self.activate_pane_menu(index);
+                    }
+                    return;
+                }
+                Some(AgentNavigatorKey::Close) => {
+                    self.close_pane_menu();
+                    return;
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Step the selection to the next enabled item, wrapping at either end as tmux does.
+    fn move_pane_menu(&mut self, entries: &[PaneMenuEntry], down: bool) {
+        let count = entries.len();
+        let current = self.pane_menu.and_then(|menu| menu.selected);
+        let order = (1..=count)
+            .map(|step| match (current, down) {
+                (None, true) => step - 1,
+                (None, false) => count - step,
+                (Some(index), true) => (index + step) % count,
+                (Some(index), false) => (index + count - step % count) % count,
+            })
+            .collect();
+        self.select_pane_menu(first_enabled(entries, order));
+    }
+
+    fn select_pane_menu(&mut self, index: Option<usize>) {
+        if let Some(menu) = &mut self.pane_menu
+            && index.is_some()
+            && menu.selected != index
+        {
+            menu.selected = index;
+            self.schedule_render();
+        }
+    }
+
+    fn pane_menu_mouse(&mut self, mouse: MouseEvent) {
+        let Some(menu) = self.pane_menu else {
+            return;
+        };
+        let Some((rect, entries)) = self.pane_menu_layout(menu) else {
+            self.close_pane_menu();
+            return;
+        };
+        let hit = pane_menu_hit(rect, mouse.x, mouse.y).filter(|index| {
+            entries
+                .get(*index)
+                .is_some_and(|entry| entry.enabled_command().is_some())
+        });
+        match mouse.kind {
+            MouseKind::Move => self.select_pane_menu(hit),
+            MouseKind::Release => {
+                if (mouse.x, mouse.y) != menu.origin
+                    && let Some(index) = hit
+                {
+                    self.activate_pane_menu(index);
+                }
+            }
+            MouseKind::Press if !rect.contains(mouse.x, mouse.y) => self.close_pane_menu(),
+            MouseKind::Press => {
+                if let Some(index) = hit {
+                    self.activate_pane_menu(index);
+                }
+            }
+            MouseKind::Wheel => {}
+        }
+    }
+
+    fn activate_pane_menu(&mut self, index: usize) {
+        let Some(menu) = self.pane_menu.take() else {
+            return;
+        };
+        self.force_full = true;
+        self.schedule_render();
+        let Some(command) = self
+            .pane_menu_entries(menu)
+            .and_then(|entries| entries.get(index).copied())
+            .and_then(PaneMenuEntry::enabled_command)
+        else {
+            return;
+        };
+        let pane_id = menu.pane_id;
+        match command {
+            PaneMenuCommand::Split(axis) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.set_focus(pane_id);
+                }
+                self.action(Action::Split(axis));
+            }
+            PaneMenuCommand::Swap(direction) => self.swap_tiled_pane(pane_id, direction),
+            PaneMenuCommand::Kill => self.close_pane(pane_id),
+            PaneMenuCommand::Respawn => self.respawn_pane(pane_id),
+            PaneMenuCommand::ToggleZoom => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.set_focus(pane_id);
+                }
+                self.action(Action::ToggleZoom);
+            }
+        }
+    }
+
+    /// Trade places with the nearest tiled pane in `direction` in the active tab. Floats are
+    /// not candidates: a float has no slot in the tree to trade.
+    fn swap_tiled_pane(&mut self, pane_id: PaneId, direction: Direction) {
+        let area = self.content_area();
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        let Some(other) = directional_focus(&tiled_projections(tab, area), pane_id, direction)
+        else {
+            return;
+        };
+        if tab
+            .tree
+            .as_mut()
+            .is_some_and(|tree| tree.swap(pane_id, other))
+        {
+            tab.zoomed = None;
+            self.force_full = true;
+            self.relayout();
+        }
+    }
+
+    fn draw_pane_menu(&mut self, screen: &mut ScreenBuffer, theme: crate::theme::ResolvedTheme) {
+        let Some(menu) = self.pane_menu else {
+            return;
+        };
+        let Some((rect, entries)) = self.pane_menu_layout(menu) else {
+            self.pane_menu = None;
+            return;
+        };
+        let frame = theme.frame(true);
+        screen.draw_frame(rect, &pane_menu_title(menu.pane_id), frame);
+        let style = theme.status();
+        let disabled = crate::screen::TextStyle {
+            foreground: theme.inactive_frame,
+            background: style.background,
+        };
+        let rule = crate::screen::TextStyle {
+            foreground: frame.border,
+            background: frame.background,
+        };
+        let inner = usize::from(rect.width.saturating_sub(2));
+        for (offset, entry) in entries.iter().enumerate() {
+            let y = rect.y + 1 + offset as u16;
+            match entry {
+                PaneMenuEntry::Separator => {
+                    let line = format!("├{}┤", "─".repeat(inner));
+                    screen.draw_text(rect.x, y, &line, rule);
+                }
+                PaneMenuEntry::Item {
+                    label,
+                    key,
+                    enabled,
+                    ..
+                } => {
+                    let text = format!(
+                        " {label:<width$}{} ",
+                        char::from(*key),
+                        width = inner.saturating_sub(3)
+                    );
+                    screen.draw_text(
+                        rect.x + 1,
+                        y,
+                        &text,
+                        if *enabled { style } else { disabled },
+                    );
+                    if menu.selected == Some(offset) {
+                        screen.invert(rect.x + 1, y, rect.width.saturating_sub(2));
+                    }
+                }
             }
         }
         screen.cursor = None;
@@ -13248,7 +13640,7 @@ impl SessionActor {
                 input: parts.input,
                 control: parts.control,
                 child_pid,
-                spawn_cwd: cwd,
+                spawn_cwd: cwd.clone(),
                 agent: AgentRuntime::new(),
                 agent_published: None,
                 agent_change_seq: 0,
@@ -13269,6 +13661,10 @@ impl SessionActor {
                 last_screen_change: Instant::now(),
                 screen_changes: VecDeque::new(),
                 role: spec.role.clone(),
+                spawn: PaneSpawn {
+                    cwd: Some(cwd),
+                    ..spec.clone()
+                },
             },
         );
         self.refresh_agent_detector_targets();
@@ -13282,6 +13678,56 @@ impl SessionActor {
     }
 
     fn close_pane(&mut self, pane_id: PaneId) {
+        let tab_id = self
+            .tabs
+            .iter()
+            .find(|tab| tab.contains(pane_id))
+            .map(|tab| tab.id);
+        self.release_pane(pane_id);
+        let Some(tab_index) = self.tabs.iter().position(|tab| tab.contains(pane_id)) else {
+            return;
+        };
+        let tab = &mut self.tabs[tab_index];
+        if !tab.floating.remove(pane_id)
+            && let Some(tree) = tab.tree.take()
+        {
+            tab.tree = tree.close(pane_id);
+        }
+        tab.zoomed = tab.zoomed.filter(|pane| *pane != pane_id);
+        tab.last_focused_tiled = tab.last_focused_tiled.filter(|pane| *pane != pane_id);
+        if tab.is_empty() {
+            // A tab lives while either class has panes; it closes with its last pane.
+            self.tabs.remove(tab_index);
+        } else if tab.focused == pane_id
+            && let Some(next) = tab.fallback_focus()
+        {
+            tab.set_focus(next);
+        }
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len().saturating_sub(1);
+        }
+        self.tab_rename = self
+            .tab_rename
+            .take()
+            .filter(|rename| self.tabs.iter().any(|tab| tab.id == rename.tab_id));
+        self.close_pane_confirmation = self.close_pane_confirmation.take().filter(|confirmation| {
+            self.tabs
+                .iter()
+                .any(|tab| tab.id == confirmation.tab_id && tab.contains(confirmation.pane_id))
+        });
+        self.force_full = true;
+        self.relayout();
+        self.publish_plugin_event(
+            "pane.closed",
+            serde_json::json!({"pane_id": pane_id, "tab_id": tab_id}),
+            Some(pane_id),
+            None,
+        );
+    }
+
+    /// End a pane's process and everything scoped to it, leaving its tab slot to the caller:
+    /// `close_pane` collapses the slot, `respawn_pane` has already handed it to a new pane.
+    fn release_pane(&mut self, pane_id: PaneId) {
         if self.direct_pane() == Some(pane_id) {
             if let Some(client) = &self.attached {
                 let _ = crate::ipc::send(
@@ -13320,47 +13766,68 @@ impl SessionActor {
             // but restores the entry rectangle.
             self.end_float_mode(modal.pane != pane_id);
         }
-        let tab_id = self
-            .tabs
-            .iter()
-            .find(|tab| tab.contains(pane_id))
-            .map(|tab| tab.id);
         if let Some(pane) = self.panes.remove(&pane_id) {
             pane.control.terminate();
         }
         self.refresh_agent_detector_targets();
         self.vivid.revoke_pane(pane_id);
-        let Some(tab_index) = self.tabs.iter().position(|tab| tab.contains(pane_id)) else {
+    }
+
+    /// Kill a pane's process and run its original command again in the same slot.
+    ///
+    /// The fresh process is a new pane with a new ID, as it has to be: the old process's reader
+    /// and exit waiter are still addressing the old ID, and its Vivid capability and media belong
+    /// to that ID alone. Only the slot, focus, zoom, transparency, and name carry over.
+    fn respawn_pane(&mut self, pane_id: PaneId) {
+        let Some(pane) = self.panes.get(&pane_id) else {
             return;
         };
-        let tab = &mut self.tabs[tab_index];
-        if !tab.floating.remove(pane_id)
-            && let Some(tree) = tab.tree.take()
-        {
-            tab.tree = tree.close(pane_id);
+        if !matches!(pane.role, PaneRole::Core) {
+            self.status("plugin panes cannot be respawned");
+            return;
         }
-        tab.zoomed = tab.zoomed.filter(|pane| *pane != pane_id);
-        tab.last_focused_tiled = tab.last_focused_tiled.filter(|pane| *pane != pane_id);
-        if tab.is_empty() {
-            // A tab lives while either class has panes; it closes with its last pane.
-            self.tabs.remove(tab_index);
-        } else if tab.focused == pane_id
-            && let Some(next) = tab.fallback_focus()
-        {
-            tab.set_focus(next);
+        let spec = PaneSpawn {
+            transparent: Some(pane.transparent),
+            ..pane.spawn.clone()
+        };
+        let name = pane.name.clone();
+        let Some(tab_id) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.contains(pane_id))
+            .map(|tab| tab.id)
+        else {
+            return;
+        };
+        let new_id = self.next_pane_id;
+        if self.spawn_pane(new_id, tab_id, &spec).is_err() {
+            self.status("could not respawn pane");
+            return;
         }
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len().saturating_sub(1);
+        self.next_pane_id += 1;
+        self.release_pane(pane_id);
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            if !tab
+                .tree
+                .as_mut()
+                .is_some_and(|tree| tree.rename_pane(pane_id, new_id))
+            {
+                tab.floating.replace(pane_id, new_id);
+            }
+            if tab.focused == pane_id {
+                tab.focused = new_id;
+            }
+            if tab.zoomed == Some(pane_id) {
+                tab.zoomed = Some(new_id);
+            }
+            if tab.last_focused_tiled == Some(pane_id) {
+                tab.last_focused_tiled = Some(new_id);
+            }
         }
-        self.tab_rename = self
-            .tab_rename
-            .take()
-            .filter(|rename| self.tabs.iter().any(|tab| tab.id == rename.tab_id));
-        self.close_pane_confirmation = self.close_pane_confirmation.take().filter(|confirmation| {
-            self.tabs
-                .iter()
-                .any(|tab| tab.id == confirmation.tab_id && tab.contains(confirmation.pane_id))
-        });
+        if let Some(pane) = self.panes.get_mut(&new_id) {
+            pane.name = name;
+        }
+        self.session_sequence = self.session_sequence.wrapping_add(1);
         self.force_full = true;
         self.relayout();
         self.publish_plugin_event(
@@ -13908,6 +14375,8 @@ impl SessionActor {
             self.draw_agent_navigator(&mut screen, theme);
         } else if session_view && self.tab_navigator.is_some() {
             self.draw_tab_navigator(&mut screen, theme);
+        } else if session_view && self.pane_menu.is_some() {
+            self.draw_pane_menu(&mut screen, theme);
         }
         self.status_tab_targets.clear();
         if session_view && self.config.general.status_visible && screen.rows > 0 {
@@ -17767,6 +18236,72 @@ fn apply_line_edit(
     LineEditInput::Editing
 }
 
+/// A tab's tiled panes at their unzoomed rectangles: the candidates for a pane-menu swap.
+fn tiled_projections(tab: &Tab, area: Rect) -> Vec<PaneProjection> {
+    tab.tree.as_ref().map_or_else(Vec::new, |tree| {
+        tree.geometry(area)
+            .into_iter()
+            .map(|(pane_id, outer)| PaneProjection {
+                pane_id,
+                outer,
+                content: outer.content(),
+                layer: PaneLayer::Tiled,
+                focused: tab.focused == pane_id,
+            })
+            .collect()
+    })
+}
+
+fn pane_menu_title(pane_id: PaneId) -> String {
+    format!(" Pane {pane_id} ")
+}
+
+/// Where the pane menu sits: its top-left corner at the click, as tmux places a mouse menu,
+/// pulled back inside `area` when it would run off the right or bottom edge.
+fn pane_menu_rect(
+    area: Rect,
+    origin: (u16, u16),
+    entries: &[PaneMenuEntry],
+    title: &str,
+) -> Option<Rect> {
+    let label_width = entries
+        .iter()
+        .map(|entry| match entry {
+            PaneMenuEntry::Item { label, .. } => label.chars().count(),
+            PaneMenuEntry::Separator => 0,
+        })
+        .max()?;
+    // Border, a space, the label, two spaces, the key, a space, border.
+    let width = (label_width + 7).max(title.chars().count() + 4);
+    let width = u16::try_from(width).ok()?;
+    let height = u16::try_from(entries.len().checked_add(2)?).ok()?;
+    if width > area.width || height > area.height {
+        return None;
+    }
+    let right = area.x + area.width - width;
+    let bottom = area.y + area.height - height;
+    Some(Rect {
+        x: origin.0.clamp(area.x, right),
+        y: origin.1.clamp(area.y, bottom),
+        width,
+        height,
+    })
+}
+
+/// The entry row under a cell of the menu, excluding its frame.
+fn pane_menu_hit(rect: Rect, x: u16, y: u16) -> Option<usize> {
+    (x > rect.x && x + 1 < rect.x + rect.width && y > rect.y && y + 1 < rect.y + rect.height)
+        .then(|| usize::from(y - rect.y - 1))
+}
+
+fn first_enabled(entries: &[PaneMenuEntry], order: Vec<usize>) -> Option<usize> {
+    order.into_iter().find(|index| {
+        entries
+            .get(*index)
+            .is_some_and(|entry| entry.enabled_command().is_some())
+    })
+}
+
 fn tab_navigator_rect(area: Rect, row_count: usize) -> Option<Rect> {
     agent_navigator_rect(area, row_count)
 }
@@ -20244,6 +20779,87 @@ mod tests {
             })
             .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod pane_menu_tests {
+    use super::*;
+
+    fn item(label: &'static str, enabled: bool) -> PaneMenuEntry {
+        PaneMenuEntry::Item {
+            label,
+            key: b'x',
+            command: PaneMenuCommand::Kill,
+            enabled,
+        }
+    }
+
+    fn area() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        }
+    }
+
+    #[test]
+    fn the_menu_opens_at_the_click_and_is_pulled_inside_the_area() {
+        let entries = [
+            item("Horizontal Split", true),
+            PaneMenuEntry::Separator,
+            item("Kill", true),
+        ];
+        let title = pane_menu_title(7);
+        let rect = pane_menu_rect(area(), (10, 5), &entries, &title).unwrap();
+        assert_eq!((rect.x, rect.y), (10, 5));
+        // Two border columns, a space, the widest label, two spaces, the key, a space.
+        assert_eq!(rect.width, 16 + 7);
+        assert_eq!(rect.height, 5);
+        let corner = pane_menu_rect(area(), (79, 23), &entries, &title).unwrap();
+        assert_eq!(
+            (corner.x + corner.width, corner.y + corner.height),
+            (80, 24)
+        );
+        let tiny = Rect {
+            width: 10,
+            ..area()
+        };
+        assert_eq!(pane_menu_rect(tiny, (0, 0), &entries, &title), None);
+        assert_eq!(pane_menu_rect(area(), (0, 0), &[], &title), None);
+    }
+
+    #[test]
+    fn only_entry_rows_inside_the_frame_are_hit() {
+        let rect = Rect {
+            x: 10,
+            y: 5,
+            width: 12,
+            height: 5,
+        };
+        assert_eq!(pane_menu_hit(rect, 11, 6), Some(0));
+        assert_eq!(pane_menu_hit(rect, 20, 8), Some(2));
+        // The opening click lands on the top-left border, which is not an entry.
+        assert_eq!(pane_menu_hit(rect, 10, 5), None);
+        assert_eq!(pane_menu_hit(rect, 21, 6), None);
+        assert_eq!(pane_menu_hit(rect, 11, 9), None);
+    }
+
+    #[test]
+    fn selection_skips_separators_and_disabled_items() {
+        let entries = [
+            item("a", false),
+            PaneMenuEntry::Separator,
+            item("b", true),
+            item("c", false),
+            item("d", true),
+        ];
+        assert_eq!(first_enabled(&entries, (0..5).collect()), Some(2));
+        assert_eq!(first_enabled(&entries, (0..5).rev().collect()), Some(4));
+        assert_eq!(first_enabled(&entries, vec![0, 1, 3]), None);
+        assert_eq!(entries[3].enabled_command(), None);
+        assert_eq!(entries[4].enabled_command(), Some(PaneMenuCommand::Kill));
     }
 }
 

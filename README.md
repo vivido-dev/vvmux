@@ -1119,6 +1119,15 @@ across pane boundaries. Use the unmodified gesture (or configure the outer termi
 Shift) when pane-bounded selection is required. Shift prevents pane-frame dragging when it is
 forwarded.
 
+A right click on a pane opens its menu, as in tmux: Horizontal Split (`h`), Vertical Split (`v`), a
+swap pair, Kill (`X`), Respawn (`R`), and Zoom or Unzoom (`z`). The swap pair follows the split that
+holds the pane — Swap Left/Right (`l`/`r`) beside its sibling, Swap Up/Down (`u`/`d`) stacked with
+it — and an item with nothing to act on is dimmed. Splits and swaps are offered for tiled panes only.
+Respawn kills the process and starts the pane's original command again in the same slot, as a new
+pane ID. Choose an item by clicking it, releasing a right-button drag over it, its key, or the
+arrows and Enter; `q`, Escape, or a click outside closes the menu. A right click inside a pane whose
+program requested mouse reports goes to that program; Shift-right-click opens the menu there.
+
 ### Hyperlinks
 
 Programs can mark text as a link with OSC 8 (`printf '\e]8;;https://example.com\e\\text\e]8;;\e\\'`).
