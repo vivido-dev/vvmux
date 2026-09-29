@@ -36,7 +36,7 @@ impl Drop for SessionGuard {
 }
 
 #[test]
-fn mouse_selection_survives_continuously_printing_pane() {
+fn double_click_copies_word_and_selection_survives_continuously_printing_pane() {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_vvmux"));
     // Short `/tmp` root: the runtime directory holds the session socket, whose path must stay
     // inside the platform's `sun_path` limit. Isolating `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR`
@@ -143,15 +143,34 @@ done
             b"\x1b[?1049h",
             Duration::from_secs(15)
         ),
-        "the client never entered the alternate screen"
+        "the client never entered the alternate screen: {}",
+        String::from_utf8_lossy(&transcript)
     );
 
     parts.input.send(b"build\r").unwrap();
     wait_for_text(&runtime, &session, 1, "alpha bravo charlie");
 
-    // First selection: prove SGR mouse -> selection -> copy buffer -> paste end to end. The paste
-    // is keyboard input, which legitimately dismisses the selection afterwards.
-    select_bravo(&parts.input, &runtime, &session);
+    // Two ordinary clicks inside a word must select and copy it without any pointer motion or
+    // Shift modifier. Prove both the clipboard update and the copy-buffer paste round-trip.
+    let y = bravo_row(&runtime, &session) + 2;
+    parts
+        .input
+        .send(format!("\x1b[<0;10;{y}M\x1b[<0;10;{y}m\x1b[<0;10;{y}M\x1b[<0;10;{y}m").as_bytes())
+        .unwrap();
+    assert!(
+        wait_for(
+            &receiver,
+            &mut transcript,
+            0,
+            b"\x1b]52;c;YnJhdm8=\x1b\\",
+            Duration::from_secs(15)
+        ),
+        "double-clicking bravo never copied the word to the host clipboard"
+    );
+    assert!(
+        wait_for_inverse(&receiver, &mut transcript, 0, Duration::from_secs(15)),
+        "the double-click word selection was never highlighted"
+    );
     parts.input.send(b"\x02]").unwrap();
     parts.input.send(b"\r").unwrap();
     wait_for_text(&runtime, &session, 1, "OUT pane=1:bravo");
@@ -186,10 +205,18 @@ done
 /// "bravo" occupies pane columns 6..=10 of the "alpha bravo charlie" row. The row is resolved
 /// from the pane grid at selection time, since earlier output may have scrolled it.
 fn select_bravo(input: &PtyInput, runtime: &Path, session: &str) {
+    // One-based SGR coordinates: pane row + border offset + 1; columns 8..=12.
+    let y = bravo_row(runtime, session) + 2;
+    input.send(format!("\x1b[<0;8;{y}M").as_bytes()).unwrap();
+    input.send(format!("\x1b[<32;12;{y}M").as_bytes()).unwrap();
+    input.send(format!("\x1b[<0;12;{y}m").as_bytes()).unwrap();
+}
+
+fn bravo_row(runtime: &Path, session: &str) -> usize {
     let output = command(runtime, session, &["get-grid", "--pane-id", "1"]);
     assert_success(&output);
     let grid: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let row = grid["rows"]
+    grid["rows"]
         .as_array()
         .and_then(|rows| {
             rows.iter().position(|row| {
@@ -205,12 +232,7 @@ fn select_bravo(input: &PtyInput, runtime: &Path, session: &str) {
                 text.starts_with("alpha bravo charlie")
             })
         })
-        .expect("the bravo row is on screen");
-    // One-based SGR coordinates: pane row + border offset + 1; columns 8..=12.
-    let y = row + 2;
-    input.send(format!("\x1b[<0;8;{y}M").as_bytes()).unwrap();
-    input.send(format!("\x1b[<32;12;{y}M").as_bytes()).unwrap();
-    input.send(format!("\x1b[<0;12;{y}m").as_bytes()).unwrap();
+        .expect("the bravo row is on screen")
 }
 
 fn wait_for(

@@ -1150,6 +1150,7 @@ impl PaneTranscript {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MouseSelectionMode {
     Character,
+    Word,
     Line,
 }
 
@@ -10304,10 +10305,10 @@ impl SessionActor {
         let click =
             MouseClickTracker::next(self.mouse_click_tracker, pane_id, cell, Instant::now());
         self.mouse_click_tracker = Some(click);
-        let mode = if click.count == 3 {
-            MouseSelectionMode::Line
-        } else {
-            MouseSelectionMode::Character
+        let mode = match click.count {
+            2 => MouseSelectionMode::Word,
+            3 => MouseSelectionMode::Line,
+            _ => MouseSelectionMode::Character,
         };
         self.mouse_selection_drag = Some(MouseSelectionDrag {
             pane: pane_id,
@@ -10317,7 +10318,7 @@ impl SessionActor {
             mode,
             moved: false,
         });
-        if mode == MouseSelectionMode::Line {
+        if mode != MouseSelectionMode::Character {
             if let Some(pane) = self.panes.get_mut(&pane_id) {
                 pane.mouse_selection = Some(MouseSelection {
                     start: cell,
@@ -10365,7 +10366,8 @@ impl SessionActor {
             return;
         };
         let end = normalize_mouse_selection_cell(&pane.terminal, end);
-        let selected = drag.mode == MouseSelectionMode::Line || drag.moved || end != drag.start;
+        let selected =
+            drag.mode != MouseSelectionMode::Character || drag.moved || end != drag.start;
         if !selected {
             if let Some(pane) = self.panes.get_mut(&drag.pane) {
                 pane.mouse_selection = None;
@@ -18995,6 +18997,93 @@ fn normalize_mouse_selection_cell(terminal: &Terminal, cell: (isize, usize)) -> 
     (line, column)
 }
 
+/// Find a word edge without crossing a hard line break or leaving the retained pane grid.
+fn mouse_selection_word_edge(
+    terminal: &Terminal,
+    mut point: (isize, usize),
+    backwards: bool,
+) -> (isize, usize) {
+    // Match Vivido's default terminal word delimiters, keeping paths and dotted names whole.
+    let is_delimiter = |cell: &Cell| {
+        !cell.wide_continuation
+            && !cell.leading_wide_spacer
+            && (cell.ch.is_whitespace() || ",│`|:\"'()[]{}<>".contains(cell.ch))
+    };
+    let Some(cell) = terminal
+        .viewport_line(point.0)
+        .and_then(|line| line.get(point.1))
+    else {
+        return point;
+    };
+    if is_delimiter(cell) {
+        return point;
+    }
+    loop {
+        let next = if backwards {
+            if let Some(column) = point.1.checked_sub(1) {
+                (point.0, column)
+            } else {
+                let Some(row) = point.0.checked_sub(1) else {
+                    break;
+                };
+                if terminal.line_wrapped(row) != Some(true) {
+                    break;
+                }
+                let Some(column) = terminal
+                    .viewport_line(row)
+                    .and_then(|line| line.len().checked_sub(1))
+                else {
+                    break;
+                };
+                (row, column)
+            }
+        } else if terminal
+            .viewport_line(point.0)
+            .is_some_and(|line| point.1 + 1 < line.len())
+        {
+            (point.0, point.1 + 1)
+        } else {
+            if terminal.line_wrapped(point.0) != Some(true) {
+                break;
+            }
+            let Some(row) = point.0.checked_add(1) else {
+                break;
+            };
+            (row, 0)
+        };
+        let Some(cell) = terminal
+            .viewport_line(next.0)
+            .and_then(|line| line.get(next.1))
+        else {
+            break;
+        };
+        if is_delimiter(cell) {
+            break;
+        }
+        point = next;
+    }
+    point
+}
+
+fn mouse_selection_bounds(
+    terminal: &Terminal,
+    selection: MouseSelection,
+) -> ((isize, usize), (isize, usize)) {
+    let (start, end) = if selection.start <= selection.end {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    };
+    if selection.mode == MouseSelectionMode::Word {
+        (
+            mouse_selection_word_edge(terminal, start, true),
+            mouse_selection_word_edge(terminal, end, false),
+        )
+    } else {
+        (start, end)
+    }
+}
+
 fn mouse_selection_runs(
     terminal: &Terminal,
     selection: MouseSelection,
@@ -19005,11 +19094,7 @@ fn mouse_selection_runs(
     if viewport_width == 0 || viewport_height == 0 {
         return Vec::new();
     }
-    let (start, end) = if selection.start <= selection.end {
-        (selection.start, selection.end)
-    } else {
-        (selection.end, selection.start)
-    };
+    let (start, end) = mouse_selection_bounds(terminal, selection);
     let offset = isize::try_from(display_offset).unwrap_or(isize::MAX);
     let mut runs = Vec::new();
     for line in start.0..=end.0 {
@@ -19019,7 +19104,7 @@ fn mouse_selection_runs(
         }
         let (first, mut last) = match selection.mode {
             MouseSelectionMode::Line => (0, viewport_width - 1),
-            MouseSelectionMode::Character => (
+            MouseSelectionMode::Character | MouseSelectionMode::Word => (
                 if line == start.0 { start.1 } else { 0 },
                 if line == end.0 {
                     end.1
@@ -19035,7 +19120,7 @@ fn mouse_selection_runs(
         if last < first {
             continue;
         }
-        if selection.mode == MouseSelectionMode::Character
+        if selection.mode != MouseSelectionMode::Line
             && last + 1 < viewport_width
             && terminal
                 .viewport_line(line)
@@ -19569,6 +19654,10 @@ fn extract_mouse_selection(terminal: &Terminal, selection: MouseSelection) -> Ve
     match selection.mode {
         MouseSelectionMode::Character => {
             extract_selection(terminal, selection.start, selection.end)
+        }
+        MouseSelectionMode::Word => {
+            let (start, end) = mouse_selection_bounds(terminal, selection);
+            extract_selection(terminal, start, end)
         }
         MouseSelectionMode::Line => {
             let (start, end) = if selection.start.0 <= selection.end.0 {
@@ -20660,6 +20749,101 @@ mod tests {
             mouse_selection_runs(&terminal, line, 0, 4, 3),
             [(0, 0, 4), (1, 0, 4)]
         );
+    }
+
+    #[test]
+    fn word_selection_highlights_and_copies_the_whole_token() {
+        let mut terminal = Terminal::new(2, 40, 0);
+        terminal.feed(b"alpha (src/main.rs) bravo");
+        let select = |column| MouseSelection {
+            start: (0, column),
+            end: (0, column),
+            mode: MouseSelectionMode::Word,
+        };
+        assert_eq!(extract_mouse_selection(&terminal, select(4)), b"alpha");
+        assert_eq!(
+            extract_mouse_selection(&terminal, select(12)),
+            b"src/main.rs"
+        );
+        assert_eq!(
+            mouse_selection_runs(&terminal, select(12), 0, 40, 2),
+            [(0, 7, 11)]
+        );
+        assert_eq!(extract_mouse_selection(&terminal, select(18)), b")");
+        assert_eq!(
+            mouse_selection_runs(&terminal, select(5), 0, 40, 2),
+            [(0, 5, 1)]
+        );
+
+        let drag = MouseSelection {
+            end: (0, 21),
+            ..select(2)
+        };
+        let reverse = MouseSelection {
+            start: drag.end,
+            end: drag.start,
+            ..drag
+        };
+        assert_eq!(
+            extract_mouse_selection(&terminal, drag),
+            b"alpha (src/main.rs) bravo"
+        );
+        assert_eq!(
+            extract_mouse_selection(&terminal, reverse),
+            extract_mouse_selection(&terminal, drag)
+        );
+        assert_eq!(
+            mouse_selection_runs(&terminal, reverse, 0, 40, 2),
+            [(0, 0, 25)]
+        );
+    }
+
+    #[test]
+    fn word_selection_keeps_wide_and_combining_characters_whole() {
+        let mut terminal = Terminal::new(2, 20, 0);
+        terminal.feed("a界e\u{301}界 z".as_bytes());
+        let cell = normalize_mouse_selection_cell(&terminal, (0, 2));
+        let selection = MouseSelection {
+            start: cell,
+            end: cell,
+            mode: MouseSelectionMode::Word,
+        };
+        assert_eq!(
+            extract_mouse_selection(&terminal, selection),
+            "a界e\u{301}界".as_bytes()
+        );
+        assert_eq!(
+            mouse_selection_runs(&terminal, selection, 0, 20, 2),
+            [(0, 0, 6)]
+        );
+    }
+
+    #[test]
+    fn word_selection_crosses_soft_wraps_and_scrollback_but_stops_at_hard_breaks() {
+        let mut terminal = Terminal::new(2, 4, 10);
+        terminal.feed(b"abcdefgh\r\nijkl");
+        let selection = MouseSelection {
+            start: (0, 1),
+            end: (0, 1),
+            mode: MouseSelectionMode::Word,
+        };
+        assert_eq!(terminal.line_wrapped(-1), Some(true));
+        assert_eq!(terminal.line_wrapped(0), Some(false));
+        assert_eq!(
+            mouse_selection_bounds(&terminal, selection),
+            ((-1, 0), (0, 3))
+        );
+        assert_eq!(extract_mouse_selection(&terminal, selection), b"abcdefgh");
+        assert_eq!(
+            mouse_selection_runs(&terminal, selection, 1, 4, 2),
+            [(0, 0, 4), (1, 0, 4)]
+        );
+        let next_line = MouseSelection {
+            start: (1, 0),
+            end: (1, 0),
+            ..selection
+        };
+        assert_eq!(extract_mouse_selection(&terminal, next_line), b"ijkl");
     }
 
     #[test]

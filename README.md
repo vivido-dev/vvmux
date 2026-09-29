@@ -1152,7 +1152,8 @@ Mouse clicks focus panes. Tiled border drags resize. On a floating pane, the top
 the pane, while side/bottom frames and corners resize it; drag geometry is based on the press-time
 rectangle and total pointer delta. Mouse input is translated into pane-local SGR coordinates when
 the application requested mouse reporting. Otherwise, a left-button drag selects text inside the
-pressed pane and copies it through OSC 52 on release; triple-click selects one displayed row, and
+pressed pane and copies it through OSC 52 on release. Double-click selects a word, and
+double-click-drag extends by whole words; triple-click selects one displayed row, and
 triple-click-drag extends by displayed rows. Selection is clipped to the pressed pane even if the
 pointer crosses another tiled or floating pane, and the highlight remains until input, output, a
 layout change, or the next click invalidates it. Copy mode (`Ctrl-b [`) owns the same gestures even
