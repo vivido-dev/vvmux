@@ -1152,19 +1152,18 @@ Mouse clicks focus panes. Tiled border drags resize. On a floating pane, the top
 the pane, while side/bottom frames and corners resize it; drag geometry is based on the press-time
 rectangle and total pointer delta. Mouse input is translated into pane-local SGR coordinates when
 the application requested mouse reporting. Otherwise, a left-button drag selects text inside the
-pressed pane and copies it through OSC 52 on release. Double-click selects a word, and
-double-click-drag extends by whole words; triple-click selects one displayed row, and
+pressed pane and copies it through OSC 52 on release. Double-click selects only the clicked word,
+even if the pointer moves while the second click is held; triple-click selects one displayed row, and
 triple-click-drag extends by displayed rows. Selection is clipped to the pressed pane even if the
 pointer crosses another tiled or floating pane, and the highlight remains until input, output, a
 layout change, or the next click invalidates it. Copy mode (`Ctrl-b [`) owns the same gestures even
 when the program in the pane requested mouse input.
 
-A Shift-modified left gesture also forces pane-local selection when the outer terminal forwards
-the standard SGR mouse report. Many terminals instead reserve Shift for their own native selection
-while application mouse tracking is active; those gestures never reach vvmux and can still select
-across pane boundaries. Use the unmodified gesture (or configure the outer terminal to forward
-Shift) when pane-bounded selection is required. Shift prevents pane-frame dragging when it is
-forwarded.
+Shift-modified left gestures belong to the outer terminal, as with tmux. The terminal decides
+whether a Shift-click starts or extends its native selection, and native selection can cross pane
+boundaries. vvmux ignores forwarded Shift-left reports, including double- and triple-clicks; they
+do not select or extend text, focus panes, or drag pane frames. Use unmodified gestures for
+pane-bounded selection, or enter copy mode when the pane's application owns the mouse.
 
 A right click on a pane opens its menu, as in tmux: Horizontal Split (`h`), Vertical Split (`v`), a
 swap pair, Kill (`X`), Respawn (`R`), and Zoom or Unzoom (`z`). The swap pair follows the split that

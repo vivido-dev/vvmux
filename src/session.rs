@@ -10334,6 +10334,11 @@ impl SessionActor {
         let Some(mut drag) = self.mouse_selection_drag.take() else {
             return;
         };
+        // A double click selects only its word; holding the second click does not extend it.
+        if drag.mode == MouseSelectionMode::Word {
+            self.mouse_selection_drag = Some(drag);
+            return;
+        }
         let Some(pane) = self.panes.get(&drag.pane) else {
             return;
         };
@@ -10365,7 +10370,11 @@ impl SessionActor {
         else {
             return;
         };
-        let end = normalize_mouse_selection_cell(&pane.terminal, end);
+        let end = if drag.mode == MouseSelectionMode::Word {
+            drag.start
+        } else {
+            normalize_mouse_selection_cell(&pane.terminal, end)
+        };
         let selected =
             drag.mode != MouseSelectionMode::Character || drag.moved || end != drag.start;
         if !selected {
@@ -10493,6 +10502,15 @@ impl SessionActor {
         }
         // Another client's menu, prompt, or drag is not this pointer's to drive or cancel.
         if self.owned_ui_active() && !self.ui_takes_current_input() {
+            return;
+        }
+        // Shift-left gestures belong to the outer terminal. If it forwards a report anyway,
+        // do not turn it into pane selection, focus changes, or a continuation of a live drag.
+        if mouse.shift && mouse.button == 0 && mouse.kind != MouseKind::Wheel {
+            self.mouse_selection_drag = None;
+            self.mouse_click_tracker = None;
+            self.plugin_link_press = None;
+            self.cancel_pointer_drag(true);
             return;
         }
         if self.agent_navigator.is_some() {
@@ -18982,7 +19000,8 @@ fn mouse_selection_cell(
 fn starts_mouse_selection(mouse: MouseEvent, copy_mode: bool, modes: TerminalModes) -> bool {
     mouse.kind == MouseKind::Press
         && mouse.button == 0
-        && (mouse.shift || copy_mode || !modes.mouse_clicks)
+        && !mouse.shift
+        && (copy_mode || !modes.mouse_clicks)
 }
 
 fn normalize_mouse_selection_cell(terminal: &Terminal, cell: (isize, usize)) -> (isize, usize) {
@@ -19069,19 +19088,18 @@ fn mouse_selection_bounds(
     terminal: &Terminal,
     selection: MouseSelection,
 ) -> ((isize, usize), (isize, usize)) {
+    if selection.mode == MouseSelectionMode::Word {
+        return (
+            mouse_selection_word_edge(terminal, selection.start, true),
+            mouse_selection_word_edge(terminal, selection.start, false),
+        );
+    }
     let (start, end) = if selection.start <= selection.end {
         (selection.start, selection.end)
     } else {
         (selection.end, selection.start)
     };
-    if selection.mode == MouseSelectionMode::Word {
-        (
-            mouse_selection_word_edge(terminal, start, true),
-            mouse_selection_word_edge(terminal, end, false),
-        )
-    } else {
-        (start, end)
-    }
+    (start, end)
 }
 
 fn mouse_selection_runs(
@@ -20696,7 +20714,7 @@ mod tests {
     }
 
     #[test]
-    fn child_mouse_keeps_normal_input_but_shift_and_copy_mode_select() {
+    fn child_mouse_keeps_normal_input_and_copy_mode_selects_without_shift() {
         let press = MouseEvent {
             button: 0,
             x: 3,
@@ -20710,17 +20728,20 @@ mod tests {
         assert!(starts_mouse_selection(press, false, modes));
         modes.mouse_clicks = true;
         assert!(!starts_mouse_selection(press, false, modes));
-        assert!(starts_mouse_selection(
-            MouseEvent {
-                shift: true,
-                alt: false,
-                ctrl: false,
-                ..press
-            },
-            false,
-            modes
-        ));
         assert!(starts_mouse_selection(press, true, modes));
+        for mouse_clicks in [false, true] {
+            modes.mouse_clicks = mouse_clicks;
+            for copy_mode in [false, true] {
+                assert!(!starts_mouse_selection(
+                    MouseEvent {
+                        shift: true,
+                        ..press
+                    },
+                    copy_mode,
+                    modes
+                ));
+            }
+        }
     }
 
     #[test]
@@ -20779,22 +20800,11 @@ mod tests {
             end: (0, 21),
             ..select(2)
         };
-        let reverse = MouseSelection {
-            start: drag.end,
-            end: drag.start,
-            ..drag
-        };
+        assert_eq!(extract_mouse_selection(&terminal, drag), b"alpha");
         assert_eq!(
-            extract_mouse_selection(&terminal, drag),
-            b"alpha (src/main.rs) bravo"
-        );
-        assert_eq!(
-            extract_mouse_selection(&terminal, reverse),
-            extract_mouse_selection(&terminal, drag)
-        );
-        assert_eq!(
-            mouse_selection_runs(&terminal, reverse, 0, 40, 2),
-            [(0, 0, 25)]
+            mouse_selection_runs(&terminal, drag, 0, 40, 2),
+            [(0, 0, 5)],
+            "a word selection stays on the clicked word when the pointer moves"
         );
     }
 

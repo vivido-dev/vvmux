@@ -175,6 +175,47 @@ done
     parts.input.send(b"\r").unwrap();
     wait_for_text(&runtime, &session, 1, "OUT pane=1:bravo");
 
+    // Holding the second click and moving onto charlie still copies only the clicked word.
+    let y = bravo_row(&runtime, &session) + 2;
+    let mark = transcript.len();
+    parts
+        .input
+        .send(
+            format!("\x1b[<0;10;{y}M\x1b[<0;10;{y}m\x1b[<0;10;{y}M\x1b[<32;20;{y}M\x1b[<0;20;{y}m")
+                .as_bytes(),
+        )
+        .unwrap();
+    assert!(
+        wait_for(
+            &receiver,
+            &mut transcript,
+            mark,
+            b"\x1b]52;c;YnJhdm8=\x1b\\",
+            Duration::from_secs(15)
+        ),
+        "moving during the second click extended the selected word"
+    );
+
+    // Some terminals forward Shift-left reports. Single, double and triple clicks, plus a drag,
+    // must leave the existing word selection and copy buffer alone rather than force selection.
+    let shifted_click = format!("\x1b[<4;4;{y}M\x1b[<4;4;{y}m");
+    parts
+        .input
+        .send(shifted_click.repeat(3).as_bytes())
+        .unwrap();
+    parts
+        .input
+        .send(format!("\x1b[<4;4;{y}M\x1b[<36;20;{y}M\x1b[<4;20;{y}m").as_bytes())
+        .unwrap();
+    // Switching to Shift during a plain drag cancels it; a later ordinary release cannot copy it.
+    parts
+        .input
+        .send(format!("\x1b[<0;4;{y}M\x1b[<36;20;{y}M\x1b[<4;20;{y}m\x1b[<0;20;{y}m").as_bytes())
+        .unwrap();
+    // A unique paste round-trip proves that none of those gestures overwrote the copy buffer.
+    parts.input.send(b"shift-probe:\x02]\r").unwrap();
+    wait_for_text(&runtime, &session, 1, "OUT pane=1:shift-probe:bravo");
+
     // Second selection, kept free of any keyboard input from here on.
     select_bravo(&parts.input, &runtime, &session);
     assert!(
