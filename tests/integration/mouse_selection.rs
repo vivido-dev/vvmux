@@ -59,6 +59,8 @@ stty echoctl 2>/dev/null
 printf 'READY pane=%s\n' "$VVMUX_PANE_ID"
 while IFS= read -r line; do
     case "$line" in
+        pixels) printf '\033[?1016hPIXELS ready\n' ;;
+        cells) printf '\033[?1016lCELLS ready\n' ;;
         build)
             i=1
             while [ "$i" -le 24 ]; do printf 'line%02d\n' "$i"; i=$((i+1)); done
@@ -145,6 +147,58 @@ done
         ),
         "the client never entered the alternate screen: {}",
         String::from_utf8_lossy(&transcript)
+    );
+
+    // Kitty and Ghostty use one mouse encoding: resetting pixel mode (1016) selects X10,
+    // even when SGR (1006) was previously enabled. The initial cell-mode sync must explicitly
+    // restore SGR, or moving the mouse types the legacy report's coordinate bytes into the pane.
+    assert!(
+        wait_for(
+            &receiver,
+            &mut transcript,
+            0,
+            b"\x1b[?1016l\x1b[?1006h",
+            Duration::from_secs(15)
+        ),
+        "the initial input-mode sync did not restore SGR cell reports after resetting pixel mode"
+    );
+
+    // A nested application's pixel request must still reach the host, and returning to cells
+    // must restore SGR again. Then exercise hover and selection with the negotiated cell format.
+    let mark = transcript.len();
+    parts.input.send(b"pixels\r").unwrap();
+    wait_for_text(&runtime, &session, 1, "PIXELS ready");
+    assert!(
+        wait_for(
+            &receiver,
+            &mut transcript,
+            mark,
+            b"\x1b[?1016h",
+            Duration::from_secs(15)
+        ),
+        "the pane's pixel mouse request never reached the host"
+    );
+    let mark = transcript.len();
+    parts.input.send(b"cells\r").unwrap();
+    wait_for_text(&runtime, &session, 1, "CELLS ready");
+    assert!(
+        wait_for(
+            &receiver,
+            &mut transcript,
+            mark,
+            b"\x1b[?1016l\x1b[?1006h",
+            Duration::from_secs(15)
+        ),
+        "returning from pixel mode did not restore SGR cell reports"
+    );
+    parts
+        .input
+        .send(b"\x1b[<35;45;10M\x1b[<35;46;11Mmouse-probe\r")
+        .unwrap();
+    wait_for_text(&runtime, &session, 1, "OUT pane=1:mouse-probe");
+    assert!(
+        !pane_text(&runtime, &session, 1).contains("^["),
+        "mouse motion was forwarded as typed text"
     );
 
     parts.input.send(b"build\r").unwrap();

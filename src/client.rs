@@ -384,9 +384,16 @@ pub fn attach(
                         // Apply the mode to the host before accepting its new encoding. The input
                         // parser understands Kitty reports as vvmux prefix chords while passing
                         // every non-command report through byte-for-byte to the pane.
-                        let pixel_mode = if sgr_pixels { 'h' } else { 'l' };
+                        // Kitty and Ghostty share one mouse encoding across 1006 and 1016:
+                        // resetting 1016 selects legacy X10, even if 1006 was enabled earlier.
+                        // Restore SGR after the reset so coordinate bytes never become pane input.
+                        let mouse_mode = if sgr_pixels {
+                            "\x1b[?1016h"
+                        } else {
+                            "\x1b[?1016l\x1b[?1006h"
+                        };
                         output_thread.enqueue_control(
-                            format!("\x1b[={keyboard_flags}u\x1b[?1016{pixel_mode}").into_bytes(),
+                            format!("\x1b[={keyboard_flags}u{mouse_mode}").into_bytes(),
                         );
                         let coordinates = if sgr_pixels {
                             MouseCoordinates::Pixels
