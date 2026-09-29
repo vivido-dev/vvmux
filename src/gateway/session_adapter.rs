@@ -94,9 +94,7 @@ impl SessionAdapter {
                     read_only: false,
                 })?;
             match reader.recv_server()? {
-                ServerMessage::Attached { session, presenter } => {
-                    Ok((reader, writer, session, !presenter))
-                }
+                ServerMessage::Attached { session, .. } => Ok((reader, writer, session, !vivid)),
                 ServerMessage::Error(message) => {
                     Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
                 }

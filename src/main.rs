@@ -100,11 +100,11 @@ enum Command {
         /// Detach every other client before attaching.
         #[arg(short = 'd', long)]
         replace: bool,
-        /// Present media here, demoting whichever client presents it now. Without this, the
-        /// first attached client that can show media presents it and the others see text.
+        /// Claim exclusive playback and host services. Other Vivid clients keep shared images
+        /// and rasters. By default the first media-capable client takes the role.
         #[arg(long, conflicts_with = "no_media")]
         media: bool,
-        /// Attach as a text viewer even when no client presents media.
+        /// Opt out of all media, including shared images and rasters.
         #[arg(long)]
         no_media: bool,
         /// Watch without sending input: keys, mouse, and actions from this client are ignored.

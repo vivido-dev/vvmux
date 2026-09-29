@@ -7,7 +7,8 @@ from projection publishes an immediate control-plane hold. A bounded background 
 and queries the physical clock before retiring its tracks; replacement slot activation waits
 for that retirement. Abrupt loss retains the last physical observation as an estimate.
 Downstream holds are translated to the owning inner surface, with local and downstream hold
-reasons composed independently. VVMX version 22 carries hold feedback and PLAY correlation.
+reasons composed independently. VVMX version 23 also qualifies retained delivery results by bridge
+instance and reports failed retained deliveries.
 
 Synchronized PLAY admits buffering without starting the clock. Bootstrap output readiness permits
 activation; target-picture readiness and audio prebuffer release physical playback together.
@@ -36,16 +37,20 @@ stays pending while every other client is served. Composition runs once per clie
 client limit, because the tab list sits at each terminal's own edge and transient UI is drawn only
 for the client that owns it.
 
-Media is not per client. One client, the presenter, owns the whole bridge-bound state — bridge
-instance, outer revisions and attachment generations, pending projections, retained replays,
-microphone recipient, Kitty transfers — and every bridge message is admitted only from it. A viewer
-never receives a media record, which is what keeps a second attachment from doubling the bandwidth
-of a playing video. The role moves only by an explicit claim or by the presenter leaving, which
-leaves it vacant rather than handing it on. Moving it runs the same reset a fresh attachment always
-did, so the new presenter starts from a parked projection exactly like a new client; the demoted
-client is told with `MediaRole` after its last media and releases its bridge without cancelling its
-session connection. `set_presenter` sends nothing to the promoted client and neither relayouts nor
-syncs, because an attach must put `Attached` on the stream before any projection.
+Non-timed image/raster tracks have per-client retained subscriptions, including on the presenter.
+The SDK composes the incoming raster delta chain once; each subscriber has at most one retained
+body per source outstanding and catches up from the latest complete state. Ingress allowance is
+released independently of subscribers; only a successful outer delivery marks presentation.
+Outgoing subscriber updates are full composed rasters, using each hop's negotiated compression.
+Viewer projection acknowledgements, failed writes, full-frame requests, and reconnects affect
+only that viewer. Read-only snapshot inspection cannot change the timed projection or its holds.
+
+One client, the presenter, still owns live audio/video, all timed tracks, vector overlays, host
+services, microphone routing, and Kitty transfers. Only its playback acknowledgements and feedback
+can change that shared state. The role moves by explicit claim and stays vacant on detach. Role
+changes reset the exclusive projection, but each client keeps its bridge and shared visuals.
+`set_presenter` sends nothing to the promoted client and neither relayouts nor syncs, because an
+attach must put `Attached` on the stream before any projection.
 
 The layout display is derived, not reported: `general.window_size` picks columns and rows from the
 clients that can type, and cell pixels come from the presenter. Input from a client passes through

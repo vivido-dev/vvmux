@@ -869,9 +869,8 @@ async fn handle_socket_message(
                         .await
                         {
                             Ok((adapter, attached_name, text_only)) => {
-                                // Only the session's media presenter gets a bridge. A viewer's
-                                // Vivid route stays unused, so a second attachment never pulls a
-                                // second copy of a playing video.
+                                // Every Vivid attachment has a retained-visual subscription;
+                                // only the selected presenter receives audio/video.
                                 let browser_bridge = if vivid && !text_only {
                                     let root_secret = broker.root_secret();
                                     let connection_factory: Arc<
@@ -1158,14 +1157,9 @@ async fn handle_session_message(
         }
         ServerMessage::Pong => {}
         ServerMessage::MediaRole { presenter: false } => {
-            // Another client claimed the media role. Everything queued before this was meant for
-            // the browser's bridge; nothing after it is. Tell the browser before its Vivid route
-            // closes, so it reads the closure as a demotion rather than a failure; the session
-            // connection stays up.
+            // Keep the Vivid route: the next projection removes exclusive tracks while retaining
+            // shared images and rasters.
             send_control(writer, &ServerControl::MediaRole { presenter: false })?;
-            if let Some(worker) = bridge.take() {
-                tokio::task::spawn_blocking(move || worker.release());
-            }
         }
         ServerMessage::MediaRole { presenter: true } => {
             return Err(io::Error::new(

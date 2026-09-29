@@ -548,6 +548,8 @@ struct AttachedClient {
     /// a client whose terminal differs sees it clipped or padded, with its tab list at its edge.
     display: DisplayMetrics,
     vivid: bool,
+    media_enabled: bool,
+    shared_visuals: SharedVisualState,
     kitty_graphics: bool,
     read_only: bool,
     /// Whether this client's host terminal holds focus. Assumed true at attach, because a client
@@ -591,6 +593,22 @@ impl AttachedClient {
     fn render_blocked(&self) -> bool {
         self.frame_id.saturating_sub(self.acknowledged_frame) >= MAX_UNACKNOWLEDGED_FRAMES
     }
+}
+
+/// Retained subscriptions never own producer credit or playback state. One body per source may
+/// be outstanding; subsequent revisions are read from the latest retained canvas after its ack.
+#[derive(Default)]
+struct SharedVisualState {
+    bridge_instance: Option<u64>,
+    revision: u64,
+    pending_revision: Option<u64>,
+    pending_sources: HashMap<BridgeSourceKey, u64>,
+    applied_sources: HashMap<BridgeSourceKey, u64>,
+    outer_revision: u64,
+    attachment_generations: HashMap<BridgeSourceKey, u64>,
+    last_projection: Option<MediaProjectionKey>,
+    sent: HashMap<BridgeSourceKey, (u64, u64)>,
+    inflight: HashSet<BridgeSourceKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1767,7 +1785,7 @@ struct SessionActor {
     /// Shared, as a tmux session's current window is, and meaningful only while a client is
     /// attached; an attach asking for a different view is refused rather than splitting geometry.
     view: AttachmentView,
-    /// The one client that receives media — Vivid sources and Kitty graphics.
+    /// The client receiving exclusive tracks and host services. Images and rasters are shared.
     ///
     /// Never reassigned implicitly. When the presenter detaches, media stays unpresented until a
     /// client claims the role, so a remote text viewer never starts pulling video because
@@ -1812,6 +1830,7 @@ struct SessionActor {
     kitty_transfers: KittyTransferBuffer,
     layout_revision: u64,
     last_media_projection: Option<MediaProjectionKey>,
+    shared_visual_sources: HashSet<BridgeSourceKey>,
     media_projection_revision: u64,
     /// Source sets submitted to the foreground bridge but not yet acknowledged as physically
     /// applied. Timed producer workers remain parked until the matching revision is consumed.
@@ -2079,6 +2098,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         kitty_transfers: KittyTransferBuffer::default(),
         layout_revision: 0,
         last_media_projection: None,
+        shared_visual_sources: HashSet::new(),
         media_projection_revision: 0,
         pending_media_projections: BTreeMap::new(),
         outer_virtual_revision: 0,
@@ -2355,6 +2375,13 @@ impl SessionActor {
         // idle sync, fill outer pre-roll with later audio, and leave video waiting for a PLAY
         // snapshot that is queued behind that media.
         self.sync_media_before_delivery(event.source);
+        if self
+            .shared_visual_sources
+            .contains(&bridge_key(event.source))
+        {
+            self.vivid.release_bridge_delivery(event.delivery_id);
+            return;
+        }
         let sent = self
             .presenter_client()
             .filter(|client| client.vivid)
@@ -2367,7 +2394,16 @@ impl SessionActor {
                     &event.body,
                 )
             });
-        if !sent {
+        if !sent
+            && matches!(
+                event.record_type,
+                vivid_protocol::messages::RASTER_FRAME | vivid_protocol::messages::IMAGE_DATA
+            )
+        {
+            // The retained canvas owns these bytes now. Viewer completions report presentation
+            // separately; a slow subscriber must not hold the producer's ingress allowance.
+            self.vivid.release_bridge_delivery(event.delivery_id);
+        } else if !sent {
             self.record_delivery_result(event.delivery_id, false);
             self.vivid
                 .complete_bridge_delivery(event.delivery_id, false);
@@ -2999,6 +3035,8 @@ impl SessionActor {
                         writer: writer.clone(),
                         display,
                         vivid,
+                        media_enabled: media != crate::ipc::MediaRequest::Never,
+                        shared_visuals: SharedVisualState::default(),
                         kitty_graphics,
                         read_only,
                         focused: true,
@@ -3021,8 +3059,7 @@ impl SessionActor {
                         outer,
                     },
                 );
-                // Media reaches one client. A second attachment is a text viewer unless it asks
-                // for the role, so attaching from elsewhere never duplicates a playing video.
+                // Playback and host services have one owner; retained visuals are shared.
                 let presents = (vivid || kitty_graphics)
                     && match media {
                         crate::ipc::MediaRequest::Claim => true,
@@ -3068,9 +3105,7 @@ impl SessionActor {
                 } else {
                     self.refresh_layout_display();
                 }
-                if presents {
-                    self.sync_media(true);
-                }
+                self.sync_media(true);
                 self.schedule_render();
             }
             ClientMessage::ClaimMedia => {
@@ -3082,6 +3117,10 @@ impl SessionActor {
                 } else if !client.media_capable() {
                     self.status_to(id, "this terminal cannot present media");
                 } else {
+                    self.clients
+                        .get_mut(&id)
+                        .expect("attached client")
+                        .media_enabled = true;
                     self.set_presenter(Some(id));
                     crate::ipc::send(&writer, &ServerMessage::MediaRole { presenter: true })?;
                     // Cell pixels follow the presenter.
@@ -3276,8 +3315,19 @@ impl SessionActor {
                 }
             }
             ClientMessage::BridgeNeedFullFrames(sources) => {
+                if let Some(client) = self.clients.get_mut(&id) {
+                    for source in &sources {
+                        client.shared_visuals.sent.remove(source);
+                    }
+                    self.last_media_projection = None;
+                    self.sync_media(false);
+                }
                 if self.is_presenter(id) {
-                    self.vivid.request_full_frames(&sources, 1);
+                    let exclusive = sources
+                        .into_iter()
+                        .filter(|source| !self.shared_visual_sources.contains(source))
+                        .collect::<Vec<_>>();
+                    self.vivid.request_full_frames(&exclusive, 1);
                 }
             }
             ClientMessage::BridgeCapabilitiesChanged { reason_mask } => {
@@ -3351,16 +3401,41 @@ impl SessionActor {
                     self.vivid.release_bridge_delivery(delivery_id);
                 }
             }
-            ClientMessage::BridgeRetainedHydrated { source } => {
-                if self.is_presenter(id) {
+            ClientMessage::BridgeRetainedResult {
+                bridge_instance_id,
+                source,
+                delivered,
+            } => {
+                let primary =
+                    self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id);
+                if primary {
                     self.retained_replay_requests.remove(&source);
                     self.retained_replay_inflight.remove(&source);
-                    self.vivid.complete_retained_hydration(source);
+                    if delivered {
+                        self.vivid.complete_retained_hydration(source);
+                    }
+                }
+                if let Some(client) = self.clients.get_mut(&id)
+                    && (primary
+                        || client.shared_visuals.bridge_instance == Some(bridge_instance_id))
+                    && client.shared_visuals.inflight.remove(&source)
+                {
+                    if delivered {
+                        self.vivid.complete_retained_hydration(source);
+                    } else {
+                        client.shared_visuals.sent.remove(&source);
+                    }
+                    self.last_media_projection = None;
+                    self.sync_media(false);
                 }
             }
             ClientMessage::BridgeSnapshotRetry {
                 reset_outer_session,
             } => {
+                if let Some(client) = self.clients.get_mut(&id) {
+                    client.shared_visuals.sent.clear();
+                    client.shared_visuals.inflight.clear();
+                }
                 if self.is_presenter(id) {
                     self.record_media_trace(
                         None,
@@ -3383,6 +3458,14 @@ impl SessionActor {
                         self.last_media_projection = None;
                     }
                     self.sync_media(true);
+                } else if let Some(client) = self.clients.get_mut(&id) {
+                    let state = &mut client.shared_visuals;
+                    state.pending_revision = None;
+                    state.last_projection = None;
+                    state.sent.clear();
+                    state.inflight.clear();
+                    self.last_media_projection = None;
+                    self.sync_media(false);
                 }
             }
             ClientMessage::BridgeApplied {
@@ -3392,6 +3475,36 @@ impl SessionActor {
                 outer_attachment_generations,
                 recreated_retained_sources,
             } => {
+                if !self.is_presenter(id) {
+                    if let Some(client) = self.clients.get_mut(&id) {
+                        let state = &mut client.shared_visuals;
+                        if state.bridge_instance == Some(bridge_instance_id)
+                            && state.pending_revision == Some(virtual_revision)
+                        {
+                            state.pending_revision = None;
+                            state.applied_sources = std::mem::take(&mut state.pending_sources);
+                            state.outer_revision = outer_revision;
+                            state.attachment_generations =
+                                outer_attachment_generations.into_iter().collect();
+                            for source in recreated_retained_sources {
+                                if !state.inflight.contains(&source) {
+                                    state.sent.remove(&source);
+                                }
+                            }
+                            if self.presenter_client().is_none_or(|client| !client.vivid) {
+                                self.outer_apply_sequence =
+                                    self.outer_apply_sequence.saturating_add(1);
+                                self.outer_projection_revision = next_outer_compatibility_revision(
+                                    self.outer_projection_revision,
+                                    outer_revision,
+                                );
+                            }
+                            self.last_media_projection = None;
+                            self.sync_media(false);
+                        }
+                    }
+                    return Ok(());
+                }
                 let instance_changed = self.bridge_instance_id != Some(bridge_instance_id);
                 if self.is_presenter(id)
                     && bridge_apply_is_current(
@@ -3441,6 +3554,13 @@ impl SessionActor {
                         },
                     );
                     let mut retry_retained = false;
+                    if let Some(client) = self.clients.get_mut(&id) {
+                        for source in &recreated_retained_sources {
+                            if !client.shared_visuals.inflight.contains(source) {
+                                client.shared_visuals.sent.remove(source);
+                            }
+                        }
+                    }
                     if let Some(applied) = self.pending_media_projections.remove(&virtual_revision)
                     {
                         self.pending_media_projections
@@ -3471,6 +3591,26 @@ impl SessionActor {
                 bridge_instance_id,
                 event,
             } => {
+                if !self.is_presenter(id)
+                    && matches!(event.kind, MediaTraceKind::BridgeClientAttached { .. })
+                    && let Some(client) = self.clients.get_mut(&id)
+                    && client.vivid
+                {
+                    let state = &mut client.shared_visuals;
+                    if state.bridge_instance != Some(bridge_instance_id) {
+                        if state.bridge_instance.is_some() {
+                            state.pending_revision = None;
+                            state.last_projection = None;
+                            state.sent.clear();
+                            state.inflight.clear();
+                            state.applied_sources.clear();
+                            state.attachment_generations.clear();
+                        }
+                        state.bridge_instance = Some(bridge_instance_id);
+                        self.last_media_projection = None;
+                        self.sync_media(false);
+                    }
+                }
                 if self.is_presenter(id) {
                     if matches!(event.kind, MediaTraceKind::BridgeClientAttached { .. })
                         || self.bridge_instance_id.is_none()
@@ -5146,9 +5286,8 @@ impl SessionActor {
 
     /// The display panes are laid out for, from the attached clients by `general.window_size`.
     ///
-    /// Columns and rows follow the policy. Cell pixels follow the presenter, because only the
-    /// presenter shows pixels: a viewer's font must not resize a producer's output for a screen
-    /// that never displays it.
+    /// Columns and rows follow the policy. Canonical cell pixels follow the presenter, or the
+    /// latest sizing client when vacant; other bridges map that layout to their own target.
     fn policy_display(&self) -> Option<DisplayMetrics> {
         // A read-only watcher resizing its window must not re-lay out the panes under whoever is
         // typing; it counts only while nobody else is attached.
@@ -5240,8 +5379,8 @@ impl SessionActor {
         self.force_full = true;
     }
 
-    /// Move the media role. The demoted client is told after its last media and stays attached as
-    /// a text viewer; the caller tells a promoted client and publishes its first projection.
+    /// Move the exclusive role. The demoted client keeps its retained subscription; the caller
+    /// tells a promoted client and publishes its first exclusive projection.
     ///
     /// Sends nothing to the promoted client, and neither relayouts nor syncs media: an attach
     /// must put its reply on the stream before any projection.
@@ -5250,6 +5389,12 @@ impl SessionActor {
             return;
         }
         let previous = std::mem::replace(&mut self.presenter, next);
+        if let Some(client) = previous.and_then(|id| self.clients.get_mut(&id)) {
+            client.shared_visuals = SharedVisualState {
+                bridge_instance: self.bridge_instance_id,
+                ..SharedVisualState::default()
+            };
+        }
         if previous.is_some() {
             self.record_media_trace(
                 None,
@@ -5323,8 +5468,11 @@ impl SessionActor {
         }
         if self.clients.is_empty() {
             self.force_full = true;
+            self.vivid.deactivate_bridge();
+            self.shared_visual_sources.clear();
         } else {
             self.refresh_layout_display();
+            self.sync_media(true);
             self.schedule_render();
         }
     }
@@ -7807,6 +7955,9 @@ impl SessionActor {
                     "presenter": self.presenter == Some(client.id),
                     "read_only": client.read_only,
                     "vivid_capable": client.vivid,
+                    "media_enabled": client.media_enabled,
+                    "retained_inflight": client.shared_visuals.inflight.len(),
+                    "retained_pending_revision": client.shared_visuals.pending_revision,
                     "kitty_graphics": client.kitty_graphics,
                     "focused": client.focused,
                     "remote": client.outer.as_ref().is_some_and(|outer| outer.remote),
@@ -15202,6 +15353,153 @@ impl SessionActor {
         self.sync_media_inner(false, Some(source));
     }
 
+    fn sync_shared_visuals(
+        &mut self,
+        force: bool,
+        key: MediaProjectionKey,
+        snapshot: &crate::media::ProjectionSnapshot,
+        surfaces: &[BridgeSurface],
+        tracks: &[BridgeSource],
+        nodes: &[BridgeNode],
+    ) {
+        let retained = snapshot
+            .sources
+            .iter()
+            .filter(|source| {
+                source.live
+                    && matches!(
+                        source.descriptor,
+                        crate::media::SourceDescriptor::Image(_)
+                            | crate::media::SourceDescriptor::Raster(_)
+                    )
+            })
+            .collect::<Vec<_>>();
+        let keys = retained
+            .iter()
+            .map(|source| bridge_key(source.key))
+            .collect::<HashSet<_>>();
+        let surface_keys = keys
+            .iter()
+            .map(|key| BridgeSurfaceKey {
+                producer: key.producer,
+                context: key.context,
+                surface: key.surface,
+            })
+            .collect::<HashSet<_>>();
+        self.shared_visual_sources = keys.clone();
+        for client in self
+            .clients
+            .values_mut()
+            .filter(|client| client.vivid && client.media_enabled)
+        {
+            let state = &mut client.shared_visuals;
+            state.applied_sources.retain(|source, reset| {
+                retained.iter().any(|current| {
+                    bridge_key(current.key) == *source && current.decoder_reset_serial == *reset
+                })
+            });
+            let primary = Some(client.id) == self.presenter;
+            if !primary && state.pending_revision.is_some() {
+                continue;
+            }
+            state.sent.retain(|source, _| keys.contains(source));
+            state.inflight.retain(|source| keys.contains(source));
+            if !primary && (force || state.last_projection != Some(key)) {
+                let Some(revision) = state.revision.checked_add(1) else {
+                    continue;
+                };
+                let message = ServerMessage::MediaSnapshot {
+                    microphones: Vec::new(),
+                    revision,
+                    surfaces: surfaces
+                        .iter()
+                        .filter(|surface| surface_keys.contains(&surface.key))
+                        .cloned()
+                        .collect(),
+                    tracks: tracks
+                        .iter()
+                        .filter(|track| keys.contains(&track.key))
+                        .cloned()
+                        .collect(),
+                    nodes: nodes
+                        .iter()
+                        .filter(|node| surface_keys.contains(&node.surface))
+                        .cloned()
+                        .collect(),
+                    videos_needing_keyframes: Vec::new(),
+                };
+                if crate::ipc::send(&client.writer, &message).is_err() {
+                    continue;
+                }
+                state.revision = revision;
+                state.pending_revision = Some(revision);
+                state.pending_sources = retained
+                    .iter()
+                    .map(|source| (bridge_key(source.key), source.decoder_reset_serial))
+                    .collect();
+                state.last_projection = Some(key);
+            }
+            for source in &retained {
+                let source_key = bridge_key(source.key);
+                let version = (
+                    source.decoder_reset_serial,
+                    source.last_inner_record_sequence,
+                );
+                if state.inflight.contains(&source_key)
+                    || state.sent.get(&source_key) == Some(&version)
+                {
+                    continue;
+                }
+                let sent = match &source.descriptor {
+                    crate::media::SourceDescriptor::Raster(_) => source
+                        .retained_raster
+                        .as_ref()
+                        .and_then(|raster| retained_raster_body(raster).ok())
+                        .is_some_and(|body| {
+                            send_media_body(
+                                &client.writer,
+                                0,
+                                source_key,
+                                vivid_protocol::messages::RASTER_FRAME,
+                                &body,
+                            )
+                        }),
+                    crate::media::SourceDescriptor::Image(_) => {
+                        source.retained.as_ref().is_some_and(|body| {
+                            send_media_body(
+                                &client.writer,
+                                0,
+                                source_key,
+                                vivid_protocol::messages::IMAGE_DATA,
+                                body,
+                            )
+                        })
+                    }
+                    _ => false,
+                };
+                if sent {
+                    state.sent.insert(source_key, version);
+                    state.inflight.insert(source_key);
+                }
+            }
+        }
+        if self.presenter_client().is_none_or(|client| !client.vivid) {
+            let applied = self
+                .clients
+                .values()
+                .filter(|client| client.vivid && client.media_enabled)
+                .flat_map(|client| {
+                    client
+                        .shared_visuals
+                        .applied_sources
+                        .iter()
+                        .map(|(key, reset)| (*key, *reset))
+                })
+                .collect();
+            self.vivid.activate_bridge_projection_at_resets(&applied);
+        }
+    }
+
     fn sync_media_inner(
         &mut self,
         force: bool,
@@ -15218,27 +15516,21 @@ impl SessionActor {
             );
             self.schedule_render();
         }
-        // Only the presenter's bridge carries media; with no presenter, timed ingress parks
-        // exactly as it does with nobody attached.
-        let Some(client) = self.presenter_client() else {
-            self.pending_media_projections.clear();
-            self.retained_replay_requests.clear();
-            self.retained_replay_inflight.clear();
-            self.record_projection_sources(&HashSet::new(), self.vivid.revision());
-            self.traced_recovery_deliveries.clear();
+        // Only the selected presenter activates timed ingress. Retained subscribers can inspect
+        // and project their own content while that role is vacant.
+        if !self
+            .clients
+            .values()
+            .any(|client| client.vivid && client.media_enabled)
+        {
             self.vivid.deactivate_bridge();
-            return;
-        };
-        if !client.vivid {
-            self.pending_media_projections.clear();
-            self.retained_replay_requests.clear();
-            self.retained_replay_inflight.clear();
-            self.record_projection_sources(&HashSet::new(), self.vivid.revision());
-            self.traced_recovery_deliveries.clear();
-            self.vivid.deactivate_bridge();
+            self.shared_visual_sources.clear();
             return;
         }
-        let writer = client.writer.clone();
+        let writer = self
+            .presenter_client()
+            .filter(|client| client.vivid)
+            .map(|client| client.writer.clone());
         let projections = self.attached_projections(self.content_area());
         if projections.is_empty() {
             return;
@@ -15278,9 +15570,13 @@ impl SessionActor {
         }
         // Preparing a snapshot parks falling edges immediately but does not wake rising edges.
         // The matching BridgeApplied acknowledgement publishes those sources below.
-        let mut snapshot = self
-            .vivid
-            .prepare_projection_snapshot_with_viewports(&panes, &viewport_offsets);
+        let mut snapshot = if writer.is_some() {
+            self.vivid
+                .prepare_projection_snapshot_with_viewports(&panes, &viewport_offsets)
+        } else {
+            self.vivid
+                .inspect_projection_snapshot_with_viewports(&panes, &viewport_offsets)
+        };
         let projection_key = MediaProjectionKey {
             virtual_revision: snapshot.revision,
             layout_revision: self.layout_revision,
@@ -15443,6 +15739,18 @@ impl SessionActor {
             ));
             self.last_projection_warning = Some(projection_key);
         }
+        let Some(writer) = writer else {
+            self.sync_shared_visuals(
+                force,
+                projection_key,
+                &snapshot,
+                &surfaces,
+                &sources,
+                &nodes,
+            );
+            self.last_media_projection = Some(projection_key);
+            return;
+        };
         let videos_needing_keyframes = snapshot
             .videos_needing_keyframes
             .iter()
@@ -15475,9 +15783,9 @@ impl SessionActor {
             &ServerMessage::MediaSnapshot {
                 microphones: self.vivid.microphone_requests(),
                 revision: projection_revision,
-                surfaces,
-                tracks: sources,
-                nodes,
+                surfaces: surfaces.clone(),
+                tracks: sources.clone(),
+                nodes: nodes.clone(),
                 videos_needing_keyframes,
             },
         )
@@ -15515,7 +15823,16 @@ impl SessionActor {
                 node_count,
             },
         );
-        for source in snapshot.sources {
+        for source in &snapshot.sources {
+            if source.live
+                && matches!(
+                    source.descriptor,
+                    crate::media::SourceDescriptor::Image(_)
+                        | crate::media::SourceDescriptor::Raster(_)
+                )
+            {
+                continue;
+            }
             let source_key = bridge_key(source.key);
             let forced_replay = self.retained_replay_requests.contains(&source_key);
             if !should_replay_retained(
@@ -15534,10 +15851,10 @@ impl SessionActor {
             }
             let sent = match source.descriptor {
                 crate::media::SourceDescriptor::Raster(_) => {
-                    let Some(raster) = source.retained_raster else {
+                    let Some(raster) = &source.retained_raster else {
                         continue;
                     };
-                    let Ok(body) = retained_raster_body(&raster) else {
+                    let Ok(body) = retained_raster_body(raster) else {
                         continue;
                     };
                     send_media_body(
@@ -15548,15 +15865,17 @@ impl SessionActor {
                         &body,
                     )
                 }
-                crate::media::SourceDescriptor::Image(_) => source.retained.is_some_and(|body| {
-                    send_media_body(
-                        &writer,
-                        0,
-                        source_key,
-                        vivid_protocol::messages::IMAGE_DATA,
-                        &body,
-                    )
-                }),
+                crate::media::SourceDescriptor::Image(_) => {
+                    source.retained.as_ref().is_some_and(|body| {
+                        send_media_body(
+                            &writer,
+                            0,
+                            source_key,
+                            vivid_protocol::messages::IMAGE_DATA,
+                            body,
+                        )
+                    })
+                }
                 crate::media::SourceDescriptor::VectorScene(_) => source
                     .retained_vector
                     .iter()
@@ -15577,6 +15896,14 @@ impl SessionActor {
                 }
             }
         }
+        self.sync_shared_visuals(
+            force,
+            projection_key,
+            &snapshot,
+            &surfaces,
+            &sources,
+            &nodes,
+        );
         self.last_media_projection = Some(projection_key);
         self.media_projection_revision = projection_revision;
     }
@@ -15604,6 +15931,22 @@ impl SessionActor {
     }
 
     fn outer_media_projection(&self) -> crate::media::OuterMediaProjection<'_> {
+        if self.presenter_client().is_none_or(|client| !client.vivid)
+            && let Some(client) = self
+                .clients
+                .values()
+                .filter(|client| client.vivid && client.media_enabled)
+                .max_by_key(|client| client.activity)
+        {
+            let state = &client.shared_visuals;
+            return crate::media::OuterMediaProjection {
+                compatibility_revision: self.outer_projection_revision,
+                apply_sequence: self.outer_apply_sequence,
+                bridge_instance_id: state.bridge_instance,
+                bridge_local_revision: state.outer_revision,
+                attachment_generations: &state.attachment_generations,
+            };
+        }
         crate::media::OuterMediaProjection {
             compatibility_revision: self.outer_projection_revision,
             apply_sequence: self.outer_apply_sequence,

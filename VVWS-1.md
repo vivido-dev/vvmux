@@ -173,13 +173,12 @@ gateway connections — that share its tabs, layout, and input. An attach joins 
 `takeover` to true cleanly detaches every other client before admission. `session_occupied` is
 returned only when the session cannot admit another client: it is at its client limit, or it is
 attached to one pane directly.
-`vivid` defaults to false for generic xterm.js clients. Media reaches exactly one attached client,
-the session's presenter. When `vivid` is true and no client presents media, this attachment becomes
-the presenter and the reply's `text_only` is false; the client must then concurrently open the
-kind-0 Vivid WebSocket so the normal Vivid HELLO/WELCOME handshake can finish. Media connections use
-the same endpoint and credentials with the connection kind requested by Vivid. When another client
-already presents media, the reply's `text_only` is true and the Vivid route is not used; the client
-should close any Vivid WebSocket it opened. A gateway attachment cannot take the role later.
+`vivid` defaults to false for generic xterm.js clients. When true, `text_only` is false and the
+client must concurrently open the kind-0 Vivid WebSocket so the normal Vivid HELLO/WELCOME handshake
+can finish. Every such attachment receives non-timed images and raster canvases. Other media and
+host services reach only the session's presenter; this attachment takes that role only if vacant.
+Media connections use the same endpoint and credentials with the connection kind requested by
+Vivid. A gateway attachment cannot claim the exclusive role later.
 
 Resize and detach:
 
@@ -286,8 +285,8 @@ Uncorrelated terminal events are:
 {"type":"detached","reason":"detached"}
 ```
 
-`media_role` with `presenter` false means another client claimed the media role: the gateway has
-released this attachment's Vivid route, and the session stays attached as text.
+`media_role` with `presenter` false means another client claimed exclusive playback. The Vivid
+route stays open for shared images and rasters; only the exclusive tracks are removed.
 
 Clipboard events do not write the browser clipboard automatically; the client decides whether and
 when to request browser permission.

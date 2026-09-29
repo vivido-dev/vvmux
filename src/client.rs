@@ -199,7 +199,11 @@ pub fn attach(
     let output = Arc::new(Mutex::new(output));
     let output_thread = TerminalOutput::spawn(output, writer.clone())?;
     if !(vivid && presenter) {
-        write_media_role_title(&output_thread, vivid, presenter);
+        write_media_role_title(
+            &output_thread,
+            vivid && join.media != crate::ipc::MediaRequest::Never,
+            presenter,
+        );
     }
     let bridge_display = display;
     let bridge_cell_size = presenter_cell_size.clone();
@@ -251,7 +255,7 @@ pub fn attach(
                     }
                 }
             };
-            let mut bridge = if presenter {
+            let mut bridge = if vivid && join.media != crate::ipc::MediaRequest::Never {
                 connect_bridge(bridge_display)
             } else {
                 None
@@ -392,20 +396,13 @@ pub fn attach(
                         let _ = input_mode_sender.send((keyboard_flags, coordinates));
                     }
                     ServerMessage::MediaRole { presenter } => {
-                        // Ordered with the media stream: everything before a demotion was meant
-                        // for the old bridge, and a promotion precedes the first new snapshot.
-                        if presenter {
-                            if bridge.is_none() {
-                                let mut display = crate::platform::current_display_metrics()
-                                    .unwrap_or(bridge_display);
-                                apply_cell_size(
-                                    &mut display,
-                                    bridge_cell_size.load(Ordering::Acquire),
-                                );
-                                bridge = connect_bridge(display);
-                            }
-                        } else if let Some(worker) = bridge.take() {
-                            worker.release();
+                        // The following projection removes or adds exclusive tracks. Keep the
+                        // existing bridge and retained content through the role change.
+                        if presenter && bridge.is_none() {
+                            let mut display = crate::platform::current_display_metrics()
+                                .unwrap_or(bridge_display);
+                            apply_cell_size(&mut display, bridge_cell_size.load(Ordering::Acquire));
+                            bridge = connect_bridge(display);
                         }
                         write_media_role_title(&output_thread, vivid, presenter);
                     }
@@ -1051,6 +1048,12 @@ impl BridgeWorker {
             .is_ok();
         if !queued {
             self.mark_dropped(delivery_id);
+            if delivery_id == 0 {
+                // A partial retained body cannot be resumed. Retire this attachment rather than
+                // leave its subscriber waiting forever for a completion that cannot arrive.
+                self.stopped.store(true, Ordering::Release);
+                (self.cancel)();
+            }
             return false;
         }
         let _ = wakeup.try_send(());
@@ -1074,31 +1077,22 @@ impl BridgeWorker {
 }
 
 impl BridgeWorker {
-    /// Stop presenting while keeping the session connection: the media role moved to another
-    /// client. The outer session closes, so the outer presenter drops everything it was showing.
-    pub(crate) fn release(mut self) {
-        self.stop(false);
-    }
-
-    fn stop(&mut self, end_client: bool) {
+    fn stop(&mut self) {
         let Some(thread) = self.thread.take() else {
             return;
         };
         // Cancellation must wake the current control request before we join.
         self.stopped.store(true, Ordering::Release);
         self.media_wakeup.take();
-        if end_client {
-            (self.cancel)();
-        } else {
-            (self.release_bridge)();
-        }
+        (self.cancel)();
+        (self.release_bridge)();
         let _ = thread.join();
     }
 }
 
 impl Drop for BridgeWorker {
     fn drop(&mut self) {
-        self.stop(true);
+        self.stop();
     }
 }
 
@@ -1442,13 +1436,17 @@ fn run_bridge_worker(
         for (delivery_id, delivered, _outer_record_sequence, object_id) in media_completions {
             if delivery_id != 0 {
                 acknowledge_bridge_delivery(&client_writer, delivery_id, delivered);
-            } else if delivered {
+            } else {
                 // Retained hydration carries no delivery ID, so its success would otherwise be
                 // invisible to the server. Report it: a retained image reaching the outer
                 // presenter is the moment it is genuinely presented, and a producer waiting on
                 // first visible presentation must not be released before then.
                 if let Some(source) = bridge.source_for_outer_object(object_id) {
-                    let _ = client_writer.send(ClientMessage::BridgeRetainedHydrated { source });
+                    let _ = client_writer.send(ClientMessage::BridgeRetainedResult {
+                        bridge_instance_id,
+                        source,
+                        delivered,
+                    });
                 }
             }
         }
@@ -2026,11 +2024,22 @@ fn run_bridge_worker(
             acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
             continue;
         }
-        if media.delivery_id == 0 && !retained_rehydration.contains(&media.source) {
-            // The server sends retained image/raster bodies after every authoritative snapshot.
-            // Replay only while this outer source genuinely needs rehydration. Source creation
-            // and the first retained body can occupy different virtual revisions, so requiring
-            // an exact generation would discard a normal image upload.
+        if media.delivery_id == 0
+            && !retained_rehydration.contains(&media.source)
+            && !(media.record_type == vivid_protocol::messages::RASTER_FRAME
+                && active_sources
+                    .iter()
+                    .any(|source| source.key == media.source && source.live))
+        {
+            // Images are immutable, but live raster subscriptions carry successive complete
+            // canvases. A redundant immutable body still completes the subscriber's pending send.
+            if media.last {
+                let _ = client_writer.send(ClientMessage::BridgeRetainedResult {
+                    bridge_instance_id,
+                    source: media.source,
+                    delivered: true,
+                });
+            }
             continue;
         }
         if !active_sources
@@ -2094,6 +2103,13 @@ fn run_bridge_worker(
             Ok(false) => {}
             Err(_) => {
                 acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
+                if media.delivery_id == 0 {
+                    let _ = client_writer.send(ClientMessage::BridgeRetainedResult {
+                        bridge_instance_id,
+                        source: media.source,
+                        delivered: false,
+                    });
+                }
                 force_sources = true;
             }
         }
@@ -2539,8 +2555,8 @@ const SYNC_UPDATE_END: &[u8] = b"\x1b[?2026l";
 fn write_media_role_title(output: &TerminalOutput, vivid: bool, presenter: bool) {
     let title = match (vivid, presenter) {
         (false, _) => "vvmux (text-only media fallback)",
-        (true, false) => "vvmux (text viewer: another client presents media; prefix M claims it)",
-        (true, true) => "vvmux (presenting media)",
+        (true, false) => "vvmux (shared images and rasters)",
+        (true, true) => "vvmux (presenting audio/video)",
     };
     write_title(output, title);
 }
@@ -3998,7 +4014,7 @@ mod tests {
             |message| {
                 matches!(
                     message,
-                    ClientMessage::BridgeRetainedHydrated { source } if *source == key
+                    ClientMessage::BridgeRetainedResult { source, .. } if *source == key
                 )
             },
         );

@@ -37,9 +37,8 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-/// A wire change does not raise this constant: the maintainer bumps it manually, so leave it alone
-/// and keep the mixed-version rejection intact.
-pub const VERSION: u16 = 22;
+/// Version 23 qualifies retained-delivery results with the bridge instance and success status.
+pub const VERSION: u16 = 23;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -1423,8 +1422,10 @@ pub enum ClientMessage {
         reset_outer_session: bool,
     },
     /// A retained body for one source reached the outer presenter.
-    BridgeRetainedHydrated {
+    BridgeRetainedResult {
+        bridge_instance_id: u64,
         source: BridgeSourceKey,
+        delivered: bool,
     },
     BridgeApplied {
         bridge_instance_id: u64,
@@ -1484,20 +1485,18 @@ pub enum ClientMessage {
     PixelMouse(MouseEvent),
 }
 
-/// Whether an attaching client asks for the session's media.
+/// Whether an attaching client asks for exclusive playback and host services.
 ///
-/// Media — Vivid sources and Kitty graphics — reaches exactly one attached client, the presenter.
-/// Every other client receives terminal frames only, so a second attachment never doubles the
-/// bandwidth a playing video costs.
+/// Non-timed Vivid images and rasters are shared unless the client explicitly opts out.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaRequest {
-    /// Take the role, demoting the current presenter to a text viewer.
+    /// Take the exclusive role; other clients keep shared images and rasters.
     Claim,
     /// Take the role only while no client holds it.
     #[default]
     IfVacant,
-    /// Stay a text viewer.
+    /// Opt out of all media.
     Never,
 }
 
@@ -1518,13 +1517,12 @@ pub enum ServerMessage {
     OverlayHostRequest(vivid_sdk::presenter::OverlayHostRequest),
     Attached {
         session: String,
-        /// This client holds the media role. A viewer receives terminal frames only.
+        /// This client holds the exclusive role. Other Vivid clients receive retained visuals.
         presenter: bool,
     },
     /// This client gained or lost the media role after it attached.
     ///
-    /// Sent before any media for a new presenter, and after the last media for a demoted one, so
-    /// a client can connect or release its outer bridge at exactly this point in the stream.
+    /// Ordered before the new exclusive projection. Shared visual subscriptions keep their bridge.
     MediaRole {
         presenter: bool,
     },

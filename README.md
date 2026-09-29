@@ -79,21 +79,22 @@ first. With no `-t`, `vvmux attach -d` replaces the clients of the `default` ses
 one view: a direct pane attachment (below) cannot join a session that is attached as a whole, or the
 reverse, without `-d`. A session admits at most 16 clients.
 
-**Media reaches one client.** Vivid sources and Kitty graphics go only to the session's
-*presenter*; every other client receives terminal frames only, so a second attachment never
-doubles what a playing video costs. The first attached client that can show media — one inside
-Vivido, or a Kitty/Ghostty terminal — becomes the presenter, and later clients join as text
-viewers. `--media` takes the role at attach, and `Ctrl+b M` takes it from inside a running client;
-the previous presenter stays attached as a viewer and its outer window stops showing the media.
-`--no-media` never takes it. When the presenter detaches, the role stays vacant rather than moving
-to another client on its own, so a remote viewer never starts pulling video because someone else
-left: timed media pauses until a client claims it.
+**Images and rasters are shared; playback reaches one client.** Every Vivid-capable client receives
+non-timed encoded images and the latest raster canvas, including read-only viewers. Late viewers
+receive the retained state; slow viewers catch up from a complete canvas without holding back
+other clients. `--no-media` opts out of all media. Live audio/video, timed tracks, vector overlays,
+microphone routing, and Kitty transfers still belong to the session's *presenter*. The first
+media-capable client becomes the presenter. `--media` takes the role at attach, and `Ctrl+b M`
+takes it inside a running client; other clients keep their shared images and rasters. When the
+presenter detaches, the role stays vacant and timed playback pauses until explicitly claimed.
+Shared visuals continue even while that role is vacant.
 
 Panes have one size, because each has one PTY. `general.window_size` chooses whose terminal they
 are laid out for: `latest` (the default: the client that last attached, resized, or typed),
 `smallest`, or `largest`. Read-only clients do not count while anyone else is attached. A client
 whose terminal differs sees the layout clipped or padded from its top-left corner, with its own tab
-list at its own edge; cell pixels always follow the presenter, because only it shows pixels. A menu
+list at its own edge; canonical cell pixels follow the presenter, or the latest sizing client
+while the role is vacant. Each Vivid bridge maps the shared layout to its own display. A menu
 or prompt belongs to the client that opened it: only that client sees and drives it, and another
 client's keys go straight to the focused pane meanwhile.
 
@@ -1017,8 +1018,9 @@ owned by that OS user. The raw token is printed once; only its hash is retained 
 record.
 
 The gateway lists, creates, and attaches to sessions, and runs automation on them. A browser joins
-a session beside any other clients; `takeover` detaches them first. It presents media only if no
-other client does when it attaches, and loses the role if another client claims it. It serves no
+a session beside any other clients; `takeover` detaches them first. Vivid browser attachments share
+images and rasters. A browser takes exclusive playback only if the role is vacant at attach, and
+keeps its shared visuals if another client claims that role. It serves no
 HTML or JavaScript and does not expose session kill operations on the loopback listener.
 
 Possession of the bearer token is equivalent to shell access, which is too much authority to hand an
@@ -1098,7 +1100,7 @@ The prefix is `Ctrl-b`.
 | `Ctrl-b P` | Pin or unpin the focused floating pane |
 | `Ctrl-b m` / `Ctrl-b r` | Enter floating move / resize mode |
 | `Ctrl-b d` | Detach this client; other clients stay attached |
-| `Ctrl-b M` | Present media on this client, demoting the current presenter to a text viewer |
+| `Ctrl-b M` | Claim exclusive playback and host services; other clients keep shared images and rasters |
 | `Ctrl-b [` / `Ctrl-b ]` | Copy mode / paste copy buffer |
 
 The agent navigator includes detected agents from every tab and orders them blocked, done,
@@ -1339,7 +1341,7 @@ animation commands, malformed packets, and more than 64 MiB of live transfer dat
 The native client advertises this exception only when the attaching terminal's exact `TERM` is
 `xterm-kitty` or `xterm-ghostty`; `TERM_PROGRAM` is never used as evidence. Hosted attachments,
 including Vivido, advertise no Kitty capability, and placeholder glyphs are suppressed there.
-Graphics are media, so they reach only the session's presenter; every other client sees the
+Kitty transfers remain exclusive to the session's presenter; every other client sees the
 placeholders suppressed. Graphics bytes belong only to the presenter's physical attachment and are
 discarded when it detaches or another client claims the role, rather than retained or replayed. Unix pane PTYs receive cell and pixel dimensions so applications can
 choose the correct image size. This behavior is private to vvmux and does not alter Vivid media or
