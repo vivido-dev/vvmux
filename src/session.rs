@@ -826,6 +826,9 @@ struct Pane {
     /// Whether this pane was last told it holds the host terminal's focus. A pane that has not
     /// enabled focus reporting still tracks it, so enabling the mode later reports no stale event.
     focus_reported: bool,
+    /// Whether this pane's client keystrokes are inside a host bracketed paste, whose contents
+    /// `key_input_bytes` must pass through untranslated even when a paste spans input messages.
+    key_paste: bool,
     last_input_warning: Option<Instant>,
     screen_sequence: u64,
     last_screen_change: Instant,
@@ -1071,6 +1074,57 @@ fn clipboard_store_allowed(
 fn osc52_reply(selection: u8, bytes: &[u8], terminator: &str) -> Vec<u8> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     format!("\x1b]52;{};{encoded}{terminator}", selection as char).into_bytes()
+}
+
+/// Queue keystrokes a client typed, encoded for the pane's cursor-key mode.
+///
+/// Host terminals encode keys for their own modes, and vvmux does not mirror a pane's DECCKM to
+/// them, so arrows arrive in the normal `CSI` form whatever the pane asked for. A program that
+/// enabled application cursor keys may recognise only the `SS3` form — Python's REPL reads
+/// terminfo's `kcuu1`, `ESC O A`, after sending `smkx` — so the pane receives what a terminal in
+/// its mode would have sent.
+fn queue_key_input(pane: &mut Pane, bytes: &[u8]) -> Option<InputFailure> {
+    let bytes = key_input_bytes(bytes, pane.terminal.modes(), &mut pane.key_paste);
+    queue_pane_input(pane, &bytes)
+}
+
+/// Rewrite unmodified normal-mode cursor keys to their application-mode form when `modes` asks
+/// for it, leaving bracketed-paste contents and every other sequence byte-for-byte intact.
+fn key_input_bytes<'a>(
+    bytes: &'a [u8],
+    modes: TerminalModes,
+    in_paste: &mut bool,
+) -> Cow<'a, [u8]> {
+    // Under Kitty's report-all-keys flag every key is already an unambiguous `CSI` sequence.
+    let translate = modes.application_cursor && modes.keyboard_flags & 8 == 0;
+    let mut output: Option<Vec<u8>> = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let rest = &bytes[index..];
+        if rest.starts_with(b"\x1b[200~") {
+            *in_paste = true;
+        } else if rest.starts_with(b"\x1b[201~") {
+            *in_paste = false;
+        } else if translate
+            && !*in_paste
+            && let [
+                0x1b,
+                b'[',
+                final_byte @ (b'A' | b'B' | b'C' | b'D' | b'H' | b'F'),
+                ..,
+            ] = rest
+        {
+            let output = output.get_or_insert_with(|| bytes[..index].to_vec());
+            output.extend_from_slice(&[0x1b, b'O', *final_byte]);
+            index += 3;
+            continue;
+        }
+        if let Some(output) = &mut output {
+            output.push(bytes[index]);
+        }
+        index += 1;
+    }
+    output.map_or(Cow::Borrowed(bytes), Cow::Owned)
 }
 
 fn queue_pane_input(pane: &mut Pane, bytes: &[u8]) -> Option<InputFailure> {
@@ -1475,7 +1529,7 @@ fn queue_input_targets(
         .filter_map(|pane_id| {
             panes
                 .get_mut(pane_id)
-                .and_then(|pane| queue_pane_input(pane, bytes))
+                .and_then(|pane| queue_key_input(pane, bytes))
                 .map(|failure| (*pane_id, failure))
         })
         .collect()
@@ -10109,7 +10163,7 @@ impl SessionActor {
             let failure = self
                 .panes
                 .get_mut(&pane_id)
-                .and_then(|pane| queue_pane_input(pane, &bytes));
+                .and_then(|pane| queue_key_input(pane, &bytes));
             self.report_input_failure(pane_id, failure);
             return;
         }
@@ -10155,7 +10209,7 @@ impl SessionActor {
         } else if self.active_tab().is_some_and(|tab| tab.sync_input) {
             self.broadcast_input(&bytes);
         } else if let Some(pane) = self.panes.get_mut(&pane_id) {
-            let failure = queue_pane_input(pane, &bytes);
+            let failure = queue_key_input(pane, &bytes);
             self.report_input_failure(pane_id, failure);
         }
     }
@@ -14432,6 +14486,7 @@ impl SessionActor {
                 hold_on_exit: spec.hold_on_exit,
                 exit_status: None,
                 focus_reported: false,
+                key_paste: false,
                 last_input_warning: None,
                 screen_sequence: 1,
                 last_screen_change: Instant::now(),
@@ -21858,6 +21913,42 @@ mod tests {
         assert_eq!(
             project_logical_node(&node, pane, pane, &occluders).unwrap_err(),
             ProjectionIssue::FragmentLimit
+        );
+    }
+
+    #[test]
+    fn client_cursor_keys_follow_pane_application_cursor_mode() {
+        let mut modes = TerminalModes::default();
+        let mut in_paste = false;
+        let typed = b"a\x1b[A\x1b[B\x1b[C\x1b[D\x1b[H\x1b[F\x1b[1;5A\x1b[3~";
+        assert!(matches!(
+            key_input_bytes(typed, modes, &mut in_paste),
+            Cow::Borrowed(bytes) if bytes == typed
+        ));
+
+        // Python's REPL sends smkx and then matches only terminfo's `ESC O A` for Up.
+        modes.application_cursor = true;
+        assert_eq!(
+            &*key_input_bytes(typed, modes, &mut in_paste),
+            b"a\x1bOA\x1bOB\x1bOC\x1bOD\x1bOH\x1bOF\x1b[1;5A\x1b[3~"
+        );
+
+        // Pasted bytes are text, even when the paste is split across input messages.
+        assert_eq!(
+            &*key_input_bytes(b"\x1b[A\x1b[200~x\x1b[A", modes, &mut in_paste),
+            b"\x1bOA\x1b[200~x\x1b[A"
+        );
+        assert!(in_paste);
+        assert_eq!(
+            &*key_input_bytes(b"\x1b[B\x1b[201~\x1b[B", modes, &mut in_paste),
+            b"\x1b[B\x1b[201~\x1bOB"
+        );
+        assert!(!in_paste);
+
+        modes.keyboard_flags = 8;
+        assert_eq!(
+            &*key_input_bytes(b"\x1b[A", modes, &mut in_paste),
+            b"\x1b[A"
         );
     }
 
