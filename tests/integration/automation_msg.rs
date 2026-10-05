@@ -1391,6 +1391,14 @@ fn agent_start_launches_into_a_shell_pane_and_refuses_everything_else() {
     .unwrap();
     fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
 
+    // The pane's shell is a login shell, and Debian's `/etc/profile` replaces PATH outright, which
+    // would drop the fixture directory. `HOME` is this directory, so its `.profile` restores it.
+    fs::write(
+        directory.path().join(".profile"),
+        format!("PATH=\"{}:$PATH\"\nexport PATH\n", bin.to_str().unwrap()),
+    )
+    .unwrap();
+
     let config = directory.path().join("vvmux.toml");
     fs::write(
         &config,
