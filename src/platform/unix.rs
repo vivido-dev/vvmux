@@ -424,6 +424,43 @@ fn update_close_on_exec(descriptor: RawFd, enabled: bool) -> io::Result<()> {
 pub struct ClientTerminal {
     original: libc::termios,
     output: File,
+    messages: Option<MessageBlock>,
+}
+
+/// Write access that `mesg n` removed from the terminal device, so it can be given back.
+///
+/// `wall`, `journald` and other broadcasters write straight to the terminal device, bypassing
+/// every pane. On the alternate screen that text lands at the cursor, scrolls the whole display
+/// up and leaves the panes offset until the next full repaint. Dropping group and other write
+/// access is the standard way to refuse those writes.
+struct MessageBlock {
+    fd: RawFd,
+    removed: libc::mode_t,
+}
+
+const MESSAGE_WRITE_BITS: libc::mode_t = libc::S_IWGRP | libc::S_IWOTH;
+
+impl MessageBlock {
+    /// Best effort: a terminal the user does not own, or one that already refuses messages, is
+    /// left alone.
+    fn engage(fd: RawFd) -> Option<Self> {
+        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(fd, &mut status) } == -1 {
+            return None;
+        }
+        let removed = status.st_mode & MESSAGE_WRITE_BITS;
+        if removed == 0 || unsafe { libc::fchmod(fd, status.st_mode & 0o7777 & !removed) } == -1 {
+            return None;
+        }
+        Some(Self { fd, removed })
+    }
+
+    fn release(&self) {
+        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(self.fd, &mut status) } == 0 {
+            unsafe { libc::fchmod(self.fd, (status.st_mode & 0o7777) | self.removed) };
+        }
+    }
 }
 
 impl ClientTerminal {
@@ -454,7 +491,12 @@ impl ClientTerminal {
             unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original) };
             return Err(error);
         }
-        Ok(Self { original, output })
+        let messages = MessageBlock::engage(libc::STDOUT_FILENO);
+        Ok(Self {
+            original,
+            output,
+            messages,
+        })
     }
 
     pub fn display_metrics(&self) -> io::Result<DisplayMetrics> {
@@ -536,6 +578,9 @@ impl Drop for ClientTerminal {
             b"\x1b[0m\x1b[=0u\x1b[?2004l\x1b[?1004l\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?25h\x1b[?1049l",
         );
         let _ = self.output.flush();
+        if let Some(messages) = &self.messages {
+            messages.release();
+        }
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
         }
@@ -745,6 +790,38 @@ mod tests {
         let descriptor = descriptor.into_raw_fd();
         let writer = ReadinessWriter::from_metadata(Some(descriptor as usize)).unwrap();
         (writer, descriptor)
+    }
+
+    #[test]
+    fn message_block_removes_and_restores_broadcast_write_access() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        let device = temp_device();
+        fs::set_permissions(&device.0, fs::Permissions::from_mode(0o620)).unwrap();
+        let file = File::open(&device.0).unwrap();
+        let mode = || fs::metadata(&device.0).unwrap().permissions().mode() & 0o777;
+        let block = MessageBlock::engage(file.as_raw_fd()).unwrap();
+        assert_eq!(mode(), 0o600, "group write must be refused while attached");
+        block.release();
+        assert_eq!(mode(), 0o620);
+        // A terminal that already refuses messages is left exactly as found.
+        fs::set_permissions(&device.0, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(MessageBlock::engage(file.as_raw_fd()).is_none());
+        assert_eq!(mode(), 0o600);
+    }
+
+    struct TempPath(PathBuf);
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn temp_device() -> TempPath {
+        let path = std::env::temp_dir().join(format!("vvmux-mesg-{}", std::process::id()));
+        File::create(&path).unwrap();
+        TempPath(path)
     }
 
     #[test]
