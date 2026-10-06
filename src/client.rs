@@ -2043,11 +2043,16 @@ fn run_bridge_worker(
                 .copied()
                 .unwrap_or(0)
         {
-            release_bridge_delivery(&client_writer, media.delivery_id);
+            if media.delivery_id == 0 {
+                reject_retained_body(&client_writer, bridge_instance_id, &media);
+            } else {
+                release_bridge_delivery(&client_writer, media.delivery_id);
+            }
             continue;
         }
         if media.generation > active_generation {
             acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
+            reject_retained_body(&client_writer, bridge_instance_id, &media);
             continue;
         }
         if media.delivery_id == 0
@@ -2073,6 +2078,7 @@ fn run_bridge_worker(
             .any(|source| source.key == media.source)
         {
             acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
+            reject_retained_body(&client_writer, bridge_instance_id, &media);
             continue;
         }
         // Timed media for a source that has not started is legitimate pre-roll. OuterBridge
@@ -2439,6 +2445,27 @@ fn complete_dropped_deliveries(
         });
     }
     retry_snapshot
+}
+
+/// Report a retained body (delivery 0) this client discarded without delivering it.
+///
+/// Retained bodies carry no delivery ID, so `acknowledge_bridge_delivery` cannot tell the session
+/// they were refused. The session marks each retained body in flight until a result arrives and
+/// sends nothing else for that source meanwhile, so a body dropped silently - one stamped before
+/// a projection recreated its track, say - strands the source blank until some unrelated
+/// snapshot retry. Only the final chunk reports, as it does when a body is delivered.
+fn reject_retained_body(
+    client_writer: &BridgeClientSender,
+    bridge_instance_id: u64,
+    media: &BridgeMedia,
+) {
+    if media.delivery_id == 0 && media.last {
+        let _ = client_writer.send(ClientMessage::BridgeRetainedResult {
+            bridge_instance_id,
+            source: media.source,
+            delivered: false,
+        });
+    }
 }
 
 fn acknowledge_bridge_delivery(
@@ -2998,6 +3025,49 @@ mod tests {
             "xterm-kitty-256color"
         ))));
         assert!(!host_supports_kitty_graphics(None));
+    }
+
+    /// A discarded retained body must reach the session as a failed result, or the presenter's
+    /// in-flight mark for that source never clears and the source stays blank.
+    #[test]
+    fn a_discarded_retained_body_reports_failure_once_and_timed_media_does_not() {
+        let (sender, receiver) = mpsc::channel();
+        let writer = BridgeClientSender::new(move |message| {
+            sender.send(message).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "test message receiver closed")
+            })
+        });
+        let key = BridgeSourceKey {
+            producer: 2,
+            context: 1,
+            surface: 1,
+            track: 4,
+        };
+        let media = |delivery_id, last| BridgeMedia {
+            generation: 24,
+            delivery_id,
+            source: key,
+            record_type: vivid_protocol::messages::RASTER_FRAME,
+            offset: 0,
+            total: 0,
+            last,
+            bytes: Vec::new(),
+        };
+
+        reject_retained_body(&writer, 9, &media(0, false));
+        reject_retained_body(&writer, 9, &media(17, true));
+        assert!(receiver.try_recv().is_err());
+
+        reject_retained_body(&writer, 9, &media(0, true));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientMessage::BridgeRetainedResult {
+                bridge_instance_id: 9,
+                source,
+                delivered: false,
+            } if source == key
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     fn test_surface(key: BridgeSourceKey) -> BridgeSurface {
