@@ -15,6 +15,7 @@ mod ipc;
 mod layout;
 mod layout_file;
 mod lease;
+mod logging;
 mod media;
 mod media_trace;
 mod metrics;
@@ -55,6 +56,13 @@ struct Cli {
     /// Print the release-matched vvmux automation skill.
     #[arg(long, global = true)]
     skill: bool,
+    /// Append a diagnostic log to this file (off by default; also `VVMUX_LOG_FILE`). The session
+    /// server it starts logs to the same file.
+    #[arg(long, global = true, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+    /// Verbosity of the diagnostic log (default debug; also `VVMUX_LOG_LEVEL`).
+    #[arg(long, global = true, value_enum)]
+    log_level: Option<logging::LogLevel>,
     #[command(subcommand)]
     command: Option<Box<Command>>,
 }
@@ -334,12 +342,19 @@ fn main() {
 
 fn main_entry() {
     if let Err(error) = run(Cli::parse()) {
+        log::error!("exiting with error: {error} (kind {:?})", error.kind());
         eprintln!("vvmux: {error}");
         std::process::exit(1);
     }
 }
 
 fn run(cli: Cli) -> io::Result<()> {
+    let role = match cli.command.as_deref() {
+        Some(Command::Server { .. }) => "server",
+        _ => "client",
+    };
+    logging::init(cli.log_file.as_deref(), cli.log_level, role);
+    log::debug!("argv: {:?}", std::env::args_os().collect::<Vec<_>>());
     if cli.skill {
         print!("{}", include_str!("../skills/vvmux/SKILL.md"));
         return Ok(());

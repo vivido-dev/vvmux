@@ -1418,6 +1418,25 @@ the matching secret `VVMUX_UPDATE_SIGNING_KEY_PEM`; local builds intentionally c
 development key. `vvmux api schema --json` emits a deterministic Draft 2020-12 document tagged with
 the exact VVMX version for client/tooling discovery.
 
+## Diagnostic log
+
+For failures that come and go, such as a launch or attach that fails once and then works, vvmux can
+append a log of what it did. It is off by default and writes nothing unless asked:
+
+```sh
+vvmux --log-file ~/vvmux.log                 # any command; the file is created 0600
+vvmux --log-file ~/vvmux.log --log-level trace
+export VVMUX_LOG_FILE=~/vvmux.log            # same, without repeating the flag
+```
+
+`--log-level` is `error`, `warn`, `info`, `debug` (the default once logging is on), or `trace`, and
+can also be set with `VVMUX_LOG_LEVEL`. A session server started by a logging client logs to the
+same file, so one file shows both sides. Each line carries a UTC timestamp, the process role
+(`client` or `server`), and the pid. It records launch arguments, server spawn and readiness,
+connect retries, attach rejections, media-bridge failures, the error a command exits with, and
+panics. Pane contents and keystrokes are never logged, but paths and session names are, so review
+the file before sharing it. The file is never rotated or truncated.
+
 ## Windows troubleshooting
 
 | Host terminal | Supported profile |

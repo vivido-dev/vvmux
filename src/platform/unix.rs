@@ -242,6 +242,7 @@ impl DaemonLauncher {
         if let Some(path) = layout_path {
             command.arg("--layout").arg(path);
         }
+        command.args(crate::logging::server_args());
         command
             .arg("--ready-handle")
             .arg(writer_descriptor.to_string())

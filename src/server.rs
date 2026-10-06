@@ -39,11 +39,16 @@ pub fn run(
     layout_path: Option<PathBuf>,
     ready_handle: Option<usize>,
 ) -> io::Result<()> {
+    log::info!("server starting: session={name} config={config_path:?} layout={layout_path:?}");
     platform::prepare_server_process();
     let mut readiness = platform::ReadinessWriter::from_metadata(ready_handle)?;
-    match run_inner(name, config_path, layout_path, &mut readiness) {
-        Ok(()) => Ok(()),
+    match run_inner(name.clone(), config_path, layout_path, &mut readiness) {
+        Ok(()) => {
+            log::info!("server for session {name} exited cleanly");
+            Ok(())
+        }
         Err(error) => {
+            log::error!("server for session {name} failed: {error}");
             readiness.failure(&error);
             Err(error)
         }
@@ -148,10 +153,12 @@ fn run_inner(
     install_signal_forwarder(actor.clone())
         .map_err(|error| context("install signal handler", error))?;
     readiness.success()?;
+    log::info!("server ready, accepting clients");
 
     while !actor.shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok(stream) => {
+                log::debug!("accepted client connection");
                 let actor = actor.clone();
                 thread::Builder::new()
                     .name("vvmux-client-ipc".into())
@@ -162,6 +169,7 @@ fn run_inner(
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
+                log::error!("accept failed, shutting down server: {error}");
                 paths.remove_instance(&registry);
                 return Err(error);
             }

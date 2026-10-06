@@ -792,6 +792,10 @@ impl DaemonLauncher {
             command_line.push_str(" --layout ");
             command_line.push_str(&quote_windows(&path.to_string_lossy()));
         }
+        for argument in crate::logging::server_args() {
+            command_line.push(' ');
+            command_line.push_str(&quote_windows(&argument.to_string_lossy()));
+        }
         let application = wide_os(executable.as_os_str())?;
         let mut command_line = wide_os(OsStr::new(&command_line))?;
         let environment = daemon_environment()?;

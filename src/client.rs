@@ -141,15 +141,23 @@ pub fn attach(
     target: crate::ipc::AttachmentTarget,
     config_path: Option<&Path>,
 ) -> io::Result<()> {
+    log::info!("attach: session={name} create={create} target={target:?} join={join:?}");
     let client_config = crate::config::Config::load(config_path)?;
     let (mut reader, writer) = match crate::server::connect(name) {
-        Ok(connection) => connection,
+        Ok(connection) => {
+            log::debug!("attach: connected to running session {name}");
+            connection
+        }
         Err(error) if create && is_missing_session(&error) => {
+            log::info!("attach: no live session {name} ({error}); starting a server");
             let layout = resolve_startup_layout(config_path, None)?;
             spawn_server(name, config_path, layout.as_deref())?;
             wait_for_server(name)?
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            log::error!("attach: cannot connect to session {name}: {error}");
+            return Err(error);
+        }
     };
 
     // Keep outer credentials exclusively in the foreground process. Zeroizing guarantees root
@@ -169,6 +177,11 @@ pub fn attach(
     let vivid = outer.is_some();
     let host_term = std::env::var_os("TERM");
     let kitty_graphics = host_supports_kitty_graphics(host_term.as_deref());
+    log::debug!(
+        "attach: outer vivid={vivid} TERM={host_term:?} kitty_graphics={kitty_graphics} \
+         control_endpoint={}",
+        std::env::var_os("VIVID_ENDPOINT_CONTROL").is_some()
+    );
     // Negotiate the attachment before entering raw/alternate-screen mode. A rejected attach must
     // remain an ordinary command error: changing terminal state here would visibly clear the
     // caller's Vivido window, and the later terminal teardown would hide the server's diagnostic.
@@ -184,6 +197,7 @@ pub fn attach(
         kitty_graphics,
         outer_identity(vivid, display),
     )?;
+    log::info!("attach: accepted by server, presenter={presenter}");
     let terminal = ClientTerminal::enter()?;
 
     let stopped = Arc::new(AtomicBool::new(false));
@@ -241,6 +255,9 @@ pub fn attach(
                         ) {
                             Ok(worker) => Some(worker),
                             Err(error) => {
+                                log::warn!(
+                                    "bridge worker failed to start, media disabled: {error}"
+                                );
                                 write_title(
                                     &output_thread,
                                     &format!("vvmux media disabled: {error}"),
@@ -250,6 +267,7 @@ pub fn attach(
                         }
                     }
                     Err(error) => {
+                        log::warn!("outer bridge connect failed, media disabled: {error}");
                         write_title(&output_thread, &format!("vvmux media disabled: {error}"));
                         None
                     }
@@ -715,6 +733,7 @@ fn request_attachment(
     match reader.recv_server()? {
         ServerMessage::Attached { presenter, .. } => Ok(presenter),
         ServerMessage::Error(message) => {
+            log::error!("attach rejected by server: {message}");
             Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
         }
         _ => Err(io::Error::new(
@@ -2510,21 +2529,40 @@ fn spawn_server(
     config_path: Option<&Path>,
     layout_path: Option<&Path>,
 ) -> io::Result<()> {
-    crate::platform::DaemonLauncher::launch(name, config_path, layout_path)
+    log::info!(
+        "spawning session server for {name} (config={config_path:?} layout={layout_path:?})"
+    );
+    let result = crate::platform::DaemonLauncher::launch(name, config_path, layout_path);
+    match &result {
+        Ok(()) => log::info!("session server for {name} reported ready"),
+        Err(error) => log::error!("session server for {name} failed to start: {error}"),
+    }
+    result
 }
 
 fn wait_for_server(name: &str) -> io::Result<(crate::ipc::RecordReader, SharedWriter)> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(3);
     let mut last_error = None;
+    let mut attempts = 0_u32;
     while Instant::now() < deadline {
+        attempts += 1;
         match crate::server::connect(name) {
-            Ok(connection) => return Ok(connection),
+            Ok(connection) => {
+                log::debug!(
+                    "connected to new server {name} after {attempts} attempt(s), {:?}",
+                    started.elapsed()
+                );
+                return Ok(connection);
+            }
             Err(error) => last_error = Some(error),
         }
         thread::sleep(Duration::from_millis(20));
     }
-    Err(last_error
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "server startup timed out")))
+    let error = last_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "server startup timed out"));
+    log::error!("gave up connecting to new server {name} after {attempts} attempt(s): {error}");
+    Err(error)
 }
 
 fn is_missing_session(error: &io::Error) -> bool {
