@@ -25,8 +25,6 @@ use zeroize::Zeroizing;
 const IDENTITY_SCHEMA: u32 = 1;
 const MAX_IDENTITY_RECORD_BYTES: u64 = 16 * 1024;
 const MAX_ENROLL_CODE_BYTES: usize = 4 * 1024;
-/// The domain-separated prefix bound into every tunnel handshake signature.
-pub(crate) const AUTH_DOMAIN: &[u8] = b"vvmux tunnel auth v1\0";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,19 +172,6 @@ impl MachineIdentity {
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(self.signing.sign(&message).to_bytes()))
     }
-
-    pub fn sign_handshake(&self, nonce: &[u8], hostname: &str, exporter: &[u8]) -> String {
-        let mut message = Vec::with_capacity(
-            AUTH_DOMAIN.len() + nonce.len() + hostname.len() + exporter.len() + 43,
-        );
-        message.extend_from_slice(AUTH_DOMAIN);
-        message.extend_from_slice(nonce);
-        message.extend_from_slice(hostname.as_bytes());
-        message.extend_from_slice(exporter);
-        message.extend_from_slice(self.machine_id().as_bytes());
-        let signature = self.signing.sign(&message);
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())
-    }
 }
 
 /// Race-free reservation of an identity destination. Creating this before the
@@ -267,32 +252,6 @@ fn auth_sibling(name: &str) -> io::Result<PathBuf> {
     {
         Ok(crate::platform::windows_runtime_root()?.join(name))
     }
-}
-
-/// Verify a handshake signature. The integration test server reimplements this
-/// tiny check with the domain constant duplicated, because a binary crate cannot
-/// import it; the handshake test proves the two agree.
-#[cfg(test)]
-pub(crate) fn verify_handshake(
-    public_key: &VerifyingKey,
-    machine_id: &str,
-    nonce: &[u8],
-    hostname: &str,
-    exporter: &[u8],
-    signature: &[u8],
-) -> bool {
-    let mut message = Vec::with_capacity(
-        AUTH_DOMAIN.len() + nonce.len() + hostname.len() + exporter.len() + machine_id.len(),
-    );
-    message.extend_from_slice(AUTH_DOMAIN);
-    message.extend_from_slice(nonce);
-    message.extend_from_slice(hostname.as_bytes());
-    message.extend_from_slice(exporter);
-    message.extend_from_slice(machine_id.as_bytes());
-    let Ok(signature) = ed25519_dalek::Signature::from_slice(signature) else {
-        return false;
-    };
-    public_key.verify_strict(&message, &signature).is_ok()
 }
 
 #[cfg(unix)]
@@ -412,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_generates_loads_and_signs_round_trip() {
+    fn identity_generates_and_loads_round_trip() {
         let directory = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -420,37 +379,6 @@ mod tests {
         let generated = MachineIdentity::generate(&path).unwrap();
         let loaded = MachineIdentity::load(&path).unwrap();
         assert_eq!(generated.machine_id(), loaded.machine_id());
-
-        let nonce = b"0123456789abcdef0123456789abcdef";
-        let signature = loaded.sign_handshake(nonce, "vvmux.example", &[7; 32]);
-        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(signature)
-            .unwrap();
-        assert!(verify_handshake(
-            &loaded.public_key(),
-            &loaded.machine_id(),
-            nonce,
-            "vvmux.example",
-            &[7; 32],
-            &signature
-        ));
-        // A different hostname or nonce must fail verification.
-        assert!(!verify_handshake(
-            &loaded.public_key(),
-            &loaded.machine_id(),
-            nonce,
-            "other.example",
-            &[7; 32],
-            &signature
-        ));
-        assert!(!verify_handshake(
-            &loaded.public_key(),
-            &loaded.machine_id(),
-            b"fedcba9876543210fedcba9876543210",
-            "vvmux.example",
-            &[7; 32],
-            &signature
-        ));
     }
 
     #[test]

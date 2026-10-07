@@ -18,7 +18,8 @@ Tickets must be presented in-band on v2 data legs, not URLs, headers, or subprot
 Relay sends `{type:"challenge",protocol:2,nonce,hostname}`. `hostname` now contains the canonical
 public origin (retained field name for the control codec). Canonical origin: lowercase ASCII/IDNA
 host, https scheme, no path/query/fragment/credentials, omit default 443; explicit nondefault port
-is retained. Loopback development may use http and omit default 80. Client derives the expected
+is retained. Client fixtures may use loopback http and omit default 80; the deployed relay configuration
+requires a canonical HTTPS public origin, including when HAProxy is on the same host. Client derives the expected
 origin from its configured deployment and compares exactly before signing; no redirects allowed.
 
 nonce is canonical unpadded base64url of 32 cryptographically random bytes. It also identifies

@@ -1045,7 +1045,8 @@ integration shape.
 
 `vvmux serve --connect https://host --acknowledge-content-visible-gateway` opens no listener at
 all. The gateway authenticates to a vvmux_server deployment with an enrolled Ed25519 identity and
-holds one outbound VVTUN/1 tunnel; the deployment dials one additional leg per browser socket, and
+holds one outbound VVTUN/2 WebSocket control connection through HAProxy on public port 443;
+the gateway opens an outbound leg per browser socket, and
 the same VVWS/1 and Vivid loops run on the legs. This is how a machine behind NAT becomes reachable
 from a browser anywhere.
 
@@ -1069,11 +1070,13 @@ started with `--allow-kill`, which additionally enables the `kill_session` VVWS 
 `--allow-account` is repeatable and bounds which authenticated accounts the deployment may present
 when opening legs; without it, any account is accepted. The visibility acknowledgement is required
 for a non-loopback deployment because the relay necessarily sees terminal and media bytes. An
-`https://` deployment base is canonical; an exact `wss://.../t/v1/control` URL forces the WebSocket
-mapping. Plain `http://` or `ws://` is accepted for loopback development only. The tunnel reconnects
+`https://` deployment base is canonical; an exact `wss://.../t/v2/control` URL selects the same
+WebSocket mapping. `auto` and `websocket` use this carrier without a WebTransport probe. Plain `http://` or `ws://` is accepted for loopback development only. The tunnel reconnects
 with full-jittered exponential backoff and survives a deployment restart; sessions are untouched by
 tunnel loss, because the hidden session daemon is fully detached from the gateway. See
-[VVTUN-1.md](VVTUN-1.md) for the tunnel protocol.
+[VVTUN-2.md](VVTUN-2.md) for the tunnel protocol. Dashboard list/create uses bounded control
+metadata messages and owner-scoped operation IDs; uncertain creation results are queried, never
+automatically replayed. Existing local daemon protocols and enrollment identities are unchanged.
 
 ## Default keys
 

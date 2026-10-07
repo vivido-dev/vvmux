@@ -1,4 +1,4 @@
-//! Outbound machine tunnel client (`vvmux serve --connect`), VVTUN/1.
+//! Outbound machine tunnel client (`vvmux serve --connect`), VVTUN/2.
 //!
 //! The gateway dials out; it opens no listener. It authenticates with an enrolled
 //! Ed25519 identity, holds one control tunnel, and dials one data leg per browser
@@ -32,14 +32,12 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use super::identity::MachineIdentity;
 use super::protocol::{MAX_FRAME_BYTES, VERSION as VVWS_VERSION};
 use super::transport::{
-    Frame, FrameSink, FrameStream, QuicMapping, TungsteniteSink, TungsteniteStream, TunnelStream,
+    Frame, FrameSink, FrameStream, TungsteniteSink, TungsteniteStream, TunnelStream,
 };
 use super::{GatewayState, TunnelContext, vivid};
 
 /// The control-tunnel subprotocol.
-pub(crate) const TUNNEL_SUBPROTOCOL: &str = "vvtun.v1";
-/// Label used to export the tunnel binding key from the TLS session (VVTUN-1).
-const EXPORTER_LABEL: &[u8] = b"EXPORTER-VVTUN-1";
+pub(crate) const TUNNEL_SUBPROTOCOL: &str = "vvtun.v2";
 
 const CONTROL_MAX_BYTES: usize = 64 * 1024;
 const MAX_TUNNEL_LEGS: usize = 32;
@@ -58,8 +56,7 @@ pub(crate) struct ConnectOptions {
     pub allow_accounts: Vec<String>,
     pub allow_kill: bool,
     pub carrier: TunnelCarrier,
-    pub certificate_sha256: Vec<String>,
-    /// Test and diagnostic knobs; the defaults are the VVTUN-1 constants.
+    /// Test and diagnostic knobs; the defaults are the VVTUN/2 defaults.
     pub heartbeat: Option<Duration>,
     pub miss_limit: Option<u32>,
     pub handshake_timeout: Option<Duration>,
@@ -68,11 +65,10 @@ pub(crate) struct ConnectOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum TunnelCarrier {
     Auto,
-    Webtransport,
     Websocket,
 }
 
-/// Strict VVTUN/1 server-to-gateway control frames.
+/// Strict VVTUN/2 server-to-gateway control frames.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ServerControl {
@@ -126,7 +122,7 @@ enum ServerControl {
     },
 }
 
-/// Strict VVTUN/1 gateway-to-server control frames.
+/// Strict VVTUN/2 gateway-to-server control frames.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum ClientControl {
@@ -161,9 +157,7 @@ struct TunnelRunner {
     url: String,
     hostname: String,
     leg_url: String,
-    webtransport_url: Option<String>,
     carrier: TunnelCarrier,
-    certificate_hashes: Vec<wtransport::tls::Sha256Digest>,
     identity: MachineIdentity,
     state: GatewayState,
     allow_accounts: HashSet<String>,
@@ -179,7 +173,6 @@ struct ConnectEndpoints {
     control_url: String,
     hostname: String,
     leg_url: String,
-    webtransport_url: Option<String>,
     requires_content_acknowledgement: bool,
 }
 
@@ -205,32 +198,11 @@ pub(crate) fn run_connect(
             ),
         )
     })?;
-    let certificate_hashes = options
-        .certificate_sha256
-        .iter()
-        .map(|value| {
-            let bytes = hex::decode(value).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid tunnel certificate hash",
-                )
-            })?;
-            let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "tunnel certificate SHA-256 must contain 64 hexadecimal digits",
-                )
-            })?;
-            Ok(wtransport::tls::Sha256Digest::new(bytes))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
     let runner = TunnelRunner {
         url: endpoints.control_url,
         hostname: endpoints.hostname,
         leg_url: endpoints.leg_url,
-        webtransport_url: endpoints.webtransport_url,
         carrier: options.carrier,
-        certificate_hashes,
         identity,
         state,
         allow_accounts: options.allow_accounts.into_iter().collect(),
@@ -248,8 +220,8 @@ pub(crate) fn run_connect(
     runtime.block_on(run_reconnect_loop(&runner))
 }
 
-/// Validate a deployment base or an explicit WebSocket fallback URL and derive
-/// the two W3 WebSocket endpoints. HTTPS is the canonical public form.
+/// Validate a deployment base or an explicit WebSocket URL and derive
+/// the VVTUN/2 WebSocket endpoints. HTTPS is the canonical public form.
 fn split_urls(url: &str) -> io::Result<ConnectEndpoints> {
     let parsed = url::Url::parse(url).map_err(|error| {
         io::Error::new(
@@ -267,11 +239,11 @@ fn split_urls(url: &str) -> io::Result<ConnectEndpoints> {
             "--connect must not contain credentials, a query, or a fragment",
         ));
     }
-    let (scheme, tls, base_only, webtransport) = match parsed.scheme() {
-        "https" => ("wss", true, true, true),
-        "http" => ("ws", false, true, false),
-        "wss" => ("wss", true, false, false),
-        "ws" => ("ws", false, false, false),
+    let (scheme, tls, base_only) = match parsed.scheme() {
+        "https" => ("wss", true, true),
+        "http" => ("ws", false, true),
+        "wss" => ("wss", true, false),
+        "ws" => ("ws", false, false),
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -318,7 +290,6 @@ fn split_urls(url: &str) -> io::Result<ConnectEndpoints> {
         control_url: format!("{scheme}://{authority}/t/v2/control"),
         hostname: format!("{}://{authority}", if tls { "https" } else { "http" }),
         leg_url: format!("{scheme}://{authority}/t/v2/leg"),
-        webtransport_url: webtransport.then(|| format!("https://{authority}/t/v1/webtransport")),
         requires_content_acknowledgement: !loopback,
     })
 }
@@ -355,8 +326,6 @@ impl From<io::Error> for TunnelAttemptError {
 
 struct ConnectedTunnel {
     socket: TunnelStream,
-    #[cfg(test)]
-    exporter: Option<[u8; 32]>,
 }
 
 async fn run_reconnect_loop(runner: &TunnelRunner) -> io::Result<()> {
@@ -387,17 +356,7 @@ async fn run_reconnect_loop(runner: &TunnelRunner) -> io::Result<()> {
 
 async fn run_tunnel_once(runner: &TunnelRunner) -> Result<(bool, Option<u64>), TunnelAttemptError> {
     match runner.carrier {
-        TunnelCarrier::Websocket => run_websocket_tunnel_once(runner).await,
-        TunnelCarrier::Webtransport => {
-            let url = runner.webtransport_url.as_deref().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "WebTransport requires an https deployment base",
-                )
-            })?;
-            run_webtransport_tunnel_once(runner, url).await
-        }
-        TunnelCarrier::Auto => run_websocket_tunnel_once(runner).await,
+        TunnelCarrier::Auto | TunnelCarrier::Websocket => run_websocket_tunnel_once(runner).await,
     }
 }
 
@@ -405,8 +364,12 @@ async fn run_tunnel_once(runner: &TunnelRunner) -> Result<(bool, Option<u64>), T
 async fn run_websocket_tunnel_once(
     runner: &TunnelRunner,
 ) -> Result<(bool, Option<u64>), TunnelAttemptError> {
-    let connected =
-        connect_with_exporter(&runner.url, &["vvtun.v2".to_owned()], CONTROL_MAX_BYTES).await?;
+    let connected = connect_websocket(
+        &runner.url,
+        &[TUNNEL_SUBPROTOCOL.to_owned()],
+        CONTROL_MAX_BYTES,
+    )
+    .await?;
     let stream = connected.socket;
 
     let (mut sink, mut reader) = {
@@ -587,443 +550,6 @@ async fn run_websocket_tunnel_once(
     Ok(outcome)
 }
 
-struct WebTransportLegOffer {
-    kind: LegKind,
-    ticket: [u8; 32],
-    subprotocols: Vec<String>,
-}
-
-struct AcceptedWebTransportLeg {
-    send: wtransport::SendStream,
-    recv: wtransport::RecvStream,
-    generation: u64,
-    leg_id: u64,
-    kind: LegKind,
-    ticket: [u8; 32],
-}
-
-async fn run_webtransport_tunnel_once(
-    runner: &TunnelRunner,
-    url: &str,
-) -> Result<(bool, Option<u64>), TunnelAttemptError> {
-    let client_config = if runner.certificate_hashes.is_empty() {
-        wtransport::ClientConfig::default()
-    } else {
-        wtransport::ClientConfig::builder()
-            .with_bind_default()
-            .with_server_certificate_hashes(runner.certificate_hashes.clone())
-            .build()
-    };
-    let endpoint = wtransport::Endpoint::client(client_config).map_err(io::Error::other)?;
-    let connect_options = wtransport::endpoint::ConnectOptions::builder(url)
-        .add_header("Sec-WebTransport-Protocol", TUNNEL_SUBPROTOCOL)
-        .build();
-    let connection = Arc::new(
-        endpoint
-            .connect(connect_options)
-            .await
-            .map_err(|error| io::Error::other(format!("WebTransport connect failed: {error}")))?,
-    );
-    let mut exporter = [0_u8; 32];
-    connection
-        .export_keying_material(&mut exporter, EXPORTER_LABEL, &[])
-        .map_err(io::Error::other)?;
-    let (mut control_send, mut control_recv) =
-        tokio::time::timeout(runner.handshake_timeout, connection.accept_bi())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control stream timed out"))?
-            .map_err(io::Error::other)?;
-    control_send.set_priority(120);
-
-    let challenge = tokio::time::timeout(
-        runner.handshake_timeout,
-        read_webtransport_control::<ServerControl>(&mut control_recv),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "initial challenge timed out"))??;
-    let ServerControl::Challenge {
-        protocol, nonce, ..
-    } = challenge
-    else {
-        return Err(io::Error::other("expected VVTUN challenge").into());
-    };
-    if protocol != 1 {
-        return Err(io::Error::other("unsupported VVTUN protocol version").into());
-    }
-    let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(nonce)
-        .map_err(|_| io::Error::other("challenge nonce is not base64url"))?;
-    if nonce.len() != 32 {
-        return Err(io::Error::other("challenge nonce must be 32 bytes").into());
-    }
-    let signature = runner
-        .identity
-        .sign_handshake(&nonce, &runner.hostname, &exporter);
-    write_webtransport_control(
-        &mut control_send,
-        &ClientControl::Auth {
-            machine_id: runner.identity.machine_id(),
-            signature,
-        },
-    )
-    .await?;
-    let authed = tokio::time::timeout(
-        runner.handshake_timeout,
-        read_webtransport_control::<ServerControl>(&mut control_recv),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "authentication timed out"))??;
-    let ServerControl::Authed {
-        protocol,
-        server_version,
-        ..
-    } = authed
-    else {
-        return Err(io::Error::other("expected VVTUN authed").into());
-    };
-    if protocol != 1 {
-        return Err(io::Error::other("unsupported VVTUN protocol version").into());
-    }
-    let server_version = bounded_ascii(&server_version, 64)?;
-    let authenticated = async {
-        let mut capabilities = vec![
-            "terminal-v1",
-            "session-list-v1",
-            "session-create-v1",
-            "vivid-bridge-v1",
-            "tunnel-attached-v1",
-            "webtransport-streams-v1",
-            "stream-priority-v1",
-        ];
-        if runner.allow_kill {
-            capabilities.push("session-kill-v1");
-        }
-        write_webtransport_control(
-            &mut control_send,
-            &ClientControl::MachineStatus {
-                vvmux_version: env!("CARGO_PKG_VERSION").to_owned(),
-                vvws_protocol: VVWS_VERSION,
-                capabilities: capabilities.into_iter().map(str::to_owned).collect(),
-            },
-        )
-        .await?;
-        println!("vvmux tunnel connected to {url} over WebTransport (server {server_version})");
-
-        // A dedicated reader preserves length-prefixed control sequencing. Polling
-        // `read_exact` directly in the select below would cancel it when a leg arrived.
-        let (control_frames, mut control_frame_receiver) = mpsc::channel(128);
-        let control_reader = tokio::spawn(async move {
-            loop {
-                let frame = read_webtransport_control::<ServerControl>(&mut control_recv).await;
-                let failed = frame.is_err();
-                if control_frames.send(frame).await.is_err() || failed {
-                    break;
-                }
-            }
-        });
-        let (reports, mut report_receiver) = mpsc::channel::<ClientControl>(128);
-        let mut offers = std::collections::HashMap::<u64, WebTransportLegOffer>::new();
-        let mut streams = std::collections::HashMap::<u64, AcceptedWebTransportLeg>::new();
-        let mut legs = std::collections::HashMap::<u64, tokio::task::JoinHandle<()>>::new();
-        let mut seen = HashSet::new();
-        let mut tunnel_generation: Option<u64> = None;
-        let mut heartbeat = tokio::time::interval(runner.heartbeat);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut ping_nonce = 0_u64;
-        let mut missed = 0_u32;
-        let mut outcome = (true, None);
-
-        loop {
-            tokio::select! {
-                incoming = control_frame_receiver.recv() => {
-                    missed = 0;
-                    match incoming {
-                        Some(Ok(ServerControl::Ping { nonce })) => write_webtransport_control(&mut control_send, &ClientControl::Pong { nonce }).await?,
-                        Some(Ok(ServerControl::Pong { .. })) => {},
-                        Some(Ok(ServerControl::OpenLeg { leg_id, kind, account, ticket, subprotocols, .. })) => {
-                            let offer = validate_webtransport_offer(runner, &mut seen, leg_id, &kind, &account, &ticket, subprotocols, &reports)?;
-                            if let Some(offer) = offer {
-                                offers.insert(leg_id, offer);
-                                if let Some(stream) = streams.remove(&leg_id) {
-                                    start_webtransport_leg(runner, &mut legs, &reports, stream, offers.remove(&leg_id).expect("offer inserted")).await;
-                                }
-                            }
-                        }
-                        Some(Ok(ServerControl::CloseLeg { leg_id, .. })) => {
-                            offers.remove(&leg_id);
-                            streams.remove(&leg_id);
-                            if let Some(handle) = legs.remove(&leg_id) { handle.abort(); }
-                        }
-                        Some(Ok(ServerControl::GoingAway { reconnect_after_seconds, .. })) => {
-                            outcome = (true, Some(reconnect_after_seconds));
-                            break;
-                        }
-                        Some(Ok(ServerControl::Challenge { .. } | ServerControl::Authed { .. } | ServerControl::SessionRequest { .. })) => {
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "out-of-sequence control frame"));
-                        }
-                        Some(Err(error)) => return Err(error),
-                        None => break,
-                    }
-                }
-                incoming = connection.accept_bi() => {
-                    if streams.len() >= MAX_TUNNEL_LEGS {
-                        return Err(io::Error::new(io::ErrorKind::OutOfMemory, "too many unpaired VVTUN streams"));
-                    }
-                    let (send, recv) = incoming.map_err(io::Error::other)?;
-                    let accepted = tokio::time::timeout(runner.handshake_timeout, read_leg_preface(send, recv))
-                        .await
-                        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "leg preface timed out"))??;
-                    if tunnel_generation.is_some_and(|generation| generation != accepted.generation) {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "mixed VVTUN generation"));
-                    }
-                    tunnel_generation.get_or_insert(accepted.generation);
-                    let leg_id = accepted.leg_id;
-                    if streams.insert(leg_id, accepted).is_some() {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate leg stream"));
-                    }
-                    if let Some(offer) = offers.remove(&leg_id) {
-                        let stream = streams.remove(&leg_id).expect("stream inserted");
-                        start_webtransport_leg(runner, &mut legs, &reports, stream, offer).await;
-                    }
-                }
-                report = report_receiver.recv() => match report {
-                    Some(report) => write_webtransport_control(&mut control_send, &report).await?,
-                    None => break,
-                },
-                _ = heartbeat.tick() => {
-                    ping_nonce = ping_nonce.wrapping_add(1);
-                    missed = missed.saturating_add(1);
-                    if missed > runner.miss_limit {
-                        break;
-                    }
-                    write_webtransport_control(&mut control_send, &ClientControl::Ping { nonce: ping_nonce }).await?;
-                }
-                _ = connection.closed() => break,
-            }
-        }
-        for handle in legs.into_values() {
-            handle.abort();
-        }
-        control_reader.abort();
-        connection.close(wtransport::VarInt::from_u32(0), b"reconnect");
-        drop(endpoint);
-        Ok(outcome)
-    };
-    authenticated.await.map_err(|error| TunnelAttemptError {
-        error,
-        retry_after_seconds: None,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_webtransport_offer(
-    runner: &TunnelRunner,
-    seen: &mut HashSet<u64>,
-    leg_id: u64,
-    kind: &str,
-    account: &str,
-    ticket: &str,
-    subprotocols: Vec<String>,
-    reports: &mpsc::Sender<ClientControl>,
-) -> io::Result<Option<WebTransportLegOffer>> {
-    let reject = |code: &str| {
-        let _ = reports.try_send(ClientControl::LegFailed {
-            leg_id,
-            code: code.to_owned(),
-        });
-        Ok(None)
-    };
-    if seen.contains(&leg_id) {
-        return reject("invalid_request");
-    }
-    if seen.len() >= MAX_SEEN_LEG_IDS {
-        return reject("capacity");
-    }
-    seen.insert(leg_id);
-    if !runner.allow_accounts.is_empty() && !runner.allow_accounts.contains(account) {
-        return reject("not_permitted");
-    }
-    let kind = match kind {
-        "vvws" => LegKind::Vvws,
-        "vivid" => LegKind::Vivid,
-        _ => return reject("invalid_request"),
-    };
-    let Ok(ticket) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(ticket) else {
-        return reject("ticket_rejected");
-    };
-    let Ok(ticket) = <[u8; 32]>::try_from(ticket) else {
-        return reject("ticket_rejected");
-    };
-    if subprotocols.len() > 8
-        || subprotocols
-            .iter()
-            .any(|value| value.is_empty() || value.len() > 256)
-    {
-        return reject("invalid_subprotocols");
-    }
-    Ok(Some(WebTransportLegOffer {
-        kind,
-        ticket,
-        subprotocols,
-    }))
-}
-
-async fn start_webtransport_leg(
-    runner: &TunnelRunner,
-    legs: &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
-    reports: &mpsc::Sender<ClientControl>,
-    stream: AcceptedWebTransportLeg,
-    offer: WebTransportLegOffer,
-) {
-    if stream.kind != offer.kind || stream.ticket != offer.ticket || legs.len() >= MAX_TUNNEL_LEGS {
-        let _ = reports.try_send(ClientControl::LegFailed {
-            leg_id: stream.leg_id,
-            code: "ticket_rejected".to_owned(),
-        });
-        return;
-    }
-    let permit = match runner.legs.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let _ = reports.try_send(ClientControl::LegFailed {
-                leg_id: stream.leg_id,
-                code: "capacity".to_owned(),
-            });
-            return;
-        }
-    };
-    let state = runner.state.clone();
-    let allow_kill = runner.allow_kill;
-    let reports = reports.clone();
-    let leg_id = stream.leg_id;
-    let handle = tokio::spawn(async move {
-        let _permit = permit;
-        let result = run_webtransport_leg(stream, offer, &state, allow_kill).await;
-        if let Err(error) = result {
-            let _ = reports.try_send(ClientControl::LegFailed {
-                leg_id,
-                code: leg_failure_code(&error),
-            });
-        }
-    });
-    legs.insert(leg_id, handle);
-}
-
-async fn run_webtransport_leg(
-    stream: AcceptedWebTransportLeg,
-    offer: WebTransportLegOffer,
-    state: &GatewayState,
-    allow_kill: bool,
-) -> io::Result<()> {
-    match offer.kind {
-        LegKind::Vvws => {
-            let (sink, reader) =
-                super::transport::quic(stream.send, stream.recv, QuicMapping::Framed);
-            super::handle_connection(
-                sink,
-                reader,
-                state.clone(),
-                None,
-                Some(TunnelContext { allow_kill }),
-            )
-            .await
-        }
-        LegKind::Vivid => {
-            let (broker, kind) = super::resolve_vivid_leg(&offer.subprotocols, state)
-                .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
-            let (sink, reader) =
-                super::transport::quic(stream.send, stream.recv, QuicMapping::RawBinary);
-            vivid::serve_socket(sink, reader, broker, kind).await
-        }
-    }
-}
-
-async fn read_leg_preface(
-    send: wtransport::SendStream,
-    mut recv: wtransport::RecvStream,
-) -> io::Result<AcceptedWebTransportLeg> {
-    let mut bytes = [0_u8; 64];
-    recv.read_exact(&mut bytes)
-        .await
-        .map_err(io::Error::other)?;
-    if &bytes[..8] != b"VVTLEG1\0" || bytes[29..32] != [0, 0, 0] {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid VVTUN leg preface",
-        ));
-    }
-    let generation = u64::from_be_bytes(bytes[8..16].try_into().expect("generation"));
-    let leg_id = u64::from_be_bytes(bytes[16..24].try_into().expect("leg id"));
-    let kind = match bytes[24] {
-        1 => LegKind::Vvws,
-        2 => LegKind::Vivid,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unknown leg kind",
-            ));
-        }
-    };
-    let priority = i32::from_be_bytes(bytes[25..29].try_into().expect("priority"));
-    if !matches!(priority, 0 | 60 | 80 | 100) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid VVTUN stream priority",
-        ));
-    }
-    send.set_priority(priority);
-    let ticket = bytes[32..64].try_into().expect("ticket");
-    Ok(AcceptedWebTransportLeg {
-        send,
-        recv,
-        generation,
-        leg_id,
-        kind,
-        ticket,
-    })
-}
-
-async fn write_webtransport_control<T: Serialize>(
-    send: &mut wtransport::SendStream,
-    value: &T,
-) -> io::Result<()> {
-    let encoded = serde_json::to_vec(value).map_err(io::Error::other)?;
-    if encoded.len() > CONTROL_MAX_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "VVTUN control object too large",
-        ));
-    }
-    let length = u32::try_from(encoded.len()).map_err(io::Error::other)?;
-    send.write_all(&length.to_be_bytes())
-        .await
-        .map_err(io::Error::other)?;
-    send.write_all(&encoded).await.map_err(io::Error::other)
-}
-
-async fn read_webtransport_control<T: serde::de::DeserializeOwned>(
-    recv: &mut wtransport::RecvStream,
-) -> io::Result<T> {
-    let mut length = [0_u8; 4];
-    recv.read_exact(&mut length)
-        .await
-        .map_err(io::Error::other)?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length > CONTROL_MAX_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "VVTUN control object too large",
-        ));
-    }
-    let mut encoded = vec![0_u8; length];
-    recv.read_exact(&mut encoded)
-        .await
-        .map_err(io::Error::other)?;
-    serde_json::from_slice(&encoded)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-/// Returns `Some(reconnect_after)` when the connection should end cleanly.
 async fn handle_server_frame<Si: FrameSink>(
     sink: &mut Si,
     legs: &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
@@ -1262,7 +788,7 @@ async fn run_leg(
         }
     };
     let offered = ["vvtun.leg.v2".to_owned()];
-    let connected = connect_with_exporter(leg_url, &offered, max_bytes)
+    let connected = connect_websocket(leg_url, &offered, max_bytes)
         .await
         .map_err(|failure| failure.error)?;
     let mut stream = connected.socket;
@@ -1339,17 +865,16 @@ async fn send_control<Si: FrameSink>(sink: &mut Si, control: &ClientControl) -> 
         .await
 }
 
-/// Connect and return the exporter-derived binding material for the TLS session,
-/// which is empty on a loopback plain `ws://` development connection.
-async fn connect_with_exporter(
+/// Connect through validated TLS, or the explicitly permitted loopback development carrier.
+async fn connect_websocket(
     url: &str,
     offered: &[String],
     max_bytes: usize,
 ) -> Result<ConnectedTunnel, TunnelAttemptError> {
-    connect_with_exporter_config(url, offered, max_bytes, None).await
+    connect_websocket_config(url, offered, max_bytes, None).await
 }
 
-async fn connect_with_exporter_config(
+async fn connect_websocket_config(
     url: &str,
     offered: &[String],
     max_bytes: usize,
@@ -1443,40 +968,7 @@ async fn connect_with_exporter_config(
                 }
                 other => io::Error::other(other).into(),
             })?;
-    Ok(ConnectedTunnel {
-        #[cfg(test)]
-        exporter: session_exporter(&socket, tls)?,
-        socket,
-    })
-}
-
-#[cfg(test)]
-fn session_exporter(socket: &TunnelStream, tls_required: bool) -> io::Result<Option<[u8; 32]>> {
-    let exporter = match socket.get_ref() {
-        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => {
-            let mut out = [0_u8; 32];
-            tls.get_ref()
-                .1
-                .export_keying_material(&mut out, EXPORTER_LABEL, None)
-                .map_err(|_| io::Error::other("TLS exporter derivation failed"))?;
-            Some(out)
-        }
-        _ => None,
-    };
-    require_exporter(tls_required, exporter)
-}
-
-#[cfg(test)]
-fn require_exporter(
-    tls_required: bool,
-    exporter: Option<[u8; 32]>,
-) -> io::Result<Option<[u8; 32]>> {
-    if tls_required && exporter.is_none() {
-        return Err(io::Error::other(
-            "TLS tunnel did not provide exporter binding material",
-        ));
-    }
-    Ok(exporter)
+    Ok(ConnectedTunnel { socket })
 }
 
 fn parse_retry_after(value: &HeaderValue, now: SystemTime) -> Option<u64> {
@@ -1543,20 +1035,8 @@ mod tests {
             "wss://vvmux.example:8443/t/v2/control"
         );
         assert_eq!(endpoints.leg_url, "wss://vvmux.example:8443/t/v2/leg");
-        assert_eq!(
-            endpoints.webtransport_url.as_deref(),
-            Some("https://vvmux.example:8443/t/v1/webtransport")
-        );
         assert_eq!(endpoints.hostname, "https://vvmux.example:8443");
         assert!(endpoints.requires_content_acknowledgement);
-
-        assert!(
-            split_urls("wss://vvmux.example/t/v2/control")
-                .unwrap()
-                .webtransport_url
-                .is_none(),
-            "an explicit WebSocket endpoint must force the fallback mapping"
-        );
 
         for bad in [
             "https://user@vvmux.example",
@@ -1567,16 +1047,6 @@ mod tests {
         ] {
             assert!(split_urls(bad).is_err(), "accepted {bad}");
         }
-    }
-
-    #[test]
-    fn tls_exporter_is_required_and_plaintext_uses_an_empty_binding() {
-        assert!(require_exporter(true, None).is_err());
-        assert_eq!(require_exporter(false, None).unwrap(), None);
-        assert_eq!(
-            require_exporter(true, Some([7; 32])).unwrap(),
-            Some([7; 32])
-        );
     }
 
     #[test]
@@ -1602,7 +1072,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_rustls_session_derives_the_same_exporter_on_both_ends() {
+    async fn v2_connects_with_verified_rustls_roots() {
         let rcgen::CertifiedKey {
             cert,
             signing_key: key_pair,
@@ -1627,19 +1097,12 @@ mod tests {
             Err(error) => panic!("TLS test listener bind failed: {error}"),
         };
         let port = listener.local_addr().unwrap().port();
-        let (exporter_sender, exporter_receiver) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            let mut exporter = [0_u8; 32];
-            tls.get_ref()
-                .1
-                .export_keying_material(&mut exporter, EXPORTER_LABEL, None)
-                .unwrap();
             let mut socket = tokio_tungstenite::accept_hdr_async(tls, select_test_subprotocol)
                 .await
                 .unwrap();
-            let _ = exporter_sender.send(exporter);
             let _ = socket.next().await;
         });
 
@@ -1654,18 +1117,14 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth(),
         );
-        let connected = connect_with_exporter_config(
-            &format!("wss://127.0.0.1:{port}/t/v1/control"),
+        let connected = connect_websocket_config(
+            &format!("wss://127.0.0.1:{port}/t/v2/control"),
             &[TUNNEL_SUBPROTOCOL.to_owned()],
             CONTROL_MAX_BYTES,
             Some(client_config),
         )
         .await
         .unwrap();
-        let client_exporter = connected.exporter.expect("TLS exporter missing");
-        let server_exporter = exporter_receiver.await.unwrap();
-        assert_eq!(client_exporter, server_exporter);
-        assert_ne!(client_exporter, [0; 32]);
         drop(connected);
         server.await.unwrap();
     }
