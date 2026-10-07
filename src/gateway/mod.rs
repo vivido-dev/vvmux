@@ -1089,7 +1089,7 @@ async fn handle_session_message(
             if bytes.is_empty() {
                 writer.send(Frame::Binary(bytes.into()))?;
             } else {
-                for chunk in bytes.chunks(MAX_FRAME_BYTES) {
+                for chunk in bytes.chunks(vivid::MAX_SOCKET_CHUNK) {
                     writer.send(Frame::Binary(Payload::copy_from_slice(chunk)))?;
                 }
             }
