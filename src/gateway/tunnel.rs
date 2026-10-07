@@ -781,11 +781,7 @@ async fn run_leg(
 ) -> io::Result<()> {
     let max_bytes = match kind {
         LegKind::Vvws => MAX_FRAME_BYTES,
-        LegKind::Vivid => {
-            vivid_protocol::HARD_MAX_RECORD_BODY as usize
-                + vivid_protocol::wire::HEADER_SIZE
-                + vivid_protocol::wire::PREFACE_SIZE
-        }
+        LegKind::Vivid => vivid::MAX_SOCKET_CHUNK,
     };
     let offered = ["vvtun.leg.v2".to_owned()];
     let connected = connect_websocket(leg_url, &offered, max_bytes)

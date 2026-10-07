@@ -345,12 +345,9 @@ async fn vivid_upgrade(
         )
             .into_response();
     };
-    let maximum = vivid_protocol::HARD_MAX_RECORD_BODY as usize
-        + vivid_protocol::wire::HEADER_SIZE
-        + vivid_protocol::wire::PREFACE_SIZE;
     websocket
-        .max_frame_size(maximum)
-        .max_message_size(maximum)
+        .max_frame_size(vivid::MAX_SOCKET_CHUNK)
+        .max_message_size(vivid::MAX_SOCKET_CHUNK)
         .protocols([vivid::SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
             let _permit = permit;
