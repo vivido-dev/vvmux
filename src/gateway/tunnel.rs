@@ -18,16 +18,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use base64::Engine;
-use futures_util::StreamExt as _;
+use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_tungstenite::Connector;
+use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::{RETRY_AFTER, SEC_WEBSOCKET_PROTOCOL};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{MaybeTlsStream, client_async_tls_with_config};
 
 use super::identity::MachineIdentity;
 use super::protocol::{MAX_FRAME_BYTES, VERSION as VVWS_VERSION};
@@ -38,10 +38,6 @@ use super::{GatewayState, TunnelContext, vivid};
 
 /// The control-tunnel subprotocol.
 pub(crate) const TUNNEL_SUBPROTOCOL: &str = "vvtun.v1";
-/// The data-leg subprotocol.
-pub(crate) const LEG_SUBPROTOCOL: &str = "vvtun.leg.v1";
-/// Prefix of the one-use leg ticket subprotocol.
-pub(crate) const LEG_TICKET_PREFIX: &str = "vvtun.ticket.";
 /// Label used to export the tunnel binding key from the TLS session (VVTUN-1).
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-VVTUN-1";
 
@@ -272,12 +268,12 @@ fn split_urls(url: &str) -> io::Result<ConnectEndpoints> {
     let valid_path = if base_only {
         path.is_empty() || path == "/"
     } else {
-        path.is_empty() || path == "/" || path == "/t/v1/control"
+        path.is_empty() || path == "/" || path == "/t/v2/control"
     };
     if !valid_path {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--connect must be a deployment base or the exact /t/v1/control WebSocket endpoint",
+            "--connect must be a deployment base or the exact /t/v2/control WebSocket endpoint",
         ));
     }
     let Some(host) = parsed.host_str() else {
@@ -304,9 +300,9 @@ fn split_urls(url: &str) -> io::Result<ConnectEndpoints> {
         None => unreachable!("host_str was checked above"),
     };
     Ok(ConnectEndpoints {
-        control_url: format!("{scheme}://{authority}/t/v1/control"),
-        hostname: host.to_owned(),
-        leg_url: format!("{scheme}://{authority}/t/v1/leg"),
+        control_url: format!("{scheme}://{authority}/t/v2/control"),
+        hostname: format!("{}://{authority}", if tls { "https" } else { "http" }),
+        leg_url: format!("{scheme}://{authority}/t/v2/leg"),
         webtransport_url: webtransport.then(|| format!("https://{authority}/t/v1/webtransport")),
         requires_content_acknowledgement: !loopback,
     })
@@ -331,7 +327,6 @@ fn full_jitter(cap: Duration) -> Duration {
 struct TunnelAttemptError {
     error: io::Error,
     retry_after_seconds: Option<u64>,
-    fallback_allowed: bool,
 }
 
 impl From<io::Error> for TunnelAttemptError {
@@ -339,13 +334,13 @@ impl From<io::Error> for TunnelAttemptError {
         Self {
             error,
             retry_after_seconds: None,
-            fallback_allowed: true,
         }
     }
 }
 
 struct ConnectedTunnel {
     socket: TunnelStream,
+    #[cfg(test)]
     exporter: Option<[u8; 32]>,
 }
 
@@ -387,23 +382,7 @@ async fn run_tunnel_once(runner: &TunnelRunner) -> Result<(bool, Option<u64>), T
             })?;
             run_webtransport_tunnel_once(runner, url).await
         }
-        TunnelCarrier::Auto => {
-            if let Some(url) = runner.webtransport_url.as_deref() {
-                match run_webtransport_tunnel_once(runner, url).await {
-                    Ok(outcome) => Ok(outcome),
-                    Err(error) if error.fallback_allowed => {
-                        eprintln!(
-                            "vvmux tunnel: WebTransport unavailable before authentication: {}; using WebSocket fallback",
-                            error.error
-                        );
-                        run_websocket_tunnel_once(runner).await
-                    }
-                    Err(error) => Err(error),
-                }
-            } else {
-                run_websocket_tunnel_once(runner).await
-            }
-        }
+        TunnelCarrier::Auto => run_websocket_tunnel_once(runner).await,
     }
 }
 
@@ -411,20 +390,9 @@ async fn run_tunnel_once(runner: &TunnelRunner) -> Result<(bool, Option<u64>), T
 async fn run_websocket_tunnel_once(
     runner: &TunnelRunner,
 ) -> Result<(bool, Option<u64>), TunnelAttemptError> {
-    let connected = connect_with_exporter(
-        &runner.url,
-        &[TUNNEL_SUBPROTOCOL.to_owned()],
-        CONTROL_MAX_BYTES,
-    )
-    .await?;
-    let ConnectedTunnel {
-        socket: stream,
-        exporter,
-    } = connected;
-    let exporter = exporter
-        .as_ref()
-        .map(|bytes| bytes.as_slice())
-        .unwrap_or_default();
+    let connected =
+        connect_with_exporter(&runner.url, &["vvtun.v2".to_owned()], CONTROL_MAX_BYTES).await?;
+    let stream = connected.socket;
 
     let (mut sink, mut reader) = {
         let (sink, stream) = stream.split();
@@ -442,13 +410,22 @@ async fn run_websocket_tunnel_once(
             )
         })?;
     let ServerControl::Challenge {
-        protocol, nonce, ..
+        protocol,
+        nonce,
+        hostname,
     } = challenge
     else {
         return Err(io::Error::other("expected VVTUN challenge").into());
     };
-    if protocol != 1 {
+    if protocol != 2 {
         return Err(io::Error::other("unsupported VVTUN protocol version").into());
+    }
+    if hostname != runner.hostname {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "deployment audience mismatch",
+        )
+        .into());
     }
     let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(nonce.as_str())
@@ -456,9 +433,12 @@ async fn run_websocket_tunnel_once(
     if nonce.len() != 32 {
         return Err(io::Error::other("challenge nonce must be 32 bytes").into());
     }
+    let nonce: [u8; 32] = nonce
+        .try_into()
+        .map_err(|_| io::Error::other("invalid nonce"))?;
     let signature = runner
         .identity
-        .sign_handshake(&nonce, &runner.hostname, exporter);
+        .sign_handshake_v2(&nonce, &runner.hostname)?;
     send_control(
         &mut sink,
         &ClientControl::Auth {
@@ -480,7 +460,7 @@ async fn run_websocket_tunnel_once(
     else {
         return Err(io::Error::other("expected VVTUN authed").into());
     };
-    if protocol != 1 {
+    if protocol != 2 {
         return Err(io::Error::other("unsupported VVTUN protocol version").into());
     }
     let server_version = bounded_ascii(&server_version, 64)?;
@@ -816,7 +796,6 @@ async fn run_webtransport_tunnel_once(
     authenticated.await.map_err(|error| TunnelAttemptError {
         error,
         retry_after_seconds: None,
-        fallback_allowed: false,
     })
 }
 
@@ -1240,14 +1219,23 @@ async fn run_leg(
                 + vivid_protocol::wire::PREFACE_SIZE
         }
     };
-    let offered = [
-        LEG_SUBPROTOCOL.to_owned(),
-        format!("{LEG_TICKET_PREFIX}{ticket}"),
-    ];
+    let offered = ["vvtun.leg.v2".to_owned()];
     let connected = connect_with_exporter(leg_url, &offered, max_bytes)
         .await
         .map_err(|failure| failure.error)?;
-    let stream = connected.socket;
+    let mut stream = connected.socket;
+    let ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(ticket)
+        .map_err(|_| io::Error::other("invalid leg ticket"))?;
+    if ticket.len() != 32 {
+        return Err(io::Error::other("invalid leg ticket"));
+    }
+    stream
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            ticket.into(),
+        ))
+        .await
+        .map_err(io::Error::other)?;
     let (sink, reader) = {
         let (sink, stream) = stream.split();
         (TungsteniteSink(sink), TungsteniteStream(stream))
@@ -1410,18 +1398,21 @@ async fn connect_with_exporter_config(
                             ),
                         ),
                         retry_after_seconds,
-                        fallback_allowed: true,
                     }
                 }
                 other => io::Error::other(other).into(),
             })?;
-    let exporter = session_exporter(&socket, tls)?;
-    Ok(ConnectedTunnel { socket, exporter })
+    Ok(ConnectedTunnel {
+        #[cfg(test)]
+        exporter: session_exporter(&socket, tls)?,
+        socket,
+    })
 }
 
+#[cfg(test)]
 fn session_exporter(socket: &TunnelStream, tls_required: bool) -> io::Result<Option<[u8; 32]>> {
     let exporter = match socket.get_ref() {
-        MaybeTlsStream::Rustls(tls) => {
+        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => {
             let mut out = [0_u8; 32];
             tls.get_ref()
                 .1
@@ -1434,6 +1425,7 @@ fn session_exporter(socket: &TunnelStream, tls_required: bool) -> io::Result<Opt
     require_exporter(tls_required, exporter)
 }
 
+#[cfg(test)]
 fn require_exporter(
     tls_required: bool,
     exporter: Option<[u8; 32]>,
@@ -1496,9 +1488,9 @@ mod tests {
 
     #[test]
     fn ws_scheme_is_rejected_for_non_loopback_hosts() {
-        assert!(split_urls("ws://vvmux.example/t/v1/control").is_err());
-        assert!(split_urls("wss://vvmux.example/t/v1/control").is_ok());
-        assert!(split_urls("ws://127.0.0.1:8000/t/v1/control").is_ok());
+        assert!(split_urls("ws://vvmux.example/t/v2/control").is_err());
+        assert!(split_urls("wss://vvmux.example/t/v2/control").is_ok());
+        assert!(split_urls("ws://127.0.0.1:8000/t/v2/control").is_ok());
         assert!(split_urls("http://127.0.0.1:8000").is_ok());
     }
 
@@ -1507,18 +1499,18 @@ mod tests {
         let endpoints = split_urls("https://vvmux.example:8443").unwrap();
         assert_eq!(
             endpoints.control_url,
-            "wss://vvmux.example:8443/t/v1/control"
+            "wss://vvmux.example:8443/t/v2/control"
         );
-        assert_eq!(endpoints.leg_url, "wss://vvmux.example:8443/t/v1/leg");
+        assert_eq!(endpoints.leg_url, "wss://vvmux.example:8443/t/v2/leg");
         assert_eq!(
             endpoints.webtransport_url.as_deref(),
             Some("https://vvmux.example:8443/t/v1/webtransport")
         );
-        assert_eq!(endpoints.hostname, "vvmux.example");
+        assert_eq!(endpoints.hostname, "https://vvmux.example:8443");
         assert!(endpoints.requires_content_acknowledgement);
 
         assert!(
-            split_urls("wss://vvmux.example/t/v1/control")
+            split_urls("wss://vvmux.example/t/v2/control")
                 .unwrap()
                 .webtransport_url
                 .is_none(),

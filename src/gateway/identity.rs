@@ -157,6 +157,24 @@ impl MachineIdentity {
     }
 
     /// Sign a tunnel handshake over the challenge material (VVTUN-1).
+    /// Hosted VVTUN/2 proof; public TLS terminates at the trusted edge.
+    pub fn sign_handshake_v2(&self, nonce: &[u8; 32], origin: &str) -> io::Result<String> {
+        if origin.is_empty() || origin.len() > 2048 {
+            return Err(io::Error::other("invalid deployment origin"));
+        }
+        let mut message = b"vvmux tunnel auth v2\0".to_vec();
+        message.extend_from_slice(nonce);
+        message.extend_from_slice(
+            &u16::try_from(origin.len())
+                .map_err(io::Error::other)?
+                .to_be_bytes(),
+        );
+        message.extend_from_slice(origin.as_bytes());
+        message.extend_from_slice(self.signing.verifying_key().as_bytes());
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(self.signing.sign(&message).to_bytes()))
+    }
+
     pub fn sign_handshake(&self, nonce: &[u8], hostname: &str, exporter: &[u8]) -> String {
         let mut message = Vec::with_capacity(
             AUTH_DOMAIN.len() + nonce.len() + hostname.len() + exporter.len() + 43,
@@ -365,6 +383,33 @@ fn validate_file(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_v2_signature_matches_published_vector() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/gateway/vvtun2-vector.json"
+        ))
+        .unwrap();
+        let seed: [u8; 32] = std::array::from_fn(|i| u8::try_from(i).unwrap());
+        let identity = MachineIdentity {
+            signing: SigningKey::from_bytes(&seed),
+        };
+        let nonce: [u8; 32] = std::array::from_fn(|i| u8::try_from(i + 32).unwrap());
+        let signature = identity
+            .sign_handshake_v2(&nonce, "https://vvmux.example")
+            .unwrap();
+        let expected = vector["signature_hex"].as_str().unwrap();
+        let actual = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(signature)
+            .unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            expected
+        );
+    }
 
     #[test]
     fn identity_generates_loads_and_signs_round_trip() {
