@@ -65,7 +65,7 @@ impl Write for Outbound {
         }
         if self
             .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes.len())
                     .filter(|next| *next <= MAX_BYTES)
             })

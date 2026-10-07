@@ -19,7 +19,7 @@ struct ClientSlot;
 impl ClientSlot {
     fn acquire() -> Option<Self> {
         ACTIVE_CLIENTS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_CLIENTS).then_some(active + 1)
             })
             .ok()
