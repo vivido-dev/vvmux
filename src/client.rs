@@ -280,6 +280,15 @@ pub fn attach(
             };
             let mut render_assembler = RenderAssembler::new(MAX_ATOMIC_RENDER_BYTES);
             while let Ok(message) = reader.recv_server() {
+                if bridge.as_ref().is_some_and(BridgeWorker::gave_up) {
+                    if let Some(worker) = bridge.take() {
+                        worker.abandon();
+                    }
+                    write_title(
+                        &output_thread,
+                        "vvmux media disabled: the outer media endpoints refuse connections",
+                    );
+                }
                 match message {
                     ServerMessage::Attached { .. } => break,
                     ServerMessage::Render {
@@ -1103,6 +1112,23 @@ impl BridgeWorker {
 }
 
 impl BridgeWorker {
+    /// The worker stopped itself because the outer media endpoints are unreachable.
+    fn gave_up(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Retire the outer bridge and keep the client attached, without media. Unlike `stop`, this
+    /// never cancels the client's session connection.
+    fn abandon(mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.stopped.store(true, Ordering::Release);
+        self.media_wakeup.take();
+        (self.release_bridge)();
+        let _ = thread.join();
+    }
+
     fn stop(&mut self) {
         let Some(thread) = self.thread.take() else {
             return;
@@ -1262,6 +1288,18 @@ struct ProjectionRetryDecision {
 /// reconciled. Escalate the second consecutive source-scoped failure to a fresh outer session and
 /// retain that decision until some projection applies successfully. `WouldBlock` gets a slightly
 /// larger allowance because it specifically means the outer presentation target is still moving.
+/// Consecutive refused or missing outer sockets mean the presenter is gone, as with an SSH
+/// forward whose local end no longer listens, rather than a display change that settles.
+fn outer_endpoint_unreachable(consecutive_failures: u32, error_kind: io::ErrorKind) -> bool {
+    consecutive_failures >= OUTER_UNREACHABLE_ATTEMPTS
+        && matches!(
+            error_kind,
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+        )
+}
+
+const OUTER_UNREACHABLE_ATTEMPTS: u32 = 2;
+
 fn projection_retry_decision(
     consecutive_failures: u32,
     error_kind: io::ErrorKind,
@@ -1789,6 +1827,14 @@ fn run_bridge_worker(
                     retry.replace_session,
                     error
                 );
+                if outer_endpoint_unreachable(consecutive_projection_failures, error.kind()) {
+                    // Retrying cannot help, and meanwhile the session keeps filling the media
+                    // queue until an overflow cancels the whole client. Give up on media alone;
+                    // the terminal session is unaffected by an unreachable presenter.
+                    log::warn!("outer media endpoints unreachable; media disabled");
+                    stopped.store(true, Ordering::Release);
+                    break;
+                }
                 let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
                     reset_outer_session: retry.replace_session,
                 });
@@ -2859,6 +2905,21 @@ mod tests {
         finish_in_place_keyframe_recoveries(&mut armed, &mut observed, &completed);
         assert!(armed.is_empty());
         assert!(observed.is_empty());
+    }
+
+    #[test]
+    fn unreachable_outer_endpoints_end_media_only_after_repeated_refusals() {
+        assert!(!outer_endpoint_unreachable(
+            1,
+            io::ErrorKind::ConnectionRefused
+        ));
+        assert!(outer_endpoint_unreachable(
+            2,
+            io::ErrorKind::ConnectionRefused
+        ));
+        assert!(outer_endpoint_unreachable(2, io::ErrorKind::NotFound));
+        assert!(!outer_endpoint_unreachable(9, io::ErrorKind::WouldBlock));
+        assert!(!outer_endpoint_unreachable(9, io::ErrorKind::InvalidData));
     }
 
     #[test]
