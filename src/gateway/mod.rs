@@ -1,5 +1,6 @@
 pub(crate) mod auth;
 pub(crate) mod identity;
+mod metadata;
 mod protocol;
 mod session_adapter;
 mod transport;

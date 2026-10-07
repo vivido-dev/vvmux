@@ -104,6 +104,15 @@ enum ServerControl {
         #[serde(default)]
         subprotocols: Vec<String>,
     },
+    SessionRequest {
+        request_id: String,
+        operation_id: String,
+        owner: String,
+        account: String,
+        action: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
     CloseLeg {
         leg_id: u64,
         #[serde(default)]
@@ -120,10 +129,14 @@ enum ServerControl {
 /// Strict VVTUN/1 gateway-to-server control frames.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum ClientControl {
+pub(super) enum ClientControl {
     Auth {
         machine_id: String,
         signature: String,
+    },
+    SessionResult {
+        request_id: String,
+        result: serde_json::Value,
     },
     MachineStatus {
         vvmux_version: String,
@@ -159,6 +172,7 @@ struct TunnelRunner {
     miss_limit: u32,
     handshake_timeout: Duration,
     legs: Arc<Semaphore>,
+    metadata: Arc<super::metadata::MetadataService>,
 }
 
 struct ConnectEndpoints {
@@ -225,6 +239,7 @@ pub(crate) fn run_connect(
         miss_limit: options.miss_limit.unwrap_or(DEFAULT_MISS_LIMIT),
         handshake_timeout: options.handshake_timeout.unwrap_or(HANDSHAKE_TIMEOUT),
         legs: Arc::new(Semaphore::new(MAX_TUNNEL_LEGS)),
+        metadata: super::metadata::MetadataService::new(),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -468,6 +483,7 @@ async fn run_websocket_tunnel_once(
     let mut capabilities = vec![
         "terminal-v1",
         "session-list-v1",
+        "session-metadata-v2",
         "session-create-v1",
         "vivid-bridge-v1",
         "tunnel-attached-v1",
@@ -490,7 +506,7 @@ async fn run_websocket_tunnel_once(
     );
 
     // Control loop with the application heartbeat.
-    let (leg_reports, mut report_receiver) = mpsc::unbounded_channel::<ClientControl>();
+    let (leg_reports, mut report_receiver) = mpsc::channel::<ClientControl>(128);
     let mut legs: std::collections::HashMap<u64, tokio::task::JoinHandle<()>> =
         std::collections::HashMap::new();
     let mut seen_leg_ids = HashSet::new();
@@ -705,7 +721,7 @@ async fn run_webtransport_tunnel_once(
                 }
             }
         });
-        let (reports, mut report_receiver) = mpsc::unbounded_channel::<ClientControl>();
+        let (reports, mut report_receiver) = mpsc::channel::<ClientControl>(128);
         let mut offers = std::collections::HashMap::<u64, WebTransportLegOffer>::new();
         let mut streams = std::collections::HashMap::<u64, AcceptedWebTransportLeg>::new();
         let mut legs = std::collections::HashMap::<u64, tokio::task::JoinHandle<()>>::new();
@@ -742,7 +758,7 @@ async fn run_webtransport_tunnel_once(
                             outcome = (true, Some(reconnect_after_seconds));
                             break;
                         }
-                        Some(Ok(ServerControl::Challenge { .. } | ServerControl::Authed { .. })) => {
+                        Some(Ok(ServerControl::Challenge { .. } | ServerControl::Authed { .. } | ServerControl::SessionRequest { .. })) => {
                             return Err(io::Error::new(io::ErrorKind::InvalidData, "out-of-sequence control frame"));
                         }
                         Some(Err(error)) => return Err(error),
@@ -808,10 +824,10 @@ fn validate_webtransport_offer(
     account: &str,
     ticket: &str,
     subprotocols: Vec<String>,
-    reports: &mpsc::UnboundedSender<ClientControl>,
+    reports: &mpsc::Sender<ClientControl>,
 ) -> io::Result<Option<WebTransportLegOffer>> {
     let reject = |code: &str| {
-        let _ = reports.send(ClientControl::LegFailed {
+        let _ = reports.try_send(ClientControl::LegFailed {
             leg_id,
             code: code.to_owned(),
         });
@@ -855,12 +871,12 @@ fn validate_webtransport_offer(
 async fn start_webtransport_leg(
     runner: &TunnelRunner,
     legs: &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
-    reports: &mpsc::UnboundedSender<ClientControl>,
+    reports: &mpsc::Sender<ClientControl>,
     stream: AcceptedWebTransportLeg,
     offer: WebTransportLegOffer,
 ) {
     if stream.kind != offer.kind || stream.ticket != offer.ticket || legs.len() >= MAX_TUNNEL_LEGS {
-        let _ = reports.send(ClientControl::LegFailed {
+        let _ = reports.try_send(ClientControl::LegFailed {
             leg_id: stream.leg_id,
             code: "ticket_rejected".to_owned(),
         });
@@ -869,7 +885,7 @@ async fn start_webtransport_leg(
     let permit = match runner.legs.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            let _ = reports.send(ClientControl::LegFailed {
+            let _ = reports.try_send(ClientControl::LegFailed {
                 leg_id: stream.leg_id,
                 code: "capacity".to_owned(),
             });
@@ -884,7 +900,7 @@ async fn start_webtransport_leg(
         let _permit = permit;
         let result = run_webtransport_leg(stream, offer, &state, allow_kill).await;
         if let Err(error) = result {
-            let _ = reports.send(ClientControl::LegFailed {
+            let _ = reports.try_send(ClientControl::LegFailed {
                 leg_id,
                 code: leg_failure_code(&error),
             });
@@ -1013,7 +1029,7 @@ async fn handle_server_frame<Si: FrameSink>(
     sink: &mut Si,
     legs: &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
     seen_leg_ids: &mut HashSet<u64>,
-    leg_reports: &mpsc::UnboundedSender<ClientControl>,
+    leg_reports: &mpsc::Sender<ClientControl>,
     runner: &TunnelRunner,
     frame: Frame,
 ) -> io::Result<Option<u64>> {
@@ -1054,6 +1070,33 @@ async fn handle_server_frame<Si: FrameSink>(
                 .await?;
                 Ok(None)
             }
+            ServerControl::SessionRequest {
+                request_id,
+                operation_id,
+                owner,
+                account,
+                action,
+                name,
+            } => {
+                if !runner.allow_accounts.is_empty() && !runner.allow_accounts.contains(&account) {
+                    let _ = leg_reports.try_send(ClientControl::SessionResult {
+                        request_id,
+                        result: serde_json::json!({"error":"account_rejected"}),
+                    });
+                } else {
+                    runner.metadata.dispatch(
+                        request_id,
+                        operation_id,
+                        owner,
+                        account,
+                        action,
+                        name,
+                        runner.state.config_path.clone(),
+                        leg_reports.clone(),
+                    );
+                }
+                Ok(None)
+            }
             ServerControl::CloseLeg { leg_id, .. } => {
                 if let Some(handle) = legs.remove(&leg_id) {
                     handle.abort();
@@ -1090,7 +1133,7 @@ fn decode_server_control(text: &str) -> io::Result<ServerControl> {
 async fn open_leg(
     legs: &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
     seen_leg_ids: &mut HashSet<u64>,
-    leg_reports: &mpsc::UnboundedSender<ClientControl>,
+    leg_reports: &mpsc::Sender<ClientControl>,
     runner: &TunnelRunner,
     leg_id: u64,
     kind: &str,
@@ -1101,14 +1144,14 @@ async fn open_leg(
 ) -> io::Result<()> {
     legs.retain(|_, handle| !handle.is_finished());
     if seen_leg_ids.contains(&leg_id) {
-        let _ = leg_reports.send(ClientControl::LegFailed {
+        let _ = leg_reports.try_send(ClientControl::LegFailed {
             leg_id,
             code: "invalid_request".to_owned(),
         });
         return Ok(());
     }
     if seen_leg_ids.len() >= MAX_SEEN_LEG_IDS {
-        let _ = leg_reports.send(ClientControl::LegFailed {
+        let _ = leg_reports.try_send(ClientControl::LegFailed {
             leg_id,
             code: "capacity".to_owned(),
         });
@@ -1116,7 +1159,7 @@ async fn open_leg(
     }
     seen_leg_ids.insert(leg_id);
     if !runner.allow_accounts.is_empty() && !runner.allow_accounts.contains(account) {
-        let _ = leg_reports.send(ClientControl::LegFailed {
+        let _ = leg_reports.try_send(ClientControl::LegFailed {
             leg_id,
             code: "not_permitted".to_owned(),
         });
@@ -1126,7 +1169,7 @@ async fn open_leg(
         "vvws" => LegKind::Vvws,
         "vivid" => LegKind::Vivid,
         _ => {
-            let _ = leg_reports.send(ClientControl::LegFailed {
+            let _ = leg_reports.try_send(ClientControl::LegFailed {
                 leg_id,
                 code: "invalid_request".to_owned(),
             });
@@ -1134,7 +1177,7 @@ async fn open_leg(
         }
     };
     if legs.len() >= MAX_TUNNEL_LEGS {
-        let _ = leg_reports.send(ClientControl::LegFailed {
+        let _ = leg_reports.try_send(ClientControl::LegFailed {
             leg_id,
             code: "capacity".to_owned(),
         });
@@ -1143,14 +1186,14 @@ async fn open_leg(
     // The ticket is a one-use 32-byte base64url value; anything else is refused
     // before any network cost.
     let Ok(ticket_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(ticket) else {
-        let _ = leg_reports.send(ClientControl::LegFailed {
+        let _ = leg_reports.try_send(ClientControl::LegFailed {
             leg_id,
             code: "ticket_rejected".to_owned(),
         });
         return Ok(());
     };
     if ticket_bytes.len() != 32 {
-        let _ = leg_reports.send(ClientControl::LegFailed {
+        let _ = leg_reports.try_send(ClientControl::LegFailed {
             leg_id,
             code: "ticket_rejected".to_owned(),
         });
@@ -1160,7 +1203,7 @@ async fn open_leg(
     let permit = match runner.legs.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            let _ = leg_reports.send(ClientControl::LegFailed {
+            let _ = leg_reports.try_send(ClientControl::LegFailed {
                 leg_id,
                 code: "capacity".to_owned(),
             });
@@ -1186,7 +1229,7 @@ async fn open_leg(
         )
         .await;
         if let Err(error) = result {
-            let _ = reports.send(ClientControl::LegFailed {
+            let _ = reports.try_send(ClientControl::LegFailed {
                 leg_id,
                 code: leg_failure_code(&error),
             });

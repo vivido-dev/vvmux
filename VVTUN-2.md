@@ -39,9 +39,11 @@ fallback. Existing enrolled identities are unchanged.
 
 ## Metadata commands
 
-Relay sends `{type:"session_request",request_id,account,action,name?}`; account is the immutable
+Relay sends `{type:"session_request",request_id,operation_id,owner,account,action,name?}`; account is the immutable
 issuer#subject identity, and gateway applies its existing allow-account restrictions. Actions:
-list, create, result. Request IDs are 32 lowercase hexadecimal characters. Name is validated by
+list, create, result. Request and operation IDs are 32 lowercase hexadecimal characters. The request ID correlates
+one transport exchange; operation_id identifies a retained mutation across exchanges. owner is
+the trusted tenant/user context, scoped separately from the allow-account identity. Name is validated by
 existing session APIs, at most 128 bytes. At most four requests concurrently, each result at most
 64 KiB. Gateway replies `{type:"session_result",request_id,result}` where result is either the
 session directory response or `{error:"..."}` with bounded nonsecret error codes. Creation is
