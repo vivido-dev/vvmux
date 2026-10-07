@@ -1,5 +1,8 @@
 # VVTUN/1: vvmux outbound machine tunnel protocol
 
+> Historical contract: hosted VVTUN/1 is retired. Current `serve --connect` and relay use
+> [VVTUN/2](VVTUN-2.md). No VVTUN/1 listener or fallback remains in this revision.
+
 VVTUN/1 is the public protocol by which a machine's `vvmux serve --connect` gateway reaches a
 vvmux_server deployment and stays reachable for browser attach, without opening any inbound port
 on the machine. The gateway dials out; the server never dials in.

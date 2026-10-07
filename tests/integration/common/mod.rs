@@ -25,7 +25,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-pub const AUTH_DOMAIN: &[u8] = b"vvmux tunnel auth v1\0";
+pub const AUTH_DOMAIN: &[u8] = b"vvmux tunnel auth v2\0";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -153,11 +153,12 @@ impl TunnelHarness {
         let shutdown_task = shutdown.clone();
         let app = Router::new()
             .route("/api/v1/machines/enroll", post(enroll_handler))
-            .route("/t/v1/control", get(control_upgrade))
-            .route("/t/v1/leg", get(leg_upgrade))
+            .route("/t/v2/control", get(control_upgrade))
+            .route("/t/v2/leg", get(leg_upgrade))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        *state.hostname.lock().unwrap() = format!("http://{addr}");
         tokio::spawn(async move {
             let _result = axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
@@ -398,7 +399,7 @@ async fn control_upgrade(
         );
         return response;
     }
-    ws.protocols(["vvtun.v1"])
+    ws.protocols(["vvtun.v2"])
         .max_frame_size(64 * 1024)
         .max_message_size(64 * 1024)
         .on_upgrade(move |socket| control_session(state, socket))
@@ -414,7 +415,7 @@ async fn control_session(state: Arc<HarnessState>, socket: WebSocket) {
     let nonce = random_ticket();
     let hostname = state.hostname.lock().unwrap().clone();
     let challenge = serde_json::to_string(&ServerControl::Challenge {
-        protocol: 1,
+        protocol: 2,
         nonce: nonce.clone(),
         hostname: hostname.clone(),
     })
@@ -453,10 +454,9 @@ async fn control_session(state: Arc<HarnessState>, socket: WebSocket) {
             let mut message = Vec::new();
             message.extend_from_slice(AUTH_DOMAIN);
             message.extend_from_slice(&nonce);
+            message.extend_from_slice(&(hostname.len() as u16).to_be_bytes());
             message.extend_from_slice(hostname.as_bytes());
-            // Loopback ws:// development tunnels export no keying material.
-            message.extend_from_slice(&[]);
-            message.extend_from_slice(machine_id.as_bytes());
+            message.extend_from_slice(&key.to_bytes());
             key.verify_strict(&message, &signature).ok()
         });
     if verified.is_none() {
@@ -465,7 +465,7 @@ async fn control_session(state: Arc<HarnessState>, socket: WebSocket) {
     }
 
     let authed = serde_json::to_string(&ServerControl::Authed {
-        protocol: 1,
+        protocol: 2,
         server_version: "test-server".to_owned(),
         reconnect_after_seconds: 0,
     })
@@ -545,45 +545,31 @@ async fn leg_upgrade(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Exactly `vvtun.leg.v1` and one `vvtun.ticket.<value>`.
-    let mut has_leg = false;
-    let mut ticket = None;
-    for value in headers.get_all("sec-websocket-protocol").iter() {
-        let Ok(value) = value.to_str() else {
-            continue;
-        };
-        for part in value.split(',') {
-            let part = part.trim();
-            if part == "vvtun.leg.v1" {
-                has_leg = true;
-            } else if let Some(rest) = part.strip_prefix("vvtun.ticket.") {
-                if ticket.is_some() {
-                    return (StatusCode::BAD_REQUEST, "duplicate ticket").into_response();
-                }
-                ticket = Some(rest.to_owned());
-            }
-        }
-    }
-    let Some(ticket) = ticket else {
-        return (StatusCode::BAD_REQUEST, "ticket subprotocol required").into_response();
-    };
-    if !has_leg {
+    if headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        != Some("vvtun.leg.v2")
+    {
         return (StatusCode::BAD_REQUEST, "leg subprotocol required").into_response();
     }
-    let Some(leg_id) = state.tickets.lock().unwrap().remove(&ticket) else {
-        // Unknown, expired, or reused ticket.
-        return (StatusCode::UNAUTHORIZED, "unknown ticket").into_response();
-    };
-    let (sender, receiver) = oneshot::channel();
-    state.leg_sockets.lock().unwrap().insert(leg_id, receiver);
-    ws.protocols(["vvtun.leg.v1"])
+    ws.protocols(["vvtun.leg.v2"])
         .max_frame_size(1024 * 1024)
         .max_message_size(1024 * 1024)
-        .on_upgrade(move |socket| async move {
+        .on_upgrade(move |mut socket| async move {
+            let Some(Ok(Message::Binary(bytes))) = socket.recv().await else {
+                return;
+            };
+            if bytes.len() != 32 {
+                return;
+            }
+            let ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+            let Some(leg_id) = state.tickets.lock().unwrap().remove(&ticket) else {
+                return;
+            };
+            let (sender, receiver) = oneshot::channel();
+            state.leg_sockets.lock().unwrap().insert(leg_id, receiver);
             let (sink, stream) = socket.split();
             let _ = sender.send(LegSocket { sink, stream });
-            // The test owns both halves; keep the connection alive until the
-            // harness drops it.
             std::future::pending::<()>().await;
         })
 }

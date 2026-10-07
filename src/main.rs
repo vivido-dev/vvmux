@@ -210,7 +210,7 @@ enum Command {
         command: plugin::PluginCommand,
     },
     /// Run the authenticated loopback VVWS/1 session gateway, or connect mode
-    /// (`--connect`) which opens no listener and serves through a VVTUN/1 tunnel.
+    /// (`--connect`) which opens no listener and serves through a VVTUN/2 WebSocket tunnel.
     #[cfg(feature = "server-capability")]
     Serve {
         #[arg(long)]
@@ -228,12 +228,9 @@ enum Command {
         allow_accounts: Vec<String>,
         #[arg(long)]
         allow_kill: bool,
-        /// Machine tunnel carrier. Auto prefers WebTransport and falls back before authentication.
+        /// Hosted machine carrier. Auto uses WebSocket through the public TLS edge.
         #[arg(long, value_enum, default_value = "auto")]
         tunnel_carrier: gateway::tunnel::TunnelCarrier,
-        /// Pin an ephemeral/self-hosted WebTransport certificate by SHA-256 (64 hex digits).
-        #[arg(long = "tunnel-certificate-sha256", hide = true)]
-        tunnel_certificate_sha256: Vec<String>,
         #[arg(long)]
         identity_file: Option<PathBuf>,
         #[arg(long, hide = true)]
@@ -474,7 +471,6 @@ fn run(cli: Cli) -> io::Result<()> {
             allow_accounts,
             allow_kill,
             tunnel_carrier,
-            tunnel_certificate_sha256,
             identity_file,
             tunnel_heartbeat_ms,
             tunnel_miss_limit,
@@ -506,7 +502,6 @@ fn run(cli: Cli) -> io::Result<()> {
                         allow_accounts,
                         allow_kill,
                         carrier: tunnel_carrier,
-                        certificate_sha256: tunnel_certificate_sha256,
                         heartbeat: tunnel_heartbeat_ms.map(std::time::Duration::from_millis),
                         miss_limit: tunnel_miss_limit,
                         handshake_timeout: tunnel_handshake_timeout_ms

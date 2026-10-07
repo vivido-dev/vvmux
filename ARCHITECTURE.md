@@ -397,6 +397,13 @@ can stay buffered at device rate
 without sharing a blocking write, decoder wait, or acknowledgement round trip with video. EOS is
 queued behind all earlier records for the same track.
 
+The `serve` Vivid WebSocket adapter splits writes at the Vivid web profile's 64 KiB
+message ceiling, including image bodies that occupy a single larger Vivid record.
+Each write completes after its bounded message is sent, preserving byte order and
+backpressure. Local and hosted Vivid sockets use the same receive ceiling.
+Terminal output on VVWS is also a byte stream and uses bounded 64 KiB binary messages;
+the larger local IPC render chunks must not become oversized hosted WebSocket messages.
+
 ## Remote playback policy and position feedback
 
 Every Vivid-enabled pane receives `VIVID_AUDIO_FALLBACK=deny` along with its freshly scoped

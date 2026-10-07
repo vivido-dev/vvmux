@@ -51,7 +51,6 @@ rpassword = { version = "7", optional = true }
 tokio-tungstenite = { version = "0.30", features = [
   "rustls-tls-native-roots",
 ], optional = true }
-wtransport = { version = "0.7", optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 toml = "1.1"
@@ -96,7 +95,6 @@ server-capability = [
   "dep:rustls-native-certs",
   "dep:tokio",
   "dep:tokio-tungstenite",
-  "dep:wtransport",
 ]
 
 [target.'cfg(unix)'.dependencies]

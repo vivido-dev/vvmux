@@ -1,5 +1,6 @@
 pub(crate) mod auth;
 pub(crate) mod identity;
+mod metadata;
 mod protocol;
 mod session_adapter;
 mod transport;
@@ -232,9 +233,9 @@ async fn websocket_upgrade(
         .max_frame_size(MAX_FRAME_BYTES)
         .max_message_size(MAX_FRAME_BYTES)
         .protocols([SUBPROTOCOL])
-        .on_upgrade(move |socket| {
+        .on_upgrade(move |socket| async move {
             let (sink, stream) = transport::split(socket);
-            handle_connection(sink, stream, state, Some(permit), None)
+            let _ = handle_connection(sink, stream, state, Some(permit), None).await;
         })
 }
 
@@ -344,12 +345,9 @@ async fn vivid_upgrade(
         )
             .into_response();
     };
-    let maximum = vivid_protocol::HARD_MAX_RECORD_BODY as usize
-        + vivid_protocol::wire::HEADER_SIZE
-        + vivid_protocol::wire::PREFACE_SIZE;
     websocket
-        .max_frame_size(maximum)
-        .max_message_size(maximum)
+        .max_frame_size(vivid::MAX_SOCKET_CHUNK)
+        .max_message_size(vivid::MAX_SOCKET_CHUNK)
         .protocols([vivid::SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
             let _permit = permit;
@@ -364,19 +362,22 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     state: GatewayState,
     permit: Option<OwnedSemaphorePermit>,
     tunnel: Option<TunnelContext>,
-) {
+) -> io::Result<()> {
     let authorization = match authenticate_connection(&mut stream, &state, tunnel.as_ref()).await {
         Ok(authorization) => authorization,
         Err(_) => {
             let _ = close_socket(&mut sink, 1008, "authentication failed").await;
-            return;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "gateway authentication failed",
+            ));
         }
     };
     let broker = match vivid::VividBroker::new() {
         Ok(broker) => broker,
         Err(_) => {
             let _ = close_socket(&mut sink, 1011, "could not initialize Vivid routing").await;
-            return;
+            return Err(io::Error::other("Vivid routing unavailable"));
         }
     };
     let registered = state.vivid_sessions.lock().is_ok_and(|mut sessions| {
@@ -391,7 +392,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     });
     if !registered {
         let _ = close_socket(&mut sink, 1013, "Vivid route capacity reached").await;
-        return;
+        return Err(io::Error::other("Vivid route capacity reached"));
     }
     let _vivid_registration = VividRegistration {
         sessions: state.vivid_sessions.clone(),
@@ -416,7 +417,10 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     .await
     .is_err()
     {
-        return;
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "gateway hello failed",
+        ));
     }
 
     drop(permit);
@@ -548,6 +552,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     {
         writer_task.abort();
     }
+    Ok(())
 }
 
 enum Incoming {
@@ -1084,7 +1089,7 @@ async fn handle_session_message(
             if bytes.is_empty() {
                 writer.send(Frame::Binary(bytes.into()))?;
             } else {
-                for chunk in bytes.chunks(MAX_FRAME_BYTES) {
+                for chunk in bytes.chunks(vivid::MAX_SOCKET_CHUNK) {
                     writer.send(Frame::Binary(Payload::copy_from_slice(chunk)))?;
                 }
             }

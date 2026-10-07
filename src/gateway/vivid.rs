@@ -24,6 +24,7 @@ pub(crate) const KIND_PROTOCOL_PREFIX: &str = "vvmux.kind.";
 const CONNECTION_WAIT: Duration = Duration::from_secs(30);
 const IO_WAIT: Duration = Duration::from_secs(30);
 const CHANNEL_CHUNKS: usize = 4;
+pub(super) const MAX_SOCKET_CHUNK: usize = vivid_protocol::web::MAX_SOCKET_CHUNK as usize;
 
 pub(crate) struct VividBroker {
     id: String,
@@ -241,10 +242,13 @@ impl Write for SocketWriter {
         if bytes.is_empty() {
             return Ok(0);
         }
+        // A Vivid record can span many WebSocket messages. Accept a bounded prefix so
+        // write_all preserves the byte stream without sending an oversized media message.
+        let count = bytes.len().min(MAX_SOCKET_CHUNK);
         let (completion, completed) = std_mpsc::sync_channel(1);
         self.sender
             .blocking_send(OutgoingChunk {
-                bytes: bytes.to_vec(),
+                bytes: bytes[..count].to_vec(),
                 completion,
             })
             .map_err(|_| {
@@ -253,7 +257,7 @@ impl Write for SocketWriter {
         completed.recv_timeout(IO_WAIT).map_err(|_| {
             io::Error::new(io::ErrorKind::TimedOut, "Vivid WebSocket write timed out")
         })??;
-        Ok(bytes.len())
+        Ok(count)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -450,5 +454,27 @@ mod tests {
 
         completed_receiver.recv_timeout(IO_WAIT).unwrap();
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn large_media_writes_preserve_bytes_within_websocket_chunk_ceiling() {
+        let maximum = vivid_protocol::web::MAX_SOCKET_CHUNK as usize;
+        for length in [maximum, maximum + 1, maximum * 3 + 7] {
+            let bytes: Vec<u8> = (0_u8..=255).cycle().take(length).collect();
+            let expected = bytes.clone();
+            let (sender, mut receiver) = mpsc::channel::<OutgoingChunk>(CHANNEL_CHUNKS);
+            let relay = thread::spawn(move || {
+                for expected_chunk in expected.chunks(maximum) {
+                    let chunk = receiver.blocking_recv().unwrap();
+                    assert_eq!(chunk.bytes, expected_chunk);
+                    chunk.completion.send(Ok(())).unwrap();
+                }
+                assert!(receiver.blocking_recv().is_none());
+            });
+            let mut writer = SocketWriter { sender };
+            writer.write_all(&bytes).unwrap();
+            drop(writer);
+            relay.join().unwrap();
+        }
     }
 }
