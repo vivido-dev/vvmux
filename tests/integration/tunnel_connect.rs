@@ -1,5 +1,5 @@
 //! End-to-end tests for `vvmux cloud enroll` and `vvmux serve --connect`
-//! (VVTUN/1), against an in-process harness server.
+//! (VVTUN/2), against an in-process harness server.
 //!
 //! These exercise the real binary: enrollment over plain HTTP, the control
 //! tunnel handshake with the Ed25519 signature, machine_status, leg dialing, a
@@ -575,6 +575,7 @@ async fn a_webtransport_stream_drives_a_real_session_without_another_machine_con
     let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
     let (open_sender, open_receiver) = tokio::sync::oneshot::channel();
     let (leg_sender, leg_receiver) = tokio::sync::oneshot::channel();
+    let audience = format!("https://{address}");
     let server = tokio::spawn(async move {
         let request = endpoint.accept().await.await.unwrap();
         assert_eq!(request.path(), "/t/v1/webtransport");
@@ -594,7 +595,7 @@ async fn a_webtransport_stream_drives_a_real_session_without_another_machine_con
             serde_json::json!({
                 "type":"challenge", "protocol":1,
                 "nonce":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
-                "hostname":"127.0.0.1"
+                "hostname":audience
             }),
         )
         .await;
@@ -605,9 +606,9 @@ async fn a_webtransport_stream_drives_a_real_session_without_another_machine_con
             .unwrap();
         let signature = Signature::from_slice(&signature).unwrap();
         let mut signed = Vec::new();
-        signed.extend_from_slice(common::AUTH_DOMAIN);
+        signed.extend_from_slice(b"vvmux tunnel auth v1\0");
         signed.extend_from_slice(&nonce);
-        signed.extend_from_slice(b"127.0.0.1");
+        signed.extend_from_slice(audience.as_bytes());
         signed.extend_from_slice(&exporter);
         signed.extend_from_slice(machine_id.as_bytes());
         public_key.verify_strict(&signed, &signature).unwrap();
@@ -899,7 +900,7 @@ fn connect_rejects_plain_ws_across_a_host_boundary() {
     let mut command = common::vvmux_command(&std::env::temp_dir());
     command
         .args(["serve", "--connect"])
-        .arg("ws://vvmux.example/t/v1/control");
+        .arg("ws://vvmux.example/t/v2/control");
     let output = command.output().unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

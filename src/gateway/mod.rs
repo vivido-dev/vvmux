@@ -233,9 +233,9 @@ async fn websocket_upgrade(
         .max_frame_size(MAX_FRAME_BYTES)
         .max_message_size(MAX_FRAME_BYTES)
         .protocols([SUBPROTOCOL])
-        .on_upgrade(move |socket| {
+        .on_upgrade(move |socket| async move {
             let (sink, stream) = transport::split(socket);
-            handle_connection(sink, stream, state, Some(permit), None)
+            let _ = handle_connection(sink, stream, state, Some(permit), None).await;
         })
 }
 
@@ -365,19 +365,22 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     state: GatewayState,
     permit: Option<OwnedSemaphorePermit>,
     tunnel: Option<TunnelContext>,
-) {
+) -> io::Result<()> {
     let authorization = match authenticate_connection(&mut stream, &state, tunnel.as_ref()).await {
         Ok(authorization) => authorization,
         Err(_) => {
             let _ = close_socket(&mut sink, 1008, "authentication failed").await;
-            return;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "gateway authentication failed",
+            ));
         }
     };
     let broker = match vivid::VividBroker::new() {
         Ok(broker) => broker,
         Err(_) => {
             let _ = close_socket(&mut sink, 1011, "could not initialize Vivid routing").await;
-            return;
+            return Err(io::Error::other("Vivid routing unavailable"));
         }
     };
     let registered = state.vivid_sessions.lock().is_ok_and(|mut sessions| {
@@ -392,7 +395,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     });
     if !registered {
         let _ = close_socket(&mut sink, 1013, "Vivid route capacity reached").await;
-        return;
+        return Err(io::Error::other("Vivid route capacity reached"));
     }
     let _vivid_registration = VividRegistration {
         sessions: state.vivid_sessions.clone(),
@@ -417,7 +420,10 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     .await
     .is_err()
     {
-        return;
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "gateway hello failed",
+        ));
     }
 
     drop(permit);
@@ -549,6 +555,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     {
         writer_task.abort();
     }
+    Ok(())
 }
 
 enum Incoming {

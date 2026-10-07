@@ -926,8 +926,7 @@ async fn run_webtransport_leg(
                 None,
                 Some(TunnelContext { allow_kill }),
             )
-            .await;
-            Ok(())
+            .await
         }
         LegKind::Vivid => {
             let (broker, kind) = super::resolve_vivid_leg(&offer.subprotocols, state)
@@ -1292,8 +1291,7 @@ async fn run_leg(
                 None,
                 Some(TunnelContext { allow_kill }),
             )
-            .await;
-            Ok(())
+            .await
         }
         LegKind::Vivid => {
             let (broker, kind) = super::resolve_vivid_leg(subprotocols, state)
