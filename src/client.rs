@@ -278,8 +278,50 @@ pub fn attach(
             } else {
                 None
             };
+            let mut media_retry_at: Option<Instant> = None;
             let mut render_assembler = RenderAssembler::new(MAX_ATOMIC_RENDER_BYTES);
             while let Ok(message) = reader.recv_server() {
+                if bridge.as_ref().is_some_and(BridgeWorker::gave_up) {
+                    if let Some(worker) = bridge.take() {
+                        worker.abandon();
+                    }
+                    write_title(
+                        &output_thread,
+                        "vvmux media disabled: the outer media endpoints refuse connections",
+                    );
+                    media_retry_at = Some(Instant::now() + OUTER_MEDIA_RETRY);
+                    wake_after(&read_writer, OUTER_MEDIA_RETRY);
+                }
+                // The side channels of a forwarded session are restarted by the SSH wrapper while
+                // the session lasts, so look again rather than stay without media until reattach.
+                if bridge.is_none() && media_retry_at.is_some_and(|at| Instant::now() >= at) {
+                    let mut display =
+                        crate::platform::current_display_metrics().unwrap_or(bridge_display);
+                    apply_cell_size(&mut display, bridge_cell_size.load(Ordering::Acquire));
+                    bridge = connect_bridge(display);
+                    log::info!(
+                        "outer media retry: bridge {}",
+                        if bridge.is_some() {
+                            "connected"
+                        } else {
+                            "unavailable"
+                        }
+                    );
+                    media_retry_at = if bridge.is_some() {
+                        // Ask for the projection again: the session sent it to a client whose
+                        // bridge was gone.
+                        let _ = send_client(
+                            &read_writer,
+                            &ClientMessage::BridgeSnapshotRetry {
+                                reset_outer_session: true,
+                            },
+                        );
+                        None
+                    } else {
+                        wake_after(&read_writer, OUTER_MEDIA_RETRY);
+                        Some(Instant::now() + OUTER_MEDIA_RETRY)
+                    };
+                }
                 match message {
                     ServerMessage::Attached { .. } => break,
                     ServerMessage::Render {
@@ -428,6 +470,9 @@ pub fn attach(
                                 .unwrap_or(bridge_display);
                             apply_cell_size(&mut display, bridge_cell_size.load(Ordering::Acquire));
                             bridge = connect_bridge(display);
+                        }
+                        if !presenter {
+                            media_retry_at = None;
                         }
                         write_media_role_title(&output_thread, vivid, presenter);
                     }
@@ -1103,6 +1148,23 @@ impl BridgeWorker {
 }
 
 impl BridgeWorker {
+    /// The worker stopped itself because the outer media endpoints are unreachable.
+    fn gave_up(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Retire the outer bridge and keep the client attached, without media. Unlike `stop`, this
+    /// never cancels the client's session connection.
+    fn abandon(mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.stopped.store(true, Ordering::Release);
+        self.media_wakeup.take();
+        (self.release_bridge)();
+        let _ = thread.join();
+    }
+
     fn stop(&mut self) {
         let Some(thread) = self.thread.take() else {
             return;
@@ -1262,6 +1324,33 @@ struct ProjectionRetryDecision {
 /// reconciled. Escalate the second consecutive source-scoped failure to a fresh outer session and
 /// retain that decision until some projection applies successfully. `WouldBlock` gets a slightly
 /// larger allowance because it specifically means the outer presentation target is still moving.
+/// Consecutive refused or missing outer sockets mean the presenter is gone, as with an SSH
+/// forward whose local end no longer listens, rather than a display change that settles.
+fn outer_endpoint_unreachable(consecutive_failures: u32, error_kind: io::ErrorKind) -> bool {
+    consecutive_failures >= OUTER_UNREACHABLE_ATTEMPTS
+        && matches!(
+            error_kind,
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+        )
+}
+
+const OUTER_UNREACHABLE_ATTEMPTS: u32 = 2;
+
+/// Make the session answer in `delay`, so the reader thread of an idle session looks at its
+/// timers. One short-lived thread per retry; it ends as soon as the connection does.
+fn wake_after(writer: &SharedWriter, delay: Duration) {
+    let writer = writer.clone();
+    let _ = thread::Builder::new()
+        .name("vvmux-media-retry".into())
+        .spawn(move || {
+            thread::sleep(delay);
+            let _ = send_client(&writer, &ClientMessage::Ping);
+        });
+}
+
+/// How long a client that gave up on media waits before trying the outer endpoints again.
+const OUTER_MEDIA_RETRY: Duration = Duration::from_secs(5);
+
 fn projection_retry_decision(
     consecutive_failures: u32,
     error_kind: io::ErrorKind,
@@ -1789,6 +1878,16 @@ fn run_bridge_worker(
                     retry.replace_session,
                     error
                 );
+                if outer_endpoint_unreachable(consecutive_projection_failures, error.kind()) {
+                    // Retrying cannot help, and meanwhile the session keeps filling the media
+                    // queue until an overflow cancels the whole client. Give up on media alone;
+                    // the terminal session is unaffected by an unreachable presenter.
+                    log::warn!("outer media endpoints unreachable; media disabled");
+                    stopped.store(true, Ordering::Release);
+                    // Wake the reader thread, which retires this worker on its next message.
+                    let _ = client_writer.send(ClientMessage::Ping);
+                    break;
+                }
                 let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
                     reset_outer_session: retry.replace_session,
                 });
@@ -2859,6 +2958,21 @@ mod tests {
         finish_in_place_keyframe_recoveries(&mut armed, &mut observed, &completed);
         assert!(armed.is_empty());
         assert!(observed.is_empty());
+    }
+
+    #[test]
+    fn unreachable_outer_endpoints_end_media_only_after_repeated_refusals() {
+        assert!(!outer_endpoint_unreachable(
+            1,
+            io::ErrorKind::ConnectionRefused
+        ));
+        assert!(outer_endpoint_unreachable(
+            2,
+            io::ErrorKind::ConnectionRefused
+        ));
+        assert!(outer_endpoint_unreachable(2, io::ErrorKind::NotFound));
+        assert!(!outer_endpoint_unreachable(9, io::ErrorKind::WouldBlock));
+        assert!(!outer_endpoint_unreachable(9, io::ErrorKind::InvalidData));
     }
 
     #[test]
