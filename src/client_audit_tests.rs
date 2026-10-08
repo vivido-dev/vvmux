@@ -164,11 +164,7 @@ fn client_encoder_preserves_microphone_framing() {
 #[test]
 fn bridge_drop_cancels_blocked_outer_request() {
     let presenter = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
-    let bridge = crate::bridge::OuterBridge::connect(
-        presenter.endpoint().into(),
-        Zeroizing::new(vivid_sdk::testing::ROOT_SECRET_HEX.into()),
-        DisplayMetrics::default(),
-    )
+    let bridge = crate::bridge::OuterBridge::builder(Secret32::from_hex(vivid_sdk::testing::ROOT_SECRET_HEX).unwrap(), DisplayMetrics::default()).control_endpoint(presenter.endpoint()).build()
     .unwrap();
     presenter
         .script()

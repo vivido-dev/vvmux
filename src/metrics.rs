@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-pub use vivid_gateway::{BridgeMetrics, DeliveryMetrics, IpcMetrics, RelayMetrics};
+pub use vivid_sdk::presenter::{BridgeMetrics, DeliveryMetrics, IpcMetrics, RelayMetrics};
 
 /// Byte and record totals for one VVMX connection, plus the time its writer spent blocked.
 ///

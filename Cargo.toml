@@ -64,7 +64,7 @@ tokio = { version = "1", features = [
 unicode-width = "0.2"
 vivid_gateway = { version = "1.5.10", path = "../vivid_gateway" }
 vivid_protocol = { version = "1.5.10", path = "../vivid_protocol" }
-vivid_sdk = { version = "1.5.9", path = "../vivid_sdk" }
+vivid_sdk = { version = "1.5.9", path = "../vivid_sdk", features = ["presenter"] }
 vvte = { version = "0.15", path = "../vvte", default-features = false, features = [
   "std",
   "ansi",

@@ -6919,13 +6919,15 @@ impl SessionActor {
             .layers
             .iter()
             .map(|layer| match &layer.content {
-                vivid_gateway::CaptureContent::Raster(raster) => (
+                vivid_sdk::presenter::CaptureContent::Raster(raster) => (
                     layer.node_id,
                     raster.width,
                     raster.height,
                     Some(raster.frame_id),
                 ),
-                vivid_gateway::CaptureContent::EncodedImage(_) => (layer.node_id, 0, 0, None),
+                vivid_sdk::presenter::CaptureContent::EncodedImage(_) => {
+                    (layer.node_id, 0, 0, None)
+                }
             })
             .collect()
     }
@@ -14797,7 +14799,7 @@ impl SessionActor {
             failed: BTreeMap::new(),
         };
 
-        // MediaConfig comes from vivid_gateway and does not derive PartialEq; comparing the
+        // MediaConfig comes from vivid_sdk::presenter and does not derive PartialEq; comparing the
         // serialized form avoids depending on that.
         let media_changed =
             serde_json::to_value(&next.media).ok() != serde_json::to_value(&self.config.media).ok();

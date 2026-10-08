@@ -882,11 +882,9 @@ async fn handle_socket_message(
                                         dyn crate::bridge::ConnectionFactory,
                                     > = broker.clone();
                                     match tokio::task::spawn_blocking(move || {
-                                        crate::bridge::OuterBridge::connect_with_factory_secret(
-                                            connection_factory,
-                                            root_secret,
-                                            display,
-                                        )
+                                        crate::bridge::OuterBridge::builder(root_secret, display)
+                                            .connection_factory(connection_factory)
+                                            .build()
                                     })
                                     .await
                                     {

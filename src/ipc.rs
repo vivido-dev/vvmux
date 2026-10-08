@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[allow(unused_imports)]
-pub use vivid_gateway::{
+pub use vivid_sdk::presenter::{
     BridgeClipRect, BridgeKeyframeRequest, BridgeNode, BridgeOverlayWindow, BridgePlayRequest,
     BridgeSource, BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface,
     BridgeSurfaceKey, DisplayMetrics, PaneMediaNodeStatus, PaneMediaStatus,
@@ -1341,7 +1341,7 @@ pub struct OverlayKeyInput {
 pub enum ClientMessage {
     Microphone {
         bridge_instance_id: u64,
-        source: vivid_gateway::BridgeSourceKey,
+        source: vivid_sdk::presenter::BridgeSourceKey,
         generation: u64,
         bytes: Vec<u8>,
     },
@@ -1553,7 +1553,7 @@ pub enum ServerMessage {
         bindings: Vec<PluginKeybinding>,
     },
     MediaSnapshot {
-        microphones: Vec<vivid_gateway::MicrophoneRequest>,
+        microphones: Vec<vivid_sdk::presenter::MicrophoneRequest>,
         revision: u64,
         surfaces: Vec<BridgeSurface>,
         tracks: Vec<BridgeSource>,
@@ -2153,7 +2153,7 @@ fn decode_microphone(body: &[u8]) -> io::Result<ClientMessage> {
     }
     Ok(ClientMessage::Microphone {
         bridge_instance_id: fields[0],
-        source: vivid_gateway::BridgeSourceKey {
+        source: vivid_sdk::presenter::BridgeSourceKey {
             producer: fields[1],
             context: fields[2],
             surface: fields[3],

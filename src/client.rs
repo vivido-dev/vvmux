@@ -7,6 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use vivid_gateway::{DeliveryOutcome, MediaChunk, MicrophonePacket};
+use vivid_protocol::auth::Secret32;
 use zeroize::Zeroizing;
 
 #[cfg(test)]
@@ -230,13 +232,25 @@ pub fn attach(
             // so a second attachment costs its outer presenter nothing.
             let connect_bridge = |display: crate::ipc::DisplayMetrics| {
                 let outer = outer.as_ref()?;
-                match crate::bridge::OuterBridge::connect_native(
-                    outer.control.clone(),
-                    outer.realtime.clone(),
-                    outer.bulk.clone(),
-                    outer.root_secret.clone(),
-                    display,
-                ) {
+                let bridge = Secret32::from_hex(&outer.root_secret)
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("VIVID_ROOT_SECRET is invalid: {error}"),
+                        )
+                    })
+                    .and_then(|secret| {
+                        let mut builder = crate::bridge::OuterBridge::builder(secret, display)
+                            .control_endpoint(outer.control.clone());
+                        if let Some(endpoint) = &outer.realtime {
+                            builder = builder.realtime_endpoint(endpoint.clone());
+                        }
+                        if let Some(endpoint) = &outer.bulk {
+                            builder = builder.bulk_endpoint(endpoint.clone());
+                        }
+                        builder.build()
+                    });
+                match bridge {
                     Ok(bridge) => {
                         let presenter_display = bridge.display_metrics();
                         bridge_cell_size
@@ -828,7 +842,7 @@ impl Drop for ClientWorkers {
 }
 
 pub(crate) struct BridgeSnapshot {
-    pub(crate) microphones: Vec<vivid_gateway::MicrophoneRequest>,
+    pub(crate) microphones: Vec<vivid_sdk::presenter::MicrophoneRequest>,
     pub(crate) generation: u64,
     pub(crate) virtual_revision: u64,
     pub(crate) surfaces: Vec<BridgeSurface>,
@@ -1452,7 +1466,12 @@ fn run_bridge_worker(
             break;
         }
         if let Ok(packets) = bridge.take_microphone_packets() {
-            for (source, generation, bytes) in packets {
+            for MicrophonePacket {
+                source,
+                generation,
+                packet: bytes,
+            } in packets
+            {
                 let _ = client_writer.send(ClientMessage::Microphone {
                     bridge_instance_id,
                     source,
@@ -1537,18 +1556,18 @@ fn run_bridge_worker(
                 );
                 traced_queue_drops = metrics.client_queue_drops;
             }
-            let (wait_us, wait_timeouts) = bridge.take_control_wait_stats();
-            metrics.control_wait_us = metrics.control_wait_us.saturating_add(wait_us);
-            metrics.control_wait_timeouts =
-                metrics.control_wait_timeouts.saturating_add(wait_timeouts);
             let _ = client_writer.send(ClientMessage::BridgeMetrics(metrics));
             metrics_reported_at = Instant::now();
         }
         let media_completions = bridge.take_media_completions();
-        let playback_may_be_ready = media_completions
-            .iter()
-            .any(|(_, delivered, _, _)| *delivered);
-        for (delivery_id, delivered, _outer_record_sequence, object_id) in media_completions {
+        let playback_may_be_ready = media_completions.iter().any(|outcome| outcome.delivered);
+        for DeliveryOutcome {
+            delivery_id,
+            delivered,
+            object_id,
+            ..
+        } in media_completions
+        {
             if delivery_id != 0 {
                 acknowledge_bridge_delivery(&client_writer, delivery_id, delivered);
             } else {
@@ -1623,18 +1642,13 @@ fn run_bridge_worker(
                 reset_outer_session: false,
             });
         }
-        for changed in bridge.take_capability_changes() {
-            let _ = client_writer.send(ClientMessage::BridgeCapabilitiesChanged {
-                reason_mask: changed.reason_mask,
-            });
-        }
         for (source, playback) in bridge.take_playback_states() {
             let _ = client_writer.send(ClientMessage::BridgePlaybackState {
                 bridge_instance_id,
                 decoder_reset_serial: playback.decoder_reset_serial,
                 source,
-                state: playback.state,
-                eos_state: playback.eos_state,
+                state: playback.clock.into(),
+                eos_state: playback.eos.into(),
             });
         }
         for (source, position) in bridge.take_positions() {
@@ -2199,15 +2213,15 @@ fn run_bridge_worker(
         }
         let is_raster_delta =
             is_raster && raster_forms.get(&media.source).copied().unwrap_or_default();
-        match bridge.media_chunk(
-            media.delivery_id,
-            media.source,
-            media.record_type,
-            media.offset,
-            media.total,
-            media.last,
-            media.bytes,
-        ) {
+        match bridge.media_chunk(MediaChunk {
+            delivery_id: media.delivery_id,
+            source: media.source,
+            record_type: media.record_type,
+            offset: media.offset,
+            total: media.total,
+            last: media.last,
+            bytes: media.bytes,
+        }) {
             Ok(true) => {
                 metrics.outer_media_records = metrics.outer_media_records.saturating_add(1);
                 metrics.outer_media_bytes =
@@ -3749,11 +3763,12 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let mut bridge = crate::bridge::OuterBridge::connect(
-            format!("unix:{}", socket.display()),
-            Zeroizing::new(token),
+        let mut bridge = crate::bridge::OuterBridge::builder(
+            Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
+        .control_endpoint(format!("unix:{}", socket.display()))
+        .build()
         .unwrap();
 
         let key = BridgeSourceKey {
@@ -3812,11 +3827,12 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let mut bridge = crate::bridge::OuterBridge::connect(
-            format!("unix:{}", socket.display()),
-            Zeroizing::new(token),
+        let mut bridge = crate::bridge::OuterBridge::builder(
+            Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
+        .control_endpoint(format!("unix:{}", socket.display()))
+        .build()
         .unwrap();
 
         presenter.update_metrics(7, 100, 30, (10, 20));
@@ -3849,11 +3865,12 @@ mod tests {
         };
         presenter.update_metrics(7, 80, 22, (10, 20));
         let secret = presenter.issue_pane_capability(7).unwrap();
-        let mut bridge = crate::bridge::OuterBridge::connect(
-            format!("unix:{}", socket.display()),
-            Zeroizing::new(secret),
+        let mut bridge = crate::bridge::OuterBridge::builder(
+            Secret32::from_hex(&secret).unwrap(),
             DisplayMetrics::default(),
         )
+        .control_endpoint(format!("unix:{}", socket.display()))
+        .build()
         .unwrap();
 
         presenter.update_metrics(7, 120, 40, (9, 18));
@@ -3897,11 +3914,12 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let bridge = crate::bridge::OuterBridge::connect(
-            format!("unix:{}", socket.display()),
-            Zeroizing::new(token),
+        let bridge = crate::bridge::OuterBridge::builder(
+            Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
+        .control_endpoint(format!("unix:{}", socket.display()))
+        .build()
         .unwrap();
 
         let (client, server) = UnixStream::pair().unwrap();
@@ -4045,11 +4063,12 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let bridge = crate::bridge::OuterBridge::connect(
-            presenter.endpoint(),
-            Zeroizing::new(token),
+        let bridge = crate::bridge::OuterBridge::builder(
+            Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
+        .control_endpoint(presenter.endpoint())
+        .build()
         .unwrap();
         let (message_sender, message_receiver) = mpsc::channel();
         let mut worker = BridgeWorker::spawn_with_sender(
@@ -4365,11 +4384,12 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let bridge = crate::bridge::OuterBridge::connect(
-            format!("unix:{}", socket.display()),
-            Zeroizing::new(token),
+        let bridge = crate::bridge::OuterBridge::builder(
+            Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
+        .control_endpoint(format!("unix:{}", socket.display()))
+        .build()
         .unwrap();
 
         let (client, server) = UnixStream::pair().unwrap();
@@ -4517,11 +4537,12 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let bridge = crate::bridge::OuterBridge::connect(
-            format!("unix:{}", socket.display()),
-            Zeroizing::new(token),
+        let bridge = crate::bridge::OuterBridge::builder(
+            Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
+        .control_endpoint(format!("unix:{}", socket.display()))
+        .build()
         .unwrap();
 
         let (client, server) = UnixStream::pair().unwrap();
@@ -5156,11 +5177,12 @@ mod tests {
             };
             let token = presenter.issue_pane_capability(7).unwrap();
             presenter.update_metrics(7, 80, 22, (10, 20));
-            let bridge = crate::bridge::OuterBridge::connect(
-                presenter.endpoint(),
-                Zeroizing::new(token),
+            let bridge = crate::bridge::OuterBridge::builder(
+                Secret32::from_hex(&token).unwrap(),
                 DisplayMetrics::default(),
             )
+            .control_endpoint(presenter.endpoint())
+            .build()
             .unwrap();
 
             let (message_sender, message_receiver) = mpsc::channel();

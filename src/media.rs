@@ -6,24 +6,24 @@ use crate::config::Media as MediaConfig;
 use crate::platform::{VirtualPresenterEndpoint, VirtualPresenterListener};
 
 #[allow(unused_imports)]
-pub use vivid_gateway::{
+pub use vivid_sdk::presenter::{
     AudioSourceConfig, ClipRect, KeyframeRequestOutcome, MediaEvent, NodeConfig,
     OuterMediaProjection, PlayRequest, ProducerId, ProjectionSnapshot, RetainedRaster, SceneNode,
     SceneNodeConfig, SemanticDescriptor, SnapshotOverlayWindow, SnapshotSource, SnapshotSurface,
     SourceDescriptor, SourceKey,
 };
 
-impl vivid_gateway::PresenterListener for VirtualPresenterListener {
+impl vivid_sdk::presenter::PresenterListener for VirtualPresenterListener {
     fn endpoint(&self) -> String {
         VirtualPresenterListener::endpoint(self)
     }
 
-    fn accept(&self) -> io::Result<vivid_gateway::Transport> {
+    fn accept(&self) -> io::Result<vivid_sdk::presenter::Transport> {
         VirtualPresenterListener::accept(self)
     }
 }
 
-pub struct VirtualVivid(vivid_gateway::VirtualVivid);
+pub struct VirtualVivid(vivid_sdk::presenter::VirtualVivid);
 
 impl VirtualVivid {
     #[allow(dead_code)]
@@ -31,7 +31,7 @@ impl VirtualVivid {
         // Terminate media at the runtime: no caller hosts a media-event consumer, so successful
         // validation must return the ingress flow directly rather than park a delivery.
         let listener = VirtualPresenterListener::bind(endpoint)?;
-        vivid_gateway::VirtualVivid::start_eventless(listener, config).map(Self)
+        vivid_sdk::presenter::VirtualVivid::start_eventless(listener, config).map(Self)
     }
 
     pub fn start_with_events(
@@ -43,9 +43,9 @@ impl VirtualVivid {
         // Overlay hosting is advertised for every pane rather than gated per pane: one presenter
         // serves them all, and negotiation is producer-driven, so a plain shell that never asks
         // for the overlay profiles is unaffected by their being on offer.
-        let presenter = vivid_gateway::VirtualVivid::start_configured(
+        let presenter = vivid_sdk::presenter::VirtualVivid::start_configured(
             listener,
-            vivid_gateway::PresenterConfig::terminal_with_overlay(config),
+            vivid_sdk::presenter::PresenterConfig::terminal_with_overlay(config),
             events,
         )?;
         presenter.enable_overlay_host_relay();
@@ -54,7 +54,7 @@ impl VirtualVivid {
 }
 
 impl Deref for VirtualVivid {
-    type Target = vivid_gateway::VirtualVivid;
+    type Target = vivid_sdk::presenter::VirtualVivid;
 
     fn deref(&self) -> &Self::Target {
         &self.0

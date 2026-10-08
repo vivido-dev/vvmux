@@ -108,7 +108,7 @@ pub struct Appearance {
 }
 
 pub use crate::theme::Theme;
-pub use vivid_gateway::MediaConfig as Media;
+pub use vivid_sdk::presenter::MediaConfig as Media;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

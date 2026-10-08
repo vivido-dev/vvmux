@@ -13,7 +13,7 @@
 use std::io::{self, Cursor};
 
 use image::{ImageEncoder, ImageReader, Limits, RgbaImage};
-use vivid_gateway::{CaptureContent, CaptureLayer, ClipRect, SourceKey};
+use vivid_sdk::presenter::{CaptureContent, CaptureLayer, ClipRect, SourceKey};
 
 /// Terminal scene geometry is fixed-point cells: one whole cell is `1 << 32`.
 const CELL_FIXED_ONE: i64 = 1 << 32;
@@ -245,7 +245,7 @@ pub fn compose(layers: &[CaptureLayer], target: CaptureTarget) -> io::Result<Cap
 mod tests {
     use std::sync::Arc;
 
-    use vivid_gateway::{RetainedRaster, SourceKey};
+    use vivid_sdk::presenter::{RetainedRaster, SourceKey};
 
     use super::*;
 

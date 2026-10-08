@@ -8,4 +8,4 @@ pub use unix::*;
 #[cfg(windows)]
 pub use windows::*;
 
-pub use vivid_gateway::{ConnectionCancel, Transport};
+pub use vivid_sdk::presenter::{ConnectionCancel, Transport};
