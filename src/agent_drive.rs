@@ -25,7 +25,7 @@ pub const AGENT_START_SETTLE: Duration = Duration::from_secs(3);
 /// time out.
 pub const AGENT_START_MIN_TIMEOUT: Duration = AGENT_START_SETTLE;
 /// Ceiling for an `agent-start` readiness timeout.
-pub const AGENT_START_MAX_TIMEOUT: Duration = Duration::from_secs(300);
+pub const AGENT_START_MAX_TIMEOUT: Duration = Duration::from_mins(5);
 /// Arguments one launch may pass through to an agent.
 pub const MAX_AGENT_START_ARGS: usize = 32;
 /// Bytes in one launch argument.

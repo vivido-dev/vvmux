@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc};
 
 /// How long a completed metadata request's result is kept for retrieval.
-const RETENTION: Duration = Duration::from_secs(600);
+const RETENTION: Duration = Duration::from_mins(10);
 /// Completed metadata results kept at once.
 const MAX_RESULTS: usize = 256;
 struct Operation {

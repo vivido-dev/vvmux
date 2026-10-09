@@ -290,7 +290,7 @@ impl Leases {
 mod tests {
     use super::*;
 
-    const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(60);
+    const DEFAULT_LEASE_TTL: Duration = Duration::from_mins(1);
 
     fn leases() -> Leases {
         Leases::default()

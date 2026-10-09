@@ -220,7 +220,7 @@ fn run_inner(
     Ok(())
 }
 
-/// Provider control and SQLite stay in a child process, never on the session actor.
+/// Provider control and `SQLite` stay in a child process, never on the session actor.
 fn start_mesh_watcher(name: &str) {
     if std::env::var("AGENT_MESH_WATCH").as_deref() == Ok("off") {
         return;

@@ -52,7 +52,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`RECONNECT_MAX`], and the actual delay is drawn with full jitter below it.
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 /// Longest reconnect delay, so a long outage is retried at least once a minute.
-const RECONNECT_MAX: Duration = Duration::from_secs(60);
+const RECONNECT_MAX: Duration = Duration::from_mins(1);
 /// Default interval between tunnel heartbeats.
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 /// Default number of missed heartbeats before the peer is declared dead.

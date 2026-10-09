@@ -393,7 +393,7 @@ fn only_states_worth_interrupting_for_notify() {
 #[test]
 fn the_notification_floor_is_per_pane_and_first_notifications_pass() {
     let now = Instant::now();
-    let floor = Duration::from_millis(2_000);
+    let floor = Duration::from_secs(2);
     // A pane that has never notified is never throttled.
     assert!(notification_allowed(None, now, floor));
     assert!(!notification_allowed(
@@ -402,7 +402,7 @@ fn the_notification_floor_is_per_pane_and_first_notifications_pass() {
         floor
     ));
     assert!(notification_allowed(
-        Some(now.checked_sub(Duration::from_millis(2_000)).unwrap()),
+        Some(now.checked_sub(Duration::from_secs(2)).unwrap()),
         now,
         floor
     ));
