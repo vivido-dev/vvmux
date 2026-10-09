@@ -509,8 +509,11 @@ Remediation validation, from `vvmux/` on macOS (rustc/cargo 1.98.1 unless pinned
 | `cargo clippy -p vvmux-plugin-sdk --target wasm32-wasip2 --locked -- -D warnings` + both guest-crate checks | Pass; the example crate's `Cargo.lock` was relocked with the SDK dependency reshape so `--locked` holds. |
 | `cargo +nightly miri test -p vvmux --lib --locked -- --skip pty::` | Pass: 50 tests, 6 filtered. |
 
-Not verified locally: Windows build, tests, and Clippy (the G01 fix follows the documented Win32
-contract and mirrors the file's own correct read path; the new CI job compiles and tests Windows on
-every push). Linux is exercised the same way.
-[ms-rust-handoff.md](ms-rust-handoff.md) carries the runbooks, watch items, and wrap-up checklist
-for closing those two platforms.
+Subsequent platform verification (2026-10-09): Linux passed the required and optional gates
+(662 passed / 0 failed / 3 ignored); Windows passed fmt, both Clippy feature configurations, and
+all-target workspace tests (565 passed / 0 failed / 3 intentional ignores), including the G01
+pending-connect cancellation regression and the real ConPTY integration tests.
+[ms-rust-handoff.md](ms-rust-handoff.md) §2a and §3a record the fixes, exact coverage, and
+toolchain caveats. G04 still awaits a green cross-platform CI run: the existing workflow failed
+during checkout of an unrelated private submodule, and its checkout is now scoped to vvmux and
+the required shared crates.

@@ -132,7 +132,7 @@ fn windows_session_exposes_structured_ai_automation() {
 }
 
 /// Concurrent clients race for the session pipe's single listening instance. A client that loses
-/// that race sees ERROR_PIPE_BUSY and must wait for the next instance rather than fail.
+/// that race sees `ERROR_PIPE_BUSY` and must wait for the next instance rather than fail.
 #[test]
 fn concurrent_clients_share_one_session_pipe() {
     let binary = env!("CARGO_BIN_EXE_vvmux");

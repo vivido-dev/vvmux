@@ -2172,8 +2172,7 @@ fn macos_argv(pid: u32) -> Option<Vec<String>> {
 
 #[cfg(windows)]
 fn foreground_processes(child_pid: u32, _group: Option<u32>) -> Vec<ProcessInfo> {
-    use std::collections::{HashMap, VecDeque};
-    use std::mem::size_of;
+    use std::collections::VecDeque;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -2231,7 +2230,7 @@ fn foreground_processes(child_pid: u32, _group: Option<u32>) -> Vec<ProcessInfo>
     while let Some(parent) = queue.pop_front() {
         for (pid, name, argv) in children.remove(&parent).unwrap_or_default() {
             queue.push_back(pid);
-            output.push(ProcessInfo { pid, argv, name });
+            output.push(ProcessInfo { pid, name, argv });
         }
     }
     output
@@ -2240,11 +2239,9 @@ fn foreground_processes(child_pid: u32, _group: Option<u32>) -> Vec<ProcessInfo>
 #[cfg(windows)]
 fn windows_command_line(pid: u32) -> Option<String> {
     use std::ffi::c_void;
-    use std::mem::{MaybeUninit, size_of};
+    use std::mem::MaybeUninit;
     use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, HANDLE, NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
-    };
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STATUS_SUCCESS, UNICODE_STRING};
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
@@ -2338,7 +2335,7 @@ fn windows_command_line(pid: u32) -> Option<String> {
                 std::ptr::null_mut(),
             )
         };
-        if status != STATUS_SUCCESS as NTSTATUS {
+        if status != STATUS_SUCCESS {
             return None;
         }
         // SAFETY: the successful query initialized the whole structure.

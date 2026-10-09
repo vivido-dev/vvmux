@@ -7,9 +7,9 @@ Everything is **uncommitted working-tree state**: in the `vvmux` submodule on to
 files), plus two root-repo changes: the untracked `.github/workflows/vvmux-ci.yml` and the
 code-map edit in `AI/vvmux-AGENTS.md`.
 
-macOS has passed every gate in the record's validation table. What no machine has done yet:
-**compile or test the Windows sources since they were changed**, and run nothing on Linux. Those
-two jobs, then the wrap-up, are the rest.
+macOS passed every gate in the record's validation table. Linux verification is recorded in
+§2a and Windows verification in §3a. Both platform runs are now complete; the first green
+cross-platform CI run and landing the Windows changes remain.
 
 ## 1. Prerequisites (both OSes)
 
@@ -143,6 +143,58 @@ Two Windows-specific expectations:
 Miri, udeps, audit, powerset, wasm32, and the MSRV pins do not need a Windows rerun; the CI job
 only asks Windows for fmt/clippy/tests too.
 
+## 3a. Windows record (2026-10-09)
+
+Verified locally on x86_64 Windows/MSVC with rustc/cargo 1.98.0. All commands ran from
+vvmux/; both Clippy configurations and the tests kept --locked, and no lockfile changed.
+
+| Command | Result |
+| --- | --- |
+| cargo fmt --all --check | Pass; stable rustfmt reports ignored nightly-only settings. |
+| cargo clippy --workspace --all-targets --locked -- -D warnings | Pass. |
+| cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings | Pass. |
+| cargo test --workspace --all-targets --locked | Pass: **565 passed / 0 failed / 3 ignored**, across 8 suites (two have no Windows tests). |
+
+Clippy 1.98 reports the shared clippy::assert_is_empty opt-out as an unknown lint because that
+lint was introduced in 1.99 (§2a). This toolchain warning does not fail either command; the
+workspace opt-out remains for newer Clippy. No Windows code lint failures remain.
+
+Windows-only fallout fixed:
+
+- Explicit raw-pointer borrows at Win32 FFI calls, statement semicolons, documentation markup,
+  redundant imports/casts/closures, struct field order, and explicit Arc::clone.
+- PendingPipe retains its event as _event, with an ownership comment: it must stay alive
+  through cancellation completion even though Rust never reads that field directly.
+- split_pipe now returns its infallible transport directly; callers wrap it at their fallible
+  boundary. Hex encoding uses the existing hex dependency.
+- Windows signal conversion, signal installation, and directory-sync stubs carry reasoned
+  item-level lint expectations that preserve their shared platform signatures.
+- The Windows Python overlay test converts coordinates through checked i32 conversion
+  before lossless f64 conversion.
+- image_probe::probe_first_image_after_cls is now an explicitly ignored manual diagnostic:
+  it requires a separately built sibling vivi.exe and machine-specific native libraries,
+  prints observations rather than asserting image acceptance, and cannot run on a clean vvmux
+  CI checkout. Its quiet-output wait now has a ten-second ceiling so continuous redraws cannot
+  keep it waiting indefinitely. The original run completed this diagnostic successfully
+  (566 passed / 0 failed / 2 ignored); the final run verifies the new opt-in configuration.
+
+All named Windows behavioral checks passed: pending-connect drop/rebind (32 iterations),
+owner-only pipe round-trip/cancellation, runtime owner/DACL validation, Ctrl+C directly and through
+an attached session, automatic split resize, detach/immediate reattach, detached daemon readiness,
+real ConPTY anchor wrapping, structured automation, and concurrent clients. The ConPTY control
+type compiled without restoring the removed unsafe impl Send/Sync.
+
+The final three ignores are the re-executed producer child helper, the existing opt-in Python
+overlay acceptance test, and the manual image diagnostic. No Windows regression was skipped.
+
+CI inspection found that [run 37891049531](https://github.com/wensheng/vivido-private/actions/runs/37891049531)
+failed on every host during checkout, before Rust ran: recursive checkout tried to clone the
+unrelated private wensheng/vvmux.com submodule. Both workflow jobs now initialize only vvmux,
+vivid_protocol, vivid_sdk, vivid_gateway, and vvte, using HTTPS for their GitHub URLs.
+cargo metadata --locked confirms these are all the external local path dependencies.
+This workflow correction and the Windows fixes still need to land and receive a green CI run;
+local success does not close that CI gate.
+
 ## 4. First CI run
 
 Once committed and pushed to `dev` (or PR'd), `.github/workflows/vvmux-ci.yml` runs:
@@ -151,7 +203,8 @@ Once committed and pushed to `dev` (or PR'd), `.github/workflows/vvmux-ci.yml` r
 - `guidelines` on ubuntu — rustdoc `-D warnings -D missing_docs`, doctests, cargo-hack powerset,
   audit, udeps, both MSRV pins, wasm32-wasip2 (SDK + both guest crates), Miri.
 
-It checks out with `submodules: recursive` and path-filters on `vvmux`, `vivid_*`, and `vvte`.
+It initializes only the required submodules listed in §3a and path-filters on vvmux,
+vivid_*, and vvte.
 Per the audit's own rule (G04: "a configured gate is unverified until it has passed on its host"),
 the finding is only closed once this workflow is green — treat its first Windows results with the
 same priority as a local Windows run.

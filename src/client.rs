@@ -548,9 +548,9 @@ pub fn attach(
         })?;
 
     #[cfg(windows)]
-    let resize_stopped = stopped.clone();
+    let resize_stopped = Arc::clone(&stopped);
     #[cfg(windows)]
-    let resize_writer = writer.clone();
+    let resize_writer = Arc::clone(&writer);
     #[cfg(windows)]
     let resize_cell_size = presenter_cell_size;
     #[cfg(windows)]

@@ -14,7 +14,7 @@ const ANCHOR_PROBE_ENV: &str = "VVMUX_TEST_CONPTY_ANCHOR_CHILD";
 const ANCHOR_BODY: &str =
     "VIVID;3;A;AAAAAAAAAAAAAAAAAAAAAA;0000000000000003;0000000000000007;AAAAAAAAAAAAAAAAAAAAAA";
 
-/// Re-executed by the parent in an actual narrow ConPTY, with libtest capture disabled.
+/// Re-executed by the parent in an actual narrow `ConPTY`, with libtest capture disabled.
 #[test]
 fn anchor_probe_child() {
     if std::env::var_os(ANCHOR_PROBE_ENV).is_none() {

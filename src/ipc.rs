@@ -378,6 +378,10 @@ impl SignalName {
     }
 
     #[cfg(not(unix))]
+    #[expect(
+        clippy::unused_self,
+        reason = "matches the Unix signal conversion API; Windows rejects signaling"
+    )]
     pub fn number(self) -> i32 {
         0
     }

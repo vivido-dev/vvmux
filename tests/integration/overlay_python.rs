@@ -128,7 +128,10 @@ fn python_hello_world_draws_and_increments_inside_a_real_vvmux() {
         }
     };
     let window = wait_label("Clicked 0 times", &mut transcript);
-    let (x, y) = (window.x as f64 + 35., window.y as f64 + 75.);
+    let (x, y) = (
+        f64::from(i32::try_from(window.x).unwrap()) + 35.,
+        f64::from(i32::try_from(window.y).unwrap()) + 75.,
+    );
     assert!(host.overlay_pointer(1, x, y, Some((1, true)), 0).unwrap());
     assert!(host.overlay_pointer(1, x, y, Some((1, false)), 0).unwrap());
     wait_label("Clicked 1 times", &mut transcript);

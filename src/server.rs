@@ -261,8 +261,8 @@ fn start_mesh_watcher(name: &str) {
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                command.creation_flags(0x0800_0000);
-            }
+                command.creation_flags(0x0800_0000)
+            };
             if let Ok(mut child) = command.spawn() {
                 let _ = child.wait();
             }
@@ -511,6 +511,10 @@ fn install_signal_forwarder(actor: ActorHandle) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the fallible Unix signal installation API"
+)]
 fn install_signal_forwarder(_actor: ActorHandle) -> io::Result<()> {
     Ok(())
 }

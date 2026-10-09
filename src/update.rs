@@ -293,6 +293,10 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the fallible Unix directory synchronization API"
+)]
 fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }

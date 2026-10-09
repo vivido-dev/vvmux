@@ -4478,9 +4478,7 @@ fn fallback_cwd() -> PathBuf {
 
 #[cfg(windows)]
 fn fallback_cwd() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\"))
+    std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from(r"C:\"), PathBuf::from)
 }
 
 fn saved_percent(extent: u16, available: u16) -> u16 {

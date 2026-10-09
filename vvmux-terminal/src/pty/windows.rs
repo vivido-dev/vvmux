@@ -51,7 +51,7 @@ const KILL_WAIT_MS: u32 = 2_000;
 /// Buffer size for each anonymous pipe between vvmux and the pseudoconsole.
 ///
 /// 64 KiB holds several full-screen repaints, so a briefly slow reader does not stall the console
-/// host; it is the size most terminal emulators use for ConPTY pipes.
+/// host; it is the size most terminal emulators use for `ConPTY` pipes.
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 
 /// The longest `NAME=value` entry the Windows environment block accepts, in UTF-16 code units.
@@ -70,7 +70,7 @@ struct ConptyApi {
 }
 
 impl ConptyApi {
-    /// Resolve the ConPTY entry points, which older Windows builds do not export.
+    /// Resolve the `ConPTY` entry points, which older Windows builds do not export.
     fn load() -> io::Result<Self> {
         type LoadedFn = unsafe extern "system" fn() -> isize;
         let module = wide(OsStr::new("kernel32.dll"))?;
@@ -105,7 +105,7 @@ impl ConptyApi {
     }
 }
 
-/// Shared handle for resizing and terminating one ConPTY pane.
+/// Shared handle for resizing and terminating one `ConPTY` pane.
 ///
 /// Clones share the same pane. Dropping the last clone terminates the pane's job object, so an
 /// abandoned pane never keeps its processes alive.
@@ -115,9 +115,8 @@ pub struct PtyControl {
 }
 
 impl fmt::Debug for PtyControl {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PtyControl")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PtyControl")
             .field("closing", &self.inner.closing.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
@@ -166,7 +165,7 @@ impl PtyControl {
         self.resize_with_pixels(columns, rows, 0, 0)
     }
 
-    /// Resize the pseudoconsole; ConPTY has no pixel size, so those arguments are ignored.
+    /// Resize the pseudoconsole, ignoring pixel dimensions unsupported by `ConPTY`.
     ///
     /// # Errors
     ///
@@ -194,7 +193,7 @@ impl PtyControl {
             .inner
             .pseudoconsole
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(handle) = *guard else {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -224,7 +223,7 @@ impl PtyControl {
 
     /// Windows has no POSIX signals and no foreground process group.
     ///
-    /// A ConPTY pane's children live in a job object, which supports termination but not the
+    /// A `ConPTY` pane's children live in a job object, which supports termination but not the
     /// selective delivery a signal expresses; there is no equivalent of "interrupt the foreground
     /// job and leave its shell alone". Refused here rather than approximated, because a caller
     /// asking for `INT` and silently getting a job-wide kill would be worse than being told no.
@@ -468,7 +467,7 @@ fn cleanup(inner: Arc<ControlInner>) {
     if let Some(handle) = inner
         .pseudoconsole
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
     {
         let api = inner.api;
@@ -494,7 +493,7 @@ impl Drop for ControlInner {
         if let Some(handle) = self
             .pseudoconsole
             .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
             let api = self.api;

@@ -162,7 +162,7 @@ pub fn windows_fallback_shell() -> OsString {
 
 /// Resolve a shell name the same way a native Windows process launch resolves an executable.
 ///
-/// Vivido records a command such as `pwsh.exe` in `SHELL`, while the ConPTY backend requires the
+/// Vivido records a command such as `pwsh.exe` in `SHELL`, while the `ConPTY` backend requires the
 /// application path to be absolute so `CreateProcessW` cannot ambiguously reinterpret it.
 pub fn resolve_windows_executable(program: &OsStr) -> Option<OsString> {
     if program.is_empty() {
@@ -220,10 +220,10 @@ impl ClientTerminal {
         let mut output_mode = 0;
         // SAFETY: the console handle was checked by `require_handle`, and the mode pointer refers
         // to a live local.
-        if unsafe { GetConsoleMode(input, &mut input_mode) } == 0
+        if unsafe { GetConsoleMode(input, &raw mut input_mode) } == 0
             // SAFETY: the console handle was checked by `require_handle`, and the mode pointer
             // refers to a live local.
-            || unsafe { GetConsoleMode(output_handle, &mut output_mode) } == 0
+            || unsafe { GetConsoleMode(output_handle, &raw mut output_mode) } == 0
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -233,12 +233,12 @@ impl ClientTerminal {
 
         let mut cursor = CONSOLE_CURSOR_INFO::default();
         // SAFETY: the console handle is valid, and the structure pointer refers to a live local.
-        if unsafe { GetConsoleCursorInfo(output_handle, &mut cursor) } == 0 {
+        if unsafe { GetConsoleCursorInfo(output_handle, &raw mut cursor) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let mut screen = CONSOLE_SCREEN_BUFFER_INFO::default();
         // SAFETY: the console handle is valid, and the structure pointer refers to a live local.
-        if unsafe { GetConsoleScreenBufferInfo(output_handle, &mut screen) } == 0 {
+        if unsafe { GetConsoleScreenBufferInfo(output_handle, &raw mut screen) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let mut title = vec![0_u16; MAX_CONSOLE_TITLE_UNITS];
@@ -275,8 +275,8 @@ impl ClientTerminal {
                 SetConsoleCP(input_code_page);
                 SetConsoleOutputCP(output_code_page);
                 SetConsoleMode(input, input_mode);
-                SetConsoleMode(output_handle, output_mode);
-            }
+                SetConsoleMode(output_handle, output_mode)
+            };
             return Err(error);
         }
 
@@ -289,8 +289,8 @@ impl ClientTerminal {
                     SetConsoleMode(input, input_mode);
                     SetConsoleMode(output_handle, output_mode);
                     SetConsoleCP(input_code_page);
-                    SetConsoleOutputCP(output_code_page);
-                }
+                    SetConsoleOutputCP(output_code_page)
+                };
                 return Err(error);
             }
         };
@@ -304,8 +304,8 @@ impl ClientTerminal {
                 SetConsoleMode(input, input_mode);
                 SetConsoleMode(output_handle, output_mode);
                 SetConsoleCP(input_code_page);
-                SetConsoleOutputCP(output_code_page);
-            }
+                SetConsoleOutputCP(output_code_page)
+            };
             return Err(error);
         }
 
@@ -321,8 +321,8 @@ impl ClientTerminal {
                     SetConsoleMode(input, input_mode);
                     SetConsoleMode(output_handle, output_mode);
                     SetConsoleCP(input_code_page);
-                    SetConsoleOutputCP(output_code_page);
-                }
+                    SetConsoleOutputCP(output_code_page)
+                };
                 return Err(error);
             }
         };
@@ -384,10 +384,10 @@ pub fn current_display_metrics() -> io::Result<DisplayMetrics> {
     let mut output_mode = 0;
     // SAFETY: the console handle was checked by `require_handle`, and the mode pointer refers to a
     // live local.
-    if unsafe { GetConsoleMode(input, &mut input_mode) } == 0
+    if unsafe { GetConsoleMode(input, &raw mut input_mode) } == 0
         // SAFETY: the console handle was checked by `require_handle`, and the mode pointer refers
         // to a live local.
-        || unsafe { GetConsoleMode(output, &mut output_mode) } == 0
+        || unsafe { GetConsoleMode(output, &raw mut output_mode) } == 0
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -396,7 +396,7 @@ pub fn current_display_metrics() -> io::Result<DisplayMetrics> {
     }
     let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
     // SAFETY: the console handle is valid, and the structure pointer refers to a live local.
-    if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } == 0 {
+    if unsafe { GetConsoleScreenBufferInfo(output, &raw mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let columns = u16::try_from(info.srWindow.Right - info.srWindow.Left + 1)
@@ -415,7 +415,7 @@ pub fn current_display_metrics() -> io::Result<DisplayMetrics> {
     };
     // SAFETY: the console handle is valid, and `font` is a live structure whose `cbSize` is set as
     // the API requires.
-    let has_font = unsafe { GetCurrentConsoleFontEx(output, 0, &mut font) } != 0;
+    let has_font = unsafe { GetCurrentConsoleFontEx(output, 0, &raw mut font) } != 0;
     let (cell_width, cell_height) = console_cell_size(has_font.then_some(font.dwFontSize));
     Ok(DisplayMetrics {
         columns,
@@ -457,9 +457,7 @@ impl Drop for ClientTerminal {
     fn drop(&mut self) {
         // SAFETY: `console_control_handler` is a `system` function valid for the life of the
         // process, and registering or removing it touches no Rust memory.
-        unsafe {
-            SetConsoleCtrlHandler(Some(console_control_handler), 0);
-        }
+        unsafe { SetConsoleCtrlHandler(Some(console_control_handler), 0) };
         CONSOLE_WAKE_EVENT.store(ptr::null_mut(), Ordering::Release);
         let _ = self
             .output
@@ -472,7 +470,7 @@ impl Drop for ClientTerminal {
         // terminated or initialized locals owned by `self`.
         unsafe {
             SetConsoleTitleW(wide_nul(&self.title).as_ptr());
-            SetConsoleCursorInfo(output, &self.cursor);
+            SetConsoleCursorInfo(output, &raw const self.cursor);
             SetConsoleCursorPosition(output, self.cursor_position);
             SetConsoleCP(self.input_code_page);
             SetConsoleOutputCP(self.output_code_page);
@@ -484,9 +482,7 @@ impl Drop for ClientTerminal {
 
 pub fn console_restoration_self_test() -> io::Result<()> {
     // SAFETY: `FreeConsole` has no preconditions.
-    unsafe {
-        FreeConsole();
-    }
+    unsafe { FreeConsole() };
     // SAFETY: `AllocConsole` has no preconditions.
     if unsafe { AllocConsole() } == 0 {
         return Err(io::Error::last_os_error());
@@ -531,9 +527,7 @@ pub fn console_restoration_self_test() -> io::Result<()> {
         Ok(())
     })();
     // SAFETY: `FreeConsole` has no preconditions.
-    unsafe {
-        FreeConsole();
-    }
+    unsafe { FreeConsole() };
     result
 }
 
@@ -558,16 +552,16 @@ impl ConsoleSnapshot {
         let mut screen = CONSOLE_SCREEN_BUFFER_INFO::default();
         // SAFETY: the console handles were just opened by `open_console_device`, and each
         // out-pointer refers to a live local.
-        if unsafe { GetConsoleMode(input, &mut input_mode) } == 0
+        if unsafe { GetConsoleMode(input, &raw mut input_mode) } == 0
             // SAFETY: the console handles were just opened by `open_console_device`, and each
             // out-pointer refers to a live local.
-            || unsafe { GetConsoleMode(output, &mut output_mode) } == 0
+            || unsafe { GetConsoleMode(output, &raw mut output_mode) } == 0
             // SAFETY: the console handles were just opened by `open_console_device`, and each
             // out-pointer refers to a live local.
-            || unsafe { GetConsoleCursorInfo(output, &mut cursor) } == 0
+            || unsafe { GetConsoleCursorInfo(output, &raw mut cursor) } == 0
             // SAFETY: the console handles were just opened by `open_console_device`, and each
             // out-pointer refers to a live local.
-            || unsafe { GetConsoleScreenBufferInfo(output, &mut screen) } == 0
+            || unsafe { GetConsoleScreenBufferInfo(output, &raw mut screen) } == 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -650,7 +644,7 @@ impl SessionListener {
         let mut slot = self
             .pending
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.is_none() {
             *slot = Some(Box::new(create_pending_pipe(
                 &self.endpoint,
@@ -671,7 +665,7 @@ impl SessionListener {
         drop(slot);
 
         require_pipe_client_owner(connected.handle.raw())?;
-        split_pipe(Arc::clone(&connected.handle))
+        Ok(split_pipe(Arc::clone(&connected.handle)))
     }
 }
 
@@ -709,15 +703,12 @@ pub fn connect_session(endpoint: &str) -> io::Result<Transport> {
         match OwnedHandle::new(handle) {
             Err(error)
                 if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
-                    && Instant::now() < deadline =>
-            {
-                continue;
-            }
+                    && Instant::now() < deadline => {}
             result => break result?,
         }
     };
     require_pipe_server_owner(handle.raw())?;
-    split_pipe(Arc::new(handle))
+    Ok(split_pipe(Arc::new(handle)))
 }
 
 pub fn session_is_connectable(endpoint: &str) -> bool {
@@ -791,7 +782,7 @@ fn windows_private_subdirectory(name: &str) -> io::Result<PathBuf> {
     let result =
         // SAFETY: the folder ID is a static GUID, and `raw` is a live local that receives a
         // CoTaskMem allocation freed below.
-        unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, ptr::null_mut(), &mut raw) };
+        unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, ptr::null_mut(), &raw mut raw) };
     if result < 0 || raw.is_null() {
         return Err(io::Error::other(format!(
             "SHGetKnownFolderPath(FOLDERID_LocalAppData) failed with HRESULT 0x{:08x}",
@@ -837,7 +828,7 @@ pub fn create_secure_windows_registry_file(path: &std::path::Path) -> io::Result
             path.as_ptr(),
             GENERIC_WRITE,
             0,
-            &attributes,
+            &raw const attributes,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL,
             ptr::null_mut(),
@@ -958,8 +949,8 @@ impl DaemonLauncher {
                 DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
                 environment.as_ptr().cast(),
                 ptr::null(),
-                &startup.StartupInfo,
-                &mut process,
+                &raw const startup.StartupInfo,
+                &raw mut process,
             )
         } == 0
         {
@@ -1011,7 +1002,7 @@ impl DaemonLauncher {
 }
 
 /// Restore normal Ctrl+C processing for the server and everything it spawns. The
-/// disabled state set by a launcher's CREATE_NEW_PROCESS_GROUP is inherited by every
+/// disabled state set by a launcher's `CREATE_NEW_PROCESS_GROUP` is inherited by every
 /// child, which would leave pane processes unable to be interrupted.
 pub fn prepare_server_process() {
     // SAFETY: `console_control_handler` is a `system` function valid for the life of the process,
@@ -1069,7 +1060,8 @@ impl ReadinessWriter {
 /// `Drop` waits for.
 struct PendingPipe {
     handle: Arc<OwnedHandle>,
-    event: OwnedHandle,
+    // Owns the event referenced by overlapped until cancellation has completed.
+    _event: OwnedHandle,
     overlapped: OVERLAPPED,
     connecting: bool,
 }
@@ -1165,7 +1157,7 @@ fn create_pending_pipe(
             PIPE_BUFFER_BYTES,
             PIPE_BUFFER_BYTES,
             0,
-            &attributes,
+            &raw const attributes,
         )
     };
     let handle = Arc::new(OwnedHandle::new(handle)?);
@@ -1178,7 +1170,7 @@ fn create_pending_pipe(
     };
     Ok(PendingPipe {
         handle,
-        event,
+        _event: event,
         overlapped,
         connecting: false,
     })
@@ -1214,8 +1206,8 @@ impl Read for PipeReader {
                 self.handle.raw(),
                 buf.as_mut_ptr(),
                 u32::try_from(buf.len()).unwrap_or(u32::MAX),
-                &mut transferred,
-                &mut overlapped,
+                &raw mut transferred,
+                &raw mut overlapped,
             )
         };
         if result == 0 && last_error_code() != ERROR_IO_PENDING {
@@ -1228,15 +1220,15 @@ impl Read for PipeReader {
         let timeout = *self
             .timeout
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let complete = if let Some(timeout) = timeout {
             // SAFETY: `overlapped` belongs to the read started above and outlives the wait;
             // `transferred` is a live local.
             unsafe {
                 GetOverlappedResultEx(
                     self.handle.raw(),
-                    &overlapped,
-                    &mut transferred,
+                    &raw const overlapped,
+                    &raw mut transferred,
                     u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1),
                     0,
                 )
@@ -1244,7 +1236,14 @@ impl Read for PipeReader {
         } else {
             // SAFETY: `overlapped` belongs to the operation started above and outlives the wait;
             // `transferred` is a live local.
-            unsafe { GetOverlappedResult(self.handle.raw(), &overlapped, &mut transferred, 1) }
+            unsafe {
+                GetOverlappedResult(
+                    self.handle.raw(),
+                    &raw const overlapped,
+                    &raw mut transferred,
+                    1,
+                )
+            }
         };
         if complete != 0 {
             Ok(transferred as usize)
@@ -1259,8 +1258,8 @@ impl Read for PipeReader {
                     &raw const overlapped,
                     &raw mut transferred,
                     1,
-                );
-            }
+                )
+            };
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "named-pipe read timed out",
@@ -1291,8 +1290,8 @@ impl Write for PipeWriter {
                 self.handle.raw(),
                 buf.as_ptr(),
                 u32::try_from(buf.len()).unwrap_or(u32::MAX),
-                &mut transferred,
-                &mut overlapped,
+                &raw mut transferred,
+                &raw mut overlapped,
             )
         };
         if result == 0 && last_error_code() != ERROR_IO_PENDING {
@@ -1301,7 +1300,7 @@ impl Write for PipeWriter {
         if result == 0
             // SAFETY: `overlapped` belongs to the operation started above and outlives the wait;
             // `transferred` is a live local.
-            && unsafe { GetOverlappedResult(self.handle.raw(), &overlapped, &mut transferred, 1) }
+            && unsafe { GetOverlappedResult(self.handle.raw(), &raw const overlapped, &raw mut transferred, 1) }
                 == 0
         {
             return Err(pipe_write_error());
@@ -1314,7 +1313,7 @@ impl Write for PipeWriter {
     }
 }
 
-fn split_pipe(handle: Arc<OwnedHandle>) -> io::Result<Transport> {
+fn split_pipe(handle: Arc<OwnedHandle>) -> Transport {
     let timeout = Arc::new(Mutex::new(None));
     let reader = PipeReader {
         handle: Arc::clone(&handle),
@@ -1336,15 +1335,10 @@ fn split_pipe(handle: Arc<OwnedHandle>) -> io::Result<Transport> {
     let set_timeout = Arc::new(move |duration| {
         *timeout
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = duration;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = duration;
         Ok(())
     });
-    Ok(Transport::new(
-        Box::new(reader),
-        Box::new(writer),
-        cancel,
-        set_timeout,
-    ))
+    Transport::new(Box::new(reader), Box::new(writer), cancel, set_timeout)
 }
 
 fn pipe_read_error() -> io::Result<usize> {
@@ -1430,7 +1424,7 @@ impl SecurityDescriptor {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
                 SDDL_REVISION_1,
-                &mut pointer,
+                &raw mut pointer,
                 ptr::null_mut(),
             )
         } == 0
@@ -1476,7 +1470,7 @@ impl ProcessToken {
         let mut token = ptr::null_mut();
         // SAFETY: the process handle is valid for the call, and `token` is a live local written
         // once.
-        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let token = OwnedHandle::new(token)?;
@@ -1518,7 +1512,7 @@ impl ProcessToken {
         let mut string = ptr::null_mut();
         // SAFETY: `self.sid()` points into this token's live buffer, and `string` is a live local
         // receiving a LocalAlloc allocation freed below.
-        if unsafe { ConvertSidToStringSidW(self.sid(), &mut string) } == 0 {
+        if unsafe { ConvertSidToStringSidW(self.sid(), &raw mut string) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let mut length = 0;
@@ -1534,9 +1528,7 @@ impl ProcessToken {
             });
         // SAFETY: the pointer was allocated with LocalAlloc by the Win32 call that produced it and
         // is freed exactly once.
-        unsafe {
-            LocalFree(string.cast());
-        }
+        unsafe { LocalFree(string.cast()) };
         value
     }
 }
@@ -1544,7 +1536,7 @@ impl ProcessToken {
 fn require_pipe_client_owner(handle: HANDLE) -> io::Result<()> {
     let mut pid = 0;
     // SAFETY: the pipe handle is open for the call, and `pid` is a live local.
-    if unsafe { GetNamedPipeClientProcessId(handle, &mut pid) } == 0 {
+    if unsafe { GetNamedPipeClientProcessId(handle, &raw mut pid) } == 0 {
         return Err(io::Error::last_os_error());
     }
     require_process_owner(pid)
@@ -1553,7 +1545,7 @@ fn require_pipe_client_owner(handle: HANDLE) -> io::Result<()> {
 fn require_pipe_server_owner(handle: HANDLE) -> io::Result<()> {
     let mut pid = 0;
     // SAFETY: the pipe handle is open for the call, and `pid` is a live local.
-    if unsafe { GetNamedPipeServerProcessId(handle, &mut pid) } == 0 {
+    if unsafe { GetNamedPipeServerProcessId(handle, &raw mut pid) } == 0 {
         return Err(io::Error::last_os_error());
     }
     require_process_owner(pid)
@@ -1628,7 +1620,7 @@ fn inheritable_null() -> io::Result<OwnedHandle> {
             name.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &attributes,
+            &raw const attributes,
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
             ptr::null_mut(),
@@ -1834,7 +1826,7 @@ fn ensure_secure_directory(
     };
     // SAFETY: the path is NUL-terminated UTF-16, and `attributes` points to a live descriptor; both
     // outlive the call.
-    if unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) } == 0 {
+    if unsafe { CreateDirectoryW(path_wide.as_ptr(), &raw const attributes) } == 0 {
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::AlreadyExists && error.raw_os_error() != Some(183) {
             return Err(error);
@@ -1891,11 +1883,11 @@ fn validate_handle_security(handle: HANDLE) -> io::Result<()> {
             handle,
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &mut owner,
+            &raw mut owner,
             ptr::null_mut(),
-            &mut dacl,
+            &raw mut dacl,
             ptr::null_mut(),
-            &mut descriptor,
+            &raw mut descriptor,
         )
     };
     if status != 0 {
@@ -1953,7 +1945,7 @@ fn validate_security_parts(
     let mut revision = 0;
     // SAFETY: `descriptor` is the live descriptor returned by `GetSecurityInfo`, and both
     // out-pointers are live locals.
-    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+    if unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) } == 0
         || control & SE_DACL_PROTECTED == 0
     {
         return Err(unsafe_runtime_security());
@@ -1981,7 +1973,7 @@ fn validate_security_parts(
         let mut raw = ptr::null_mut();
         // SAFETY: `dacl` points into the live security descriptor, `index` is below its ACE count,
         // and `raw` is a live local.
-        if unsafe { GetAce(dacl, index, &mut raw) } == 0 || raw.is_null() {
+        if unsafe { GetAce(dacl, index, &raw mut raw) } == 0 || raw.is_null() {
             return Err(unsafe_runtime_security());
         }
         // SAFETY: `GetAce` returned a pointer to a DWORD-aligned ACE inside the live `dacl`; its
@@ -2024,7 +2016,7 @@ fn validate_security_parts(
     }
 }
 
-/// The LocalSystem SID, in pointer-aligned storage as the security APIs expect.
+/// The `LocalSystem` SID, in pointer-aligned storage as the security APIs expect.
 fn local_system_sid() -> io::Result<Vec<usize>> {
     let mut length = SECURITY_MAX_SID_SIZE;
     let mut sid = vec![0_usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
@@ -2060,10 +2052,7 @@ fn domain_hash(domain: &[u8], value: &[u8]) -> [u8; 32] {
 }
 
 fn hex_prefix(bytes: &[u8], length: usize) -> String {
-    bytes[..length]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(&bytes[..length])
 }
 
 fn split_tcp(stream: TcpStream) -> io::Result<Transport> {
@@ -2104,7 +2093,7 @@ fn duplicate_file(handle: HANDLE) -> io::Result<File> {
             process,
             handle,
             process,
-            &mut duplicate,
+            &raw mut duplicate,
             0,
             0,
             DUPLICATE_SAME_ACCESS,
@@ -2142,7 +2131,10 @@ mod tests {
         assert_ne!(
             // SAFETY: the handle is open for the test, and `flags` is a live local.
             unsafe {
-                windows_sys::Win32::Foundation::GetHandleInformation(handle as HANDLE, &mut flags)
+                windows_sys::Win32::Foundation::GetHandleInformation(
+                    handle as HANDLE,
+                    &raw mut flags,
+                )
             },
             0
         );
@@ -2177,7 +2169,7 @@ mod tests {
         assert_eq!(
             std::path::Path::new(&resolved)
                 .file_name()
-                .map(|name| name.to_ascii_lowercase()),
+                .map(std::ffi::OsStr::to_ascii_lowercase),
             Some(file_name.to_ascii_lowercase())
         );
     }

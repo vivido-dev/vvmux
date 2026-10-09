@@ -37,6 +37,7 @@ fn normalized(transcript: &[u8]) -> String {
 }
 
 #[test]
+#[ignore = "manual image diagnostic; requires separately built vivi and its native libraries"]
 fn probe_first_image_after_cls() {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_vvmux"));
     let vivi = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -78,8 +79,17 @@ fn probe_first_image_after_cls() {
 
     let mut transcript = Vec::new();
     let wait_quiet = |transcript: &mut Vec<u8>, quiet_ms: u64| {
-        while let Ok(chunk) = receiver.recv_timeout(Duration::from_millis(quiet_ms)) {
-            transcript.extend(chunk);
+        // Cursor redraws can keep producing output indefinitely, even with no user input.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match receiver.recv_timeout(Duration::from_millis(quiet_ms).min(remaining)) {
+                Ok(chunk) => transcript.extend(chunk),
+                Err(_) => break,
+            }
         }
     };
     let wait_for = |needle: &str, timeout_ms: u64, transcript: &mut Vec<u8>| -> bool {

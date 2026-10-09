@@ -77,7 +77,7 @@ impl VividMarkerScanner {
                         break;
                     }
                     Scan::Invalid => {
-                        push_bytes(&mut chunks, &self.pending[start..start + 1]);
+                        push_bytes(&mut chunks, &self.pending[start..=start]);
                         cursor = start + 1;
                     }
                 }
