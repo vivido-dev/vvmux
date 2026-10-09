@@ -14,7 +14,7 @@ pub struct TextStyle {
 
 impl TextStyle {
     // Themed colors reach production through `ResolvedTheme`; this shorthand is for tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn indexed(foreground: u8, background: u8) -> Self {
         Self {
             foreground: TerminalColor::Indexed(foreground),
@@ -115,7 +115,6 @@ impl ScreenBuffer {
     /// Paint an entire row with `style`, so a themed status bar spans the full width instead of
     /// only the columns its text happens to occupy.
     // Consumed by the themed status bar; only the unit tests exercise it until then.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn fill_row(&mut self, y: u16, style: TextStyle) {
         if y >= self.rows {
             return;
@@ -139,7 +138,6 @@ impl ScreenBuffer {
     /// Search highlighting needs to restyle a match in place: rewriting the cells would lose wide
     /// glyphs, combining marks, and hyperlinks that the pane's own output put there.
     // Consumed by scrollback search highlighting; only the unit tests exercise it until then.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn restyle(&mut self, x: u16, y: u16, width: u16, style: TextStyle) {
         if y >= self.rows {
             return;
@@ -472,7 +470,7 @@ fn write_underline_color(output: &mut Vec<u8>, color: Option<TerminalColor>) {
 fn write_color(output: &mut Vec<u8>, color: TerminalColor, foreground: bool) {
     match color {
         TerminalColor::Default => {
-            output.extend_from_slice(if foreground { b";39" } else { b";49" })
+            output.extend_from_slice(if foreground { b";39" } else { b";49" });
         }
         TerminalColor::Indexed(index) if index < 8 => {
             output.extend_from_slice(
@@ -536,7 +534,6 @@ mod tests {
         assert_eq!(screen.cells[0].foreground, TerminalColor::Default);
         assert_eq!(screen.cells[1], text);
     }
-    use vvmux_terminal::TerminalHyperlink;
 
     #[test]
     fn diff_skips_unchanged_cells() {
@@ -551,6 +548,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::naive_bytecount,
+        reason = "counting one short test frame needs no vectorized search"
+    )]
     fn full_redraw_repaints_without_clearing_outer_media() {
         let screen = ScreenBuffer::new(4, 2);
         let full = ansi_diff(None, &screen, true);

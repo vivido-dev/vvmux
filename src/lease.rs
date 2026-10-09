@@ -25,7 +25,9 @@ use crate::layout::PaneId;
 /// able to grow this without limit. Expired entries are swept on every access, so the ceiling is
 /// only ever reached by live holders.
 const MAX_LEASES: usize = 64;
-pub const MAX_LEASE_TTL: Duration = Duration::from_secs(60 * 60);
+/// Longest a pane lease may last without renewal.
+pub const MAX_LEASE_TTL: Duration = Duration::from_hours(1);
+/// Longest lease holder name, in bytes.
 const MAX_HOLDER_BYTES: usize = 64;
 
 /// What a lease excludes other callers from doing.
@@ -300,32 +302,24 @@ mod tests {
         let first = leases
             .acquire(1, LeaseScope::Input, DEFAULT_LEASE_TTL, None, "test")
             .unwrap();
-        assert!(
-            leases
-                .acquire(1, LeaseScope::Input, DEFAULT_LEASE_TTL, None, "test")
-                .is_err()
-        );
+        leases
+            .acquire(1, LeaseScope::Input, DEFAULT_LEASE_TTL, None, "test")
+            .unwrap_err();
         // A different pane and a different scope are both free.
-        assert!(
-            leases
-                .acquire(2, LeaseScope::Input, DEFAULT_LEASE_TTL, None, "test")
-                .is_ok()
-        );
-        assert!(
-            leases
-                .acquire(1, LeaseScope::Layout, DEFAULT_LEASE_TTL, None, "test")
-                .is_ok()
-        );
+        leases
+            .acquire(2, LeaseScope::Input, DEFAULT_LEASE_TTL, None, "test")
+            .unwrap();
+        leases
+            .acquire(1, LeaseScope::Layout, DEFAULT_LEASE_TTL, None, "test")
+            .unwrap();
         // Observation is shared, because watching a pane changes nothing about it.
         for _ in 0..3 {
-            assert!(
-                leases
-                    .acquire(1, LeaseScope::Observe, DEFAULT_LEASE_TTL, None, "test")
-                    .is_ok()
-            );
+            leases
+                .acquire(1, LeaseScope::Observe, DEFAULT_LEASE_TTL, None, "test")
+                .unwrap();
         }
         let id = first["lease_id"].as_str().unwrap().to_owned();
-        assert!(leases.release(&id).is_ok());
+        leases.release(&id).unwrap();
         assert!(
             leases
                 .acquire(1, LeaseScope::Input, DEFAULT_LEASE_TTL, None, "test")
@@ -343,20 +337,20 @@ mod tests {
             MethodClass::Layout,
             MethodClass::Process,
         ] {
-            assert!(leases.check(Some(1), class, None).is_ok());
+            leases.check(Some(1), class, None).unwrap();
         }
         let held = leases
             .acquire(1, LeaseScope::Input, DEFAULT_LEASE_TTL, None, "test")
             .unwrap();
         let id = held["lease_id"].as_str().unwrap();
 
-        assert!(leases.check(Some(1), MethodClass::Input, Some(id)).is_ok());
+        leases.check(Some(1), MethodClass::Input, Some(id)).unwrap();
         assert!(leases.check(Some(1), MethodClass::Input, None).is_err());
         // Only the leased scope is excluded; an observation and an unrelated pane still pass.
-        assert!(leases.check(Some(1), MethodClass::Observe, None).is_ok());
-        assert!(leases.check(Some(2), MethodClass::Input, None).is_ok());
+        leases.check(Some(1), MethodClass::Observe, None).unwrap();
+        leases.check(Some(2), MethodClass::Input, None).unwrap();
         // A scope with no lease on this pane is unaffected.
-        assert!(leases.check(Some(1), MethodClass::Layout, None).is_ok());
+        leases.check(Some(1), MethodClass::Layout, None).unwrap();
     }
 
     #[test]
@@ -369,23 +363,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         // The holder is gone, so the pane is free again. This is the only release that does not
         // need the holder to still be alive.
-        assert!(leases.check(Some(1), MethodClass::Input, None).is_ok());
-        assert!(leases.renew(&id, DEFAULT_LEASE_TTL).is_err());
+        leases.check(Some(1), MethodClass::Input, None).unwrap();
+        leases.renew(&id, DEFAULT_LEASE_TTL).unwrap_err();
         assert!(leases.list()["leases"].as_array().unwrap().is_empty());
     }
 
     #[test]
     fn a_ttl_is_required_and_bounded() {
         let mut leases = leases();
-        assert!(
-            leases
-                .acquire(1, LeaseScope::Input, Duration::ZERO, None, "test")
-                .is_err()
-        );
-        assert!(
-            leases
-                .acquire(1, LeaseScope::Input, MAX_LEASE_TTL * 2, None, "test")
-                .is_err()
-        );
+        leases
+            .acquire(1, LeaseScope::Input, Duration::ZERO, None, "test")
+            .unwrap_err();
+        leases
+            .acquire(1, LeaseScope::Input, MAX_LEASE_TTL * 2, None, "test")
+            .unwrap_err();
     }
 }

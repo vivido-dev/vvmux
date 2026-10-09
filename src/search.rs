@@ -3,8 +3,11 @@
 use regex::{Regex, RegexBuilder};
 use vvmux_terminal::Terminal;
 
+/// Most rows one search visits, so a search in a huge scrollback returns promptly.
 pub const MAX_SEARCH_SCAN_LINES: usize = 200_000;
+/// Longest search pattern, in bytes.
 pub const MAX_PATTERN_BYTES: usize = 8 * 1024;
+/// Compiled regex size limit, which keeps a pathological pattern from consuming memory.
 pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
@@ -340,7 +343,7 @@ mod tests {
         let mut terminal = Terminal::new(2, 20, 100);
         terminal.feed(b"line 001\r\nline 002\r\nline 003\r\nline 004");
         let pattern = compile("line", false, true).unwrap();
-        assert!(find_on_line(&terminal, &pattern, -1).len() == 1);
+        assert_eq!(find_on_line(&terminal, &pattern, -1).len(), 1);
         let (matches, truncated) = find_all(&terminal, &pattern, 2);
         assert_eq!(matches.len(), 2);
         assert!(truncated);
@@ -348,7 +351,7 @@ mod tests {
 
     #[test]
     fn compile_enforces_pattern_and_regex_program_limits() {
-        assert!(compile(&"x".repeat(MAX_PATTERN_BYTES + 1), false, true).is_err());
+        compile(&"x".repeat(MAX_PATTERN_BYTES + 1), false, true).unwrap_err();
         let large_program = format!(
             "(?:{}){{1000}}",
             (0..200)
@@ -356,7 +359,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("|")
         );
-        assert!(compile(&large_program, true, false).is_err());
+        compile(&large_program, true, false).unwrap_err();
     }
 
     #[test]

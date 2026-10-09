@@ -524,7 +524,8 @@ fn four_pane_stack_starts_before_a_real_display_is_attached() {
                 "[[tabs.layout.children]]\npane='p{pane}'\ncommand=\"printf 'STACK {pane}\\\\n'; sleep 30\"\n"
             )
         })
-        .collect::<String>();
+        .collect::<Vec<_>>()
+        .concat();
     let layout = fixture.write_layout(
         "stack.toml",
         &format!("[[tabs]]\n[tabs.layout]\nsplit='vertical'\nsizes=[1,1,1,1]\n{children}"),

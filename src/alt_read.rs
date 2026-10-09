@@ -10,15 +10,26 @@ use vvmux_terminal::{Terminal, TerminalModes};
 
 use crate::agent_drive::{WHEEL_DOWN, WHEEL_UP, encode_sgr_mouse};
 
+/// Most alternate-screen reads running at once in a session; each one drives a pane's scrolling.
 pub(crate) const MAX_ALT_SCREEN_READS: usize = 8;
+/// Most lines one alternate-screen read may collect.
 pub(crate) const MAX_READ_LINES: usize = 1000;
 
+/// How long to let a full-screen agent redraw after each scroll step before reading its screen.
 const STEP_SETTLE: Duration = Duration::from_millis(120);
+/// Longest one alternate-screen read may take before it returns what it has.
 const MAX_DURATION: Duration = Duration::from_secs(15);
+/// Longest the read may spend scrolling the agent back to where it was.
 const MAX_RESTORE_DURATION: Duration = Duration::from_secs(5);
+/// Scroll steps that may fail to line up with the collected text before the read stops, rather than
+/// merging a misaligned transcript.
 const MAX_UNALIGNED_CHECKS: u8 = 4;
+/// Wheel events sent per scroll step; small enough that consecutive screens overlap and can be
+/// merged.
 const WHEEL_STEP_EVENTS: usize = 3;
+/// Fewest matching rows, as a percentage, for two screens to be treated as overlapping.
 const MIN_ALIGNMENT_RATIO_PERCENT: usize = 30;
+/// Matching rows, as a percentage, at which a scroll is judged to have had no effect.
 const SIMILAR_VIEWPORT_RATIO_PERCENT: usize = 70;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

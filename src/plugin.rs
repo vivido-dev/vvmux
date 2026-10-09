@@ -18,10 +18,27 @@ use vvmux_plugin_api::{
     PluginError, Runtime, RuntimeKind, read_frame, write_frame,
 };
 
+/// Version of the installed-plugin registry file format.
 const REGISTRY_SCHEMA: u16 = 2;
+/// Largest plugin registry file read, in bytes.
 const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
+/// Largest action output accepted from a one-shot plugin process, matching the protocol frame
+/// limit.
 const MAX_ACTION_OUTPUT: usize = 1024 * 1024;
+/// Most stderr kept from a plugin process.
 const MAX_LOG_OUTPUT: usize = 256 * 1024;
+/// How long a native service has to send its hello and finish initializing.
+const NATIVE_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// First restart delay after a native service crashes; it doubles per consecutive crash.
+const CRASH_BACKOFF_BASE: Duration = Duration::from_millis(100);
+/// Longest restart delay for a repeatedly crashing native service.
+const CRASH_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Longest single wait for a native service reply, so cancellation is checked between waits.
+const NATIVE_RECEIVE_SLICE: Duration = Duration::from_millis(20);
+/// How long a native service has to acknowledge a cancellation before it is terminated.
+const NATIVE_CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// How long a native service has to exit after `Shutdown` before it is terminated.
+const NATIVE_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 fn known_plugin_event(name: &str) -> bool {
     matches!(
@@ -151,7 +168,7 @@ pub enum PluginJobCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum PluginPaneCommand {
-    /// Open a pane entrypoint, identified as PLUGIN_ID/PANE_ID.
+    /// Open a pane entrypoint, identified as `PLUGIN_ID/PANE_ID`.
     Open {
         reference: String,
         #[arg(long)]
@@ -840,7 +857,7 @@ fn schema_at_pointer<'a>(schema: &'a Value, pointer: &str) -> io::Result<&'a Val
     let mut current = dereference_schema(schema, schema)?;
     for component in pointer.split('/').skip(1) {
         let component = component.replace("~1", "/").replace("~0", "~");
-        if current.as_object().is_none_or(|schema| schema.is_empty()) {
+        if current.as_object().is_none_or(serde_json::Map::is_empty) {
             return Ok(current);
         }
         current = current
@@ -1296,6 +1313,10 @@ fn reload_live_sessions() -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "a test stand-in for the fallible production function"
+)]
 fn reload_live_sessions() -> io::Result<()> {
     Ok(())
 }
@@ -1379,12 +1400,13 @@ fn install_local(
     // never fatal: the package is installed either way, and a hand-edited agent config file must
     // not undo a commit that already succeeded.
     for package in pending.values() {
-        let root = match package.linked {
-            true => package.source_dir.clone(),
-            false => match load_registry(paths)?.plugins.get(&package.id) {
+        let root = if package.linked {
+            package.source_dir.clone()
+        } else {
+            match load_registry(paths)?.plugins.get(&package.id) {
                 Some(entry) => entry.root.clone(),
                 None => continue,
-            },
+            }
         };
         apply_integrations(&package.id, &root);
     }
@@ -1660,7 +1682,10 @@ fn ensure_current_platform(loaded: &LoadedManifest) -> io::Result<()> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the recursive walk threads its accumulators and depth explicitly"
+)]
 fn collect_dependency_sources(
     paths: &PluginPaths,
     id: &str,
@@ -1900,8 +1925,8 @@ fn commit_package_graph(
         registry.plugins.insert(package.id.clone(), entry);
     }
     if let Err(error) = validate_dependency_graph(&registry)
-        .and_then(|_| validate_registry_for_install(&registry))
-        .and_then(|_| commit_registry(paths, previous, &mut registry))
+        .and_then(|()| validate_registry_for_install(&registry))
+        .and_then(|()| commit_registry(paths, previous, &mut registry))
     {
         cleanup_temporary(paths, &installed_new);
         return Err(error);
@@ -2234,7 +2259,7 @@ fn session_capabilities(target: &str) -> io::Result<Value> {
     let (mut reader, writer) = crate::server::connect(target)?;
     writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .send(&ClientMessage::Automation(AutomationRequest {
             id: 1,
             pane_id: None,
@@ -2261,7 +2286,7 @@ fn invoke_via_session(
     let (mut reader, writer) = crate::server::connect(target)?;
     writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .send(&ClientMessage::Automation(AutomationRequest {
             id: 1,
             pane_id: None,
@@ -2324,7 +2349,7 @@ fn events(target: &str, after_sequence: Option<u64>) -> io::Result<()> {
     let (mut reader, writer) = crate::server::connect(target)?;
     writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .send(&ClientMessage::Automation(AutomationRequest {
             id: 1,
             pane_id: None,
@@ -2370,7 +2395,7 @@ fn plugin_session_request(target: &str, method: crate::ipc::PluginMethod) -> io:
     let (mut reader, writer) = crate::server::connect(target)?;
     writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .send(&ClientMessage::Automation(AutomationRequest {
             id: 1,
             pane_id: None,
@@ -2465,20 +2490,19 @@ impl SessionPluginRuntime {
             .as_millis()
             .saturating_add(action_timeout.as_millis())
             .min(u128::from(u64::MAX)) as u64;
-        let mut context = match context {
-            Some(context) => context,
-            None => {
-                let correlation_id = random_id()?;
-                InvocationContext {
-                    correlation_id: correlation_id.clone(),
-                    causation_id: correlation_id,
-                    causation_depth: 0,
-                    source: "automation".into(),
-                    session_instance: self.session_instance.clone(),
-                    pane_id: None,
-                    tab_id: None,
-                    deadline_unix_ms,
-                }
+        let mut context = if let Some(context) = context {
+            context
+        } else {
+            let correlation_id = random_id()?;
+            InvocationContext {
+                correlation_id: correlation_id.clone(),
+                causation_id: correlation_id,
+                causation_depth: 0,
+                source: "automation".into(),
+                session_instance: self.session_instance.clone(),
+                pane_id: None,
+                tab_id: None,
+                deadline_unix_ms,
             }
         };
         context.session_instance.clone_from(&self.session_instance);
@@ -2582,7 +2606,7 @@ impl SessionPluginRuntime {
                             Some(&self.broker),
                             &self.loaded.manifest.plugin.permissions,
                             &runtime.preopens,
-                            cancel.clone(),
+                            Arc::clone(&cancel),
                             Instant::now() + component_startup_timeout(runtime),
                         ) {
                             Ok(component) => self.component = Some(component),
@@ -2644,7 +2668,7 @@ impl SessionPluginRuntime {
         let Some(runtime) = self.loaded.manifest.runtime.clone() else {
             return Ok(());
         };
-        let timeout = Duration::from_secs(10);
+        let timeout = NATIVE_ACTIVATION_TIMEOUT;
         match runtime.kind {
             RuntimeKind::Process if self.service.is_none() => {
                 self.service = Some(NativeService::start(
@@ -2772,7 +2796,9 @@ impl SessionPluginRuntime {
 
 fn crash_backoff(consecutive_crashes: u32) -> Duration {
     let exponent = consecutive_crashes.saturating_sub(1).min(8);
-    Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent)).min(Duration::from_secs(30))
+    CRASH_BACKOFF_BASE
+        .saturating_mul(1_u32 << exponent)
+        .min(CRASH_BACKOFF_MAX)
 }
 
 struct NativeService {
@@ -2920,7 +2946,7 @@ impl NativeService {
             }
             match self
                 .receiver
-                .recv_timeout(remaining.min(Duration::from_millis(20)))
+                .recv_timeout(remaining.min(NATIVE_RECEIVE_SLICE))
             {
                 Ok(Ok(NativeReply::Result(result))) if result.request_id == request_id => {
                     return Ok(result.result);
@@ -2994,7 +3020,7 @@ impl NativeService {
             "event": event.name,
             "payload": event.payload,
         });
-        event.name = handler.to_owned();
+        handler.clone_into(&mut event.name);
         let _cause = self
             .broker_lease
             .as_ref()
@@ -3013,9 +3039,9 @@ impl NativeService {
             }
             match self
                 .receiver
-                .recv_timeout(remaining.min(Duration::from_millis(20)))
+                .recv_timeout(remaining.min(NATIVE_RECEIVE_SLICE))
             {
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     self.healthy = false;
                     return Err(invalid("runtime_crashed: native plugin protocol closed"));
@@ -3093,7 +3119,7 @@ impl NativeService {
 
     fn cancel(&mut self, request_id: u64, message: &'static str) -> io::Result<Value> {
         let _ = self.write(&NativeMessage::Cancel { request_id });
-        let grace = Instant::now() + Duration::from_secs(2);
+        let grace = Instant::now() + NATIVE_CANCEL_GRACE;
         match self
             .receiver
             .recv_timeout(grace.saturating_duration_since(Instant::now()))
@@ -3107,7 +3133,7 @@ impl NativeService {
             Ok(Ok(NativeReply::Error(error))) if error.request_id == request_id => {
                 Err(invalid(message))
             }
-            Ok(Ok(_)) | Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(Ok(_) | Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 self.healthy = false;
                 Err(invalid(message))
             }
@@ -3123,7 +3149,7 @@ impl NativeService {
         if self.healthy {
             let request_id = self.next_request_id;
             let _ = self.write(&NativeMessage::Shutdown { request_id });
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + NATIVE_SHUTDOWN_GRACE;
             if wait_until(&mut self.child, deadline)
                 .ok()
                 .flatten()
@@ -3142,9 +3168,11 @@ impl NativeService {
             && let Ok(Ok(logs)) = stderr_reader.join()
             && logs.truncated
         {
-            eprintln!(
-                "vvmux: plugin {} stderr truncated at {MAX_LOG_OUTPUT} bytes",
-                self.plugin_id
+            log::warn!(
+                event = "plugin.stderr.truncated",
+                plugin = self.plugin_id.as_str(),
+                limit = MAX_LOG_OUTPUT;
+                "plugin stderr truncated"
             );
         }
     }
@@ -3556,14 +3584,14 @@ fn run_one_shot(
             let _ = stderr_reader.join();
             return Err(invalid("timeout: plugin action exceeded its deadline"));
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(EXIT_POLL_INTERVAL);
     };
     let stdout = stdout_reader
         .join()
-        .map_err(|_| io::Error::other("stdout reader panicked"))??;
+        .map_err(|_panic| io::Error::other("stdout reader panicked"))??;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| io::Error::other("stderr reader panicked"))??;
+        .map_err(|_panic| io::Error::other("stderr reader panicked"))??;
     if !status.success() {
         return Err(io::Error::other(format!(
             "runtime_crashed: plugin exited with {status}: {}",
@@ -3603,6 +3631,9 @@ fn trusted_command(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // SAFETY: the hook runs between `fork` and `exec` and calls only the async-signal-safe
+        // `setsid`, reporting failure through `last_os_error`, which reads `errno` without
+        // allocating.
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -3616,6 +3647,19 @@ fn trusted_command(
     command
 }
 
+/// How often a waiting caller polls a plugin process for exit.
+///
+/// Short enough that a quick action returns promptly, long enough that polling costs nothing
+/// measurable next to process startup.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long a plugin's process group gets between SIGTERM and SIGKILL.
+///
+/// Plugins are short-lived helpers; two seconds lets one flush output and remove temporary files
+/// without letting a stuck plugin delay cancellation noticeably.
+#[cfg(unix)]
+const PLUGIN_TERMINATE_GRACE: Duration = Duration::from_secs(2);
+
 fn wait_until(
     child: &mut std::process::Child,
     deadline: Instant,
@@ -3627,7 +3671,7 @@ fn wait_until(
         if Instant::now() >= deadline {
             return Ok(None);
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(EXIT_POLL_INTERVAL);
     }
 }
 
@@ -3656,15 +3700,22 @@ fn read_capped(mut reader: impl Read, limit: usize) -> io::Result<CappedOutput> 
 struct ProcessTree;
 
 #[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Windows job-object attachment can fail, so both platforms share the signature"
+)]
 fn attach_process_tree(_child: &mut std::process::Child) -> io::Result<ProcessTree> {
     Ok(ProcessTree)
 }
 
+/// The kill-on-close job object that owns a plugin process and its descendants.
 #[cfg(windows)]
 struct ProcessTree {
     job: windows_sys::Win32::Foundation::HANDLE,
 }
 
+// SAFETY: the job handle is a process-wide kernel handle usable from any thread; `ProcessTree`
+// uses it only for thread-safe kernel calls and closes it once, in `Drop`.
 #[cfg(windows)]
 unsafe impl Send for ProcessTree {}
 
@@ -3672,9 +3723,8 @@ unsafe impl Send for ProcessTree {}
 impl Drop for ProcessTree {
     fn drop(&mut self) {
         if !self.job.is_null() {
-            unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(self.job);
-            }
+            // SAFETY: the job handle is open and owned by `self`; this is its only close.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job) };
         }
     }
 }
@@ -3689,6 +3739,7 @@ fn attach_process_tree(child: &mut std::process::Child) -> io::Result<ProcessTre
         SetInformationJobObject,
     };
 
+    // SAFETY: null attributes and a null name request an unnamed job with default security.
     let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
     if job.is_null() {
         let error = io::Error::last_os_error();
@@ -3698,21 +3749,22 @@ fn attach_process_tree(child: &mut std::process::Child) -> io::Result<ProcessTre
     }
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: `job` is open, and the pointer and length describe the live `limits` structure.
     let configured = unsafe {
         SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
-            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            (&raw const limits).cast(),
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )
     };
+    // SAFETY: `job` is open, and `child` keeps its process handle open for the call.
     let assigned = configured != 0
         && unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) } != 0;
     if !assigned {
         let error = io::Error::last_os_error();
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(job);
-        }
+        // SAFETY: `job` was created above, is not yet owned by a `ProcessTree`, and is closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
@@ -3722,27 +3774,32 @@ fn attach_process_tree(child: &mut std::process::Child) -> io::Result<ProcessTre
 
 fn terminate_process_tree(
     child: &mut std::process::Child,
-    _process_id: u32,
-    _process_tree: &ProcessTree,
+    process_id: u32,
+    process_tree: &ProcessTree,
 ) {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(-(_process_id as i32), libc::SIGTERM);
-        let grace = Instant::now() + Duration::from_secs(2);
+    {
+        // The plugin was started with `setsid`, so its PID is also its process-group ID.
+        let _ = process_tree;
+        let group = -(process_id as i32);
+        // SAFETY: `kill` has no memory-safety preconditions; a negative PID addresses a group.
+        unsafe { libc::kill(group, libc::SIGTERM) };
+        let grace = Instant::now() + PLUGIN_TERMINATE_GRACE;
         while Instant::now() < grace {
             if child.try_wait().ok().flatten().is_some() {
                 return;
             }
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(EXIT_POLL_INTERVAL);
         }
-        libc::kill(-(_process_id as i32), libc::SIGKILL);
+        // SAFETY: as above.
+        unsafe { libc::kill(group, libc::SIGKILL) };
         let _ = child.wait();
     }
     #[cfg(windows)]
     {
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(_process_tree.job, 1);
-        }
+        let _ = process_id;
+        // SAFETY: the job handle is open for as long as `process_tree` is borrowed.
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(process_tree.job, 1) };
         let _ = child.wait();
     }
 }
@@ -3814,7 +3871,7 @@ const BUILD_OUTPUT_DIRECTORIES: [&str; 3] = ["target", "node_modules", "__pycach
 fn digest_tree(root: &Path, linked: bool) -> io::Result<String> {
     fn visit(root: &Path, current: &Path, linked: bool, hasher: &mut Sha256) -> io::Result<()> {
         let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
+        entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             if entry.file_name() == ".git" {
                 continue;
@@ -3924,7 +3981,7 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    };
     Ok(())
 }
 
@@ -3934,8 +3991,8 @@ fn private_new_file(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+        options.mode(0o600)
+    };
     options.open(path)
 }
 
@@ -4114,7 +4171,7 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
         let candidate = registry_candidate(&Registry::default()).unwrap();
         assert!(candidate.agent_catalog.describe().is_empty());
         assert!(candidate.plugins.is_empty());
-        assert!(crate::agent::AgentCatalog::compile(Vec::new()).is_ok());
+        crate::agent::AgentCatalog::compile(Vec::new()).unwrap();
     }
 
     /// Agent IDs are global, so two installed providers claiming `codex` is a registry-level
@@ -4318,10 +4375,10 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
     fn detached_job_ids_route_to_their_exact_session() {
         let id = "work/0123456789abcdef0123456789abcdef-0000000000000001";
         assert_eq!(job_target(id).unwrap(), "work");
-        assert!(job_target("missing-session-component").is_err());
-        assert!(job_target("../0123456789abcdef0123456789abcdef-0000000000000001").is_err());
-        assert!(job_target("work/").is_err());
-        assert!(job_target("work/0123456789abcdef-0000000000000001").is_err());
+        job_target("missing-session-component").unwrap_err();
+        job_target("../0123456789abcdef0123456789abcdef-0000000000000001").unwrap_err();
+        job_target("work/").unwrap_err();
+        job_target("work/0123456789abcdef-0000000000000001").unwrap_err();
     }
 
     #[cfg(unix)]
@@ -4395,7 +4452,7 @@ process = {{ executables = ["{agent_id}"], argv_contains = [] }}
     #[test]
     fn cancelling_one_shot_terminates_its_process_group() {
         let cancelled = std::sync::Arc::new(AtomicBool::new(false));
-        let setter = cancelled.clone();
+        let setter = Arc::clone(&cancelled);
         let cancel_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             setter.store(true, Ordering::Release);

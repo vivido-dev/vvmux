@@ -72,7 +72,7 @@ impl Client {
                 .recv_timeout(remaining.min(Duration::from_millis(50)))
             {
                 Ok(chunk) => self.transcript.extend(chunk),
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }

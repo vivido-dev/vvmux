@@ -5,12 +5,12 @@ fn ipc_writer_rejects_calls_after_partial_record_failure() {
         calls: usize,
     }
     impl std::io::Write for FailOnce {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.calls += 1;
             if self.calls == 2 {
                 return Err(io::Error::other("injected body failure"));
             }
-            Ok(bytes.len())
+            Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
@@ -90,33 +90,33 @@ fn total_media_queue_has_source_and_byte_limits() {
 
 #[test]
 fn queued_ipc_send_does_not_wait_for_client_writer() {
-    use std::sync::Condvar;
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let (entered, entry) = mpsc::channel();
     struct Blocked {
         gate: Arc<(Mutex<bool>, Condvar)>,
         entered: mpsc::Sender<()>,
     }
     impl std::io::Write for Blocked {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             let _ = self.entered.send(());
             let (lock, changed) = &*self.gate;
             let mut released = lock.lock().unwrap();
             while !*released {
                 released = changed.wait(released).unwrap();
             }
-            Ok(bytes.len())
+            Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
+    use std::sync::Condvar;
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (entered, entry) = mpsc::channel();
     let writer = crate::ipc::test_shared_writer(Box::new(Blocked {
-        gate: gate.clone(),
+        gate: std::sync::Arc::clone(&gate),
         entered,
     }));
     writer.lock().unwrap().enable_queued_output().unwrap();
-    let _keep_writer = writer.clone();
+    let _keep_writer = std::sync::Arc::clone(&writer);
     let (done, finished) = mpsc::channel();
     let worker = thread::spawn(move || {
         crate::ipc::send(&writer, &ServerMessage::Bell).unwrap();
@@ -164,7 +164,7 @@ fn client_encoder_preserves_microphone_framing() {
 #[test]
 fn bridge_drop_cancels_blocked_outer_request() {
     let presenter = vivid_sdk::testing::TestPresenter::start(80, 24).unwrap();
-    let bridge = crate::bridge::OuterBridge::builder(Secret32::from_hex(vivid_sdk::testing::ROOT_SECRET_HEX).unwrap(), DisplayMetrics::default()).control_endpoint(presenter.endpoint()).build()
+    let bridge = vivid_gateway::OuterBridge::builder(Secret32::from_hex(vivid_sdk::testing::ROOT_SECRET_HEX).unwrap(), DisplayMetrics::default()).control_endpoint(presenter.endpoint()).build()
     .unwrap();
     presenter
         .script()

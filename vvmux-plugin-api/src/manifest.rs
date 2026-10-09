@@ -1,3 +1,14 @@
+//! The `vvmux-plugin.toml` package manifest and its validation.
+//!
+//! A plugin package is a directory whose root holds `vvmux-plugin.toml`. [`LoadedManifest::load`]
+//! reads it, parses it as a [`Manifest`], runs [`Manifest::validate`], and then loads and
+//! compiles every JSON Schema the manifest references. Every list, string, and nested structure
+//! is bounded by one of the `MAX_*` constants in this module, so a hostile package cannot make
+//! validation allocate without limit.
+//!
+//! Paths inside a manifest are package-relative and may not escape the package directory or pass
+//! through a symlink.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -9,53 +20,99 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// The bounds below keep manifest validation and the host's own data structures small no matter
+// what a package declares. They are part of the published contract: raising one lets newer
+// packages fail on older hosts, so each is set well above what the shipped packages use.
+
+/// Largest `vvmux-plugin.toml`, in bytes.
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+/// Largest single JSON Schema document, in bytes.
 pub const MAX_SCHEMA_BYTES: u64 = 64 * 1024;
+/// Deepest nesting of arrays and objects in a JSON Schema document.
 pub const MAX_SCHEMA_DEPTH: usize = 32;
+/// Most workflows one manifest may declare.
 pub const MAX_WORKFLOWS: usize = 128;
+/// Most steps one workflow may declare.
 pub const MAX_WORKFLOW_STEPS: usize = 32;
+/// Most agent definitions one manifest may declare.
 pub const MAX_AGENTS_PER_PLUGIN: usize = 16;
+/// Most executable-name matchers one agent may declare.
 pub const MAX_AGENT_EXECUTABLES: usize = 32;
+/// Longest agent launch executable name, in bytes.
 pub const MAX_AGENT_EXECUTABLE_BYTES: usize = 128;
+/// Most argv-substring matchers one agent may declare.
 pub const MAX_AGENT_ARGV_MARKERS: usize = 16;
+/// Most screen-classification rules one agent may declare.
 pub const MAX_AGENT_RULES: usize = 64;
+/// Deepest nesting of `all`, `any`, and `not` gates in one rule.
 pub const MAX_AGENT_GATE_DEPTH: usize = 8;
+/// Longest single agent matcher, substring, or regex, in bytes.
 pub const MAX_AGENT_MATCHER_BYTES: usize = 4 * 1024;
+/// Most lifecycle integrations one manifest may declare.
 pub const MAX_INTEGRATIONS_PER_PLUGIN: usize = 4;
+/// Most files one integration may install.
 pub const MAX_INTEGRATION_FILES: usize = 8;
+/// Most configuration edits one integration may make.
 pub const MAX_INTEGRATION_REGISTRATIONS: usize = 8;
+/// Largest file an integration may install, in bytes.
 pub const MAX_INTEGRATION_FILE_BYTES: u64 = 1024 * 1024;
 /// Segments allowed in a home-relative `config_dir` or a config-relative `dest`.
 pub const MAX_INTEGRATION_PATH_SEGMENTS: usize = 4;
+/// Longest post-install notice, in bytes.
 pub const MAX_INTEGRATION_NOTICE_BYTES: usize = 512;
+/// Most arguments one hook registration may pass.
 pub const MAX_INTEGRATION_ARGS: usize = 8;
+/// Longest hook argument, section, key, or matcher, in bytes.
 pub const MAX_INTEGRATION_ARG_BYTES: usize = 128;
+/// Most prefix keybindings one manifest may declare.
 pub const MAX_KEYBINDINGS_PER_PLUGIN: usize = 16;
+/// Most link handlers one manifest may declare.
 pub const MAX_LINK_HANDLERS_PER_PLUGIN: usize = 16;
+/// Longest link-handler regex, in bytes.
 pub const MAX_LINK_PATTERN_BYTES: usize = 512;
+/// Largest WebAssembly component artifact, in bytes.
+const MAX_COMPONENT_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Why a plugin package failed to load or validate.
 #[derive(Debug)]
 pub enum ManifestError {
+    /// Reading the manifest or a referenced file failed.
     Io(std::io::Error),
+    /// `vvmux-plugin.toml` is not valid TOML for a [`Manifest`].
     Toml(toml::de::Error),
+    /// The manifest parsed but breaks a validation rule; the message says which.
     Invalid(String),
-    Schema { path: PathBuf, message: String },
+    /// A referenced JSON Schema document is missing, oversized, or invalid.
+    Schema {
+        /// The schema's package-relative path.
+        path: PathBuf,
+        /// What is wrong with it.
+        message: String,
+    },
 }
 
 impl fmt::Display for ManifestError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(error) => write!(formatter, "{error}"),
-            Self::Toml(error) => write!(formatter, "{error}"),
-            Self::Invalid(message) => formatter.write_str(message),
+            Self::Io(error) => write!(f, "plugin manifest I/O failed: {error}"),
+            Self::Toml(error) => write!(f, "plugin manifest is not valid TOML: {error}"),
+            Self::Invalid(message) => f.write_str(message),
             Self::Schema { path, message } => {
-                write!(formatter, "schema {}: {message}", path.display())
+                write!(f, "schema {}: {message}", path.display())
             }
         }
     }
 }
 
-impl std::error::Error for ManifestError {}
+impl std::error::Error for ManifestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Toml(error) => Some(error),
+            Self::Invalid(_) | Self::Schema { .. } => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for ManifestError {
     fn from(value: std::io::Error) -> Self {
@@ -88,71 +145,108 @@ pub const EVENT_KINDS: &[&str] = &[
     "plugin.runtime_crashed",
 ];
 
+/// The parsed contents of `vvmux-plugin.toml`.
+///
+/// Every table except `[plugin]` is optional. Parse with `toml`, then call
+/// [`Manifest::validate`]; [`LoadedManifest::load`] does both and also loads the schemas.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// `1`, or `2` for manifests that declare agents, integrations, keybindings, or link handlers.
     pub manifest_version: u16,
+    /// Package identity, compatibility, and permissions.
     pub plugin: Plugin,
+    /// The long-running service or component that implements `handler` entrypoints.
     #[serde(default)]
     pub runtime: Option<Runtime>,
+    /// Actions that users, agents, and workflows can invoke.
     #[serde(default)]
     pub actions: Vec<Action>,
+    /// Hooks run when the session publishes an event.
     #[serde(default)]
     pub events: Vec<EventHook>,
+    /// Prefix-key chords bound to actions.
     #[serde(default)]
     pub keybindings: Vec<Keybinding>,
+    /// Ctrl-click routes from OSC 8 links to actions.
     #[serde(default)]
     pub link_handlers: Vec<LinkHandler>,
+    /// Terminal panes the package can open.
     #[serde(default)]
     pub panes: Vec<Pane>,
+    /// Other packages whose actions this package's workflows call.
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
+    /// Declarative compositions of dependency actions.
     #[serde(default)]
     pub workflows: Vec<Workflow>,
+    /// Coding agents this package teaches vvmux to recognize and classify.
     #[serde(default)]
     pub agents: Vec<Agent>,
+    /// Lifecycle adapters installed into agents' own configuration directories.
     #[serde(default)]
     pub integrations: Vec<Integration>,
 }
 
+/// The `[plugin]` table: package identity, compatibility, and requested permissions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Plugin {
+    /// Reverse-DNS package ID, such as `com.example.tools`.
     pub id: String,
+    /// Display name, 1 through 128 bytes.
     pub name: String,
+    /// The package's own version.
     pub version: Version,
+    /// The oldest vvmux release the package supports.
     pub min_vvmux_version: Version,
+    /// Description shown in catalogs, at most 4096 bytes.
     pub description: String,
+    /// Supported platforms: any of `linux`, `macos`, and `windows`.
     pub platforms: Vec<String>,
+    /// Capabilities the package requests; each must be approved at install.
     #[serde(default)]
     pub permissions: Vec<Permission>,
 }
 
+/// A capability a package requests in `[plugin].permissions`, named by its dotted wire form.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
+    /// `session.read`: call `session.inspect`.
     #[serde(rename = "session.read")]
     SessionRead,
+    /// `pane.read`: call `pane.get_text`.
     #[serde(rename = "pane.read")]
     PaneRead,
+    /// `pane.input`: call `pane.input`.
     #[serde(rename = "pane.input")]
     PaneInput,
+    /// `pane.create`: open panes, including the package's declared panes.
     #[serde(rename = "pane.create")]
     PaneCreate,
+    /// `pane.manage_own`: close panes the package opened.
     #[serde(rename = "pane.manage_own")]
     PaneManageOwn,
+    /// `pane.manage_any`: close any pane.
     #[serde(rename = "pane.manage_any")]
     PaneManageAny,
+    /// `layout.read`: reserved; protocol-1 hosts enforce nothing with it yet.
     #[serde(rename = "layout.read")]
     LayoutRead,
+    /// `layout.write`: reserved; protocol-1 hosts enforce nothing with it yet.
     #[serde(rename = "layout.write")]
     LayoutWrite,
+    /// `events.subscribe`: receive session events and run event-triggered workflows.
     #[serde(rename = "events.subscribe")]
     EventsSubscribe,
+    /// `plugin.invoke`: invoke other packages' actions.
     #[serde(rename = "plugin.invoke")]
     PluginInvoke,
+    /// `clipboard.write`: reserved; protocol-1 hosts enforce nothing with it yet.
     #[serde(rename = "clipboard.write")]
     ClipboardWrite,
+    /// `media.produce`: receive the pane-scoped Vivid media capability in its panes.
     #[serde(rename = "media.produce")]
     MediaProduce,
     /// Write this plugin's declared lifecycle-adapter files into an agent's own config directory.
@@ -164,14 +258,19 @@ pub enum Permission {
     IntegrationWrite,
 }
 
+/// The `[runtime]` table: how the package's `handler` entrypoints are hosted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Runtime {
+    /// A sandboxed WebAssembly component or a trusted native process.
     pub kind: RuntimeKind,
+    /// The package-relative component file; required for, and only for, components.
     #[serde(default)]
     pub artifact: Option<PathBuf>,
+    /// The exact argv of a native service; required for, and only for, processes.
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// When the runtime starts.
     #[serde(default = "default_activation")]
     pub activation: Activation,
     /// Explicit filesystem capabilities for a WebAssembly component.
@@ -189,6 +288,7 @@ pub struct Runtime {
     pub startup_timeout_ms: u64,
 }
 
+/// Default [`Runtime::startup_timeout_ms`]: generous for a cold compile on a slow machine.
 fn default_startup_timeout() -> u64 {
     30_000
 }
@@ -196,6 +296,7 @@ fn default_startup_timeout() -> u64 {
 /// Ceiling for [`Runtime::startup_timeout_ms`].
 pub const MAX_STARTUP_TIMEOUT_MS: u64 = 120_000;
 
+/// A directory made visible to a WebAssembly component.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentPreopen {
@@ -207,17 +308,23 @@ pub enum ComponentPreopen {
     Data,
 }
 
+/// How a runtime is hosted.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeKind {
+    /// A WebAssembly component in the vvmux sandbox.
     Component,
+    /// A native child process speaking the framed JSON protocol; trusted same-user code.
     Process,
 }
 
+/// When a runtime starts.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Activation {
+    /// At the first invocation that needs it.
     OnDemand,
+    /// With each session, so it can receive events from the start.
     Session,
 }
 
@@ -225,38 +332,55 @@ fn default_activation() -> Activation {
     Activation::OnDemand
 }
 
+/// An invocable action. Exactly one of `handler` and `command` must be set.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Action {
+    /// Local ID, unique among the manifest's actions and panes.
     pub id: String,
+    /// Short display title.
     pub title: String,
+    /// What the action does, shown in catalogs.
     pub description: String,
+    /// The runtime entrypoint that implements the action.
     #[serde(default)]
     pub handler: Option<String>,
+    /// The exact argv of a one-shot process that implements the action.
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// Package-relative JSON Schema (Draft 2020-12) for the input.
     pub input_schema: PathBuf,
+    /// Package-relative JSON Schema (Draft 2020-12) for the output.
     pub output_schema: PathBuf,
+    /// Whether agents may discover and invoke the action.
     #[serde(default)]
     pub agent_visible: bool,
+    /// Execution budget, from 1 ms through 24 hours; defaults to 30 seconds.
     #[serde(default = "default_action_timeout")]
     pub timeout_ms: u64,
 }
 
+/// Default [`Action::timeout_ms`] and [`Workflow::timeout_ms`]: long enough for typical tools.
 fn default_action_timeout() -> u64 {
     30_000
 }
 
+/// A hook run when the session publishes an event. Exactly one of `handler` and `command` is set.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EventHook {
+    /// The event kind; one of [`EVENT_KINDS`], otherwise the hook loads but stays inactive.
     pub on: String,
+    /// The runtime entrypoint that handles the event.
     #[serde(default)]
     pub handler: Option<String>,
+    /// The exact argv of a one-shot process that handles the event.
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// Whether events caused by this plugin's own requests are delivered too.
     #[serde(default)]
     pub include_self: bool,
+    /// Execution budget, from 1 ms through 24 hours; defaults to 10 seconds.
     #[serde(default = "default_event_timeout")]
     pub timeout_ms: u64,
 }
@@ -275,46 +399,65 @@ pub struct Keybinding {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LinkHandler {
+    /// A regex, up to [`MAX_LINK_PATTERN_BYTES`], matched against the link's URL.
     pub pattern: String,
     /// A local action id declared by this manifest.
     pub action: String,
 }
 
+/// Default [`EventHook::timeout_ms`]: event hooks should be quick.
 fn default_event_timeout() -> u64 {
     10_000
 }
 
+/// A terminal pane the package can open, running an exact argv without a shell.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Pane {
+    /// Local ID, unique among the manifest's actions and panes.
     pub id: String,
+    /// Pane title, 1 through 128 printable bytes.
     pub title: String,
+    /// Where the pane opens.
     pub placement: Placement,
+    /// The exact argv to run.
     pub command: Vec<String>,
+    /// Whether the pane stays open, showing the exit status, after the process exits.
     #[serde(default = "default_pane_hold")]
     pub hold_on_exit: bool,
+    /// Whether synchronized keyboard and paste input fans out to this pane.
     #[serde(default)]
     pub accept_sync_input: bool,
 }
 
+/// Default [`Pane::hold_on_exit`]: keep the pane so its final output stays readable.
 fn default_pane_hold() -> bool {
     true
 }
 
+/// Where a plugin pane opens.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Placement {
+    /// Split the current pane.
     Split,
+    /// A floating pane over the current tab.
     Float,
+    /// A new tab.
     Tab,
 }
 
+/// Another package whose actions this package's workflows call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Dependency {
+    /// Local name used in workflow `uses = "<alias>/<action>"`.
     pub alias: String,
+    /// The dependency's package ID.
     pub id: String,
+    /// Acceptable dependency versions.
     pub version: VersionReq,
+    /// HTTPS location the dependency can be installed from.
     pub source: String,
 }
 
@@ -343,12 +486,15 @@ pub struct Integration {
     /// Printed after a successful install, for an agent whose enablement vvmux cannot perform.
     #[serde(default)]
     pub notice: Option<String>,
+    /// Files copied from the package into the config directory.
     #[serde(default)]
     pub files: Vec<IntegrationFile>,
+    /// Configuration edits that make the installed files take effect.
     #[serde(default)]
     pub registrations: Vec<IntegrationRegistration>,
 }
 
+/// One file an integration copies into an agent's configuration directory.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IntegrationFile {
@@ -359,6 +505,7 @@ pub struct IntegrationFile {
     /// Platforms this file belongs on; empty means every platform.
     #[serde(default)]
     pub platforms: Vec<String>,
+    /// Whether the installed file is made executable.
     #[serde(default)]
     pub executable: bool,
 }
@@ -371,11 +518,14 @@ pub enum IntegrationRegistration {
     JsonHook {
         /// Config-relative JSON file to edit.
         file: PathBuf,
+        /// The agent's hook event name.
         event: String,
+        /// The agent's optional hook matcher.
         #[serde(default)]
         matcher: Option<String>,
         /// The `dest` of a declared file, run as the hook command.
         command_file: PathBuf,
+        /// Shell-safe words appended to the hook command.
         #[serde(default)]
         args: Vec<String>,
     },
@@ -383,52 +533,79 @@ pub enum IntegrationRegistration {
     TomlFlag {
         /// Config-relative TOML file to edit.
         file: PathBuf,
+        /// The table that holds the key.
         section: String,
+        /// The boolean key to set.
         key: String,
+        /// The value to set.
         value: bool,
     },
 }
 
+/// A declarative composition of dependency actions, run as a directed acyclic graph of steps.
+///
+/// Step inputs and the workflow output are JSON values in which a string of exactly
+/// `${trigger}`, `${trigger#/pointer}`, `${steps.<id>.output}`, or `${steps.<id>.output#/pointer}`
+/// is replaced by that value. Referencing a step's output implies a `needs` edge.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Workflow {
+    /// Local ID, distinct from every action ID.
     pub id: String,
+    /// Short display title.
     pub title: String,
+    /// `manual`, or an event kind that starts the workflow (requires `events.subscribe`).
     #[serde(default = "manual_trigger")]
     pub trigger: String,
+    /// Whether agents may discover and invoke the workflow.
     #[serde(default)]
     pub agent_visible: bool,
+    /// Package-relative JSON Schema for the trigger input; absent accepts any object.
     #[serde(default)]
     pub input_schema: Option<PathBuf>,
+    /// Package-relative JSON Schema for the output.
     #[serde(default)]
     pub output_schema: Option<PathBuf>,
+    /// Budget for the whole workflow, from 1 ms through 24 hours; defaults to 30 seconds.
     #[serde(default = "default_action_timeout")]
     pub timeout_ms: u64,
+    /// The result template, with substitutions.
     pub output: Value,
+    /// The steps; a workflow without steps is inert.
     #[serde(default)]
     pub steps: Vec<WorkflowStep>,
 }
 
+/// Default [`Workflow::trigger`]: run only when invoked.
 fn manual_trigger() -> String {
     "manual".into()
 }
 
+/// One workflow step: a call to a dependency's action.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStep {
+    /// Local ID, unique within the workflow.
     pub id: String,
+    /// `<dependency alias>/<action id>`.
     pub uses: String,
+    /// The action input template, written as `with` in TOML.
     #[serde(default, rename = "with")]
     pub input: Value,
+    /// Steps that must finish first, in addition to those implied by substitutions.
     #[serde(default)]
     pub needs: Vec<String>,
 }
 
+/// A coding agent that vvmux recognizes in a pane and whose state it classifies from the screen.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Agent {
+    /// Local ID, unique among the manifest's agents.
     pub id: String,
+    /// Display name, 1 through 128 printable bytes.
     pub name: String,
+    /// How to recognize the agent's process.
     pub process: AgentProcess,
     /// How to start this agent, for providers that support being launched.
     ///
@@ -438,10 +615,12 @@ pub struct Agent {
     /// the same thing as what to type to start one.
     #[serde(default)]
     pub launch: Option<AgentLaunch>,
+    /// Screen-classification rules, tried in descending priority.
     #[serde(default)]
     pub rules: Vec<AgentRule>,
 }
 
+/// How `agent-start` launches an agent, and how a restored pane resumes it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentLaunch {
@@ -463,77 +642,106 @@ pub struct AgentLaunch {
     pub resume: Option<Vec<String>>,
 }
 
-/// The placeholders a resume template may carry.
+/// The placeholder replaced by the agent's reported session ID in a resume template.
 pub const RESUME_ID_PLACEHOLDER: &str = "{session_id}";
+/// The placeholder replaced by the agent's reported session path in a resume template.
 pub const RESUME_PATH_PLACEHOLDER: &str = "{session_path}";
 /// Arguments one resume template may hold.
 pub const MAX_AGENT_RESUME_ARGS: usize = 8;
 
+/// Process matchers that identify a running agent. At least one list must be non-empty.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentProcess {
+    /// Executable names, matched case-insensitively.
     #[serde(default)]
     pub executables: Vec<String>,
+    /// Substrings of the command line, for agents run through an interpreter or wrapper.
     #[serde(default)]
     pub argv_contains: Vec<String>,
 }
 
+/// One screen-classification rule. The first matching rule, by descending priority, decides.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRule {
+    /// Local ID, unique within the agent.
     pub id: String,
+    /// The state a match reports.
     pub state: AgentRuleState,
+    /// Higher priorities are tried first.
     pub priority: u16,
+    /// The text the gate sees: `osc_title`, `osc_progress`, `whole_recent` (the default),
+    /// `after_last_prompt_marker`, `prompt_box_body`, `after_last_horizontal_rule`, or
+    /// `bottom_non_empty_lines(N)` with N from 1 through 64.
     #[serde(default = "default_agent_rule_region")]
     pub region: String,
+    /// Report idle at once instead of waiting for repeated idle observations after work.
     #[serde(default)]
     pub visible_idle: bool,
+    /// On a match, stop classification and keep the previous state.
     #[serde(default)]
     pub skip_state_update: bool,
+    /// The match condition, written inline in the rule's table.
     #[serde(flatten)]
     pub gate: AgentGate,
 }
 
+/// A text condition. Every non-empty list must hold for the gate to match.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentGate {
+    /// Substrings that must all appear, compared case-insensitively.
     #[serde(default)]
     pub contains: Vec<String>,
+    /// Regexes that must all match somewhere in the text.
     #[serde(default)]
     pub regex: Vec<String>,
+    /// Regexes that must each match at least one line.
     #[serde(default)]
     pub line_regex: Vec<String>,
+    /// Nested gates that must all match.
     #[serde(default)]
     pub all: Vec<AgentGate>,
+    /// Nested gates of which at least one must match, when any are given.
     #[serde(default)]
     pub any: Vec<AgentGate>,
+    /// Nested gates none of which may match; written as `not` in TOML.
     #[serde(default, rename = "not")]
     pub not_gate: Vec<AgentGate>,
 }
 
+/// The state an [`AgentRule`] reports.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRuleState {
+    /// Waiting for the user.
     Idle,
+    /// Busy on a task.
     Working,
+    /// Waiting for an approval or answer.
     Blocked,
+    /// Matched, but the state cannot be told; the previous state is kept.
     Unknown,
 }
 
+/// Default [`AgentRule::region`]: the recent screen contents.
 fn default_agent_rule_region() -> String {
     "whole_recent".into()
 }
 
+/// A loaded, compiled JSON Schema (Draft 2020-12) from a plugin package.
 pub struct SchemaDocument {
+    /// The schema's package-relative path.
     pub path: PathBuf,
+    /// The schema document.
     pub value: Value,
     validator: Validator,
 }
 
 impl fmt::Debug for SchemaDocument {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SchemaDocument")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SchemaDocument")
             .field("path", &self.path)
             .field("value", &self.value)
             .finish_non_exhaustive()
@@ -541,6 +749,13 @@ impl fmt::Debug for SchemaDocument {
 }
 
 impl SchemaDocument {
+    /// Check `instance` against this schema.
+    ///
+    /// Formats are not asserted, matching how the host validates action input and output.
+    ///
+    /// # Errors
+    ///
+    /// Returns one message per violation when `instance` does not conform.
     pub fn validate(&self, instance: &Value) -> Result<(), Vec<String>> {
         let errors = self
             .validator
@@ -555,6 +770,11 @@ impl SchemaDocument {
     }
 }
 
+/// Compile `schema` (Draft 2020-12, formats not asserted) and check `instance` against it.
+///
+/// # Errors
+///
+/// Returns one message per violation, or a single message when `schema` itself is invalid.
 pub fn validate_schema_instance(schema: &Value, instance: &Value) -> Result<(), Vec<String>> {
     let validator = jsonschema::options()
         .with_draft(Draft::Draft202012)
@@ -572,15 +792,28 @@ pub fn validate_schema_instance(schema: &Value, instance: &Value) -> Result<(), 
     }
 }
 
+/// A validated manifest together with its package directory and compiled schemas.
 #[derive(Debug)]
 pub struct LoadedManifest {
+    /// The package directory the manifest was loaded from.
     pub root: PathBuf,
+    /// The validated manifest.
     pub manifest: Manifest,
+    /// Every schema the manifest references, keyed by package-relative path.
     pub schemas: BTreeMap<PathBuf, SchemaDocument>,
+    /// Non-fatal findings, such as hooks on unknown events.
     pub warnings: Vec<String>,
 }
 
 impl LoadedManifest {
+    /// Load and validate the package at `root`, including every referenced schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::Io`] when a file cannot be read, [`ManifestError::Toml`] when the
+    /// manifest does not parse, [`ManifestError::Schema`] for a missing, oversized, or invalid
+    /// schema, and [`ManifestError::Invalid`] for any other rule the package breaks, including
+    /// paths that escape the package or pass through a symlink.
     pub fn load(root: impl AsRef<Path>) -> Result<Self, ManifestError> {
         let root = root.as_ref();
         let manifest_path = root.join("vvmux-plugin.toml");
@@ -598,7 +831,7 @@ impl LoadedManifest {
         {
             let resolved = root.join(artifact);
             ensure_package_file(root, &resolved, artifact)?;
-            if fs::metadata(&resolved)?.len() > 32 * 1024 * 1024 {
+            if fs::metadata(&resolved)?.len() > MAX_COMPONENT_ARTIFACT_BYTES {
                 return Err(ManifestError::Invalid(
                     "WebAssembly component artifact exceeds 32 MiB".into(),
                 ));
@@ -688,20 +921,55 @@ impl LoadedManifest {
         })
     }
 
+    /// Find the action with this local ID.
+    #[must_use]
     pub fn action(&self, id: &str) -> Option<&Action> {
         self.manifest.actions.iter().find(|action| action.id == id)
     }
 
+    /// Check `value` against `action`'s input schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns one message per schema violation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `action` does not belong to this manifest.
     pub fn validate_input(&self, action: &Action, value: &Value) -> Result<(), Vec<String>> {
-        self.schemas[&action.input_schema].validate(value)
+        self.schema(&action.input_schema).validate(value)
     }
 
+    /// Check `value` against `action`'s output schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns one message per schema violation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `action` does not belong to this manifest.
     pub fn validate_output(&self, action: &Action, value: &Value) -> Result<(), Vec<String>> {
-        self.schemas[&action.output_schema].validate(value)
+        self.schema(&action.output_schema).validate(value)
+    }
+
+    fn schema(&self, path: &Path) -> &SchemaDocument {
+        self.schemas.get(path).unwrap_or_else(|| {
+            panic!(
+                "schema `{}` is not part of this manifest; was the action taken from another one?",
+                path.display()
+            )
+        })
     }
 }
 
 impl Manifest {
+    /// Check every rule that does not need the package files: IDs, bounds, cross-references,
+    /// workflow graphs, and permission requirements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::Invalid`] naming the first rule the manifest breaks.
     pub fn validate(&self) -> Result<(), ManifestError> {
         if !matches!(self.manifest_version, 1 | 2) {
             return invalid("unsupported manifest_version (expected 1 or 2)");
@@ -753,7 +1021,12 @@ impl Manifest {
             if !ids.insert((&action.id, "action")) {
                 return invalid(format!("duplicate action id `{}`", action.id));
             }
-            exactly_one(&action.handler, &action.command, "action", &action.id)?;
+            exactly_one(
+                action.handler.as_ref(),
+                action.command.as_ref(),
+                "action",
+                &action.id,
+            )?;
             if let Some(handler) = &action.handler {
                 validate_local_id(handler, "action handler")?;
             }
@@ -763,7 +1036,12 @@ impl Manifest {
             }
         }
         for event in &self.events {
-            exactly_one(&event.handler, &event.command, "event", &event.on)?;
+            exactly_one(
+                event.handler.as_ref(),
+                event.command.as_ref(),
+                "event",
+                &event.on,
+            )?;
             if let Some(handler) = &event.handler {
                 validate_local_id(handler, "event handler")?;
             }
@@ -990,10 +1268,7 @@ fn validate_integrations(
                     }
                 }
                 IntegrationRegistration::TomlFlag {
-                    file,
-                    section,
-                    key,
-                    value: _,
+                    file, section, key, ..
                 } => {
                     validate_integration_path(file, "registration file", &integration.id)?;
                     validate_integration_word(section, "section", &integration.id)?;
@@ -1241,7 +1516,11 @@ impl Runtime {
                 if self.command.is_some() || self.artifact.is_none() {
                     return invalid("component runtime requires artifact and forbids command");
                 }
-                validate_relative_path(self.artifact.as_ref().unwrap(), "runtime artifact")?;
+                let artifact = self
+                    .artifact
+                    .as_ref()
+                    .expect("presence was checked just above");
+                validate_relative_path(artifact, "runtime artifact")?;
                 let mut preopens = BTreeSet::new();
                 for preopen in &self.preopens {
                     if !preopens.insert(*preopen) {
@@ -1415,7 +1694,11 @@ fn visit_step<'a>(
             workflow.id
         ));
     }
-    let step = workflow.steps.iter().find(|step| step.id == id).unwrap();
+    let step = workflow
+        .steps
+        .iter()
+        .find(|step| step.id == id)
+        .expect("step IDs come from this workflow's own steps");
     for need in &step.needs {
         visit_step(need, workflow, visiting, visited)?;
     }
@@ -1425,8 +1708,8 @@ fn visit_step<'a>(
 }
 
 fn exactly_one<T, U>(
-    left: &Option<T>,
-    right: &Option<U>,
+    left: Option<&T>,
+    right: Option<&U>,
     kind: &str,
     id: &str,
 ) -> Result<(), ManifestError> {
@@ -1641,7 +1924,7 @@ launch = {{ executable = "demo", resume = {resume} }}
             assert!(accepted(valid), "expected {valid} to be accepted");
         }
         for invalid in [
-            r#"[]"#,                               // names no session
+            r"[]",                                 // names no session
             r#"["--resume"]"#,                     // no placeholder
             r#"["{session_id}", "{session_id}"]"#, // names it twice
             r#"["{session_id}{session_path}"]"#,   // two kinds in one argument
@@ -2413,7 +2696,7 @@ kind = "yaml-merge"
 file = "config.yaml"
 "#
         );
-        assert!(toml::from_str::<Manifest>(&format!("{HEADER}{unknown_kind}")).is_err());
+        toml::from_str::<Manifest>(&format!("{HEADER}{unknown_kind}")).unwrap_err();
 
         // An argument is appended to a command line unquoted, so a word with a space in it would
         // become two arguments rather than one.
@@ -2462,12 +2745,12 @@ args = ["session; rm -rf /"]
                     .to_string()
                     .contains("symlink")
             );
-        }
+        };
 
         fs::remove_file(root.join("integration/demo.sh")).unwrap();
         fs::write(
             root.join("integration/demo.sh"),
-            [b'x'; MAX_INTEGRATION_FILE_BYTES as usize + 1],
+            vec![b'x'; MAX_INTEGRATION_FILE_BYTES as usize + 1],
         )
         .unwrap();
         assert!(

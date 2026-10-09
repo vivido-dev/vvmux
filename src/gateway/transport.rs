@@ -9,7 +9,6 @@
 //! protocol one: the state machine, the input parser, the liveness and contention
 //! rules, and the byte-transparent Vivid relay are all untouched.
 
-use std::future::Future;
 use std::io;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};

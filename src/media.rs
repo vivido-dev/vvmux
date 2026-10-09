@@ -5,13 +5,7 @@ use std::sync::mpsc;
 use crate::config::Media as MediaConfig;
 use crate::platform::{VirtualPresenterEndpoint, VirtualPresenterListener};
 
-#[allow(unused_imports)]
-pub use vivid_sdk::presenter::{
-    AudioSourceConfig, ClipRect, KeyframeRequestOutcome, MediaEvent, NodeConfig,
-    OuterMediaProjection, PlayRequest, ProducerId, ProjectionSnapshot, RetainedRaster, SceneNode,
-    SceneNodeConfig, SemanticDescriptor, SnapshotOverlayWindow, SnapshotSource, SnapshotSurface,
-    SourceDescriptor, SourceKey,
-};
+use vivid_sdk::presenter::MediaEvent;
 
 impl vivid_sdk::presenter::PresenterListener for VirtualPresenterListener {
     fn endpoint(&self) -> String {
@@ -26,7 +20,7 @@ impl vivid_sdk::presenter::PresenterListener for VirtualPresenterListener {
 pub struct VirtualVivid(vivid_sdk::presenter::VirtualVivid);
 
 impl VirtualVivid {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn start(endpoint: VirtualPresenterEndpoint, config: MediaConfig) -> io::Result<Self> {
         // Terminate media at the runtime: no caller hosts a media-event consumer, so successful
         // validation must return the ingress flow directly rather than park a delivery.

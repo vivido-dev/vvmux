@@ -6,12 +6,9 @@ use std::sync::{Arc, Mutex};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[allow(unused_imports)]
-pub use vivid_sdk::presenter::{
-    BridgeClipRect, BridgeKeyframeRequest, BridgeNode, BridgeOverlayWindow, BridgePlayRequest,
-    BridgeSource, BridgeSourceDescriptor, BridgeSourceKey, BridgeSourceKind, BridgeSurface,
-    BridgeSurfaceKey, DisplayMetrics, PaneMediaNodeStatus, PaneMediaStatus,
-    PaneMediaSurfaceDescriptor, PaneMediaSurfaceStatus, PaneMediaTrackStatus,
+use vivid_sdk::presenter::{
+    BridgeKeyframeRequest, BridgeNode, BridgeSource, BridgeSourceKey, BridgeSurface,
+    BridgeSurfaceKey, DisplayMetrics,
 };
 
 use crate::metrics::{BlockTimer, IpcCounters};
@@ -46,13 +43,19 @@ pub const VERSION: u16 = 23;
 /// identity to this text; see `server::describe_peer_version`.
 pub const VERSION_MISMATCH: &str =
     "unsupported VVMX protocol version; restart the vvmux client and session server";
+/// Largest record body on a control channel, in bytes. Both peers enforce it; records larger than
+/// this belong on the bulk channel.
 pub const CONTROL_MAX_BODY: u32 = 1024 * 1024;
+/// Largest record body on a bulk channel, in bytes; bounds the buffer a reader may allocate for one
+/// media or render record.
 pub const BULK_MAX_BODY: u32 = 64 * 1024 * 1024;
+/// Record type of a JSON-encoded message. Part of the VVMX wire format: values are never reused.
 const STRUCTURED_RECORD: u16 = 1;
 /// Media body chunk: fixed binary header, then raw payload bytes.
 const MEDIA_RECORD: u16 = 2;
 /// Terminal frame chunk: fixed binary header, then raw terminal bytes.
 const RENDER_RECORD: u16 = 3;
+/// Record type of a microphone audio chunk. Part of the VVMX wire format.
 const MICROPHONE_RECORD: u16 = 4;
 
 /// Byte payloads bypass JSON because `serde_json` has no byte representation: a `Vec<u8>` becomes a
@@ -60,13 +63,18 @@ const MICROPHONE_RECORD: u16 = 4;
 /// twice — once formatting on the session actor, once parsing on the client's reader thread. Both
 /// are single-threaded, so that cost is latency on the two hops least able to absorb it.
 const MEDIA_RECORD_HEADER: usize = 56;
+/// Size of the fixed binary header of a `RENDER_RECORD` chunk, in bytes.
 const RENDER_RECORD_HEADER: usize = 24;
+/// Media chunk flag: this chunk completes its delivery.
 const MEDIA_FLAG_LAST: u16 = 0x0001;
+/// Render chunk flag: the frame is a full repaint rather than a diff.
 const RENDER_FLAG_FULL: u16 = 0x0001;
+/// Render chunk flag: this chunk completes its frame.
 const RENDER_FLAG_LAST: u16 = 0x0002;
 /// Preferred chunk sizes. The negotiated ceiling still bounds them; these keep a single record
 /// from monopolizing the writer or the peer's reader for too long.
 const MEDIA_CHUNK: usize = 128 * 1024;
+/// Preferred render chunk size; see [`MEDIA_CHUNK`].
 const RENDER_CHUNK: usize = 256 * 1024;
 
 /// Header fields of one `MEDIA_RECORD` chunk.
@@ -79,7 +87,10 @@ struct MediaChunk {
     total: u32,
     last: bool,
 }
+/// Largest encoded automation response, in bytes; larger responses are replaced by an error.
 const AUTOMATION_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+/// Size of each chunk an oversized automation response is split into, so it fits under
+/// [`CONTROL_MAX_BODY`].
 const AUTOMATION_CHUNK_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -162,6 +173,10 @@ pub struct OuterIdentity {
 /// it read.
 #[derive(
     Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
+)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the field names are the automation API's serialized contract"
 )]
 pub struct ExpectedState {
     /// The target pane's screen sequence.
@@ -444,6 +459,10 @@ pub enum AutomationMethod {
     /// Attach display-only metadata to one pane, without claiming lifecycle authority.
     ///
     /// Every field distinguishes "absent, leave alone" from "present but empty, clear".
+    #[expect(
+        clippy::option_option,
+        reason = "the outer `Option` is presence in the patch, the inner one a value or a clear"
+    )]
     ReportMetadata {
         source: String,
         sequence: u64,
@@ -1038,7 +1057,9 @@ pub struct EventFilter {
 }
 
 impl EventFilter {
+    /// Most event names one filter may list.
     pub const MAX_NAMES: usize = 16;
+    /// Longest event name a filter may list, in bytes.
     pub const MAX_NAME_BYTES: usize = 64;
 
     pub fn accepts(&self, envelope: &PluginEventEnvelope) -> bool {
@@ -1081,6 +1102,10 @@ pub enum AutomationCompletion {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the field names are the media trace's serialized contract"
+)]
 pub struct MediaTrackIdentity {
     pub producer_id: u64,
     pub context_id: u64,
@@ -1650,7 +1675,7 @@ pub fn establish(
             expected_sequence: 0,
             maximum_body: maximum,
             cancel: cancel.clone(),
-            counters: counters.clone(),
+            counters: Arc::clone(&counters),
         },
         Arc::new(Mutex::new(RecordWriter {
             failed: false,
@@ -1898,7 +1923,7 @@ impl RecordWriter {
     }
 
     pub fn counters(&self) -> Arc<IpcCounters> {
-        self.counters.clone()
+        Arc::clone(&self.counters)
     }
 }
 
@@ -1918,7 +1943,7 @@ pub(crate) fn test_shared_writer(stream: Box<dyn Write + Send>) -> SharedWriter 
 pub fn send(writer: &SharedWriter, message: &ServerMessage) -> io::Result<()> {
     writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .send(message)
 }
 
@@ -1936,10 +1961,10 @@ pub fn send_media_record(
 ) -> io::Result<()> {
     let mut writer = writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     writer.counters().record_media_payload(body.len());
     let total = u32::try_from(body.len())
-        .map_err(|_| invalid("VVMX media body exceeds the addressable chunk range"))?;
+        .map_err(|_out_of_range| invalid("VVMX media body exceeds the addressable chunk range"))?;
     let chunk = writer
         .payload_capacity(MEDIA_RECORD_HEADER)
         .clamp(1, MEDIA_CHUNK);
@@ -1972,7 +1997,7 @@ pub fn send_render_record(
 ) -> io::Result<()> {
     let mut writer = writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     writer.counters().record_render_payload(body.len());
     let chunk = writer
         .payload_capacity(RENDER_RECORD_HEADER)
@@ -1994,6 +2019,7 @@ pub fn send_render_record(
 }
 
 pub fn send_automation(writer: &SharedWriter, mut response: AutomationResponse) -> io::Result<()> {
+    use base64::Engine;
     let mut encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
     if encoded.len() > AUTOMATION_RESPONSE_LIMIT {
         response = AutomationResponse::error(
@@ -2006,10 +2032,9 @@ pub fn send_automation(writer: &SharedWriter, mut response: AutomationResponse) 
     if encoded.len() <= CONTROL_MAX_BODY as usize / 2 {
         return send(writer, &ServerMessage::Automation(response));
     }
-    use base64::Engine;
     let mut locked = writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let chunks = encoded.chunks(AUTOMATION_CHUNK_BYTES).collect::<Vec<_>>();
     for (index, chunk) in chunks.iter().enumerate() {
         locked.send(&ServerMessage::AutomationChunk {
@@ -2057,7 +2082,7 @@ fn decode_media_record(mut body: Vec<u8>) -> io::Result<ServerMessage> {
     }
     body.drain(..MEDIA_RECORD_HEADER);
     // The chunk must fit inside the declared body, and the final chunk must end exactly at it.
-    let end = (offset as u64)
+    let end = u64::from(offset)
         .checked_add(body.len() as u64)
         .ok_or_else(|| invalid("VVMX media record chunk extent overflows"))?;
     if end > u64::from(total) {
@@ -2208,14 +2233,14 @@ mod tests {
             (7, 9, 11, 13, 2)
         );
         assert_eq!(bytes, packet);
-        assert!(decode_microphone(&body[..48]).is_ok());
-        assert!(decode_microphone(&body[..47]).is_err());
-        assert!(decode_microphone(&body[..body.len() - 1]).is_err());
+        decode_microphone(&body[..48]).unwrap();
+        decode_microphone(&body[..47]).unwrap_err();
+        decode_microphone(&body[..body.len() - 1]).unwrap_err();
         body.push(0);
-        assert!(decode_microphone(&body).is_err());
+        decode_microphone(&body).unwrap_err();
         body.truncate(48);
         body[..8].fill(0);
-        assert!(decode_microphone(&body).is_err());
+        decode_microphone(&body).unwrap_err();
     }
 
     #[test]
@@ -2239,9 +2264,9 @@ mod tests {
     struct SharedBytes(Arc<Mutex<Vec<u8>>>);
 
     impl Write for SharedBytes {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -2254,7 +2279,7 @@ mod tests {
         let mut preface = encode_preface(ChannelKind::Control, CONTROL_MAX_BODY);
         assert_eq!(decode_preface(&preface).unwrap().0, ChannelKind::Control);
         preface[7] = 1;
-        assert!(decode_preface(&preface).is_err());
+        decode_preface(&preface).unwrap_err();
         preface = encode_preface(ChannelKind::Control, CONTROL_MAX_BODY);
         preface[4..6].copy_from_slice(&VERSION.wrapping_add(1).to_be_bytes());
         let error = decode_preface(&preface).unwrap_err();
@@ -2341,7 +2366,7 @@ mod tests {
                 track: 11,
             },
             minimum_epoch: Some(3),
-            reason: crate::bridge::KEYFRAME_REASON_TRANSPORT_LOSS,
+            reason: vivid_sdk::presenter::KEYFRAME_REASON_TRANSPORT_LOSS,
         }]);
         client_writer.lock().unwrap().send(&recovery).unwrap();
         assert_eq!(server_reader.recv::<ClientMessage>().unwrap(), recovery);
@@ -2360,7 +2385,7 @@ mod tests {
             stream: Box::new(output.clone()),
             next_sequence: 0,
             maximum_body: CONTROL_MAX_BODY,
-            counters: counters.clone(),
+            counters: Arc::clone(counters),
         }))
     }
 
@@ -2572,23 +2597,23 @@ mod tests {
         // Reserved word set.
         let mut reserved = good.clone();
         reserved[16 + 52] = 1;
-        assert!(test_reader(reserved).recv_server().is_err());
+        test_reader(reserved).recv_server().unwrap_err();
 
         // Unknown flag bit set.
         let mut flags = good.clone();
         flags[16 + 43] = 0xff;
-        assert!(test_reader(flags).recv_server().is_err());
+        test_reader(flags).recv_server().unwrap_err();
 
         // `last` set while the chunk stops short of the declared total.
         let mut short = good.clone();
         short[16 + 51] = 8;
-        assert!(test_reader(short).recv_server().is_err());
+        test_reader(short).recv_server().unwrap_err();
 
         // Body shorter than the fixed header.
         let mut truncated = good[..16].to_vec();
         truncated[15] = 4;
         truncated.extend_from_slice(&[0; 4]);
-        assert!(test_reader(truncated).recv_server().is_err());
+        test_reader(truncated).recv_server().unwrap_err();
     }
 
     #[test]

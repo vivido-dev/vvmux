@@ -1,6 +1,6 @@
 //! Desktop notifications rendered into the outer terminal by the foreground client.
 //!
-//! Backend detection and the OSC 9 / OSC 99 encodings are adapted from HerdR commit
+//! Backend detection and the OSC 9 / OSC 99 encodings are adapted from `HerdR` commit
 //! `6c6ddcd49384d6ea9f0ee2e63bf7b2643dfd5bcf` (`src/terminal_notify.rs`, Apache-2.0). See
 //! `agent/PROVENANCE.md`.
 //!
@@ -35,10 +35,11 @@ fn backend_for(
     term: Option<&str>,
     kitty_window: bool,
 ) -> Option<NotificationBackend> {
-    match term_program {
-        Some("ghostty" | "iTerm.app" | "WezTerm") => return Some(NotificationBackend::Osc9),
-        Some("vivido") => return Some(NotificationBackend::Osc9),
-        _ => {}
+    if matches!(
+        term_program,
+        Some("ghostty" | "iTerm.app" | "WezTerm" | "vivido")
+    ) {
+        return Some(NotificationBackend::Osc9);
     }
     if kitty_window {
         return Some(NotificationBackend::Osc99);

@@ -1,87 +1,131 @@
 [package]
 name = "vvmux"
 version = "0.5.3"
-authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
-edition = "2024"
-rust-version = "1.95"
-license = "Apache-2.0"
-repository = "https://github.com/vivido-dev/vvmux"
+authors.workspace = true
+edition.workspace = true
+# The locked wasmtime 49 / cranelift 0.136 line requires Rust 1.96.
+rust-version = "1.96"
+license.workspace = true
+repository.workspace = true
 description = "A detachable Vivid-aware terminal multiplexer"
+keywords = ["terminal", "multiplexer", "tmux", "vivid"]
+categories = ["command-line-utilities"]
 
 [workspace]
 members = [".", "vvmux-plugin-api", "vvmux-plugin-sdk"]
 resolver = "2"
+
+[workspace.package]
+authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/vivido-dev/vvmux"
+
+[workspace.dependencies]
+axum = "0.8"
+base64 = "0.23"
+clap = "4.6"
+ed25519-dalek = "3"
+futures-util = "0.3"
+getrandom = "0.4"
+hex = "0.4"
+httpdate = "1"
+image = { version = "0.25", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
+libc = "0.2"
+log = "0.4"
+mimalloc = { version = "0.1", default-features = false }
+rcgen = "0.14"
+regex = { version = "1", default-features = false }
+rpassword = "7"
+rustls = "0.23"
+rustls-native-certs = "0.8"
+schemars = "1.2"
+semver = "1"
+serde = "1"
+serde_json = "1"
+sha2 = "0.11"
+signal-hook = { version = "0.4", default-features = false }
+subtle = "2.6"
+tempfile = "3"
+tokio = "1"
+tokio-rustls = "0.26"
+tokio-tungstenite = "0.30"
+toml = "1.1"
+unicode-width = "0.2"
+ureq = { version = "3.4", default-features = false }
+url = { version = "2", default-features = false }
+vivid_gateway = { version = "1.5", path = "../vivid_gateway" }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
+vvmux-plugin-api = { version = "0.5.5", path = "vvmux-plugin-api" }
+vvmux-plugin-sdk = { version = "0.1.0", path = "vvmux-plugin-sdk" }
+vvte = { version = "0.15", path = "../vvte", default-features = false }
+# Track the current wasmtime line rather than an older maintenance one: the sandbox and WASI
+# host surfaces are where security fixes land, and falling behind is how this pin previously
+# ended up on a release with open advisories. `wasmtime` and `wasmtime-wasi` are one versioned
+# surface and must move together; their locked line sets the `vvmux` MSRV.
+wasmtime = { version = "49", default-features = false }
+wasmtime-wasi = { version = "49", default-features = false }
+wat = "1"
+windows-sys = "0.61"
+wit-bindgen = "0.57.1"
+zeroize = "1.9"
 
 [lib]
 name = "vvmux_terminal"
 path = "vvmux-terminal/src/lib.rs"
 
 [dependencies]
-axum = { version = "0.8", features = ["ws"], optional = true }
-base64 = "0.23"
-clap = { version = "4.6", features = ["derive"] }
-getrandom = "0.4"
-hex = "0.4"
-url = { version = "2", default-features = false }
-image = { version = "0.25", default-features = false, features = [
-  "png",
-  "jpeg",
-] }
-futures-util = { version = "0.3", optional = true }
-log = "0.4"
-regex = { version = "1", default-features = false, features = [
-  "std",
-  "unicode-case",
-  "unicode-perl",
-] }
-schemars = "1.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.11"
-semver = { version = "1", features = ["serde"] }
-subtle = { version = "2.6", optional = true }
-ed25519-dalek = { version = "3", features = [
-  "fast",
-  "signature",
-  "digest",
-  "zeroize",
-] }
-httpdate = { version = "1", optional = true }
-rpassword = { version = "7", optional = true }
-tokio-tungstenite = { version = "0.30", features = [
-  "rustls-tls-native-roots",
-], optional = true }
-rustls = { version = "0.23", features = ["ring"], optional = true }
-rustls-native-certs = { version = "0.8", optional = true }
-toml = "1.1"
-tokio = { version = "1", features = [
+axum = { workspace = true, features = ["ws"], optional = true }
+base64.workspace = true
+clap = { workspace = true, features = ["derive"] }
+ed25519-dalek = { workspace = true, features = ["fast", "signature", "digest", "zeroize"] }
+futures-util = { workspace = true, optional = true }
+getrandom.workspace = true
+hex.workspace = true
+httpdate = { workspace = true, optional = true }
+image = { workspace = true, features = ["png", "jpeg"] }
+log = { workspace = true, features = ["kv"] }
+# The binary's global allocator; see `src/main.rs`. The library never sets one.
+mimalloc.workspace = true
+regex = { workspace = true, features = ["std", "unicode-case", "unicode-perl"] }
+rpassword = { workspace = true, optional = true }
+rustls = { workspace = true, features = ["ring"], optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+schemars.workspace = true
+semver = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+subtle = { workspace = true, optional = true }
+tokio = { workspace = true, features = [
   "macros",
   "net",
   "rt-multi-thread",
   "sync",
   "time",
 ], optional = true }
-unicode-width = "0.2"
-vivid_gateway = { version = "1.5.10", path = "../vivid_gateway" }
-vivid_protocol = { version = "1.5.10", path = "../vivid_protocol" }
-vivid_sdk = { version = "1.5.9", path = "../vivid_sdk", features = ["presenter"] }
-vvte = { version = "0.15", path = "../vvte", default-features = false, features = [
-  "std",
-  "ansi",
-] }
-zeroize = { version = "1.9", features = ["serde"] }
-vvmux-plugin-api = { version = "0.5.4", path = "vvmux-plugin-api" }
-# Track the current wasmtime line rather than an older maintenance one: the sandbox and WASI
-# host surfaces are where security fixes land, and falling behind is how this pin previously
-# ended up on a release with open advisories. `wasmtime` and `wasmtime-wasi` are one versioned
-# surface and must move together. Both require Rust 1.95, which sets this crate's MSRV.
-wasmtime = { version = "49", default-features = false, features = [
-  "component-model",
-  "cranelift",
-  "runtime",
-  "std",
-] }
-wasmtime-wasi = { version = "49", default-features = false }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"], optional = true }
+toml.workspace = true
+unicode-width.workspace = true
+url.workspace = true
+vivid_gateway.workspace = true
+vivid_protocol.workspace = true
+vivid_sdk = { workspace = true, features = ["presenter"] }
+vvmux-plugin-api.workspace = true
+vvte = { workspace = true, features = ["std", "ansi"] }
+wasmtime = { workspace = true, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime-wasi.workspace = true
+zeroize = { workspace = true, features = ["serde"] }
+
+[[bench]]
+name = "terminal_ingest"
+harness = false
+
+[profile.bench]
+# Symbols let a profiler attribute samples to functions.
+debug = 1
 
 [features]
 default = ["server-capability"]
@@ -98,14 +142,12 @@ server-capability = [
 ]
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
-signal-hook = { version = "0.4", default-features = false, features = [
-  "iterator",
-] }
-ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+libc.workspace = true
+signal-hook = { workspace = true, features = ["iterator"] }
+ureq = { workspace = true, features = ["rustls"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
+windows-sys = { workspace = true, features = [
   "Wdk_System_Threading",
   "Win32_Foundation",
   "Win32_Security",
@@ -129,12 +171,72 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-rcgen = "0.14"
-tempfile = "3"
-wat = "1"
-tokio-rustls = "0.26"
-tokio-tungstenite = "0.30"
+rcgen.workspace = true
+tempfile.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
 # The gateway's test-support API (wait_for_retained_media) is gated behind its testing feature.
-vivid_gateway = { version = "1.5", path = "../vivid_gateway", features = [
-  "testing",
-] }
+vivid_gateway = { workspace = true, features = ["testing"] }
+wat.workspace = true
+
+[lints]
+workspace = true
+
+# The guideline lint baseline (M-STATIC-VERIFICATION). Opt-outs are listed with their reason.
+[workspace.lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+as_pointer_underscore = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+semicolon_outside_block = "warn"
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unneeded_field_pattern = "warn"
+unused_result_ok = "warn"
+too_long_first_doc_paragraph = "warn"
+# May cause issues with structured logging otherwise.
+literal_string_with_formatting_args = "allow"
+# Opt-outs from `pedantic` and `cargo`, each a judgment call the guideline leaves to the project:
+# Terminal, layout, and wire geometry moves between `u16`, `u32`, `usize`, and `i32`
+# constantly. Values from untrusted input go through checked conversion (AGENTS.md), so these
+# lints would mostly flag already-bounded internal arithmetic.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# Function length is reviewed with module structure, not a line threshold.
+too_many_lines = "allow"
+# Ownership-taking signatures are used for values that are consumed or moved to threads.
+needless_pass_by_value = "allow"
+# Terminal modes, cells, and configuration mirror independent wire and protocol flags.
+struct_excessive_bools = "allow"
+# Paired names such as `rows`/`cols` and `reader`/`writer` are intentional.
+similar_names = "allow"
+# Duplicate versions come from transitive dependencies outside this workspace's control.
+multiple_crate_versions = "allow"

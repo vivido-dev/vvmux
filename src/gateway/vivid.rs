@@ -14,16 +14,21 @@ use vivid_protocol::messages::LaneClass;
 use vivid_protocol::wire::{Connection, ConnectionKind};
 use zeroize::Zeroizing;
 
-use crate::bridge::ConnectionFactory;
+use vivid_sdk::ConnectionFactory;
 
 pub(crate) const SUBPROTOCOL: &str = "vvmux.vivid.v1";
 pub(crate) const CONNECTION_PROTOCOL_PREFIX: &str = "vvmux.connection.";
 pub(crate) const AUTH_PROTOCOL_PREFIX: &str = "vvmux.auth.";
 pub(crate) const KIND_PROTOCOL_PREFIX: &str = "vvmux.kind.";
 
+/// How long a Vivid connection request waits for the browser to supply a socket.
 const CONNECTION_WAIT: Duration = Duration::from_secs(30);
+/// How long a Vivid WebSocket read or write may block before it fails.
 const IO_WAIT: Duration = Duration::from_secs(30);
+/// Chunks buffered between a Vivid socket and its bridge; small, so backpressure reaches the
+/// producer quickly.
 const CHANNEL_CHUNKS: usize = 4;
+/// Largest Vivid WebSocket message, from the web profile.
 pub(super) const MAX_SOCKET_CHUNK: usize = vivid_protocol::web::MAX_SOCKET_CHUNK as usize;
 
 pub(crate) struct VividBroker {
@@ -114,7 +119,7 @@ impl VividBroker {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| io::Error::other("Vivid broker lock is poisoned"))?;
+            .map_err(|_poisoned| io::Error::other("Vivid broker lock is poisoned"))?;
         if state.closed {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -162,7 +167,7 @@ impl VividBroker {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| io::Error::other("Vivid broker lock is poisoned"))?;
+            .map_err(|_poisoned| io::Error::other("Vivid broker lock is poisoned"))?;
         loop {
             if let Some(io) = state
                 .available
@@ -187,7 +192,7 @@ impl VividBroker {
             let (next, timeout) = self
                 .changed
                 .wait_timeout(state, deadline.saturating_duration_since(now))
-                .map_err(|_| io::Error::other("Vivid broker lock is poisoned"))?;
+                .map_err(|_poisoned| io::Error::other("Vivid broker lock is poisoned"))?;
             state = next;
             if timeout.timed_out() {
                 return Err(io::Error::new(
@@ -216,8 +221,8 @@ impl ConnectionFactory for VividBroker {
 }
 
 impl Read for SocketReader {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
             return Ok(0);
         }
         while self.offset == self.current.len() {
@@ -226,35 +231,32 @@ impl Read for SocketReader {
             })?;
             self.current = chunk.bytes;
             self.offset = 0;
-            if self.current.is_empty() {
-                continue;
-            }
         }
-        let count = output.len().min(self.current.len() - self.offset);
-        output[..count].copy_from_slice(&self.current[self.offset..self.offset + count]);
+        let count = buf.len().min(self.current.len() - self.offset);
+        buf[..count].copy_from_slice(&self.current[self.offset..self.offset + count]);
         self.offset += count;
         Ok(count)
     }
 }
 
 impl Write for SocketWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.is_empty() {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
             return Ok(0);
         }
         // A Vivid record can span many WebSocket messages. Accept a bounded prefix so
         // write_all preserves the byte stream without sending an oversized media message.
-        let count = bytes.len().min(MAX_SOCKET_CHUNK);
+        let count = buf.len().min(MAX_SOCKET_CHUNK);
         let (completion, completed) = std_mpsc::sync_channel(1);
         self.sender
             .blocking_send(OutgoingChunk {
-                bytes: bytes[..count].to_vec(),
+                bytes: buf[..count].to_vec(),
                 completion,
             })
-            .map_err(|_| {
+            .map_err(|_timeout| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "Vivid WebSocket output closed")
             })?;
-        completed.recv_timeout(IO_WAIT).map_err(|_| {
+        completed.recv_timeout(IO_WAIT).map_err(|_timeout| {
             io::Error::new(io::ErrorKind::TimedOut, "Vivid WebSocket write timed out")
         })??;
         Ok(count)
@@ -301,7 +303,7 @@ pub(crate) async fn serve_socket<Si: FrameSink, St: FrameStream>(
                             bytes: bytes.to_vec(),
                         })
                         .await
-                        .map_err(|_| {
+                        .map_err(|_closed| {
                             io::Error::new(
                                 io::ErrorKind::BrokenPipe,
                                 "Vivid WebSocket input reader closed",
@@ -309,7 +311,7 @@ pub(crate) async fn serve_socket<Si: FrameSink, St: FrameStream>(
                         })?;
                 }
                 Ok(Frame::Ping(bytes)) => {
-                    pong_sender.send(bytes).await.map_err(|_| {
+                    pong_sender.send(bytes).await.map_err(|_closed| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "Vivid WebSocket output closed")
                     })?;
                 }
@@ -334,7 +336,7 @@ pub(crate) async fn serve_socket<Si: FrameSink, St: FrameStream>(
                         let result = socket_writer
                             .send_frame(Frame::Binary(chunk.bytes.into()))
                             .await;
-                        let report = result.as_ref().map(|_| ()).map_err(|error| {
+                        let report = result.as_ref().copied().map_err(|error| {
                             io::Error::new(error.kind(), error.to_string())
                         });
                         let _ = chunk.completion.send(report);
@@ -355,7 +357,7 @@ pub(crate) async fn serve_socket<Si: FrameSink, St: FrameStream>(
         Ok(())
     } else {
         tokio::select! {
-            _ = &mut shutdown => Ok(()),
+            () = &mut shutdown => Ok(()),
             result = read_socket => result,
             result = write_socket => result,
         }

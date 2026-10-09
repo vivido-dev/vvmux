@@ -12,7 +12,13 @@ use crate::session::{self, ActorEvent, ActorHandle};
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+/// Most client connections one session server serves at once.
 const MAX_CLIENTS: usize = 32;
+/// How often the non-blocking listener is polled for new clients; also bounds how quickly a
+/// shutdown request is noticed.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How often shutdown checks whether the actor has finished tearing down panes.
+const ACTOR_EXIT_POLL: Duration = Duration::from_millis(10);
 
 struct ClientSlot;
 
@@ -39,16 +45,31 @@ pub fn run(
     layout_path: Option<PathBuf>,
     ready_handle: Option<usize>,
 ) -> io::Result<()> {
-    log::info!("server starting: session={name} config={config_path:?} layout={layout_path:?}");
+    log::info!(
+        event = "server.start",
+        session = name.as_str(),
+        config:? = config_path.as_deref().map(crate::logging::redact_path),
+        layout:? = layout_path.as_deref().map(crate::logging::redact_path);
+        "server starting"
+    );
     platform::prepare_server_process();
     let mut readiness = platform::ReadinessWriter::from_metadata(ready_handle)?;
     match run_inner(name.clone(), config_path, layout_path, &mut readiness) {
         Ok(()) => {
-            log::info!("server for session {name} exited cleanly");
+            log::info!(
+                event = "server.exit.success",
+                session = name.as_str();
+                "server exited cleanly"
+            );
             Ok(())
         }
         Err(error) => {
-            log::error!("server for session {name} failed: {error}");
+            log::error!(
+                event = "server.exit.failure",
+                session = name.as_str(),
+                error:% = error;
+                "server failed"
+            );
             readiness.failure(&error);
             Err(error)
         }
@@ -96,7 +117,12 @@ fn run_inner(
         (false, Some(paths)) => {
             for path in [&paths.snapshot, &paths.history] {
                 if let Err(error) = crate::session_state::clear(path) {
-                    eprintln!("vvmux: could not discard {}: {error}", path.display());
+                    log::warn!(
+                        event = "session.snapshot.discard.failure",
+                        path:% = crate::logging::redact_path(path),
+                        error:% = error;
+                        "could not discard a session snapshot"
+                    );
                 }
             }
             None
@@ -111,7 +137,11 @@ fn run_inner(
         && let Some(paths) = snapshot_paths.as_ref()
         && let Err(error) = crate::session_state::clear(&paths.history)
     {
-        eprintln!("vvmux: could not discard pane history: {error}");
+        log::warn!(
+            event = "session.history.discard.failure",
+            error:% = error;
+            "could not discard pane history"
+        );
     }
     // Precedence: an explicit `--layout` is a request and wins; otherwise a snapshot restores the
     // session that existed; otherwise the conventional startup layout builds a new one. A snapshot
@@ -153,23 +183,27 @@ fn run_inner(
     install_signal_forwarder(actor.clone())
         .map_err(|error| context("install signal handler", error))?;
     readiness.success()?;
-    log::info!("server ready, accepting clients");
+    log::info!(event = "server.ready"; "server ready, accepting clients");
 
     while !actor.shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok(stream) => {
-                log::debug!("accepted client connection");
+                log::debug!(event = "server.accept.success"; "accepted client connection");
                 let actor = actor.clone();
                 thread::Builder::new()
                     .name("vvmux-client-ipc".into())
                     .spawn(move || handle_client(stream, actor))?;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
+                thread::sleep(ACCEPT_POLL_INTERVAL);
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
-                log::error!("accept failed, shutting down server: {error}");
+                log::error!(
+                    event = "server.accept.failure",
+                    error:% = error;
+                    "accept failed, shutting down server"
+                );
                 paths.remove_instance(&registry);
                 return Err(error);
             }
@@ -180,7 +214,7 @@ fn run_inner(
     // underneath `terminate_children`, which otherwise orphans panes and eventually exhausts the
     // finite PTY pool on macOS.
     while !actor.terminated.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(ACTOR_EXIT_POLL);
     }
     paths.remove_instance(&registry);
     Ok(())
@@ -249,9 +283,11 @@ fn restore_snapshot(
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => return None,
         Err(error) => {
-            eprintln!(
-                "vvmux: ignoring session snapshot {}: {error}",
-                path.display()
+            log::warn!(
+                event = "session.snapshot.load.failure",
+                path:% = crate::logging::redact_path(path),
+                error:% = error;
+                "ignoring an unreadable session snapshot"
             );
             return None;
         }
@@ -259,9 +295,11 @@ fn restore_snapshot(
     match snapshot.layout.into_plan() {
         Ok(plan) => Some((plan, snapshot.extras)),
         Err(error) => {
-            eprintln!(
-                "vvmux: session snapshot {} does not describe a usable layout: {error}",
-                path.display()
+            log::warn!(
+                event = "session.snapshot.layout.failure",
+                path:% = crate::logging::redact_path(path),
+                error:% = error;
+                "session snapshot does not describe a usable layout"
             );
             None
         }
@@ -273,7 +311,12 @@ fn restore_history(path: &std::path::Path) -> Option<crate::session_state::Sessi
     match crate::session_state::load_history(path) {
         Ok(history) => history,
         Err(error) => {
-            eprintln!("vvmux: ignoring pane history {}: {error}", path.display());
+            log::warn!(
+                event = "session.history.load.failure",
+                path:% = crate::logging::redact_path(path),
+                error:% = error;
+                "ignoring unreadable pane history"
+            );
             None
         }
     }
@@ -320,7 +363,7 @@ pub fn probe(name: &str) -> io::Result<()> {
     let (mut reader, writer) = connect(name)?;
     writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .send(&ClientMessage::Ping)?;
     match reader.recv()? {
         crate::ipc::ServerMessage::Pong => Ok(()),
@@ -341,7 +384,7 @@ fn handle_client(stream: Transport, actor: ActorHandle) {
     let cancel = reader.cancel_handle();
     if writer
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .enable_queued_output()
         .is_err()
     {
@@ -353,7 +396,7 @@ fn handle_client(stream: Transport, actor: ActorHandle) {
             .sender
             .send(ActorEvent::Client {
                 id,
-                writer: writer.clone(),
+                writer: std::sync::Arc::clone(&writer),
                 cancel: cancel.clone(),
                 message,
             })

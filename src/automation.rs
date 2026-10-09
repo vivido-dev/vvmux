@@ -16,7 +16,9 @@ use crate::media_trace::{
 };
 use crate::search::SearchDirection;
 
+/// Longest timeout an automation command may request: one day.
 const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+/// Largest input one automation command may send, matching the PTY input queue.
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1113,7 +1115,9 @@ pub fn run(
             println!();
             Ok(())
         }
-        Output::TraceFollow | Output::EventStream => unreachable!(),
+        Output::TraceFollow | Output::EventStream => {
+            unreachable!("streaming outputs returned before the single-response path")
+        }
     }
 }
 
@@ -1172,16 +1176,16 @@ pub(crate) fn send_request(
 ) -> io::Result<()> {
     writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .send(&ClientMessage::Automation(request))
 }
 
 pub(crate) fn response_result(response: AutomationResponse) -> io::Result<serde_json::Value> {
     if !response.ok {
-        let error = response
-            .error
-            .map(|error| format!("{}: {}", error.code, error.message))
-            .unwrap_or_else(|| "automation request failed".into());
+        let error = response.error.map_or_else(
+            || "automation request failed".into(),
+            |error| format!("{}: {}", error.code, error.message),
+        );
         return Err(io::Error::other(error));
     }
     Ok(response.result.unwrap_or(serde_json::Value::Null))
@@ -1214,7 +1218,7 @@ fn run_trace_follow(
         stdout.flush()?;
         let requested_after = match &request.method {
             AutomationMethod::TraceMedia { after_sequence, .. } => *after_sequence,
-            _ => unreachable!(),
+            _ => unreachable!("run_trace_follow is only called for a TraceMedia request"),
         };
         let after = batch.events.last().map_or_else(
             || {
@@ -1225,7 +1229,7 @@ fn run_trace_follow(
             |event| event.sequence,
         );
         let AutomationMethod::TraceMedia { after_sequence, .. } = &mut request.method else {
-            unreachable!();
+            unreachable!("run_trace_follow is only called for a TraceMedia request");
         };
         *after_sequence = Some(after);
         request.id = request
@@ -1253,10 +1257,10 @@ fn parse_mouse_point(value: &str) -> Result<(u16, u16), String> {
         column
             .trim()
             .parse()
-            .map_err(|_| format!("invalid column in `{value}`"))?,
+            .map_err(|_invalid| format!("invalid column in `{value}`"))?,
         row.trim()
             .parse()
-            .map_err(|_| format!("invalid row in `{value}`"))?,
+            .map_err(|_invalid| format!("invalid row in `{value}`"))?,
     ))
 }
 
@@ -1365,11 +1369,7 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             false,
             Output::Json,
         ),
-        MsgCommand::PaneRename {
-            name,
-            clear: _,
-            pane_id,
-        } => (
+        MsgCommand::PaneRename { name, pane_id, .. } => (
             AutomationMethod::PaneRename { name },
             pane_id,
             false,
@@ -2047,11 +2047,7 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             true,
             Output::Json,
         ),
-        MsgCommand::SyncInput {
-            on,
-            off: _,
-            pane_id,
-        } => (
+        MsgCommand::SyncInput { on, pane_id, .. } => (
             AutomationMethod::SetSyncInput { enabled: on },
             pane_id,
             true,
@@ -2264,7 +2260,7 @@ pub(crate) fn receive_response(
                 }
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(base64)
-                    .map_err(|_| {
+                    .map_err(|_invalid| {
                         io::Error::new(io::ErrorKind::InvalidData, "invalid response base64")
                     })?;
                 if chunks.len().saturating_add(decoded.len()) > 16 * 1024 * 1024 {
@@ -2370,7 +2366,7 @@ fn parse_timeout(value: &str) -> Result<Duration, String> {
     };
     let number = number
         .parse::<u64>()
-        .map_err(|_| format!("invalid duration {value:?}"))?;
+        .map_err(|_invalid| format!("invalid duration {value:?}"))?;
     let millis = number
         .checked_mul(multiplier)
         .ok_or_else(|| "duration is too large".to_string())?;
@@ -2388,9 +2384,9 @@ mod tests {
     fn timeout_bounds_and_units() {
         assert_eq!(parse_timeout("1ms").unwrap(), Duration::from_millis(1));
         assert_eq!(parse_timeout("30s").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_timeout("24h").unwrap(), Duration::from_secs(86_400));
-        assert!(parse_timeout("0").is_err());
-        assert!(parse_timeout("25h").is_err());
+        assert_eq!(parse_timeout("24h").unwrap(), Duration::from_hours(24));
+        parse_timeout("0").unwrap_err();
+        parse_timeout("25h").unwrap_err();
     }
 
     #[test]

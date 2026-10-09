@@ -485,7 +485,7 @@ impl OuterWindow {
             .into_iter()
             .filter_map(|layer| match layer.content {
                 vivid_sdk::presenter::CaptureContent::Raster(raster) => Some(raster.pixels[0]),
-                _ => None,
+                vivid_sdk::presenter::CaptureContent::EncodedImage(_) => None,
             })
             .collect::<Vec<_>>();
         colors.sort_unstable();
@@ -634,6 +634,7 @@ fn raster_producer_child() {
             session.close().unwrap();
         }
         if !after_close && directory.join("after-close").exists() {
+            use vivid_protocol::cbor::Value;
             let (session, surface, node, channel) = producers[1].as_mut().unwrap();
             channel
                 .send_raster_delta(
@@ -652,7 +653,6 @@ fn raster_producer_child() {
                     false,
                 )
                 .unwrap();
-            use vivid_protocol::cbor::Value;
             session
                 .update_node(
                     &vivid_protocol::scene::SceneNode {
@@ -797,12 +797,12 @@ fn shared_rasters_recover_independently_of_playback_and_other_owners() {
     let _late = Client::attach(&runtime, &session, 100, 30, "-r", &late.environment);
     wait_for_colors(&late, &[22]);
     let text = OuterWindow::start(100, 30);
-    let _text = Client::attach(&runtime, &session, 100, 30, "--no-media", &text.environment);
+    let text_client = Client::attach(&runtime, &session, 100, 30, "--no-media", &text.environment);
     wait_for_clients(&runtime, &config, &session, "text opt-out", |listing| {
         client_ids(listing).len() == 3
     });
     assert_eq!(text.tracks(), 0);
-    _text.send(b"\x02M");
+    text_client.send(b"\x02M");
     wait_for_colors(&text, &[22]);
 }
 

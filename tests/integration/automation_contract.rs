@@ -41,7 +41,7 @@ struct Fixture {
     state: PathBuf,
     config_home: PathBuf,
     _guard: SessionGuard,
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
 }
 
 impl Fixture {
@@ -129,7 +129,7 @@ exec /bin/sh
                 state,
                 config_home,
             },
-            _directory: directory,
+            directory,
         };
         let ready = fixture.msg(&[
             "wait",
@@ -534,7 +534,7 @@ fn mouse_encodes_pane_local_cells_for_a_pane_that_is_not_visible() {
                 "submit",
                 "--pane-id",
                 "2",
-                r#"printf '\033[?1000h\033[?1006h'; cat -v"#,
+                r"printf '\033[?1000h\033[?1006h'; cat -v",
             ])
             .status
             .success()
@@ -747,7 +747,7 @@ fn resize_pane_sets_an_exact_size_and_move_pane_relocates_without_respawning() {
 #[test]
 fn run_plan_binds_results_between_steps_and_verifies_them() {
     let fixture = Fixture::start("plan");
-    let plan = fixture._directory.path().join("plan.json");
+    let plan = fixture.directory.path().join("plan.json");
     fs::write(
         &plan,
         r#"{
@@ -800,7 +800,7 @@ fn run_plan_binds_results_between_steps_and_verifies_them() {
 #[test]
 fn run_plan_preflight_skips_mutations_and_validation_rejects_a_plan_whole() {
     let fixture = Fixture::start("plan-guards");
-    let plan = fixture._directory.path().join("plan.json");
+    let plan = fixture.directory.path().join("plan.json");
     fs::write(
         &plan,
         r#"{
@@ -843,7 +843,7 @@ fn run_plan_preflight_skips_mutations_and_validation_rejects_a_plan_whole() {
 
     // A plan is rejected before any of it runs, so a typo on the last step does not first perform
     // the mutations in the steps before it.
-    let forward = fixture._directory.path().join("forward.json");
+    let forward = fixture.directory.path().join("forward.json");
     fs::write(
         &forward,
         r#"{"version":1,"steps":[
@@ -864,7 +864,7 @@ fn run_plan_preflight_skips_mutations_and_validation_rejects_a_plan_whole() {
         String::from_utf8_lossy(&rejected.stdout)
     );
 
-    let unknown = fixture._directory.path().join("unknown.json");
+    let unknown = fixture.directory.path().join("unknown.json");
     fs::write(
         &unknown,
         r#"{"version":1,"steps":[{"id":"nope","method":"teleport"}]}"#,
@@ -1236,7 +1236,7 @@ fn a_lease_excludes_other_automation_without_locking_anyone_out() {
 #[test]
 fn a_recording_replays_output_and_never_stores_what_was_typed() {
     let fixture = Fixture::start("record");
-    let path = fixture._directory.path().join("recording.ndjson");
+    let path = fixture.directory.path().join("recording.ndjson");
 
     assert_eq!(fixture.json(&["record", "status"])["recording"], false);
     let started = fixture.json(&["record", "start", path.to_str().unwrap()]);

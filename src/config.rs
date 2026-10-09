@@ -365,6 +365,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        const COPY_CHORDS: &[&str] = &[
+            "Up", "Down", "Left", "Right", "PageUp", "PageDown", "Space", "Enter", "q", "Escape",
+            "/", "?", "n", "N",
+        ];
         if parse_control_chord(&self.general.prefix).is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -415,7 +419,7 @@ impl Config {
             .server
             .listen
             .parse::<std::net::SocketAddr>()
-            .map_err(|_| {
+            .map_err(|_invalid| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "[server].listen must be an IP socket address",
@@ -463,10 +467,6 @@ impl Config {
                 "[keys.prefix] contains an unsupported chord or action",
             ));
         }
-        const COPY_CHORDS: &[&str] = &[
-            "Up", "Down", "Left", "Right", "PageUp", "PageDown", "Space", "Enter", "q", "Escape",
-            "/", "?", "n", "N",
-        ];
         if self.keys.copy.iter().any(|(chord, action)| {
             !COPY_CHORDS.contains(&chord.as_str())
                 || crate::session::copy_action_bytes(action).is_none()
@@ -525,7 +525,7 @@ pub fn parse_control_chord(chord: &str) -> Option<u8> {
     let bytes = chord.as_bytes();
     (bytes.len() == 3 && bytes[0] == b'C' && bytes[1] == b'-')
         .then(|| bytes[2].to_ascii_lowercase())
-        .filter(|byte| byte.is_ascii_lowercase())
+        .filter(u8::is_ascii_lowercase)
         .map(|byte| byte - b'a' + 1)
 }
 
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_rejected() {
-        assert!(toml::from_str::<Config>("[general]\nunknown = true").is_err());
+        toml::from_str::<Config>("[general]\nunknown = true").unwrap_err();
     }
 
     /// Comments are ordinary TOML and must survive everywhere a user writes them: above a table,
@@ -636,7 +636,7 @@ mod tests {
         assert!(!config.panes.transparent);
         config.validate().unwrap();
 
-        assert!(toml::from_str::<Config>("[panes]\nopaque = true").is_err());
+        toml::from_str::<Config>("[panes]\nopaque = true").unwrap_err();
     }
 
     #[test]
@@ -665,15 +665,15 @@ mod tests {
             config.validate().unwrap();
         }
 
-        assert!(toml::from_str::<Config>("[clipboard]\nosc52 = \"always\"").is_err());
-        assert!(toml::from_str::<Config>("[clipboard]\nunknown = true").is_err());
+        toml::from_str::<Config>("[clipboard]\nosc52 = \"always\"").unwrap_err();
+        toml::from_str::<Config>("[clipboard]\nunknown = true").unwrap_err();
     }
 
     #[test]
     fn plugin_kill_switch_is_strict_and_can_be_disabled() {
         let config: Config = toml::from_str("[plugins]\nenabled = false").unwrap();
         assert!(!config.plugins.enabled);
-        assert!(toml::from_str::<Config>("[plugins]\nunknown = true").is_err());
+        toml::from_str::<Config>("[plugins]\nunknown = true").unwrap_err();
     }
 
     #[test]
@@ -696,7 +696,7 @@ mod tests {
             .prefix
             .insert("g".into(), "new-floating-pane".into());
         config.validate().unwrap();
-        assert!(toml::from_str::<Config>("[floating]\nunknown = 1").is_err());
+        toml::from_str::<Config>("[floating]\nunknown = 1").unwrap_err();
     }
 
     #[test]
@@ -842,7 +842,7 @@ status_fill = false
             toml::from_str::<Config>("[theme]\nactive_frame = 12").is_err(),
             "a bare integer is not the documented form; colors are strings"
         );
-        assert!(toml::from_str::<Config>("[theme]\nunknown = \"red\"").is_err());
+        toml::from_str::<Config>("[theme]\nunknown = \"red\"").unwrap_err();
     }
 
     #[test]

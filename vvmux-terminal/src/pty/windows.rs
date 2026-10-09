@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString, c_void};
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -24,13 +25,37 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::core::HRESULT;
 
 use super::{PtyParts, input};
+
+/// How long `terminate_blocking` waits for a pane to exit on its own, in milliseconds.
+///
+/// Matches the blocking path's purpose: give the console host time to deliver the close event
+/// before the job is killed. Raising it lengthens synchronous session teardown.
+const EXIT_GRACE_MS: u32 = 500;
+
+/// How long background cleanup waits for a pane to exit after closing its console.
+const CLOSE_GRACE_MS: u32 = 250;
+
+/// How long to wait for a killed job's process to be reaped before giving up.
+///
+/// Termination is asynchronous in the kernel; this bounds the wait so a stuck process cannot hang
+/// teardown, at the cost of possibly returning before the process object is signaled.
+const KILL_WAIT_MS: u32 = 2_000;
+
+/// Buffer size for each anonymous pipe between vvmux and the pseudoconsole.
+///
+/// 64 KiB holds several full-screen repaints, so a briefly slow reader does not stall the console
+/// host; it is the size most terminal emulators use for ConPTY pipes.
+const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
+
+/// The longest `NAME=value` entry the Windows environment block accepts, in UTF-16 code units.
+const MAX_ENVIRONMENT_ENTRY_UNITS: usize = 32_767;
 
 type CreatePseudoConsoleFn =
     unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT;
@@ -45,39 +70,73 @@ struct ConptyApi {
 }
 
 impl ConptyApi {
+    /// Resolve the ConPTY entry points, which older Windows builds do not export.
     fn load() -> io::Result<Self> {
         type LoadedFn = unsafe extern "system" fn() -> isize;
-        let kernel32 = unsafe { GetModuleHandleW(wide(OsStr::new("kernel32.dll"))?.as_ptr()) };
+        let module = wide(OsStr::new("kernel32.dll"))?;
+        // SAFETY: `module` is a NUL-terminated UTF-16 string that outlives the call, and
+        // kernel32 is always loaded, so the returned module handle stays valid for the process.
+        let kernel32 = unsafe { GetModuleHandleW(module.as_ptr()) };
         if kernel32.is_null() {
             return Err(unsupported());
         }
+        // SAFETY: `kernel32` is a loaded module handle and each name is a NUL-terminated C string.
         let create = unsafe { GetProcAddress(kernel32, c"CreatePseudoConsole".as_ptr().cast()) }
             .ok_or_else(unsupported)?;
+        // SAFETY: as above.
         let resize = unsafe { GetProcAddress(kernel32, c"ResizePseudoConsole".as_ptr().cast()) }
             .ok_or_else(unsupported)?;
+        // SAFETY: as above.
         let close = unsafe { GetProcAddress(kernel32, c"ClosePseudoConsole".as_ptr().cast()) }
             .ok_or_else(unsupported)?;
+        // SAFETY: each pointer is the export of that exact name, and the target types match the
+        // documented Win32 signatures and the `system` calling convention; transmuting between
+        // function-pointer types of the same size only restores the real signature.
+        let create = unsafe { std::mem::transmute::<LoadedFn, CreatePseudoConsoleFn>(create) };
+        // SAFETY: as above, for `ResizePseudoConsole`.
+        let resize = unsafe { std::mem::transmute::<LoadedFn, ResizePseudoConsoleFn>(resize) };
+        // SAFETY: as above, for `ClosePseudoConsole`.
+        let close = unsafe { std::mem::transmute::<LoadedFn, ClosePseudoConsoleFn>(close) };
         Ok(Self {
-            create: unsafe { std::mem::transmute::<LoadedFn, CreatePseudoConsoleFn>(create) },
-            resize: unsafe { std::mem::transmute::<LoadedFn, ResizePseudoConsoleFn>(resize) },
-            close: unsafe { std::mem::transmute::<LoadedFn, ClosePseudoConsoleFn>(close) },
+            create,
+            resize,
+            close,
         })
     }
 }
 
+/// Shared handle for resizing and terminating one ConPTY pane.
+///
+/// Clones share the same pane. Dropping the last clone terminates the pane's job object, so an
+/// abandoned pane never keeps its processes alive.
 #[derive(Clone)]
 pub struct PtyControl {
     inner: Arc<ControlInner>,
 }
 
+impl fmt::Debug for PtyControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PtyControl")
+            .field("closing", &self.inner.closing.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owner of the pane's process handle, used to collect its exit status.
+#[derive(Debug)]
 pub struct PtyWaiter {
     process: OwnedHandle,
 }
 
+/// How a pane's process ended.
 #[derive(Debug, Clone, Copy)]
 pub struct PtyExitStatus {
+    /// The process exit code.
     pub code: Option<i64>,
+    /// Always `None`: Windows processes do not end by signal.
     pub signal: Option<i32>,
+    /// Whether the process exited with code zero.
     pub success: bool,
 }
 
@@ -89,18 +148,29 @@ struct ControlInner {
     closing: AtomicBool,
 }
 
-unsafe impl Send for ControlInner {}
-unsafe impl Sync for ControlInner {}
-
 impl PtyControl {
+    /// Always `None`: Windows has no foreground process group.
+    #[must_use]
     pub fn foreground_process_group_id(&self) -> Option<u32> {
         None
     }
 
+    /// Resize the pseudoconsole to `columns` by `rows` cells.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] for a zero dimension,
+    /// [`io::ErrorKind::BrokenPipe`] once the pane is closing, or an error carrying the
+    /// `ResizePseudoConsole` failure.
     pub fn resize(&self, columns: u16, rows: u16) -> io::Result<()> {
         self.resize_with_pixels(columns, rows, 0, 0)
     }
 
+    /// Resize the pseudoconsole; ConPTY has no pixel size, so those arguments are ignored.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`PtyControl::resize`].
     pub fn resize_with_pixels(
         &self,
         columns: u16,
@@ -131,6 +201,8 @@ impl PtyControl {
                 "ConPTY is closed",
             ));
         };
+        // SAFETY: `handle` is a live pseudoconsole: it is only closed after being taken out of
+        // this mutex, which the guard holds for the duration of the call.
         let result = unsafe {
             (self.inner.api.resize)(
                 handle,
@@ -157,6 +229,10 @@ impl PtyControl {
     /// job and leave its shell alone". Refused here rather than approximated, because a caller
     /// asking for `INT` and silently getting a job-wide kill would be worse than being told no.
     /// `Ctrl+C` is still available as ordinary input through `key`.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`io::ErrorKind::Unsupported`].
     pub fn signal(&self, _signal: i32) -> io::Result<u32> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -164,33 +240,45 @@ impl PtyControl {
         ))
     }
 
+    /// Start closing the pane in the background, killing its job if it does not exit promptly.
+    ///
+    /// Returns immediately. Only the first termination request on a pane has any effect.
     pub fn terminate(&self) {
         if self.inner.closing.swap(true, Ordering::AcqRel) {
             return;
         }
-        let inner = self.inner.clone();
+        let inner = Arc::clone(&self.inner);
         let _ = std::thread::Builder::new()
             .name("vvmux-conpty-cleanup".into())
             .spawn(move || cleanup(inner));
     }
 
+    /// Close the pane and wait for its process, killing the job if it outlives the grace period.
     pub fn terminate_blocking(&self) {
         self.terminate();
-        let result = unsafe { WaitForSingleObject(self.inner.process.raw(), 500) };
+        // SAFETY: `process` is an open process handle owned by `inner` for this whole call.
+        let result = unsafe { WaitForSingleObject(self.inner.process.raw(), EXIT_GRACE_MS) };
         if result == WAIT_TIMEOUT {
-            unsafe {
-                TerminateJobObject(self.inner.job.raw(), 1);
-            }
-            let _ = unsafe { WaitForSingleObject(self.inner.process.raw(), 2_000) };
+            // SAFETY: `job` is an open job handle owned by `inner`.
+            unsafe { TerminateJobObject(self.inner.job.raw(), 1) };
+            // SAFETY: as for the first wait.
+            let _ = unsafe { WaitForSingleObject(self.inner.process.raw(), KILL_WAIT_MS) };
         }
     }
 }
 
 impl PtyWaiter {
+    /// Block until the pane's process exits and report its exit code.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error when waiting fails or the exit code cannot be read.
     pub fn wait(self) -> io::Result<PtyExitStatus> {
-        if unsafe { WaitForSingleObject(self.process.raw(), u32::MAX) } == WAIT_OBJECT_0 {
+        // SAFETY: `process` is an open process handle owned by `self`.
+        if unsafe { WaitForSingleObject(self.process.raw(), INFINITE) } == WAIT_OBJECT_0 {
             let mut code = 0;
-            if unsafe { GetExitCodeProcess(self.process.raw(), &mut code) } == 0 {
+            // SAFETY: `process` is open, and `code` is a live local the call writes once.
+            if unsafe { GetExitCodeProcess(self.process.raw(), &raw mut code) } == 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(PtyExitStatus {
@@ -266,6 +354,8 @@ fn spawn_prepared(
     set_inheritable(input_writer.raw(), false)?;
 
     let mut pseudoconsole = 0;
+    // SAFETY: both pipe handles are open for the duration of the call, and `pseudoconsole` is a
+    // live local that the call writes once.
     let result = unsafe {
         (api.create)(
             COORD {
@@ -275,7 +365,7 @@ fn spawn_prepared(
             input_child.raw(),
             output_child.raw(),
             0,
-            &mut pseudoconsole,
+            &raw mut pseudoconsole,
         )
     };
     if result < 0 || pseudoconsole == 0 {
@@ -309,6 +399,9 @@ fn spawn_prepared(
 
     let job = create_kill_job()?;
     let mut process_info = PROCESS_INFORMATION::default();
+    // SAFETY: `application`, `cwd`, and `environment` are NUL-terminated UTF-16 buffers and
+    // `command_line` is a mutable NUL-terminated buffer, all outliving the call; `startup` and its
+    // attribute list stay alive until after the call; and `process_info` is written once.
     let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -322,8 +415,8 @@ fn spawn_prepared(
             EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             environment.as_ptr().cast(),
             cwd.as_ptr(),
-            &startup.StartupInfo,
-            &mut process_info,
+            &raw const startup.StartupInfo,
+            &raw mut process_info,
         )
     };
     if created == 0 {
@@ -332,17 +425,19 @@ fn spawn_prepared(
     let process = OwnedHandle::new(process_info.hProcess)?;
     let thread = OwnedHandle::new(process_info.hThread)?;
 
+    // SAFETY: `job` and `process` are open handles owned by this function.
     if unsafe { AssignProcessToJobObject(job.raw(), process.raw()) } == 0 {
-        unsafe {
-            TerminateProcess(process.raw(), 1);
-        }
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // SAFETY: `process` is an open, still-suspended process handle.
+        unsafe { TerminateProcess(process.raw(), 1) };
+        return Err(error);
     }
+    // SAFETY: `thread` is the open handle of the suspended primary thread.
     if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
-        unsafe {
-            TerminateJobObject(job.raw(), 1);
-        }
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // SAFETY: `job` is an open job handle that now contains the process.
+        unsafe { TerminateJobObject(job.raw(), 1) };
+        return Err(error);
     }
     drop(thread);
 
@@ -377,23 +472,25 @@ fn cleanup(inner: Arc<ControlInner>) {
         .take()
     {
         let api = inner.api;
+        // `ClosePseudoConsole` blocks until the console host drains, so it runs off this thread.
         let _ = std::thread::Builder::new()
             .name("vvmux-conpty-close".into())
+            // SAFETY: `handle` was taken out of the mutex, so this is its only close.
             .spawn(move || unsafe { (api.close)(handle) });
     }
-    if unsafe { WaitForSingleObject(inner.process.raw(), 250) } == WAIT_TIMEOUT {
-        unsafe {
-            TerminateJobObject(inner.job.raw(), 1);
-        }
-        let _ = unsafe { WaitForSingleObject(inner.process.raw(), 2_000) };
+    // SAFETY: `process` is an open process handle owned by `inner`, which this function holds.
+    if unsafe { WaitForSingleObject(inner.process.raw(), CLOSE_GRACE_MS) } == WAIT_TIMEOUT {
+        // SAFETY: `job` is an open job handle owned by `inner`.
+        unsafe { TerminateJobObject(inner.job.raw(), 1) };
+        // SAFETY: as for the first wait.
+        let _ = unsafe { WaitForSingleObject(inner.process.raw(), KILL_WAIT_MS) };
     }
 }
 
 impl Drop for ControlInner {
     fn drop(&mut self) {
-        unsafe {
-            TerminateJobObject(self.job.raw(), 1);
-        }
+        // SAFETY: `job` is still open; it is closed only when this value's fields drop.
+        unsafe { TerminateJobObject(self.job.raw(), 1) };
         if let Some(handle) = self
             .pseudoconsole
             .get_mut()
@@ -403,6 +500,7 @@ impl Drop for ControlInner {
             let api = self.api;
             let _ = std::thread::Builder::new()
                 .name("vvmux-conpty-drop".into())
+                // SAFETY: `handle` was taken out of the mutex, so this is its only close.
                 .spawn(move || unsafe { (api.close)(handle) });
         }
     }
@@ -416,14 +514,20 @@ struct PseudoconsoleGuard {
 impl Drop for PseudoconsoleGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
+            // SAFETY: the guard still owns `handle`; taking it out makes this the only close.
             unsafe { (self.api.close)(handle) };
         }
     }
 }
 
+/// A kernel handle closed exactly once, on drop.
+#[derive(Debug)]
 struct OwnedHandle(HANDLE);
 
+// SAFETY: a Win32 kernel handle is a process-wide table index, valid from any thread. Every use
+// here goes through thread-safe kernel calls, and the handle is closed only once, by `Drop`.
 unsafe impl Send for OwnedHandle {}
+// SAFETY: as above; `&OwnedHandle` only exposes the raw value for those thread-safe calls.
 unsafe impl Sync for OwnedHandle {}
 
 impl OwnedHandle {
@@ -442,14 +546,16 @@ impl OwnedHandle {
     fn duplicate(&self) -> io::Result<Self> {
         use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: `GetCurrentProcess` has no preconditions and returns a pseudo-handle.
         let process = unsafe { GetCurrentProcess() };
         let mut duplicate = ptr::null_mut();
+        // SAFETY: `self.0` is an open handle, and `duplicate` is a live local written once.
         if unsafe {
             DuplicateHandle(
                 process,
                 self.0,
                 process,
-                &mut duplicate,
+                &raw mut duplicate,
                 0,
                 0,
                 DUPLICATE_SAME_ACCESS,
@@ -465,15 +571,16 @@ impl OwnedHandle {
     fn into_file(self) -> File {
         let raw = self.0;
         std::mem::forget(self);
+        // SAFETY: ownership of the open handle moves from the forgotten `OwnedHandle` to the file,
+        // so it is still closed exactly once.
         unsafe { File::from_raw_handle(raw as RawHandle) }
     }
 }
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.0);
-        }
+        // SAFETY: the handle is open and owned by `self`; this is its only close.
+        unsafe { CloseHandle(self.0) };
     }
 }
 
@@ -485,7 +592,17 @@ fn anonymous_pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
         lpSecurityDescriptor: ptr::null_mut(),
         bInheritHandle: 1,
     };
-    if unsafe { CreatePipe(&mut read, &mut write, &attributes, 64 * 1024) } == 0 {
+    // SAFETY: the two handle slots are live locals written once, and `attributes` outlives the
+    // call.
+    if unsafe {
+        CreatePipe(
+            &raw mut read,
+            &raw mut write,
+            &raw const attributes,
+            PIPE_BUFFER_BYTES,
+        )
+    } == 0
+    {
         Err(io::Error::last_os_error())
     } else {
         Ok((OwnedHandle::new(read)?, OwnedHandle::new(write)?))
@@ -494,6 +611,7 @@ fn anonymous_pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
 
 fn set_inheritable(handle: HANDLE, inheritable: bool) -> io::Result<()> {
     let flags = if inheritable { HANDLE_FLAG_INHERIT } else { 0 };
+    // SAFETY: callers pass an open handle that they own.
     if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flags) } == 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -502,14 +620,16 @@ fn set_inheritable(handle: HANDLE, inheritable: bool) -> io::Result<()> {
 }
 
 fn create_kill_job() -> io::Result<OwnedHandle> {
+    // SAFETY: null attributes and a null name request an unnamed job with default security.
     let job = OwnedHandle::new(unsafe { CreateJobObjectW(ptr::null(), ptr::null()) })?;
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: `job` is open, and the pointer and length describe the live `limits` structure.
     if unsafe {
         SetInformationJobObject(
             job.raw(),
             JobObjectExtendedLimitInformation,
-            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            (&raw const limits).cast(),
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )
     } == 0
@@ -527,9 +647,8 @@ struct AttributeList {
 impl AttributeList {
     fn new(count: u32) -> io::Result<Self> {
         let mut bytes = 0;
-        unsafe {
-            InitializeProcThreadAttributeList(ptr::null_mut(), count, 0, &mut bytes);
-        }
+        // SAFETY: a null list asks only for the required size, which is written to `bytes`.
+        unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), count, 0, &raw mut bytes) };
         if bytes == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -537,7 +656,10 @@ impl AttributeList {
         let mut result = Self {
             storage: vec![0usize; words],
         };
-        if unsafe { InitializeProcThreadAttributeList(result.pointer(), count, 0, &mut bytes) } == 0
+        // SAFETY: `storage` is pointer-aligned and at least `bytes` long, as the sizing call
+        // required.
+        if unsafe { InitializeProcThreadAttributeList(result.pointer(), count, 0, &raw mut bytes) }
+            == 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -549,6 +671,8 @@ impl AttributeList {
     }
 
     fn set_pseudoconsole(&mut self, handle: HPCON) -> io::Result<()> {
+        // SAFETY: the list was initialized by `new`. For the pseudoconsole attribute, the value
+        // is the `HPCON` itself, not a pointer to it, as `CreateProcessW` documents.
         if unsafe {
             UpdateProcThreadAttribute(
                 self.pointer(),
@@ -570,6 +694,7 @@ impl AttributeList {
 
 impl Drop for AttributeList {
     fn drop(&mut self) {
+        // SAFETY: the list was initialized by `new` and is deleted exactly once.
         unsafe { DeleteProcThreadAttributeList(self.pointer()) };
     }
 }
@@ -598,7 +723,7 @@ fn environment_block(overrides: &[(String, String)]) -> io::Result<Vec<u16>> {
     let mut block = Vec::new();
     for (_, (key, value)) in values {
         block.extend(OsStr::new(&key).encode_wide());
-        block.push(b'=' as u16);
+        block.push(u16::from(b'='));
         block.extend(OsStr::new(&value).encode_wide());
         block.push(0);
     }
@@ -612,9 +737,9 @@ fn validate_environment_pair(key: &OsStr, value: &OsStr) -> io::Result<()> {
     if key_units.is_empty()
         || key_units
             .iter()
-            .any(|unit| *unit == 0 || *unit == b'=' as u16)
+            .any(|unit| *unit == 0 || *unit == u16::from(b'='))
         || value_units.contains(&0)
-        || key_units.len() + value_units.len() > 32_767
+        || key_units.len() + value_units.len() > MAX_ENVIRONMENT_ENTRY_UNITS
     {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,

@@ -12,11 +12,13 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+/// Version of the gateway authentication file format with only a bearer token.
 const AUTH_SCHEMA: u32 = 1;
 /// Schema 2 adds scoped automation tokens beside the full-authority bearer token.
 const AUTH_SCHEMA_SCOPED: u32 = 2;
 /// Scoped tokens one record may hold.
 const MAX_SCOPED_TOKENS: usize = 32;
+/// Largest authentication file read, in bytes.
 const MAX_AUTH_RECORD_BYTES: u64 = 16 * 1024;
 const TOKEN_DOMAIN: &[u8] = b"vvmux network authentication v1\0";
 
@@ -171,7 +173,7 @@ pub(crate) fn authorize(path: &Path, submitted: &str) -> io::Result<Option<Autho
     let decoded = Zeroizing::new(
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(submitted)
-            .map_err(|_| {
+            .map_err(|_invalid| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid authentication token")
             })?,
     );
@@ -344,7 +346,7 @@ fn ensure_auth_parent(path: &Path) -> io::Result<()> {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
     let metadata = fs::symlink_metadata(parent)?;
-    let uid = unsafe { libc::geteuid() };
+    let uid = crate::platform::effective_uid();
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
         || metadata.uid() != uid
@@ -401,7 +403,7 @@ fn open_auth_file(path: &Path) -> io::Result<File> {
 #[cfg(unix)]
 fn validate_open_unix_file(file: &File) -> io::Result<()> {
     let metadata = file.metadata()?;
-    let uid = unsafe { libc::geteuid() };
+    let uid = crate::platform::effective_uid();
     if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -429,7 +431,7 @@ mod tests {
         let first = create_token(Some(&path), false).unwrap();
         assert!(authenticate(&path, &first).unwrap());
         assert!(!authenticate(&path, &"A".repeat(43)).unwrap_or(false));
-        assert!(create_token(Some(&path), false).is_err());
+        create_token(Some(&path), false).unwrap_err();
 
         let second = create_token(Some(&path), true).unwrap();
         assert!(!authenticate(&path, &first).unwrap());
@@ -441,7 +443,7 @@ mod tests {
 
     #[test]
     fn malformed_hash_is_rejected() {
-        assert!(decode_hex_32("00").is_err());
-        assert!(decode_hex_32(&"z".repeat(64)).is_err());
+        decode_hex_32("00").unwrap_err();
+        decode_hex_32(&"z".repeat(64)).unwrap_err();
     }
 }

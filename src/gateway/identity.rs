@@ -22,8 +22,11 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+/// Version of the machine identity file format.
 const IDENTITY_SCHEMA: u32 = 1;
+/// Largest identity file read, in bytes.
 const MAX_IDENTITY_RECORD_BYTES: u64 = 16 * 1024;
+/// Longest enrollment code accepted, in bytes.
 const MAX_ENROLL_CODE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -120,9 +123,11 @@ impl MachineIdentity {
         let seed = Zeroizing::new(
             base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(record.private_key.as_str())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid private key"))?,
+                .map_err(|_invalid| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid private key")
+                })?,
         );
-        let seed: &[u8; 32] = seed.as_slice().try_into().map_err(|_| {
+        let seed: &[u8; 32] = seed.as_slice().try_into().map_err(|_out_of_range| {
             io::Error::new(io::ErrorKind::InvalidData, "private key must be 32 bytes")
         })?;
         Ok(Self {
@@ -267,7 +272,7 @@ fn ensure_parent(path: &Path) -> io::Result<()> {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
     let metadata = fs::symlink_metadata(parent)?;
-    let uid = unsafe { libc::geteuid() };
+    let uid = crate::platform::effective_uid();
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
         || metadata.uid() != uid
@@ -324,7 +329,7 @@ fn open_identity_file(path: &Path) -> io::Result<File> {
 #[cfg(unix)]
 fn validate_open_unix_file(file: &File) -> io::Result<()> {
     let metadata = file.metadata()?;
-    let uid = unsafe { libc::geteuid() };
+    let uid = crate::platform::effective_uid();
     if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -361,13 +366,7 @@ mod tests {
         let actual = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(signature)
             .unwrap();
-        assert_eq!(
-            actual
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
-            expected
-        );
+        assert_eq!(hex::encode(&actual), expected);
     }
 
     #[test]
@@ -401,7 +400,7 @@ mod tests {
             let _reservation = IdentityReservation::new(&path).unwrap();
             assert!(path.exists());
             assert!(IdentityReservation::new(&path).is_err());
-        }
+        };
         assert!(!path.exists());
     }
 
@@ -469,7 +468,9 @@ fn read_bounded_code(mut reader: impl Read) -> io::Result<Zeroizing<String>> {
         .by_ref()
         .take((MAX_ENROLL_CODE_BYTES + 1) as u64)
         .read_to_string(&mut code)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "enrollment code is not UTF-8"))?;
+        .map_err(|_invalid| {
+            io::Error::new(io::ErrorKind::InvalidData, "enrollment code is not UTF-8")
+        })?;
     Ok(code)
 }
 
@@ -508,6 +509,7 @@ fn normalize_enrollment_code(mut code: Zeroizing<String>) -> io::Result<Zeroizin
 /// chunked transfer encoding is rejected because this server never emits it.
 pub(crate) fn enroll(server: &str, code: &str, public_key: &VerifyingKey) -> io::Result<()> {
     use std::io::Write as _;
+    use std::net::ToSocketAddrs as _;
     use std::sync::Arc;
 
     let parsed = url::Url::parse(server).map_err(|error| {
@@ -578,7 +580,6 @@ pub(crate) fn enroll(server: &str, code: &str, public_key: &VerifyingKey) -> io:
     )
     .map_err(io::Error::other)?;
 
-    use std::net::ToSocketAddrs as _;
     let address = (host.as_str(), port)
         .to_socket_addrs()
         .map_err(|error| {
@@ -597,12 +598,8 @@ pub(crate) fn enroll(server: &str, code: &str, public_key: &VerifyingKey) -> io:
             )
         },
     )?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-        .ok();
-    stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(10)))
-        .ok();
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
     let mut stream: EnrollStream = if tls {
         let mut roots = rustls::RootCertStore::empty();
         for cert in rustls_native_certs::load_native_certs().certs {
@@ -618,7 +615,9 @@ pub(crate) fn enroll(server: &str, code: &str, public_key: &VerifyingKey) -> io:
             .with_no_client_auth(),
         );
         let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid server hostname"))?
+            .map_err(|_invalid| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid server hostname")
+            })?
             .to_owned();
         let connection =
             rustls::ClientConnection::new(config, server_name).map_err(io::Error::other)?;
@@ -680,19 +679,19 @@ enum EnrollStream {
 }
 
 impl std::io::Read for EnrollStream {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            EnrollStream::Plain(stream) => stream.read(buffer),
-            EnrollStream::Tls(stream) => stream.read(buffer),
+            EnrollStream::Plain(stream) => stream.read(buf),
+            EnrollStream::Tls(stream) => stream.read(buf),
         }
     }
 }
 
 impl std::io::Write for EnrollStream {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            EnrollStream::Plain(stream) => stream.write(buffer),
-            EnrollStream::Tls(stream) => stream.write(buffer),
+            EnrollStream::Plain(stream) => stream.write(buf),
+            EnrollStream::Tls(stream) => stream.write(buf),
         }
     }
 
@@ -759,7 +758,7 @@ impl<S: std::io::Read> ResponseReader<S> {
                 "enrollment server sent a non-HTTP response",
             ));
         }
-        status.parse::<u16>().map_err(|_| {
+        status.parse::<u16>().map_err(|_invalid| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "enrollment server sent a bad status line",
@@ -781,7 +780,7 @@ impl<S: std::io::Read> ResponseReader<S> {
             let value = value.trim();
             match name.as_str() {
                 "content-length" => {
-                    content_length = Some(value.parse::<usize>().map_err(|_| {
+                    content_length = Some(value.parse::<usize>().map_err(|_invalid| {
                         io::Error::new(io::ErrorKind::InvalidData, "bad Content-Length")
                     })?);
                 }
@@ -795,40 +794,37 @@ impl<S: std::io::Read> ResponseReader<S> {
     }
 
     fn read_body(&mut self, content_length: Option<usize>) -> io::Result<Vec<u8>> {
-        match content_length {
-            Some(length) => {
-                if length > MAX_ENROLL_RESPONSE_BYTES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "enrollment response exceeds 64 KiB",
-                    ));
-                }
-                while self.pending.len() < length {
-                    self.fill()?;
-                }
-                let body: Vec<u8> = self.pending.drain(..length).collect();
-                Ok(body)
+        if let Some(length) = content_length {
+            if length > MAX_ENROLL_RESPONSE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "enrollment response exceeds 64 KiB",
+                ));
             }
-            None => {
-                // Read until EOF, bounded.
-                loop {
-                    let mut buffer = [0_u8; 4096];
-                    match self.stream.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(count) => {
-                            self.pending.extend_from_slice(&buffer[..count]);
-                            if self.pending.len() > MAX_ENROLL_RESPONSE_BYTES {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "enrollment response exceeds 64 KiB",
-                                ));
-                            }
+            while self.pending.len() < length {
+                self.fill()?;
+            }
+            let body: Vec<u8> = self.pending.drain(..length).collect();
+            Ok(body)
+        } else {
+            // Read until EOF, bounded.
+            loop {
+                let mut buffer = [0_u8; 4096];
+                match self.stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        self.pending.extend_from_slice(&buffer[..count]);
+                        if self.pending.len() > MAX_ENROLL_RESPONSE_BYTES {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "enrollment response exceeds 64 KiB",
+                            ));
                         }
-                        Err(error) => return Err(io::Error::other(error)),
                     }
+                    Err(error) => return Err(io::Error::other(error)),
                 }
-                Ok(std::mem::take(&mut self.pending))
             }
+            Ok(std::mem::take(&mut self.pending))
         }
     }
 }
@@ -891,11 +887,9 @@ mod enroll_tests {
                 .as_str(),
             "one-use"
         );
-        assert!(normalize_enrollment_code(Zeroizing::new(String::new())).is_err());
-        assert!(normalize_enrollment_code(Zeroizing::new("one\ntwo".to_owned())).is_err());
-        assert!(
-            normalize_enrollment_code(Zeroizing::new("x".repeat(MAX_ENROLL_CODE_BYTES + 1)))
-                .is_err()
-        );
+        normalize_enrollment_code(Zeroizing::new(String::new())).unwrap_err();
+        normalize_enrollment_code(Zeroizing::new("one\ntwo".to_owned())).unwrap_err();
+        normalize_enrollment_code(Zeroizing::new("x".repeat(MAX_ENROLL_CODE_BYTES + 1)))
+            .unwrap_err();
     }
 }

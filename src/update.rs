@@ -7,10 +7,13 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use sha2::{Digest, Sha256};
 
+/// Largest update manifest downloaded, in bytes.
 #[cfg(unix)]
 const MANIFEST_LIMIT: usize = 64 * 1024;
+/// Largest update signature downloaded, in bytes.
 #[cfg(unix)]
 const SIGNATURE_LIMIT: usize = 512;
+/// Largest update binary downloaded, in bytes.
 #[cfg(unix)]
 const BINARY_LIMIT: usize = 128 * 1024 * 1024;
 #[cfg(unix)]
@@ -100,7 +103,7 @@ pub(crate) fn run(check: bool) -> io::Result<()> {
     let manifest_bytes = download(&manifest_url, MANIFEST_LIMIT)?;
     let signature_text =
         String::from_utf8(download(&format!("{manifest_url}.sig"), SIGNATURE_LIMIT)?)
-            .map_err(|_| invalid("update signature is not UTF-8"))?;
+            .map_err(|_invalid| invalid("update signature is not UTF-8"))?;
     let public_hex = option_env!("VVMUX_UPDATE_PUBLIC_KEY_HEX").unwrap_or(DEVELOPMENT_PUBLIC_KEY);
     verify_manifest_signature(&manifest_bytes, &signature_text, public_hex)?;
 
@@ -129,7 +132,7 @@ pub(crate) fn run(check: bool) -> io::Result<()> {
 
     let executable = std::env::current_exe()?;
     let metadata = fs::metadata(&executable)?;
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+    if !metadata.is_file() || metadata.uid() != crate::platform::effective_uid() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "refusing to replace an executable not owned by the current user",
@@ -183,17 +186,17 @@ fn verify_manifest_signature(
 
     let signature_bytes = base64::engine::general_purpose::STANDARD
         .decode(signature_text.trim())
-        .map_err(|_| invalid("update signature is not valid base64"))?;
+        .map_err(|_invalid| invalid("update signature is not valid base64"))?;
     let signature = Signature::from_slice(&signature_bytes)
-        .map_err(|_| invalid("update signature has the wrong length"))?;
+        .map_err(|_invalid| invalid("update signature has the wrong length"))?;
     let public: [u8; 32] = hex::decode(public_hex)
-        .map_err(|_| invalid("compiled update public key is invalid hex"))?
+        .map_err(|_invalid| invalid("compiled update public key is invalid hex"))?
         .try_into()
-        .map_err(|_| invalid("compiled update public key has the wrong length"))?;
+        .map_err(|_invalid| invalid("compiled update public key has the wrong length"))?;
     VerifyingKey::from_bytes(&public)
-        .map_err(|_| invalid("compiled update public key is invalid"))?
+        .map_err(|_invalid| invalid("compiled update public key is invalid"))?
         .verify(bytes, &signature)
-        .map_err(|_| invalid("update manifest signature verification failed"))?;
+        .map_err(|_invalid| invalid("update manifest signature verification failed"))?;
     Ok(())
 }
 
@@ -268,8 +271,8 @@ fn write_channel(channel: Channel) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+        options.mode(0o600)
+    };
     let mut file = options.open(&temporary)?;
     if let Err(error) = (|| -> io::Result<()> {
         writeln!(file, "{}", channel.as_str())?;

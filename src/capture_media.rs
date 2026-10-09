@@ -245,7 +245,7 @@ pub fn compose(layers: &[CaptureLayer], target: CaptureTarget) -> io::Result<Cap
 mod tests {
     use std::sync::Arc;
 
-    use vivid_sdk::presenter::{RetainedRaster, SourceKey};
+    use vivid_sdk::presenter::RetainedRaster;
 
     use super::*;
 
@@ -395,6 +395,6 @@ mod tests {
             cell_width: 8,
             cell_height: 16,
         };
-        assert!(compose(&[], empty).is_err());
+        compose(&[], empty).unwrap_err();
     }
 }

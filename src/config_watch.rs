@@ -24,6 +24,7 @@ use crate::session::ActorEvent;
 /// further poll before it fires.
 #[cfg(not(test))]
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the configuration file is checked for changes.
 #[cfg(test)]
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -183,7 +184,7 @@ mod tests {
         spawn_plugin_registry(
             path,
             sender,
-            shutdown.clone(),
+            Arc::clone(&shutdown),
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
@@ -202,7 +203,13 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(4);
         let shutdown = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(AtomicBool::new(false));
-        spawn_plugin_registry(path.clone(), sender, shutdown.clone(), pending.clone()).unwrap();
+        spawn_plugin_registry(
+            path.clone(),
+            sender,
+            Arc::clone(&shutdown),
+            Arc::clone(&pending),
+        )
+        .unwrap();
         std::thread::sleep(POLL_INTERVAL * 2);
         std::fs::write(&path, r#"{"schema":1,"generation":2,"plugins":{}}"#).unwrap();
         assert!(matches!(

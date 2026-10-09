@@ -360,7 +360,7 @@ fn drain_for(receiver: &mpsc::Receiver<Vec<u8>>, transcript: &mut Vec<u8>, durat
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
             Ok(chunk) => transcript.extend(chunk),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }

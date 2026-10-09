@@ -182,7 +182,7 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
             .unwrap();
         assert!(matches!(
             wrong_token.next().await,
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None
+            Some(Ok(Message::Close(_)) | Err(_)) | None
         ));
 
         let (mut wrong_version, _) =
@@ -199,7 +199,7 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
             .unwrap();
         assert!(matches!(
             wrong_version.next().await,
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None
+            Some(Ok(Message::Close(_)) | Err(_)) | None
         ));
 
         let (mut pre_auth_request, _) =
@@ -214,7 +214,7 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
             .unwrap();
         assert!(matches!(
             pre_auth_request.next().await,
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None
+            Some(Ok(Message::Close(_)) | Err(_)) | None
         ));
 
         let (mut oversized, _) =
@@ -230,7 +230,7 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
                 .expect("oversized authentication frame was not rejected");
             assert!(matches!(
                 oversized_result,
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None
+                Some(Ok(Message::Close(_)) | Err(_)) | None
             ));
         }
 
@@ -290,7 +290,7 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
             .expect("unauthenticated connection exceeded the authentication deadline");
         assert!(matches!(
             timeout_result,
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None
+            Some(Ok(Message::Close(_)) | Err(_)) | None
         ));
 
         let session = format!("gateway-{}", std::process::id());
@@ -1196,7 +1196,7 @@ where
                     panic!("invalid control frame ({error}): {text}");
                 });
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("gateway closed: {other:?}"),
         }
     }

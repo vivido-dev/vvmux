@@ -127,7 +127,7 @@ impl Recorder {
         self.events.push_back(RecordedFrame {
             sequence: self.sequence,
             session_sequence,
-            elapsed_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            elapsed_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             event,
         });
         self.bytes = self.bytes.saturating_add(size);
@@ -216,13 +216,13 @@ pub fn replay(path: &Path, pane_filter: Option<PaneId>) -> io::Result<serde_json
                 layout = opened;
             }
             RecordedEvent::Output { pane_id, base64 } => {
+                use base64::Engine as _;
                 if pane_filter.is_some_and(|wanted| wanted != pane_id) {
                     continue;
                 }
-                use base64::Engine as _;
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(&base64)
-                    .map_err(|_| {
+                    .map_err(|_invalid| {
                         io::Error::new(io::ErrorKind::InvalidData, "invalid recorded output")
                     })?;
                 terminals

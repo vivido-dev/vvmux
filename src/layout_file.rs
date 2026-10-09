@@ -10,9 +10,13 @@ use crate::ipc::Axis;
 use crate::layout::{PaneId, TiledNode};
 use crate::session::PaneSpawn;
 
+/// Most tabs a layout file may declare.
 pub const MAX_LAYOUT_TABS: usize = 64;
+/// Most panes a layout file may declare.
 pub const MAX_LAYOUT_PANES: usize = 128;
+/// Most children one split may declare.
 const MAX_SPLIT_CHILDREN: usize = 16;
+/// Longest pane command in a layout file, in bytes.
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 /// The conventional startup layout, applied when a session is created without `--layout`.
 pub const STARTUP_FILE: &str = "startup.toml";
@@ -114,6 +118,10 @@ pub struct LayoutFloat {
     opaque: bool,
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "`skip_serializing_if` passes the field by reference"
+)]
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -719,7 +727,8 @@ hold = true
     fn pane_and_tab_caps_are_enforced() {
         let too_many_tabs = (0..65)
             .map(|index| format!("[[tabs]]\n[[tabs.floating]]\npane='p{index}'\n"))
-            .collect::<String>();
+            .collect::<Vec<_>>()
+            .concat();
         assert!(
             parse(&too_many_tabs)
                 .unwrap_err()
@@ -729,7 +738,8 @@ hold = true
 
         let panes = (0..129)
             .map(|index| format!("[[tabs.floating]]\npane='p{index}'\n"))
-            .collect::<String>();
+            .collect::<Vec<_>>()
+            .concat();
         let error = parse(&format!("[[tabs]]\n{panes}"))
             .unwrap_err()
             .to_string();

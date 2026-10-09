@@ -37,8 +37,8 @@ impl PaneName {
 }
 
 impl std::fmt::Display for PaneName {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -62,9 +62,13 @@ impl<'de> serde::Deserialize<'de> for PaneName {
     }
 }
 
+/// Narrowest a pane's content area may become; splits and resizes stop here.
 pub const MIN_CONTENT_COLUMNS: u16 = 4;
+/// Shortest a pane's content area may become.
 pub const MIN_CONTENT_ROWS: u16 = 2;
+/// Columns taken by a floating pane's border.
 const FRAME_COLUMNS: u16 = 2;
+/// Rows taken by a floating pane's border.
 const FRAME_ROWS: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -195,7 +199,9 @@ fn span_gap(a_start: u16, a_len: u16, b_start: u16, b_len: u16) -> u16 {
     }
 }
 
+/// Narrowest a floating pane may be, border included.
 pub const MIN_FLOAT_WIDTH: u16 = MIN_CONTENT_COLUMNS + FRAME_COLUMNS;
+/// Shortest a floating pane may be, border included.
 pub const MIN_FLOAT_HEIGHT: u16 = MIN_CONTENT_ROWS + FRAME_ROWS;
 
 /// Frame edges selected by a resize operation; corners set two bits.
@@ -211,6 +217,10 @@ pub struct EdgeMask {
 /// its left/top edge sits as a percent of the content area. Until a user edit clears it, the
 /// float is re-proportioned from these percents whenever the host area changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "every field is a percentage, and the suffix keeps the unit visible at use sites"
+)]
 pub struct FloatOrigin {
     pub width_percent: u16,
     pub height_percent: u16,
@@ -1742,8 +1752,8 @@ mod tests {
         fn next(&mut self) -> u64 {
             self.0 = self
                 .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             self.0 >> 33
         }
 

@@ -20,17 +20,25 @@ use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::plugin_supervisor::{BrokerLease, HostBroker};
 
+/// Largest component artifact the runtime will load, matching the manifest validation limit.
 const MAX_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+/// Largest JSON payload passed into or out of a component call, in bytes.
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Linear memory one component instance may grow to.
 const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+/// Table elements one component instance may allocate.
 const MAX_TABLE_ELEMENTS: usize = 100_000;
+/// Durable storage one plugin may use across all keys.
 const MAX_STORAGE_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest compiled-component cache file read; a larger file is refused rather than loaded.
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+/// Log output one component invocation may produce before it is truncated.
 const MAX_LOG_BYTES: usize = 256 * 1024;
 // Epoch interruption is the primary deadline/cancellation mechanism. Keep a generous independent
 // fuel ceiling as a deterministic backstop without letting a valid call exhaust before the
 // supervisor can deliver a cancellation from another process.
 const FUEL_PER_CALL: u64 = 1_000_000_000;
+/// Epoch interruption tick: deadlines and cancellation take effect within about this long.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// How long a component gets to run `shutdown` while its runtime is being dropped.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -201,7 +209,10 @@ fn component_log_entry(level: &str, message: &str, truncated: bool) -> String {
 }
 
 impl ComponentRuntime {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the manifest's independent component settings"
+    )]
     pub(crate) fn start(
         root: &Path,
         artifact: &Path,
@@ -461,6 +472,8 @@ fn configure_call(
 }
 
 fn component_engine() -> io::Result<&'static Engine> {
+    static TICKER: OnceLock<()> = OnceLock::new();
+    static TICKER_ERROR: OnceLock<String> = OnceLock::new();
     static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
     let engine = ENGINE.get_or_init(|| {
         let mut config = Config::new();
@@ -472,8 +485,6 @@ fn component_engine() -> io::Result<&'static Engine> {
     let engine = engine
         .as_ref()
         .map_err(|error| invalid(format!("runtime_unavailable: Wasmtime engine: {error}")))?;
-    static TICKER: OnceLock<()> = OnceLock::new();
-    static TICKER_ERROR: OnceLock<String> = OnceLock::new();
     TICKER.get_or_init(|| {
         let engine = engine.clone();
         if let Err(error) = thread::Builder::new()
@@ -756,8 +767,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+        options.mode(0o600)
+    };
     let mut file = options.open(&temporary)?;
     let result = (|| {
         file.write_all(bytes)?;
@@ -847,11 +858,11 @@ mod tests {
         let path = directory.path().join("component.cwasm");
         write_cache(&path, &"a".repeat(64), b"serialized").unwrap();
         assert_eq!(read_cache(&path, &"a".repeat(64)).unwrap(), b"serialized");
-        assert!(read_cache(&path, &"b".repeat(64)).is_err());
+        read_cache(&path, &"b".repeat(64)).unwrap_err();
         let mut corrupt = fs::read(&path).unwrap();
         *corrupt.last_mut().unwrap() ^= 1;
         fs::write(&path, corrupt).unwrap();
-        assert!(read_cache(&path, &"a".repeat(64)).is_err());
+        read_cache(&path, &"a".repeat(64)).unwrap_err();
     }
 
     #[test]
@@ -953,11 +964,9 @@ mod tests {
             store.limiter(|state| &mut state.limits);
             store.set_fuel(FUEL_PER_CALL).unwrap();
             store.set_epoch_deadline(100);
-            assert!(
-                Linker::new(engine)
-                    .instantiate(&mut store, &component)
-                    .is_err()
-            );
+            Linker::new(engine)
+                .instantiate(&mut store, &component)
+                .unwrap_err();
         }
     }
 
@@ -1031,7 +1040,7 @@ mod tests {
         assert!(one.starts_with(root));
         assert!(two.starts_with(root));
         assert_ne!(one, two);
-        assert!(storage_path(root, "").is_err());
-        assert!(storage_path(root, &"x".repeat(129)).is_err());
+        storage_path(root, "").unwrap_err();
+        storage_path(root, &"x".repeat(129)).unwrap_err();
     }
 }

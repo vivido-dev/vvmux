@@ -104,7 +104,7 @@ impl TabView {
         let sidebar = self.sidebar_width(columns);
         Rect {
             x: if self == Self::Left { sidebar } else { 0 },
-            y: if self == Self::Top { 1 } else { 0 },
+            y: u16::from(self == Self::Top),
             width: (columns - sidebar).max(1),
             height: rows.saturating_sub(self.bar_rows()).max(1),
         }

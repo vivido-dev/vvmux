@@ -32,17 +32,22 @@ const WIN32_INPUT_MAX: usize = 2 + 6 * 5 + 5 + 1;
 /// Bounds how many bytes one record's repeat count can expand to.
 const WIN32_INPUT_MAX_REPEAT: u16 = 64;
 
+/// Win32 input-mode modifier bit, as defined by the console `dwControlKeyState` flags.
 const WIN32_RIGHT_ALT: u32 = 0x1;
+/// Win32 input-mode modifier bit; see [`WIN32_RIGHT_ALT`].
 const WIN32_LEFT_ALT: u32 = 0x2;
+/// Win32 input-mode modifier bit; see [`WIN32_RIGHT_ALT`].
 const WIN32_RIGHT_CTRL: u32 = 0x4;
+/// Win32 input-mode modifier bit; see [`WIN32_RIGHT_ALT`].
 const WIN32_LEFT_CTRL: u32 = 0x8;
+/// Win32 input-mode modifier bit; see [`WIN32_RIGHT_ALT`].
 const WIN32_SHIFT: u32 = 0x10;
 
 /// Translates Windows Terminal's win32-input-mode key records into ordinary terminal input.
 ///
 /// A console can hand this client the host's raw `ESC [ Vk;Sc;Uc;Kd;Cs;Rc _` records instead of
 /// the VT bytes it asked for: every press, release, and bare modifier as its own record. Left
-/// alone they reach a pane's ConPTY, which decodes them itself, so keys still type but no prefix
+/// alone they reach a pane's `ConPTY`, which decodes them itself, so keys still type but no prefix
 /// chord, prompt, or copy-mode key is ever recognized. Decoding here, before anything else reads
 /// the input, gives the rest of the client the same bytes a VT console would have produced.
 #[derive(Default)]
@@ -303,13 +308,13 @@ impl FloatEditScanner {
 
     pub(crate) fn expire(&mut self, now: Instant) -> Option<FloatingEditCommand> {
         let since = self.pending_since?;
-        if self.pending == b"\x1b" && now.saturating_duration_since(since) >= ESCAPE_DELAY {
-            self.pending.clear();
-            self.pending_since = None;
-            Some(FloatingEditCommand::Cancel)
-        } else {
-            None
-        }
+        (self.pending == b"\x1b" && now.saturating_duration_since(since) >= ESCAPE_DELAY).then(
+            || {
+                self.pending.clear();
+                self.pending_since = None;
+                FloatingEditCommand::Cancel
+            },
+        )
     }
 
     /// Whether a bare Escape is being held and therefore needs an expiry poll.
@@ -358,7 +363,7 @@ fn float_edit_sequence_prefix(sequence: &[u8]) -> bool {
 /// Kitty keyboard flag for reporting key release and repeat events, not only presses.
 const KITTY_REPORT_EVENT_TYPES: u8 = 2;
 
-/// ConPTY preserves the legacy F12 press but drops the Kitty release that follows it.
+/// `ConPTY` preserves the legacy F12 press but drops the Kitty release that follows it.
 const LEGACY_F12_PRESS: &[u8] = b"\x1b[24~";
 const KITTY_F12_RELEASE: &[u8] = b"\x1b[24;1:3~";
 
@@ -449,11 +454,11 @@ impl PrefixParser {
         }
     }
 
-    /// Record whether input reaches this foreground client through ConPTY.
+    /// Record whether input reaches this foreground client through `ConPTY`.
     ///
     /// Pane environments cannot carry this attachment-local fact: the hidden server strips the
     /// outer Vivid namespace, and pane producers need their own anchor transport. The foreground
-    /// client is therefore the boundary that repairs ConPTY's missing F12 release.
+    /// client is therefore the boundary that repairs `ConPTY`'s missing F12 release.
     pub(crate) fn set_conpty_input_transport(&mut self, conpty: bool) {
         self.conpty_input_transport = conpty;
     }
@@ -478,12 +483,11 @@ impl PrefixParser {
     /// keystroke arrives makes vim and other modal programs look like they need Escape twice.
     pub(crate) fn expire(&mut self, now: Instant) -> Option<Vec<u8>> {
         let since = self.escape_since?;
-        if self.escape_sequence == b"\x1b" && now.saturating_duration_since(since) >= ESCAPE_DELAY {
-            self.escape_since = None;
-            Some(std::mem::take(&mut self.escape_sequence))
-        } else {
-            None
-        }
+        (self.escape_sequence == b"\x1b" && now.saturating_duration_since(since) >= ESCAPE_DELAY)
+            .then(|| {
+                self.escape_since = None;
+                std::mem::take(&mut self.escape_sequence)
+            })
     }
 
     /// Whether a bare Escape is being held and therefore needs an expiry poll.

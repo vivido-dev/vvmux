@@ -40,13 +40,13 @@ pub(crate) enum Status {
 }
 
 impl std::fmt::Display for Status {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Skipped => formatter.write_str("skipped"),
-            Self::NotInstalled => formatter.write_str("not installed"),
-            Self::Current(version) => write!(formatter, "current (v{version})"),
-            Self::Outdated => formatter.write_str("outdated"),
-            Self::Foreign => formatter.write_str("foreign file"),
+            Self::Skipped => f.write_str("skipped"),
+            Self::NotInstalled => f.write_str("not installed"),
+            Self::Current(version) => write!(f, "current (v{version})"),
+            Self::Outdated => f.write_str("outdated"),
+            Self::Foreign => f.write_str("foreign file"),
         }
     }
 }
@@ -93,8 +93,7 @@ impl<'a> Adapter<'a> {
             .as_ref()
             .and_then(std::env::var_os)
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(&integration.config_dir));
+            .map_or_else(|| home.join(&integration.config_dir), PathBuf::from);
         Self {
             integration,
             package_root: package_root.to_path_buf(),
@@ -486,8 +485,8 @@ fn write_atomic(path: &Path, contents: &[u8], executable: bool) -> io::Result<()
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+        options.mode(0o600)
+    };
     let mut file = options.open(&temporary)?;
     let result = file.write_all(contents).and_then(|()| file.sync_all());
     drop(file);
@@ -618,28 +617,25 @@ fn set_toml_flag(contents: &str, section: &str, key: &str, value: bool) -> Strin
     let assignment = format!("{key} = {value}");
     let header = format!("[{section}]");
     let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
-    match lines.iter().position(|line| line.trim() == header) {
-        Some(start) => {
-            let end = lines[start + 1..]
-                .iter()
-                .position(|line| line.trim_start().starts_with('['))
-                .map_or(lines.len(), |offset| start + 1 + offset);
-            if let Some(index) = (start + 1..end).find(|index| {
-                lines[*index]
-                    .split_once('=')
-                    .is_some_and(|(name, _)| name.trim() == key)
-            }) {
-                lines[index] = assignment;
-            } else {
-                lines.insert(start + 1, assignment);
-            }
+    if let Some(start) = lines.iter().position(|line| line.trim() == header) {
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| line.trim_start().starts_with('['))
+            .map_or(lines.len(), |offset| start + 1 + offset);
+        if let Some(index) = (start + 1..end).find(|index| {
+            lines[*index]
+                .split_once('=')
+                .is_some_and(|(name, _)| name.trim() == key)
+        }) {
+            lines[index] = assignment;
+        } else {
+            lines.insert(start + 1, assignment);
         }
-        None => {
-            if !lines.is_empty() && !lines.last().is_some_and(String::is_empty) {
-                lines.push(String::new());
-            }
-            lines.extend([header, assignment]);
+    } else {
+        if !lines.is_empty() && !lines.last().is_some_and(String::is_empty) {
+            lines.push(String::new());
         }
+        lines.extend([header, assignment]);
     }
     let mut output = lines.join("\n");
     output.push('\n');
@@ -775,7 +771,7 @@ executable = true
                 fs::metadata(&managed).unwrap().permissions().mode() & 0o777,
                 0o700
             );
-        }
+        };
         assert_eq!(adapter.uninstall().unwrap(), vec![managed.clone()]);
         assert!(!managed.exists());
         // The directory the install created is gone; the config directory itself is not.

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{ConnectionCancel, Transport};
-use crate::ipc::DisplayMetrics;
+use vivid_sdk::presenter::DisplayMetrics;
 
 pub type SessionEndpoint = PathBuf;
 pub type VirtualPresenterEndpoint = PathBuf;
@@ -43,14 +43,16 @@ pub fn open_external(uri: &str) -> io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // SAFETY: the hook runs between `fork` and `exec` and calls only the async-signal-safe
+    // `setsid`, reporting failure through `last_os_error`, which reads `errno` without allocating.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
-        });
-    }
+        })
+    };
     let mut child = command.spawn()?;
     // `setsid` detaches the session, not the parent link: the opener is still a direct child, so
     // something has to reap it or every clicked link leaves a zombie for the daemon's lifetime.
@@ -90,8 +92,11 @@ impl ReadinessWriter {
             })?;
         // The flag is a hidden argument, so treat its value as untrusted: report a result only
         // over an inherited pipe, never into whatever else happens to occupy that number.
+        // SAFETY: `stat` is plain old data for which all-zero bytes are a valid value.
         let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
-        if unsafe { libc::fstat(descriptor, &mut status) } == -1 {
+        // SAFETY: `fstat` writes one `stat` into the live local; an invalid descriptor only yields
+        // an error.
+        if unsafe { libc::fstat(descriptor, &raw mut status) } == -1 {
             return Err(io::Error::last_os_error());
         }
         if status.st_mode & libc::S_IFMT != libc::S_IFIFO {
@@ -105,6 +110,9 @@ impl ReadinessWriter {
         // session, and the launcher waits for the channel to close before it reads a diagnostic.
         set_close_on_exec(descriptor)?;
         Ok(Self {
+            // SAFETY: the descriptor was validated above as an inherited pipe above the standard
+            // descriptors, which nothing else in this freshly started process owns, so the file
+            // becomes its sole owner.
             file: Some(unsafe { File::from_raw_fd(descriptor) }),
         })
     }
@@ -202,7 +210,9 @@ impl ReadinessReader {
             revents: 0,
         };
         let milliseconds = i32::try_from(timeout.as_millis().max(1)).unwrap_or(i32::MAX);
-        match unsafe { libc::poll(&mut poll_fd, 1, milliseconds) } {
+        // SAFETY: `poll` reads and writes exactly one `pollfd`, the live local passed with a count
+        // of one.
+        match unsafe { libc::poll(&raw mut poll_fd, 1, milliseconds) } {
             -1 => {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -250,6 +260,9 @@ impl DaemonLauncher {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         scrub_daemon_environment(&mut command, std::env::vars_os());
+        // SAFETY: the hook runs between `fork` and `exec` and calls only async-signal-safe
+        // functions: `setsid`, `close_stray_descriptors`, and `clear_close_on_exec`, each documented
+        // as such, with errors read from `errno` without allocating.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
@@ -262,8 +275,8 @@ impl DaemonLauncher {
                 // The startup channel is the one descriptor that must survive exec. Its reading end
                 // stays close-on-exec, so the launcher sees EOF the moment the server exits.
                 clear_close_on_exec(writer_descriptor)
-            });
-        }
+            })
+        };
         let child = command.spawn()?;
         // Only the server may hold the writing end now; otherwise EOF would never arrive.
         drop(writer);
@@ -339,6 +352,8 @@ fn relocate_above_standard_descriptors(descriptor: OwnedFd) -> io::Result<OwnedF
     if descriptor.as_raw_fd() > libc::STDERR_FILENO {
         return Ok(descriptor);
     }
+    // SAFETY: `F_DUPFD_CLOEXEC` duplicates the descriptor owned by `descriptor`, which stays open
+    // for the call.
     let relocated = unsafe {
         libc::fcntl(
             descriptor.as_raw_fd(),
@@ -349,6 +364,7 @@ fn relocate_above_standard_descriptors(descriptor: OwnedFd) -> io::Result<OwnedF
     if relocated == -1 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: `fcntl` returned a new descriptor that nothing else owns.
     Ok(unsafe { OwnedFd::from_raw_fd(relocated) })
 }
 
@@ -366,11 +382,16 @@ fn relocate_above_standard_descriptors(descriptor: OwnedFd) -> io::Result<OwnedF
 /// and `exec`. Failures are ignored — a descriptor that cannot be closed must not stop the server
 /// from starting.
 fn close_stray_descriptors(keep: RawFd) {
+    // No `close_range`: an open descriptor is always below the soft descriptor limit, so that is a
+    // real upper bound. Cap it anyway, because the limit may be effectively unlimited.
+    const SCAN_LIMIT: RawFd = 64 * 1024;
     let first = libc::STDERR_FILENO + 1;
     #[cfg(target_os = "linux")]
     {
         // Two ranges, because the startup channel sits somewhere in the middle.
         let close_range = |low: RawFd, high: RawFd| -> bool {
+            // SAFETY: `close_range` takes plain integers and is async-signal-safe; closing
+            // descriptors cannot violate memory safety in this single-threaded child.
             low > high
                 || unsafe { libc::syscall(libc::SYS_close_range, low as u32, high as u32, 0) } == 0
         };
@@ -378,11 +399,10 @@ fn close_stray_descriptors(keep: RawFd) {
             return;
         }
     }
-    // No `close_range`: an open descriptor is always below the soft descriptor limit, so that is a
-    // real upper bound. Cap it anyway, because the limit may be effectively unlimited.
-    const SCAN_LIMIT: RawFd = 64 * 1024;
+    // SAFETY: `rlimit` is plain old data for which all-zero bytes are a valid value.
     let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
-    let bound = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+    // SAFETY: `getrlimit` writes one `rlimit` into the live local and is async-signal-safe.
+    let bound = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0 {
         RawFd::try_from(limit.rlim_cur)
             .unwrap_or(SCAN_LIMIT)
             .min(SCAN_LIMIT)
@@ -391,6 +411,8 @@ fn close_stray_descriptors(keep: RawFd) {
     };
     for descriptor in first..bound {
         if descriptor != keep {
+            // SAFETY: this runs in the forked child before `exec`, where no Rust value still owns
+            // these descriptors; closing one cannot invalidate memory.
             unsafe { libc::close(descriptor) };
         }
     }
@@ -406,6 +428,7 @@ fn set_close_on_exec(descriptor: RawFd) -> io::Result<()> {
 }
 
 fn update_close_on_exec(descriptor: RawFd, enabled: bool) -> io::Result<()> {
+    // SAFETY: `F_GETFD` only reads descriptor flags; an invalid descriptor yields an error.
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
     if flags == -1 {
         return Err(io::Error::last_os_error());
@@ -415,6 +438,7 @@ fn update_close_on_exec(descriptor: RawFd, enabled: bool) -> io::Result<()> {
     } else {
         flags & !libc::FD_CLOEXEC
     };
+    // SAFETY: `F_SETFD` only changes this descriptor's close-on-exec flag.
     if unsafe { libc::fcntl(descriptor, libc::F_SETFD, updated) } == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -444,11 +468,15 @@ impl MessageBlock {
     /// Best effort: a terminal the user does not own, or one that already refuses messages, is
     /// left alone.
     fn engage(fd: RawFd) -> Option<Self> {
+        // SAFETY: `stat` is plain old data for which all-zero bytes are a valid value.
         let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
-        if unsafe { libc::fstat(fd, &mut status) } == -1 {
+        // SAFETY: `fstat` writes one `stat` into the live local; an invalid descriptor only yields
+        // an error.
+        if unsafe { libc::fstat(fd, &raw mut status) } == -1 {
             return None;
         }
         let removed = status.st_mode & MESSAGE_WRITE_BITS;
+        // SAFETY: `fchmod` takes plain integers and only changes the terminal's permission bits.
         if removed == 0 || unsafe { libc::fchmod(fd, status.st_mode & 0o7777 & !removed) } == -1 {
             return None;
         }
@@ -456,8 +484,13 @@ impl MessageBlock {
     }
 
     fn release(&self) {
+        // SAFETY: `stat` is plain old data for which all-zero bytes are a valid value.
         let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
-        if unsafe { libc::fstat(self.fd, &mut status) } == 0 {
+        // SAFETY: `fstat` writes one `stat` into the live local; an invalid descriptor only yields
+        // an error.
+        if unsafe { libc::fstat(self.fd, &raw mut status) } == 0 {
+            // SAFETY: `fchmod` takes plain integers and only restores the permission bits `engage`
+            // removed.
             unsafe { libc::fchmod(self.fd, (status.st_mode & 0o7777) | self.removed) };
         }
     }
@@ -466,19 +499,24 @@ impl MessageBlock {
 impl ClientTerminal {
     pub fn enter() -> io::Result<Self> {
         require_interactive_terminal()?;
+        // SAFETY: `termios` is plain old data for which all-zero bytes are a valid value.
         let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
-        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } == -1 {
+        // SAFETY: `tcgetattr` writes one `termios` into the live local.
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &raw mut original) } == -1 {
             return Err(io::Error::last_os_error());
         }
         let mut raw = original;
-        unsafe { libc::cfmakeraw(&mut raw) };
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } == -1 {
+        // SAFETY: `cfmakeraw` modifies the initialized `termios` copy in place.
+        unsafe { libc::cfmakeraw(&raw mut raw) };
+        // SAFETY: `tcsetattr` reads one initialized `termios` from the live local.
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const raw) } == -1 {
             return Err(io::Error::last_os_error());
         }
         let mut output = match duplicate_fd(libc::STDOUT_FILENO) {
             Ok(output) => output,
             Err(error) => {
-                unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original) };
+                // SAFETY: `original` is the initialized `termios` read from stdin above.
+                unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const original) };
                 return Err(error);
             }
         };
@@ -488,7 +526,8 @@ impl ClientTerminal {
             )
             .and_then(|()| output.flush())
         {
-            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original) };
+            // SAFETY: `original` is the initialized `termios` read from stdin above.
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const original) };
             return Err(error);
         }
         let messages = MessageBlock::engage(libc::STDOUT_FILENO);
@@ -499,6 +538,10 @@ impl ClientTerminal {
         })
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "the Windows client keeps per-terminal state here, so both platforms share the method"
+    )]
     pub fn display_metrics(&self) -> io::Result<DisplayMetrics> {
         current_display_metrics()
     }
@@ -507,6 +550,10 @@ impl ClientTerminal {
         Ok(Box::new(self.output.try_clone()?))
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "the Windows client keeps per-terminal state here, so both platforms share the method"
+    )]
     pub fn read_input(&self, buffer: &mut [u8], timeout: Duration) -> io::Result<Option<usize>> {
         let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         let mut poll_fd = libc::pollfd {
@@ -514,7 +561,9 @@ impl ClientTerminal {
             events: libc::POLLIN,
             revents: 0,
         };
-        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        // SAFETY: `poll` reads and writes exactly one `pollfd`, the live local passed with a count
+        // of one.
+        let result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_ms) };
         if result == -1 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -542,7 +591,9 @@ pub fn current_display_metrics() -> io::Result<DisplayMetrics> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut size) } == -1 {
+    // SAFETY: `TIOCGWINSZ` writes exactly one `winsize` into the live local; a non-terminal stdout
+    // only yields an error.
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &raw mut size) } == -1 {
         return Err(io::Error::last_os_error());
     }
     if size.ws_col == 0 || size.ws_row == 0 {
@@ -560,9 +611,11 @@ pub fn current_display_metrics() -> io::Result<DisplayMetrics> {
 }
 
 fn require_interactive_terminal() -> io::Result<()> {
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1
-        && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1
-    {
+    // SAFETY: `isatty` only inspects the descriptor number and has no memory preconditions.
+    let stdin_is_terminal = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    // SAFETY: as above.
+    let stdout_is_terminal = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+    if stdin_is_terminal && stdout_is_terminal {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -581,17 +634,18 @@ impl Drop for ClientTerminal {
         if let Some(messages) = &self.messages {
             messages.release();
         }
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
-        }
+        // SAFETY: `original` is the initialized `termios` that `enter` read from stdin.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const self.original) };
     }
 }
 
 fn duplicate_fd(fd: RawFd) -> io::Result<File> {
+    // SAFETY: `dup` takes a plain descriptor number; an invalid one only yields an error.
     let duplicate = unsafe { libc::dup(fd) };
     if duplicate == -1 {
         Err(io::Error::last_os_error())
     } else {
+        // SAFETY: `dup` returned a new descriptor that nothing else owns.
         Ok(unsafe { File::from_raw_fd(duplicate) })
     }
 }
@@ -672,11 +726,11 @@ fn split_unix(stream: UnixStream) -> io::Result<Transport> {
     // userspace and poll before each read so handshake deadlines work identically on every Unix
     // platform without changing the socket into nonblocking mode.
     let read_timeout = Arc::new(Mutex::new(None));
-    let timeout_value = read_timeout.clone();
+    let timeout_value = Arc::clone(&read_timeout);
     let timeout = Arc::new(move |duration: Option<Duration>| {
         *timeout_value
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = duration;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = duration;
         Ok(())
     });
     Ok(Transport::new(
@@ -696,11 +750,11 @@ struct PollTimeoutReader {
 }
 
 impl Read for PollTimeoutReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let timeout = *self
             .timeout
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(timeout) = timeout {
             let milliseconds = i32::try_from(timeout.as_millis().max(1)).unwrap_or(i32::MAX);
             let mut descriptor = libc::pollfd {
@@ -709,7 +763,9 @@ impl Read for PollTimeoutReader {
                 revents: 0,
             };
             loop {
-                match unsafe { libc::poll(&mut descriptor, 1, milliseconds) } {
+                // SAFETY: `poll` reads and writes exactly one `pollfd`, the live local passed with
+                // a count of one.
+                match unsafe { libc::poll(&raw mut descriptor, 1, milliseconds) } {
                     -1 => {
                         let error = io::Error::last_os_error();
                         if error.kind() != io::ErrorKind::Interrupted {
@@ -726,39 +782,45 @@ impl Read for PollTimeoutReader {
                 }
             }
         }
-        self.stream.read(buffer)
+        self.stream.read(buf)
     }
 }
 
+/// The effective user ID of this process: the owner every private vvmux file must have.
+pub fn effective_uid() -> libc::uid_t {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 pub fn require_peer_owner(stream: &UnixStream) -> io::Result<()> {
-    let expected = unsafe { libc::geteuid() };
+    let expected = effective_uid();
     let actual = peer_uid(stream)?;
-    if actual != expected {
+    if actual == expected {
+        Ok(())
+    } else {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "local stream peer UID mismatch",
         ))
-    } else {
-        Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
 fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
-    use std::os::fd::AsRawFd;
     let mut credentials = libc::ucred {
         pid: 0,
         uid: 0,
         gid: 0,
     };
     let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the option buffer is the live `credentials` local, and `length` holds its exact size.
     let result = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
+            (&raw mut credentials).cast(),
+            &raw mut length,
         )
     };
     if result == -1 {
@@ -770,10 +832,11 @@ fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
 
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
 fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
-    use std::os::fd::AsRawFd;
     let mut uid = 0;
     let mut gid = 0;
-    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    // SAFETY: `getpeereid` writes one ID into each live local, for a socket that `stream` keeps
+    // open.
+    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
     if result == -1 {
         Err(io::Error::last_os_error())
     } else {
@@ -830,6 +893,7 @@ mod tests {
         let (mut writer, descriptor) = writer_for(descriptor);
         // A pane process must not be able to hold the startup channel open, so the descriptor is
         // close-on-exec again as soon as the server owns it.
+        // SAFETY: `F_GETFD` only reads descriptor flags; an invalid descriptor yields an error.
         let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
         assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
         writer.success().unwrap();
@@ -883,6 +947,7 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+        // SAFETY: the test owns this raw descriptor and closes it once.
         unsafe { libc::close(descriptor) };
     }
 

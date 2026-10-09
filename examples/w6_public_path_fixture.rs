@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::media;
 use vivid_protocol::track::{
-    KindConfiguration, RasterConfiguration, TrackConfiguration, TrackMode,
+    KindConfiguration, RasterConfiguration, TrackConfiguration, TrackDirection, TrackMode,
 };
 use vivid_sdk::{
     CoordinateModel, Fit, LaneClass, MILESTONE_OUTPUT_READY, ProducerConfig, RasterDeltaOperation,
@@ -34,7 +34,7 @@ fn run() -> io::Result<()> {
     let inject_bad_delta = env::var_os("VVMUX_W6_BAD_DELTA").is_some();
     let pixel_bytes =
         usize::try_from(media::rgba8_pixel_len(width, height).map_err(io::Error::other)?)
-            .map_err(|_| invalid("pixel buffer exceeds address space"))?;
+            .map_err(|_out_of_range| invalid("pixel buffer exceeds address space"))?;
     let maximum_record_body =
         media::rgba8_raw_frame_body_len(width, height).map_err(io::Error::other)?;
     let byte_rate = u64::from(maximum_record_body)
@@ -97,7 +97,7 @@ fn run() -> io::Result<()> {
         )?;
         let track = client.create_track(
             TrackConfiguration {
-                direction: Default::default(),
+                direction: TrackDirection::default(),
                 context_id: context,
                 surface_id,
                 track_id,
@@ -202,7 +202,7 @@ fn bounded(name: &str, default: u64, minimum: u64, maximum: u64) -> io::Result<u
         .map(|value| {
             value
                 .parse::<u64>()
-                .map_err(|_| invalid("fixture setting is not an integer"))
+                .map_err(|_invalid| invalid("fixture setting is not an integer"))
         })
         .transpose()?
         .unwrap_or(default);

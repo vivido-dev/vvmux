@@ -2,7 +2,7 @@
 //! (VVTUN/2), against an in-process harness server.
 //!
 //! These exercise the real binary: enrollment over plain HTTP, the control
-//! tunnel handshake with the Ed25519 signature, machine_status, leg dialing, a
+//! tunnel handshake with the Ed25519 signature, `machine_status`, leg dialing, a
 //! real VVWS session through a tunnel leg, ticket rejection, tunnel loss, and
 //! session survival.
 
@@ -158,7 +158,7 @@ fn start_gateway(
 }
 
 /// Enroll a machine and start its gateway in connect mode.
-async fn enroll_and_connect(
+fn enroll_and_connect(
     harness: &TunnelHarness,
     runtime: &std::path::Path,
 ) -> (String, std::process::Child) {
@@ -191,7 +191,7 @@ async fn enroll_then_tunnel_authenticates_and_reports_status() {
     let runtime = std::env::temp_dir().join(format!("vvmux-tun-auth-{}", std::process::id()));
     private_directory(&runtime);
     let harness = TunnelHarness::start("test-code").await;
-    let (_machine_id, mut gateway) = enroll_and_connect(&harness, &runtime).await;
+    let (_machine_id, mut gateway) = enroll_and_connect(&harness, &runtime);
 
     let status = timeout(Duration::from_secs(10), harness.next_control())
         .await
@@ -215,7 +215,7 @@ async fn enroll_then_tunnel_authenticates_and_reports_status() {
 
     gateway.kill().unwrap();
     gateway.wait().unwrap();
-    std::fs::remove_dir_all(&runtime).ok();
+    let _ = std::fs::remove_dir_all(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -257,7 +257,7 @@ async fn enrollment_preflights_identity_and_uses_the_correct_http_authority() {
         Some(expected_host.as_str())
     );
 
-    std::fs::remove_dir_all(&runtime).ok();
+    let _ = std::fs::remove_dir_all(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -278,7 +278,7 @@ async fn enrollment_rejects_a_machine_id_for_another_key_and_removes_reservation
         !identity.exists(),
         "failed enrollment left a reserved identity file"
     );
-    std::fs::remove_dir_all(&runtime).ok();
+    let _ = std::fs::remove_dir_all(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -303,7 +303,7 @@ async fn an_initial_challenge_timeout_reconnects() {
 
     gateway.kill().unwrap();
     gateway.wait().unwrap();
-    std::fs::remove_dir_all(&runtime).ok();
+    let _ = std::fs::remove_dir_all(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -332,7 +332,7 @@ async fn a_rejected_upgrade_honors_retry_after() {
     gateway.kill().unwrap();
     gateway.wait().unwrap();
     gateway.wait().unwrap();
-    std::fs::remove_dir_all(&runtime).ok();
+    let _ = std::fs::remove_dir_all(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -344,7 +344,7 @@ async fn a_signature_from_the_wrong_deployment_is_rejected() {
     // Challenge with a hostname that is not the gateway's: the gateway signs
     // the hostname it connected to, so the signature must not verify.
     harness.set_hostname("attacker.example");
-    let (_machine_id, mut gateway) = enroll_and_connect(&harness, &runtime).await;
+    let (_machine_id, mut gateway) = enroll_and_connect(&harness, &runtime);
 
     // The harness rejects the auth; the gateway reconnects. The harness keeps
     // challenging with the wrong hostname, so no machine_status ever arrives.
@@ -355,7 +355,7 @@ async fn a_signature_from_the_wrong_deployment_is_rejected() {
     );
 
     gateway.kill().unwrap();
-    std::fs::remove_dir_all(&runtime).ok();
+    let _ = std::fs::remove_dir_all(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -374,7 +374,7 @@ async fn a_tunnel_leg_drives_a_real_session() {
         String::from_utf8_lossy(&created.stderr)
     );
 
-    let (_machine_id, mut gateway) = enroll_and_connect(&harness, runtime.path()).await;
+    let (_machine_id, mut gateway) = enroll_and_connect(&harness, runtime.path());
     let status = timeout(Duration::from_secs(10), harness.next_control())
         .await
         .expect("no machine_status")
@@ -382,7 +382,7 @@ async fn a_tunnel_leg_drives_a_real_session() {
     assert!(matches!(status, ClientControl::MachineStatus { .. }));
 
     // Open a VVWS leg.
-    harness.open_leg(1, "vvws", Vec::new()).await;
+    harness.open_leg(1, "vvws", Vec::new());
     let mut leg = harness.accept_leg(1).await;
 
     // The tunnel hello form, then attach to the real session.
@@ -410,7 +410,7 @@ async fn a_tunnel_leg_drives_a_real_session() {
             .iter()
             .any(|cap| cap == "tunnel-attached-v1")
     );
-    assert!(hello["vivid"]["wire_version"] == "1.5");
+    assert_eq!(hello["vivid"]["wire_version"], "1.5");
 
     leg.sink
         .send(axum::extract::ws::Message::Text(
@@ -431,7 +431,7 @@ async fn a_tunnel_leg_drives_a_real_session() {
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            _ = &mut deadline => panic!("no attached/render over the tunnel leg"),
+            () = &mut deadline => panic!("no attached/render over the tunnel leg"),
             message = leg.stream.next() => {
                 let Some(Ok(message)) = message else { panic!("leg closed early") };
                 match message {
@@ -529,7 +529,7 @@ async fn an_unknown_leg_ticket_is_refused_and_reported() {
     let runtime = std::env::temp_dir().join(format!("vvmux-tun-tick-{}", std::process::id()));
     private_directory(&runtime);
     let harness = TunnelHarness::start("test-code").await;
-    let (_machine_id, mut gateway) = enroll_and_connect(&harness, &runtime).await;
+    let (_machine_id, mut gateway) = enroll_and_connect(&harness, &runtime);
     let status = timeout(Duration::from_secs(10), harness.next_control())
         .await
         .expect("no machine_status");
@@ -548,7 +548,7 @@ async fn an_unknown_leg_ticket_is_refused_and_reported() {
 
     gateway.kill().unwrap();
     gateway.wait().unwrap();
-    std::fs::remove_dir_all(&runtime).ok();
+    let _ = std::fs::remove_dir_all(&runtime);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -561,8 +561,8 @@ async fn duplicate_leg_id_is_source_scoped_and_close_releases_only_its_attachmen
     private_directory(&runtime_b);
     let harness_a = TunnelHarness::start("test-code").await;
     let harness_b = TunnelHarness::start("test-code").await;
-    let (_machine_a, mut gateway_a) = enroll_and_connect(&harness_a, &runtime_a).await;
-    let (_machine_b, mut gateway_b) = enroll_and_connect(&harness_b, &runtime_b).await;
+    let (_machine_a, mut gateway_a) = enroll_and_connect(&harness_a, &runtime_a);
+    let (_machine_b, mut gateway_b) = enroll_and_connect(&harness_b, &runtime_b);
     assert!(matches!(
         timeout(Duration::from_secs(10), harness_a.next_control()).await,
         Ok(Some(ClientControl::MachineStatus { .. }))
@@ -574,11 +574,11 @@ async fn duplicate_leg_id_is_source_scoped_and_close_releases_only_its_attachmen
 
     // Two independent tunnel generations deliberately reuse the same numeric
     // leg ID. The duplicate is injected only into owner A.
-    harness_a.open_leg(9, "vvws", Vec::new()).await;
-    harness_b.open_leg(9, "vvws", Vec::new()).await;
+    harness_a.open_leg(9, "vvws", Vec::new());
+    harness_b.open_leg(9, "vvws", Vec::new());
     let mut leg_a = harness_a.accept_leg(9).await;
     let mut leg_b = harness_b.accept_leg(9).await;
-    harness_a.open_leg(9, "vvws", Vec::new()).await;
+    harness_a.open_leg(9, "vvws", Vec::new());
     let failure = timeout(Duration::from_secs(10), harness_a.next_control())
         .await
         .expect("duplicate leg was not rejected")
@@ -622,8 +622,8 @@ async fn duplicate_leg_id_is_source_scoped_and_close_releases_only_its_attachmen
     gateway_b.kill().unwrap();
     gateway_a.wait().unwrap();
     gateway_b.wait().unwrap();
-    std::fs::remove_dir_all(&runtime_a).ok();
-    std::fs::remove_dir_all(&runtime_b).ok();
+    let _ = std::fs::remove_dir_all(&runtime_a);
+    let _ = std::fs::remove_dir_all(&runtime_b);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -641,7 +641,7 @@ async fn a_tunnel_loss_reconnects_and_sessions_survive() {
         String::from_utf8_lossy(&created.stderr)
     );
 
-    let (_machine_id, mut gateway) = enroll_and_connect(&harness, runtime.path()).await;
+    let (_machine_id, mut gateway) = enroll_and_connect(&harness, runtime.path());
     let status = timeout(Duration::from_secs(10), harness.next_control())
         .await
         .expect("no first machine_status");
@@ -704,5 +704,5 @@ fn public_connect_requires_content_visibility_acknowledgement() {
         stderr.contains("--acknowledge-content-visible-gateway"),
         "stderr was: {stderr}"
     );
-    std::fs::remove_dir_all(&runtime).ok();
+    let _ = std::fs::remove_dir_all(&runtime);
 }

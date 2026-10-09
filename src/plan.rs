@@ -24,9 +24,13 @@ use crate::ipc::{AutomationMethod, AutomationRequest, METHOD_CAPABILITIES};
 
 /// The only plan version this release accepts.
 pub const PLAN_VERSION: u16 = 1;
+/// Most steps one automation plan may hold.
 const MAX_PLAN_STEPS: usize = 256;
+/// Longest plan step name, in bytes.
 const MAX_PLAN_NAME_BYTES: usize = 64;
+/// Largest plan file, in bytes.
 const MAX_PLAN_BYTES: usize = 1024 * 1024;
+/// Longest timeout one plan step may request: one day.
 const MAX_VERIFY_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -70,6 +74,10 @@ pub struct PlanStep {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the field names are the plan file's serialized contract"
+)]
 pub struct PlanExpect {
     #[serde(default)]
     pub screen_sequence: Option<Value>,

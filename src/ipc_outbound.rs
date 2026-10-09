@@ -6,7 +6,10 @@ use std::thread;
 
 use crate::platform::ConnectionCancel;
 
+/// Bytes one connection's outbound VVMX queue may hold, including the record being written;
+/// saturation cancels the connection.
 const MAX_BYTES: usize = 128 * 1024 * 1024;
+/// Chunks one connection's outbound VVMX queue may hold.
 const MAX_CHUNKS: usize = 1024;
 
 pub(super) struct Outbound {
@@ -24,8 +27,8 @@ impl Outbound {
         let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(MAX_CHUNKS);
         let bytes = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicBool::new(false));
-        let worker_bytes = bytes.clone();
-        let worker_closed = closed.clone();
+        let worker_bytes = Arc::clone(&bytes);
+        let worker_closed = Arc::clone(&closed);
         let worker_cancel = cancel.clone();
         thread::Builder::new()
             .name("vvmux-client-output".into())
@@ -53,20 +56,20 @@ impl Outbound {
 }
 
 impl Write for Outbound {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.closed.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "client output closed",
             ));
         }
-        if bytes.is_empty() {
+        if buf.is_empty() {
             return Ok(0);
         }
         if self
             .bytes
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes.len())
+                used.checked_add(buf.len())
                     .filter(|next| *next <= MAX_BYTES)
             })
             .is_err()
@@ -79,15 +82,15 @@ impl Write for Outbound {
             ));
         }
         let mut chunk = Vec::new();
-        if let Err(error) = chunk.try_reserve_exact(bytes.len()) {
-            self.bytes.fetch_sub(bytes.len(), Ordering::AcqRel);
+        if let Err(error) = chunk.try_reserve_exact(buf.len()) {
+            self.bytes.fetch_sub(buf.len(), Ordering::AcqRel);
             self.closed.store(true, Ordering::Release);
             self.cancel.cancel();
             return Err(io::Error::other(error));
         }
-        chunk.extend_from_slice(bytes);
+        chunk.extend_from_slice(buf);
         if self.sender.try_send(chunk).is_err() {
-            self.bytes.fetch_sub(bytes.len(), Ordering::AcqRel);
+            self.bytes.fetch_sub(buf.len(), Ordering::AcqRel);
             self.closed.store(true, Ordering::Release);
             self.cancel.cancel();
             return Err(io::Error::new(
@@ -95,7 +98,7 @@ impl Write for Outbound {
                 "client output queue unavailable",
             ));
         }
-        Ok(bytes.len())
+        Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())

@@ -153,9 +153,8 @@ pub struct PaneAgentExtras {
 /// derived `Debug` would leak a resumable session identity through any diagnostic that formats a
 /// snapshot.
 impl std::fmt::Debug for PaneAgentExtras {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PaneAgentExtras")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaneAgentExtras")
             .field("alias", &self.alias)
             .field("kind", &self.kind)
             .field("session_source", &self.session_source)
@@ -331,10 +330,18 @@ pub enum HistoryColor {
     Rgb(u8, u8, u8),
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "`skip_serializing_if` passes the field by reference"
+)]
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "`skip_serializing_if` passes the field by reference"
+)]
 fn is_zero(value: &u8) -> bool {
     *value == 0
 }
@@ -367,7 +374,7 @@ pub fn save_snapshot(path: &Path, snapshot: &SessionSnapshot) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout_file::{LayoutFile, LayoutNode, LayoutTab};
+    use crate::layout_file::{LayoutNode, LayoutTab};
 
     fn temporary_directory() -> tempfile::TempDir {
         tempfile::TempDir::new().unwrap()

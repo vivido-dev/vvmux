@@ -41,14 +41,16 @@ fn a_detached_server_does_not_inherit_its_launchers_descriptors() {
     // every other test in this binary until the fork, so an inheritable writing end in this process
     // would also reach the long-lived children those tests spawn, and they — not the daemon under
     // test — would be what holds the pipe open.
+    // SAFETY: the hook runs between `fork` and `exec` and calls only the async-signal-safe
+    // `fcntl`, reporting failure through `last_os_error` without allocating.
     unsafe {
         command.pre_exec(move || {
             if libc::fcntl(inherited, libc::F_SETFD, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
-        });
-    }
+        })
+    };
     let created = command.output().unwrap();
     assert!(
         created.status.success(),

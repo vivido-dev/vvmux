@@ -1,6 +1,5 @@
 use std::fs;
 #[cfg(unix)]
-use std::fs::File;
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
@@ -14,7 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::ipc;
 use crate::platform::{SessionEndpoint, VirtualPresenterEndpoint};
 
+/// Version of the session registry file format.
 const REGISTRY_SCHEMA: u32 = 2;
+/// Largest session registry file read, in bytes.
 const MAX_REGISTRY_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone)]
@@ -305,6 +306,8 @@ pub fn list_registries() -> io::Result<Vec<SessionRegistry>> {
 pub fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
+        // SAFETY: signal 0 performs only the existence and permission check; `kill` has no memory
+        // preconditions.
         let result = unsafe { libc::kill(pid as i32, 0) };
         result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
@@ -314,10 +317,12 @@ pub fn process_alive(pid: u32) -> bool {
         use windows_sys::Win32::System::Threading::{
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
+        // SAFETY: `OpenProcess` takes plain values and returns a new handle or null.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             false
         } else {
+            // SAFETY: `handle` was just opened by this function and is closed exactly once.
             unsafe { CloseHandle(handle) };
             true
         }
@@ -392,7 +397,7 @@ pub(crate) fn read_private_bytes(
     limit: u64,
     what: &str,
 ) -> io::Result<Vec<u8>> {
-    let uid = unsafe { libc::geteuid() };
+    let uid = crate::platform::effective_uid();
     let mut options = OpenOptions::new();
     options.read(true).custom_flags(libc::O_NOFOLLOW);
     let mut file = options.open(path)?;
@@ -533,7 +538,7 @@ fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
                 io::Error::new(io::ErrorKind::InvalidData, "Linux process start is missing")
             })?
             .parse::<u64>()
-            .map_err(|_| {
+            .map_err(|_invalid| {
                 io::Error::new(io::ErrorKind::InvalidData, "Linux process start is invalid")
             })?;
         Ok(ProcessBirth::Linux { start_ticks })
@@ -548,6 +553,7 @@ fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
         use windows_sys::Win32::System::Threading::{
             GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
+        // SAFETY: `OpenProcess` takes plain values and returns a new handle or null.
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if process.is_null() {
             return Err(io::Error::last_os_error());
@@ -556,8 +562,17 @@ fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
         let mut exit = FILETIME::default();
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
-        let result =
-            unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+        // SAFETY: `process` is open, and each pointer is a live `FILETIME` local written once.
+        let result = unsafe {
+            GetProcessTimes(
+                process,
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        // SAFETY: `process` was opened above and is closed exactly once.
         unsafe { CloseHandle(process) };
         if result == 0 {
             return Err(io::Error::last_os_error());
@@ -571,66 +586,33 @@ fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
 
 #[cfg(target_os = "macos")]
 fn macos_process_birth(pid: u32) -> io::Result<ProcessBirth> {
-    const PROC_PIDTBSDINFO: i32 = 3;
-    #[repr(C)]
-    #[derive(Default)]
-    struct ProcBsdInfo {
-        flags: u32,
-        status: u32,
-        xstatus: u32,
-        pid: u32,
-        ppid: u32,
-        uid: u32,
-        gid: u32,
-        ruid: u32,
-        rgid: u32,
-        svuid: u32,
-        svgid: u32,
-        rfu_1: u32,
-        comm: [u8; 16],
-        name: [u8; 32],
-        nfiles: u32,
-        pgid: u32,
-        pjobc: u32,
-        e_tdev: u32,
-        e_tpgid: u32,
-        nice: i32,
-        start_seconds: u64,
-        start_microseconds: u64,
-    }
-    unsafe extern "C" {
-        fn proc_pidinfo(
-            pid: i32,
-            flavor: i32,
-            arg: u64,
-            buffer: *mut core::ffi::c_void,
-            buffer_size: i32,
-        ) -> i32;
-    }
-    let mut info = ProcBsdInfo::default();
-    let size = std::mem::size_of::<ProcBsdInfo>();
+    // SAFETY: `proc_bsdinfo` is plain old data for which all-zero bytes are a valid value.
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is the live `info` local, and `size` is its exact size, which is what the
+    // `PROC_PIDTBSDINFO` flavor writes.
     let result = unsafe {
-        proc_pidinfo(
-            pid as i32,
-            PROC_PIDTBSDINFO,
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
             0,
-            (&mut info as *mut ProcBsdInfo).cast(),
-            size as i32,
+            (&raw mut info).cast(),
+            size,
         )
     };
-    if result != size as i32 {
-        Err(io::Error::last_os_error())
-    } else {
+    if result == size {
         Ok(ProcessBirth::Macos {
-            start_seconds: info.start_seconds,
-            start_microseconds: info.start_microseconds,
+            start_seconds: info.pbi_start_tvsec,
+            start_microseconds: info.pbi_start_tvusec,
         })
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
 #[cfg(unix)]
 fn runtime_root() -> io::Result<PathBuf> {
-    let uid = unsafe { libc::geteuid() };
+    let uid = crate::platform::effective_uid();
     let base = if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {
         let path = PathBuf::from(path);
         validate_parent(&path, uid, "XDG_RUNTIME_DIR")?;
@@ -658,7 +640,7 @@ fn runtime_root() -> io::Result<PathBuf> {
 /// Reached only through [`SnapshotPaths`].
 #[cfg(unix)]
 fn state_root() -> io::Result<PathBuf> {
-    let uid = unsafe { libc::geteuid() };
+    let uid = crate::platform::effective_uid();
     let base = if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
         let path = PathBuf::from(path);
         // Created rather than required: the XDG base-directory spec has the *user* own this path,
@@ -752,6 +734,7 @@ pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()
         .encode_wide()
         .chain(Some(0))
         .collect();
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers that outlive the call.
     if unsafe {
         MoveFileExW(
             source.as_ptr(),
@@ -766,17 +749,6 @@ pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()
     }
 }
 
-#[cfg(unix)]
-#[allow(dead_code)]
-fn _assert_file_is_owned(file: &File, uid: u32) -> io::Result<()> {
-    let metadata = file.metadata()?;
-    if metadata.uid() == uid {
-        Ok(())
-    } else {
-        Err(io::ErrorKind::PermissionDenied.into())
-    }
-}
-
 fn domain_hash(domain: &[u8], value: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(domain);
@@ -785,7 +757,7 @@ fn domain_hash(domain: &[u8], value: &[u8]) -> [u8; 32] {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    hex::encode(bytes)
 }
 
 fn is_lower_hex(value: &str, expected_length: usize) -> bool {
@@ -842,7 +814,7 @@ mod tests {
                 "{file} looks like a registry"
             );
         }
-        assert!(SnapshotPaths::within(root, "work").snapshot == work.snapshot);
+        assert_eq!(SnapshotPaths::within(root, "work").snapshot, work.snapshot);
 
         for escape in ["../escape", "/etc/passwd", ".hidden", ""] {
             assert!(
@@ -858,7 +830,7 @@ mod tests {
     #[test]
     fn a_private_directory_is_created_locked_down_and_refused_when_widened() {
         let parent = tempfile::TempDir::new().unwrap();
-        let uid = unsafe { libc::geteuid() };
+        let uid = crate::platform::effective_uid();
         let directory = parent.path().join("vvmux");
 
         ensure_private_directory(&directory, uid).unwrap();

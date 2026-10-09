@@ -39,13 +39,23 @@ use super::{GatewayState, TunnelContext, vivid};
 /// The control-tunnel subprotocol.
 pub(crate) const TUNNEL_SUBPROTOCOL: &str = "vvtun.v2";
 
+/// Largest tunnel control message, in bytes.
 const CONTROL_MAX_BYTES: usize = 64 * 1024;
+/// Most tunnel legs open at once; each carries one remote attachment.
 const MAX_TUNNEL_LEGS: usize = 32;
+/// Leg IDs remembered to reject replays of an already-used leg; once full, new legs are refused
+/// with `capacity` until the tunnel reconnects.
 const MAX_SEEN_LEG_IDS: usize = 4096;
+/// Longest the tunnel handshake may take before the attempt is abandoned and retried.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// First reconnect backoff cap after the tunnel drops. Each failed attempt doubles the cap up to
+/// [`RECONNECT_MAX`], and the actual delay is drawn with full jitter below it.
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
+/// Longest reconnect delay, so a long outage is retried at least once a minute.
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
+/// Default interval between tunnel heartbeats.
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
+/// Default number of missed heartbeats before the peer is declared dead.
 const DEFAULT_MISS_LIMIT: u32 = 3;
 
 /// Options for `vvmux serve --connect`.
@@ -302,7 +312,7 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 fn full_jitter(cap: Duration) -> Duration {
-    let cap_nanos = cap.as_nanos().min(u64::MAX as u128) as u64;
+    let cap_nanos = cap.as_nanos().min(u128::from(u64::MAX)) as u64;
     let mut bytes = [0_u8; 8];
     getrandom::fill(&mut bytes).expect("random backoff generation");
     let value = u64::from_ne_bytes(bytes);
@@ -342,13 +352,12 @@ async fn run_reconnect_loop(runner: &TunnelRunner) -> io::Result<()> {
             // A successful connection — even a short one — resets the backoff.
             backoff_cap = RECONNECT_MIN;
         }
-        let delay = match retry_after {
-            Some(seconds) => RECONNECT_MAX.min(Duration::from_secs(seconds)),
-            None => {
-                let delay = full_jitter(backoff_cap);
-                backoff_cap = (backoff_cap * 2).min(RECONNECT_MAX);
-                delay
-            }
+        let delay = if let Some(seconds) = retry_after {
+            RECONNECT_MAX.min(Duration::from_secs(seconds))
+        } else {
+            let delay = full_jitter(backoff_cap);
+            backoff_cap = (backoff_cap * 2).min(RECONNECT_MAX);
+            delay
         };
         tokio::time::sleep(delay).await;
     }
@@ -380,7 +389,7 @@ async fn run_websocket_tunnel_once(
     // Handshake: challenge -> auth -> authed -> machine_status.
     let challenge = tokio::time::timeout(runner.handshake_timeout, read_control_frame(&mut reader))
         .await
-        .map_err(|_| io::Error::other("initial challenge timed out"))??
+        .map_err(|_elapsed| io::Error::other("initial challenge timed out"))??
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -407,13 +416,13 @@ async fn run_websocket_tunnel_once(
     }
     let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(nonce.as_str())
-        .map_err(|_| io::Error::other("challenge nonce is not base64url"))?;
+        .map_err(|_invalid| io::Error::other("challenge nonce is not base64url"))?;
     if nonce.len() != 32 {
         return Err(io::Error::other("challenge nonce must be 32 bytes").into());
     }
     let nonce: [u8; 32] = nonce
         .try_into()
-        .map_err(|_| io::Error::other("invalid nonce"))?;
+        .map_err(|_wrong_length| io::Error::other("invalid nonce"))?;
     let signature = runner
         .identity
         .sign_handshake_v2(&nonce, &runner.hostname)?;
@@ -428,12 +437,12 @@ async fn run_websocket_tunnel_once(
 
     let authed = tokio::time::timeout(runner.handshake_timeout, read_control_frame(&mut reader))
         .await
-        .map_err(|_| io::Error::other("authentication timed out"))??
+        .map_err(|_elapsed| io::Error::other("authentication timed out"))??
         .ok_or_else(|| io::Error::other("server closed during authentication"))?;
     let ServerControl::Authed {
         protocol,
         server_version,
-        reconnect_after_seconds: _,
+        ..
     } = authed
     else {
         return Err(io::Error::other("expected VVTUN authed").into());
@@ -591,8 +600,7 @@ async fn handle_server_frame<Si: FrameSink>(
                     &account,
                     &ticket,
                     &subprotocols,
-                )
-                .await?;
+                );
                 Ok(None)
             }
             ServerControl::SessionRequest {
@@ -654,8 +662,11 @@ fn decode_server_control(text: &str) -> io::Result<ServerControl> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn open_leg(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is independent per-tunnel state owned by the control loop"
+)]
+fn open_leg(
     legs: &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
     seen_leg_ids: &mut HashSet<u64>,
     leg_reports: &mpsc::Sender<ClientControl>,
@@ -666,21 +677,21 @@ async fn open_leg(
     account: &str,
     ticket: &str,
     subprotocols: &[String],
-) -> io::Result<()> {
+) {
     legs.retain(|_, handle| !handle.is_finished());
     if seen_leg_ids.contains(&leg_id) {
         let _ = leg_reports.try_send(ClientControl::LegFailed {
             leg_id,
             code: "invalid_request".to_owned(),
         });
-        return Ok(());
+        return;
     }
     if seen_leg_ids.len() >= MAX_SEEN_LEG_IDS {
         let _ = leg_reports.try_send(ClientControl::LegFailed {
             leg_id,
             code: "capacity".to_owned(),
         });
-        return Ok(());
+        return;
     }
     seen_leg_ids.insert(leg_id);
     if !runner.allow_accounts.is_empty() && !runner.allow_accounts.contains(account) {
@@ -688,7 +699,7 @@ async fn open_leg(
             leg_id,
             code: "not_permitted".to_owned(),
         });
-        return Ok(());
+        return;
     }
     let kind = match kind {
         "vvws" => LegKind::Vvws,
@@ -698,7 +709,7 @@ async fn open_leg(
                 leg_id,
                 code: "invalid_request".to_owned(),
             });
-            return Ok(());
+            return;
         }
     };
     if legs.len() >= MAX_TUNNEL_LEGS {
@@ -706,7 +717,7 @@ async fn open_leg(
             leg_id,
             code: "capacity".to_owned(),
         });
-        return Ok(());
+        return;
     }
     // The ticket is a one-use 32-byte base64url value; anything else is refused
     // before any network cost.
@@ -715,25 +726,22 @@ async fn open_leg(
             leg_id,
             code: "ticket_rejected".to_owned(),
         });
-        return Ok(());
+        return;
     };
     if ticket_bytes.len() != 32 {
         let _ = leg_reports.try_send(ClientControl::LegFailed {
             leg_id,
             code: "ticket_rejected".to_owned(),
         });
-        return Ok(());
+        return;
     }
 
-    let permit = match runner.legs.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let _ = leg_reports.try_send(ClientControl::LegFailed {
-                leg_id,
-                code: "capacity".to_owned(),
-            });
-            return Ok(());
-        }
+    let Ok(permit) = Arc::clone(&runner.legs).try_acquire_owned() else {
+        let _ = leg_reports.try_send(ClientControl::LegFailed {
+            leg_id,
+            code: "capacity".to_owned(),
+        });
+        return;
     };
     let state = runner.state.clone();
     let allow_kill = runner.allow_kill;
@@ -761,7 +769,6 @@ async fn open_leg(
         }
     });
     legs.insert(leg_id, handle);
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,7 +797,7 @@ async fn run_leg(
     let mut stream = connected.socket;
     let ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(ticket)
-        .map_err(|_| io::Error::other("invalid leg ticket"))?;
+        .map_err(|_invalid| io::Error::other("invalid leg ticket"))?;
     if ticket.len() != 32 {
         return Err(io::Error::other("invalid leg ticket"));
     }
@@ -827,7 +834,6 @@ fn leg_failure_code(error: &io::Error) -> String {
     match error.kind() {
         io::ErrorKind::PermissionDenied => "ticket_rejected".to_owned(),
         io::ErrorKind::InvalidData => "invalid_subprotocols".to_owned(),
-        io::ErrorKind::TimedOut => "transport_error".to_owned(),
         _ => "transport_error".to_owned(),
     }
 }
@@ -843,7 +849,7 @@ async fn read_control_frame<St: FrameStream>(reader: &mut St) -> io::Result<Opti
             Frame::Ping(_bytes) => {
                 return Err(io::Error::other("server sent a ping before authentication"));
             }
-            Frame::Pong(_) => continue,
+            Frame::Pong(_) => {}
             Frame::Binary(_) => {
                 return Err(io::Error::other("binary frame on the VVTUN control tunnel"));
             }
@@ -904,23 +910,22 @@ async fn connect_websocket_config(
         .await
         .map_err(io::Error::other)?;
     let connector = if tls {
-        let config = match tls_config {
-            Some(config) => config,
-            None => {
-                let mut roots = rustls::RootCertStore::empty();
-                for cert in rustls_native_certs::load_native_certs().certs {
-                    roots.add(cert).map_err(io::Error::other)?;
-                }
-                Arc::new(
-                    rustls::ClientConfig::builder_with_provider(Arc::new(
-                        rustls::crypto::ring::default_provider(),
-                    ))
-                    .with_safe_default_protocol_versions()
-                    .map_err(io::Error::other)?
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-                )
+        let config = if let Some(config) = tls_config {
+            config
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls_native_certs::load_native_certs().certs {
+                roots.add(cert).map_err(io::Error::other)?;
             }
+            Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .map_err(io::Error::other)?
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            )
         };
         Some(Connector::Rustls(config))
     } else {
@@ -969,15 +974,14 @@ async fn connect_websocket_config(
 
 fn parse_retry_after(value: &HeaderValue, now: SystemTime) -> Option<u64> {
     let value = value.to_str().ok()?.trim();
-    let seconds = match value.parse::<u64>() {
-        Ok(seconds) => seconds,
-        Err(_) => {
-            let deadline = httpdate::parse_http_date(value).ok()?;
-            deadline
-                .duration_since(now)
-                .unwrap_or(Duration::ZERO)
-                .as_secs()
-        }
+    let seconds = if let Ok(seconds) = value.parse::<u64>() {
+        seconds
+    } else {
+        let deadline = httpdate::parse_http_date(value).ok()?;
+        deadline
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+            .as_secs()
     };
     Some(seconds.min(RECONNECT_MAX.as_secs()))
 }
@@ -1000,7 +1004,11 @@ fn bounded_ascii(value: &str, max: usize) -> io::Result<&str> {
 mod tests {
     use super::*;
 
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        clippy::unnecessary_wraps,
+        reason = "the signature is fixed by tungstenite's handshake callback"
+    )]
     fn select_test_subprotocol(
         _request: &tokio_tungstenite::tungstenite::handshake::server::Request,
         mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
@@ -1018,9 +1026,9 @@ mod tests {
     #[test]
     fn ws_scheme_is_rejected_for_non_loopback_hosts() {
         assert!(split_urls("ws://vvmux.example/t/v2/control").is_err());
-        assert!(split_urls("wss://vvmux.example/t/v2/control").is_ok());
-        assert!(split_urls("ws://127.0.0.1:8000/t/v2/control").is_ok());
-        assert!(split_urls("http://127.0.0.1:8000").is_ok());
+        split_urls("wss://vvmux.example/t/v2/control").unwrap();
+        split_urls("ws://127.0.0.1:8000/t/v2/control").unwrap();
+        split_urls("http://127.0.0.1:8000").unwrap();
     }
 
     #[test]

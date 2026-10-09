@@ -1,4 +1,19 @@
+//! Platform pseudo-terminals for pane processes.
+//!
+//! [`PtyProcess::spawn`] and [`PtyProcess::spawn_argv`] start a child attached to a new
+//! pseudo-terminal and return its [`PtyParts`]: a reader for the terminal's output, a bounded
+//! [`PtyInput`] queue for its input, a shared [`PtyControl`] for resizing and termination, and a
+//! [`PtyWaiter`] that collects the exit status.
+//!
+//! On Unix the child becomes the leader of a new session and process group, with the PTY as its
+//! controlling terminal; signals go to that group. On Windows the child runs under `ConPTY` inside
+//! a kill-on-close job object; there are no signals or process groups.
+//!
+//! Vivid endpoints, tokens, and root secrets are removed from every child's environment, so a
+//! pane process never inherits the multiplexer's own media credentials.
+
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -15,16 +30,34 @@ pub use unix::{PtyControl, PtyExitStatus, PtyWaiter};
 #[cfg(windows)]
 pub use windows::{PtyControl, PtyExitStatus, PtyWaiter};
 
+/// Writes that may wait in a pane's input queue before senders see `WouldBlock`.
+///
+/// Paired with [`INPUT_QUEUE_BYTES`] so that neither many tiny writes nor a few large pastes can
+/// grow memory without bound while a child is not reading its input.
 const INPUT_QUEUE_ITEMS: usize = 64;
+
+/// Bytes that may wait in a pane's input queue; also the largest single write accepted.
+///
+/// 1 MiB comfortably holds a large paste, and is the same ceiling the session applies to
+/// automation input, so anything the session accepts can be queued in one write.
 const INPUT_QUEUE_BYTES: usize = 1024 * 1024;
 
+/// Entry points for starting pane processes.
+#[derive(Debug)]
 pub struct PtyProcess;
 
+/// Everything needed to drive one newly started pane process.
+#[derive(Debug)]
 pub struct PtyParts {
+    /// The operating-system ID of the started process.
     pub child_pid: u32,
+    /// The terminal's output stream.
     pub reader: File,
+    /// The bounded queue that writes to the terminal's input.
     pub input: PtyInput,
+    /// The shared handle for resizing, signalling, and termination.
     pub control: PtyControl,
+    /// The owner of the process, used to collect its exit status.
     pub waiter: PtyWaiter,
 }
 
@@ -33,16 +66,29 @@ struct InputMessage {
     completion: Option<mpsc::Sender<io::Result<()>>>,
 }
 
+/// Bounded, non-blocking writer for a pane's terminal input.
+///
+/// A dedicated thread performs the blocking writes, so a child that stops reading its input
+/// fills this queue and makes further sends fail with [`io::ErrorKind::WouldBlock`] instead of
+/// blocking the caller.
 pub struct PtyInput {
     sender: mpsc::SyncSender<InputMessage>,
     queued_bytes: Arc<AtomicUsize>,
+}
+
+impl fmt::Debug for PtyInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PtyInput")
+            .field("queued_bytes", &self.queued_bytes.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
 }
 
 impl PtyInput {
     fn start(mut writer: File) -> io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<InputMessage>(INPUT_QUEUE_ITEMS);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
-        let worker_bytes = queued_bytes.clone();
+        let worker_bytes = Arc::clone(&queued_bytes);
         std::thread::Builder::new()
             .name("vvmux-pty-input".into())
             .spawn(move || {
@@ -70,10 +116,25 @@ impl PtyInput {
         })
     }
 
+    /// Queue `bytes` for the terminal's input without waiting for them to be written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] when `bytes` exceeds the queue's byte limit,
+    /// [`io::ErrorKind::WouldBlock`] when the queue is full, or [`io::ErrorKind::BrokenPipe`]
+    /// after the writer thread stopped because a write failed.
     pub fn send(&self, bytes: &[u8]) -> io::Result<()> {
         self.enqueue(bytes, None)
     }
 
+    /// Queue `bytes` and return a receiver that reports when they were written and flushed.
+    ///
+    /// Empty input completes immediately.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`PtyInput::send`]. A write failure after queueing is reported through the
+    /// returned receiver instead.
     pub fn send_with_completion(&self, bytes: &[u8]) -> io::Result<mpsc::Receiver<io::Result<()>>> {
         let (sender, receiver) = mpsc::channel();
         if bytes.is_empty() {
@@ -139,9 +200,9 @@ impl PtyInput {
 }
 
 impl Write for PtyInput {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.send(buffer)?;
-        Ok(buffer.len())
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.send(buf)?;
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -156,6 +217,12 @@ impl PtyProcess {
     /// without it, the shell starts as an interactive login shell. The command is handed to the
     /// shell verbatim, so it may contain pipes and redirection — it is a shell command, not an
     /// argument vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] for a zero dimension (and, on Windows, for a
+    /// relative shell or working-directory path), [`io::ErrorKind::Unsupported`] on Windows
+    /// builds without `ConPTY`, or the OS error from creating the terminal or process.
     pub fn spawn(
         shell: &OsStr,
         command: Option<&OsStr>,
@@ -175,6 +242,10 @@ impl PtyProcess {
     }
 
     /// Start a pane process from an exact program and argument vector, without a shell.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`PtyProcess::spawn`].
     pub fn spawn_argv(
         program: &OsStr,
         arguments: &[impl AsRef<OsStr>],

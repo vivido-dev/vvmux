@@ -3,10 +3,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::{BridgePlayRequest, BridgeSourceKey};
+use vivid_sdk::presenter::{BridgePlayRequest, BridgeSourceKey};
 
+/// Media trace events retained per session.
 pub const MAX_MEDIA_TRACE_EVENTS: usize = 4096;
+/// Serialized bytes the media trace may retain.
 pub const MAX_MEDIA_TRACE_BYTES: usize = 2 * 1024 * 1024;
+/// Most trace events returned by one query.
 pub const MAX_MEDIA_TRACE_QUERY_EVENTS: u16 = 512;
 
 #[derive(
@@ -217,6 +220,10 @@ impl MediaTraceFilter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the field names are the media trace's serialized contract"
+)]
 pub struct MediaTraceGap {
     pub requested_sequence: u64,
     pub oldest_sequence: u64,

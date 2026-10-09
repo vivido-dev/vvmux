@@ -1831,8 +1831,10 @@ fn error_code(output: Output) -> String {
         .trim()
         .strip_prefix("vvmux: ")
         .and_then(|rest| rest.split_once(':'))
-        .map(|(code, _)| code.to_owned())
-        .unwrap_or_else(|| panic!("unrecognized error format: {stderr}"))
+        .map_or_else(
+            || panic!("unrecognized error format: {stderr}"),
+            |(code, _)| code.to_owned(),
+        )
 }
 
 fn wait_text(runtime: &Path, session: &str, pane: u64, pattern: &str) {

@@ -174,6 +174,7 @@ pub fn encode_sgr_mouse(button: u16, column: u32, row: u32, press: bool) -> Stri
 
 /// The SGR button code for a wheel click. Wheel buttons carry bit 64; 0 is up, 1 is down.
 pub const WHEEL_UP: u16 = 64;
+/// The SGR button code for a wheel click down; see [`WHEEL_UP`].
 pub const WHEEL_DOWN: u16 = 65;
 
 #[cfg(test)]

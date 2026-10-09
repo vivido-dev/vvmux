@@ -10,7 +10,11 @@ use serde_json::Value;
 // Never constructed: this exists only to name both records in one schema document, so the size
 // difference between its variants costs nothing. Boxing one to even them out would change the
 // generated schema, which is the published contract.
-#[allow(dead_code, clippy::large_enum_variant)]
+#[expect(
+    dead_code,
+    clippy::large_enum_variant,
+    reason = "a schema-only type: never constructed, and boxing a variant would change the schema"
+)]
 enum AutomationRecord {
     Request(crate::ipc::AutomationRequest),
     Response(crate::ipc::AutomationResponse),

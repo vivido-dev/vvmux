@@ -17,27 +17,45 @@ use crate::client_input::{
     self, FloatEditScanner, MouseCoordinates, ParsedInput, PrefixParser, Win32InputDecoder,
 };
 #[cfg(test)]
-use crate::ipc::DisplayMetrics;
-#[cfg(test)]
 use crate::ipc::{Action, Axis, Direction, MouseEvent, MouseKind};
-use crate::ipc::{
-    BridgeKeyframeRequest, BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind,
-    BridgeSurface, ClientMessage, FloatingEditCommand, ServerMessage, SharedWriter,
-};
+use crate::ipc::{ClientMessage, FloatingEditCommand, ServerMessage, SharedWriter};
 use crate::media_trace::{
     BridgeMediaTraceEvent, MediaKeyframeStage, MediaPlaybackControl, MediaTraceKind,
 };
 use crate::platform::ClientTerminal;
+#[cfg(test)]
+use vivid_sdk::presenter::DisplayMetrics;
+use vivid_sdk::presenter::{
+    BridgeKeyframeRequest, BridgeNode, BridgeSource, BridgeSourceKey, BridgeSourceKind,
+    BridgeSurface,
+};
 
+/// Typical media chunk size, used to turn the configured byte budget into a chunk count.
 const BRIDGE_MEDIA_CHUNK: usize = 128 * 1024;
 /// How often the bridge worker reports its counters to the session server.
 ///
 /// Coarse on purpose: these are diagnostics and must not add measurable traffic to the client
 /// connection they are measuring.
 const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the client checks for host terminal resizes; frequent enough that resizing feels
+/// immediate.
 #[cfg(windows)]
 const DISPLAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long a detaching client waits for the server's acknowledgement before leaving anyway.
 const DETACH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a detaching client checks for the server's acknowledgement.
+const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long the bridge worker sleeps when no queued media can be sent, before checking again.
+///
+/// A wake signal normally ends the wait early; this bounds the delay if a signal is missed.
+const BRIDGE_IDLE_WAIT: Duration = Duration::from_millis(10);
+/// How long a client waits for a server it just launched to accept connections.
+///
+/// The launcher already waited for the readiness report, so this only covers the race between
+/// that report and the listener accepting.
+const SERVER_START_WAIT: Duration = Duration::from_secs(3);
+/// How often a client retries connecting to a server it just launched.
+const SERVER_START_POLL: Duration = Duration::from_millis(20);
 /// Idle wait for host terminal input when nothing time-sensitive is buffered.
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// One 64 MiB graphics transfer plus the largest bounded composed text repaint and framing.
@@ -143,21 +161,42 @@ pub fn attach(
     target: crate::ipc::AttachmentTarget,
     config_path: Option<&Path>,
 ) -> io::Result<()> {
-    log::info!("attach: session={name} create={create} target={target:?} join={join:?}");
+    log::info!(
+        event = "client.attach.start",
+        session = name,
+        create = create,
+        target:? = target,
+        join:? = join;
+        "attaching"
+    );
     let client_config = crate::config::Config::load(config_path)?;
     let (mut reader, writer) = match crate::server::connect(name) {
         Ok(connection) => {
-            log::debug!("attach: connected to running session {name}");
+            log::debug!(
+                event = "client.attach.connected",
+                session = name;
+                "connected to running session"
+            );
             connection
         }
         Err(error) if create && is_missing_session(&error) => {
-            log::info!("attach: no live session {name} ({error}); starting a server");
+            log::info!(
+                event = "client.attach.spawn",
+                session = name,
+                error:% = error;
+                "no live session; starting a server"
+            );
             let layout = resolve_startup_layout(config_path, None)?;
             spawn_server(name, config_path, layout.as_deref())?;
             wait_for_server(name)?
         }
         Err(error) => {
-            log::error!("attach: cannot connect to session {name}: {error}");
+            log::error!(
+                event = "client.attach.failure",
+                session = name,
+                error:% = error;
+                "cannot connect to session"
+            );
             return Err(error);
         }
     };
@@ -180,9 +219,12 @@ pub fn attach(
     let host_term = std::env::var_os("TERM");
     let kitty_graphics = host_supports_kitty_graphics(host_term.as_deref());
     log::debug!(
-        "attach: outer vivid={vivid} TERM={host_term:?} kitty_graphics={kitty_graphics} \
-         control_endpoint={}",
-        std::env::var_os("VIVID_ENDPOINT_CONTROL").is_some()
+        event = "client.attach.outer",
+        vivid = vivid,
+        term:? = host_term,
+        kitty_graphics = kitty_graphics,
+        control_endpoint = std::env::var_os("VIVID_ENDPOINT_CONTROL").is_some();
+        "outer terminal capabilities"
     );
     // Negotiate the attachment before entering raw/alternate-screen mode. A rejected attach must
     // remain an ordinary command error: changing terminal state here would visibly clear the
@@ -199,13 +241,13 @@ pub fn attach(
         kitty_graphics,
         outer_identity(vivid, display),
     )?;
-    log::info!("attach: accepted by server, presenter={presenter}");
+    log::info!(event = "client.attach.success", presenter = presenter; "attach accepted by server");
     let terminal = ClientTerminal::enter()?;
 
     let stopped = Arc::new(AtomicBool::new(false));
     let ipc_cancel = reader.cancel_handle();
-    let read_stopped = stopped.clone();
-    let read_writer = writer.clone();
+    let read_stopped = Arc::clone(&stopped);
+    let read_writer = Arc::clone(&writer);
     // Authoritative float-edit mode state travels from the reader thread to the input loop
     // through this bounded channel; edit keys are parsed only while a confirmed mode is active.
     let (mode_sender, mode_receiver) = mpsc::sync_channel::<(u64, bool)>(8);
@@ -213,7 +255,7 @@ pub fn attach(
     let (plugin_keymap_sender, plugin_keymap_receiver) = mpsc::sync_channel(8);
     let output = terminal.output()?;
     let output = Arc::new(Mutex::new(output));
-    let output_thread = TerminalOutput::spawn(output, writer.clone())?;
+    let output_thread = TerminalOutput::spawn(output, Arc::clone(&writer))?;
     if !(vivid && presenter) {
         write_media_role_title(
             &output_thread,
@@ -222,7 +264,7 @@ pub fn attach(
         );
     }
     let bridge_display = display;
-    let bridge_cell_size = presenter_cell_size.clone();
+    let bridge_cell_size = Arc::clone(&presenter_cell_size);
     let bridge_queue_records =
         (client_config.media.ipc_queue_bytes / BRIDGE_MEDIA_CHUNK).clamp(1, 1024);
     let reader_thread = thread::Builder::new()
@@ -230,7 +272,7 @@ pub fn attach(
         .spawn(move || {
             // Connected only while this client presents media. A viewer holds no outer bridge,
             // so a second attachment costs its outer presenter nothing.
-            let connect_bridge = |display: crate::ipc::DisplayMetrics| {
+            let connect_bridge = |display: vivid_sdk::presenter::DisplayMetrics| {
                 let outer = outer.as_ref()?;
                 let bridge = Secret32::from_hex(&outer.root_secret)
                     .map_err(|error| {
@@ -240,7 +282,7 @@ pub fn attach(
                         )
                     })
                     .and_then(|secret| {
-                        let mut builder = crate::bridge::OuterBridge::builder(secret, display)
+                        let mut builder = vivid_gateway::OuterBridge::builder(secret, display)
                             .control_endpoint(outer.control.clone());
                         if let Some(endpoint) = &outer.realtime {
                             builder = builder.realtime_endpoint(endpoint.clone());
@@ -263,14 +305,16 @@ pub fn attach(
                         }
                         match BridgeWorker::spawn(
                             bridge,
-                            read_writer.clone(),
+                            Arc::clone(&read_writer),
                             bridge_queue_records,
-                            bridge_cell_size.clone(),
+                            Arc::clone(&bridge_cell_size),
                         ) {
                             Ok(worker) => Some(worker),
                             Err(error) => {
                                 log::warn!(
-                                    "bridge worker failed to start, media disabled: {error}"
+                                    event = "client.bridge.start.failure",
+                                    error:% = error;
+                                    "bridge worker failed to start; media disabled"
                                 );
                                 write_title(
                                     &output_thread,
@@ -281,7 +325,11 @@ pub fn attach(
                         }
                     }
                     Err(error) => {
-                        log::warn!("outer bridge connect failed, media disabled: {error}");
+                        log::warn!(
+                            event = "client.bridge.connect.failure",
+                            error:% = error;
+                            "outer bridge connect failed; media disabled"
+                        );
                         write_title(&output_thread, &format!("vvmux media disabled: {error}"));
                         None
                     }
@@ -314,12 +362,9 @@ pub fn attach(
                     apply_cell_size(&mut display, bridge_cell_size.load(Ordering::Acquire));
                     bridge = connect_bridge(display);
                     log::info!(
-                        "outer media retry: bridge {}",
-                        if bridge.is_some() {
-                            "connected"
-                        } else {
-                            "unavailable"
-                        }
+                        event = "client.bridge.retry",
+                        connected = bridge.is_some();
+                        "outer media retry"
                     );
                     media_retry_at = if bridge.is_some() {
                         // Ask for the projection again: the session sent it to a client whose
@@ -337,7 +382,6 @@ pub fn attach(
                     };
                 }
                 match message {
-                    ServerMessage::Attached { .. } => break,
                     ServerMessage::Render {
                         frame_id,
                         session_sequence,
@@ -490,9 +534,11 @@ pub fn attach(
                         }
                         write_media_role_title(&output_thread, vivid, presenter);
                     }
-                    ServerMessage::Detached { .. } | ServerMessage::Error(_) => break,
                     ServerMessage::Pong => {}
-                    ServerMessage::Automation(_)
+                    ServerMessage::Attached { .. }
+                    | ServerMessage::Detached { .. }
+                    | ServerMessage::Error(_)
+                    | ServerMessage::Automation(_)
                     | ServerMessage::AutomationChunk { .. }
                     | ServerMessage::PluginEvent { .. } => break,
                 }
@@ -539,7 +585,7 @@ pub fn attach(
     };
 
     #[cfg(unix)]
-    let signal_stopped = stopped.clone();
+    let signal_stopped = Arc::clone(&stopped);
     #[cfg(unix)]
     let mut signals =
         match signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM, libc::SIGHUP]) {
@@ -570,7 +616,7 @@ pub fn attach(
     };
 
     let mut workers = ClientWorkers {
-        stopped: stopped.clone(),
+        stopped: Arc::clone(&stopped),
         ipc_cancel,
         reader_thread: Some(reader_thread),
         #[cfg(windows)]
@@ -602,7 +648,7 @@ pub fn attach(
                 if requested_at.elapsed() >= DETACH_ACK_TIMEOUT {
                     break;
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(DETACH_POLL_INTERVAL);
                 continue;
             }
             while let Ok((mode_id, active)) = mode_receiver.try_recv() {
@@ -660,23 +706,23 @@ pub fn attach(
                 for command in parsed {
                     match command {
                         ParsedInput::Input(bytes) => {
-                            send_client(&writer, &crate::client_input::key_input_message(bytes))?
+                            send_client(&writer, &crate::client_input::key_input_message(bytes))?;
                         }
                         ParsedInput::Action(action) => {
-                            send_client(&writer, &ClientMessage::Action(action))?
+                            send_client(&writer, &ClientMessage::Action(action))?;
                         }
                         ParsedInput::Mouse(mouse, coordinates) => {
                             let message = match coordinates {
                                 MouseCoordinates::Cells => ClientMessage::Mouse(mouse),
                                 MouseCoordinates::Pixels => ClientMessage::PixelMouse(mouse),
                             };
-                            send_client(&writer, &message)?
+                            send_client(&writer, &message)?;
                         }
                         ParsedInput::Focus(focused) => {
-                            send_client(&writer, &ClientMessage::Focus(focused))?
+                            send_client(&writer, &ClientMessage::Focus(focused))?;
                         }
                         ParsedInput::ClaimMedia => {
-                            send_client(&writer, &ClientMessage::ClaimMedia)?
+                            send_client(&writer, &ClientMessage::ClaimMedia)?;
                         }
                         ParsedInput::Detach => {
                             send_client(&writer, &ClientMessage::Detach)?;
@@ -739,7 +785,7 @@ fn host_supports_kitty_graphics(term: Option<&std::ffi::OsStr>) -> bool {
 /// exists is to give the daemon an identity without giving it authority.
 fn outer_identity(
     vivid: bool,
-    display: crate::ipc::DisplayMetrics,
+    display: vivid_sdk::presenter::DisplayMetrics,
 ) -> Option<crate::ipc::OuterIdentity> {
     let window_id = std::env::var("VIVIDO_WINDOW_ID")
         .ok()
@@ -765,13 +811,16 @@ fn outer_identity(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the client loop's independently owned state"
+)]
 fn request_attachment(
     reader: &mut crate::ipc::RecordReader,
     writer: &SharedWriter,
     join: JoinOptions,
     target: crate::ipc::AttachmentTarget,
-    display: crate::ipc::DisplayMetrics,
+    display: vivid_sdk::presenter::DisplayMetrics,
     vivid: bool,
     kitty_graphics: bool,
     outer: Option<crate::ipc::OuterIdentity>,
@@ -792,7 +841,11 @@ fn request_attachment(
     match reader.recv_server()? {
         ServerMessage::Attached { presenter, .. } => Ok(presenter),
         ServerMessage::Error(message) => {
-            log::error!("attach rejected by server: {message}");
+            log::error!(
+                event = "client.attach.rejected",
+                reason = message.as_str();
+                "attach rejected by server"
+            );
             Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
         }
         _ => Err(io::Error::new(
@@ -885,9 +938,14 @@ impl BridgeClientSender {
     }
 }
 
+/// Media bytes queued for the outer bridge; past this, new deliveries are refused until the queue
+/// drains.
 const BRIDGE_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+/// Most media sources with queued deliveries at once.
 const BRIDGE_QUEUE_SOURCES: usize = 1024;
+/// Most media chunks queued for the outer bridge.
 const BRIDGE_QUEUE_CHUNKS: usize = 4096;
+/// Most dropped delivery IDs remembered, so their late chunks are recognized and discarded.
 const BRIDGE_DROPPED_IDS: usize = 4096;
 
 pub(crate) struct BridgeWorker {
@@ -1000,14 +1058,14 @@ impl BridgeWorker {
         }
     }
     fn spawn(
-        bridge: crate::bridge::OuterBridge,
+        bridge: vivid_gateway::OuterBridge,
         client_writer: SharedWriter,
         queue_records: usize,
         presenter_cell_size: Arc<AtomicU32>,
     ) -> io::Result<Self> {
         let cancel = client_writer
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cancel_handle();
         Self::spawn_inner(
             bridge,
@@ -1018,8 +1076,9 @@ impl BridgeWorker {
         )
     }
 
+    #[cfg(any(test, feature = "server-capability"))]
     pub(crate) fn spawn_with_sender(
-        bridge: crate::bridge::OuterBridge,
+        bridge: vivid_gateway::OuterBridge,
         client_writer: BridgeClientSender,
         queue_records: usize,
     ) -> io::Result<Self> {
@@ -1027,13 +1086,13 @@ impl BridgeWorker {
     }
 
     fn spawn_inner(
-        bridge: crate::bridge::OuterBridge,
+        bridge: vivid_gateway::OuterBridge,
         client_writer: BridgeClientSender,
         queue_records: usize,
         presenter_cell_size: Option<Arc<AtomicU32>>,
     ) -> io::Result<Self> {
         let bridge_cancel = bridge.cancel_handle();
-        let client_cancel = client_writer.1.clone();
+        let client_cancel = Arc::clone(&client_writer.1);
         let release_cancel = bridge_cancel.clone();
         let release_bridge: Arc<dyn Fn() + Send + Sync> = Arc::new(move || release_cancel.cancel());
         let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -1046,12 +1105,12 @@ impl BridgeWorker {
         let snapshot = Arc::new(Mutex::new(None));
         let dropped = Arc::new(Mutex::new(HashSet::new()));
         let queue_drops = Arc::new(AtomicU64::new(0));
-        let worker_snapshot = snapshot.clone();
-        let worker_dropped = dropped.clone();
-        let worker_drops = queue_drops.clone();
-        let worker_media = media.clone();
+        let worker_snapshot = Arc::clone(&snapshot);
+        let worker_dropped = Arc::clone(&dropped);
+        let worker_drops = Arc::clone(&queue_drops);
+        let worker_media = Arc::clone(&media);
         let stopped = Arc::new(AtomicBool::new(false));
-        let worker_stopped = stopped.clone();
+        let worker_stopped = Arc::clone(&stopped);
         let thread = thread::Builder::new()
             .name("vvmux-media-bridge".into())
             .spawn(move || {
@@ -1066,7 +1125,7 @@ impl BridgeWorker {
                     worker_stopped,
                     bridge_instance_id,
                     presenter_cell_size,
-                )
+                );
             })?;
         Ok(Self {
             admitted_sources: HashSet::new(),
@@ -1099,7 +1158,10 @@ impl BridgeWorker {
         self.admitted_sources = snapshot.tracks.iter().map(|track| track.key).collect();
         let mut retired = Vec::new();
         {
-            let mut queues = self.media.lock().unwrap_or_else(|p| p.into_inner());
+            let mut queues = self
+                .media
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             while let Some(media) = queues.pop_where(|key| !self.admitted_sources.contains(&key)) {
                 retired.push(media.delivery_id);
             }
@@ -1111,7 +1173,7 @@ impl BridgeWorker {
         *self
             .snapshot
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
     }
 
     pub(crate) fn queue_media(&mut self, mut media: BridgeMedia) -> bool {
@@ -1128,7 +1190,7 @@ impl BridgeWorker {
         let queued = self
             .media
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(media, self.queue_records_per_track)
             .is_ok();
         if !queued {
@@ -1150,7 +1212,10 @@ impl BridgeWorker {
         if delivery_id == 0 {
             return;
         }
-        let mut dropped = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
+        let mut dropped = self
+            .dropped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if dropped.len() >= BRIDGE_DROPPED_IDS && !dropped.contains(&delivery_id) {
             drop(dropped);
             self.stopped.store(true, Ordering::Release);
@@ -1222,11 +1287,11 @@ fn send_bridge_trace(
     });
 }
 
-fn pack_cell_size(display: crate::ipc::DisplayMetrics) -> u32 {
+fn pack_cell_size(display: vivid_sdk::presenter::DisplayMetrics) -> u32 {
     u32::from(display.cell_width) | (u32::from(display.cell_height) << 16)
 }
 
-fn apply_cell_size(display: &mut crate::ipc::DisplayMetrics, packed: u32) {
+fn apply_cell_size(display: &mut vivid_sdk::presenter::DisplayMetrics, packed: u32) {
     display.cell_width = packed as u16;
     display.cell_height = (packed >> 16) as u16;
 }
@@ -1259,9 +1324,9 @@ fn finish_in_place_keyframe_recoveries(
 
 /// Video resets initiated by the nested producer rather than requested by the outer presenter.
 ///
-/// ADVANCE_CHANNEL/FLUSH increments the decoder-reset serial and makes the virtual presenter ask
+/// `ADVANCE_CHANNEL/FLUSH` increments the decoder-reset serial and makes the virtual presenter ask
 /// for a keyframe. The producer is already opening that new generation at a random-access unit, so
-/// reflecting another NEED_KEYFRAME back to it only abandons the seek that is currently in flight.
+/// reflecting another `NEED_KEYFRAME` back to it only abandons the seek that is currently in flight.
 fn producer_decoder_resets(
     previous: &[BridgeSource],
     current: &[BridgeSource],
@@ -1348,12 +1413,14 @@ fn outer_endpoint_unreachable(consecutive_failures: u32, error_kind: io::ErrorKi
         )
 }
 
+/// Consecutive projection failures with an unreachable outer endpoint before media is given up for
+/// this attachment.
 const OUTER_UNREACHABLE_ATTEMPTS: u32 = 2;
 
 /// Make the session answer in `delay`, so the reader thread of an idle session looks at its
 /// timers. One short-lived thread per retry; it ends as soon as the connection does.
 fn wake_after(writer: &SharedWriter, delay: Duration) {
-    let writer = writer.clone();
+    let writer = Arc::clone(writer);
     let _ = thread::Builder::new()
         .name("vvmux-media-retry".into())
         .spawn(move || {
@@ -1396,9 +1463,12 @@ fn reconcile_requested_virtual_keyframes(
     requested.extend(producer_resets.iter().copied());
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the client loop's independently owned state"
+)]
 fn run_bridge_worker(
-    mut bridge: crate::bridge::OuterBridge,
+    mut bridge: vivid_gateway::OuterBridge,
     client_writer: BridgeClientSender,
     receiver: mpsc::Receiver<()>,
     media_queues: Arc<Mutex<TrackMediaQueues>>,
@@ -1480,23 +1550,20 @@ fn run_bridge_worker(
                 });
             }
         }
-        match bridge.take_overlay_input() {
-            Ok(events) => {
-                for (surface, body) in events {
-                    let _ = client_writer.send(ClientMessage::OverlayInput {
-                        bridge_instance_id,
-                        surface,
-                        body,
-                    });
-                }
-            }
-            Err(_) => {
-                force_sources = true;
-                force_replacement = true;
-                let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
-                    reset_outer_session: true,
+        if let Ok(events) = bridge.take_overlay_input() {
+            for (surface, body) in events {
+                let _ = client_writer.send(ClientMessage::OverlayInput {
+                    bridge_instance_id,
+                    surface,
+                    body,
                 });
             }
+        } else {
+            force_sources = true;
+            force_replacement = true;
+            let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
+                reset_outer_session: true,
+            });
         }
         if let Some(body) = bridge.take_overlay_environment() {
             let _ = client_writer.send(ClientMessage::OverlayEnvironment {
@@ -1533,7 +1600,7 @@ fn run_bridge_worker(
         }
         let mut eos_blocked = media_queues
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .source_keys();
         if let Some(media) = &deferred {
             eos_blocked.insert(media.source);
@@ -1674,11 +1741,15 @@ fn run_bridge_worker(
         }
         let pending = snapshot
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(mut pending) = pending {
             if let Err(error) = bridge.sync_microphones(&pending.microphones) {
-                log::warn!("microphone relay unavailable: {error}");
+                log::warn!(
+                    event = "client.microphone.failure",
+                    error:% = error;
+                    "microphone relay unavailable"
+                );
             }
             if grouped_discontinuity_is_incomplete(&active_sources, &pending.tracks) {
                 // Do not acknowledge this partial generation. The paired control mutation wakes
@@ -1777,7 +1848,7 @@ fn run_bridge_worker(
                     minimum_epoch: None,
                     // The gateway raises the minimum epoch for this replacement handoff, so no
                     // same-epoch keyframe queued under the detached presenter can satisfy it.
-                    reason: crate::bridge::KEYFRAME_REASON_TRANSPORT_LOSS,
+                    reason: vivid_sdk::presenter::KEYFRAME_REASON_TRANSPORT_LOSS,
                 })
                 .collect::<Vec<_>>();
             early_keyframes.sort_by_key(|request| {
@@ -1887,16 +1958,20 @@ fn run_bridge_worker(
                 force_sources = true;
                 force_replacement = retry.replace_session;
                 log::warn!(
-                    "outer media projection failed on attempt {} (replace_session={}): {}",
-                    consecutive_projection_failures,
-                    retry.replace_session,
-                    error
+                    event = "client.projection.failure",
+                    attempt = consecutive_projection_failures,
+                    replace_session = retry.replace_session,
+                    error:% = error;
+                    "outer media projection failed"
                 );
                 if outer_endpoint_unreachable(consecutive_projection_failures, error.kind()) {
                     // Retrying cannot help, and meanwhile the session keeps filling the media
                     // queue until an overflow cancels the whole client. Give up on media alone;
                     // the terminal session is unaffected by an unreachable presenter.
-                    log::warn!("outer media endpoints unreachable; media disabled");
+                    log::warn!(
+                        event = "client.projection.unreachable";
+                        "outer media endpoints unreachable; media disabled"
+                    );
                     stopped.store(true, Ordering::Release);
                     // Wake the reader thread, which retires this worker on its next message.
                     let _ = client_writer.send(ClientMessage::Ping);
@@ -2014,7 +2089,7 @@ fn run_bridge_worker(
                         BridgeKeyframeRequest {
                             source,
                             minimum_epoch: None,
-                            reason: crate::bridge::KEYFRAME_REASON_DECODER_ERROR,
+                            reason: vivid_sdk::presenter::KEYFRAME_REASON_DECODER_ERROR,
                         },
                     ))
             }));
@@ -2029,7 +2104,7 @@ fn run_bridge_worker(
                         BridgeKeyframeRequest {
                             source: source.key,
                             minimum_epoch: None,
-                            reason: crate::bridge::KEYFRAME_REASON_INITIAL,
+                            reason: vivid_sdk::presenter::KEYFRAME_REASON_INITIAL,
                         },
                     ))
                 }));
@@ -2099,7 +2174,7 @@ fn run_bridge_worker(
         let host_request = {
             let mut queues = media_queues
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let index = queues.host_requests.iter().position(|request| {
                 bridge.can_service_overlay_host_request(request)
                     && (request.record_type == vivid_protocol::messages::MEASURE_OVERLAY_TEXT_BATCH
@@ -2130,21 +2205,20 @@ fn run_bridge_worker(
             // re-arm the retained replay for every source at once.
             force_sources = true;
         }
-        let media = match deferred.take().or_else(|| {
+        let Some(media) = deferred.take().or_else(|| {
             media_queues
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pop_where(|source| bridge.can_accept_media(source))
-        }) {
-            Some(media) => media,
-            None => match receiver.recv_timeout(Duration::from_millis(10)) {
+        }) else {
+            match receiver.recv_timeout(BRIDGE_IDLE_WAIT) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            },
+            }
         };
         if snapshot
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
         {
             deferred = Some(media);
@@ -2361,7 +2435,10 @@ fn compare_projection(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the client loop's independently owned state"
+)]
 fn trace_projection_change(
     client_writer: &BridgeClientSender,
     bridge_instance_id: u64,
@@ -2493,7 +2570,10 @@ fn recreated_playing_video_sources(
         .iter()
         .filter(|source| {
             source.playing
-                && matches!(&source.kind, crate::ipc::BridgeSourceKind::Video { .. })
+                && matches!(
+                    &source.kind,
+                    vivid_sdk::presenter::BridgeSourceKind::Video { .. }
+                )
                 && previous
                     .iter()
                     .find(|old| old.key == source.key)
@@ -2514,7 +2594,7 @@ fn source_is_playing(sources: &[BridgeSource], key: BridgeSourceKey) -> bool {
     if source.playing {
         return true;
     }
-    let crate::ipc::BridgeSourceKind::Audio {
+    let vivid_sdk::presenter::BridgeSourceKind::Audio {
         linked_video: Some(video),
         ..
     } = &source.kind
@@ -2533,7 +2613,7 @@ fn complete_dropped_deliveries(
     let delivery_ids = {
         let mut dropped = dropped
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if dropped.is_empty() {
             return false;
         }
@@ -2611,16 +2691,15 @@ pub fn create_detached(
     layout: Option<&str>,
 ) -> io::Result<()> {
     let layout_path = resolve_startup_layout(config_path, layout)?;
-    match crate::server::probe(name) {
-        Ok(()) => Err(io::Error::new(
+    if let Ok(()) = crate::server::probe(name) {
+        Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "session already exists",
-        )),
-        Err(_) => {
-            spawn_server(name, config_path, layout_path.as_deref())?;
-            let _ = wait_for_server(name)?;
-            Ok(())
-        }
+        ))
+    } else {
+        spawn_server(name, config_path, layout_path.as_deref())?;
+        let _ = wait_for_server(name)?;
+        Ok(())
     }
 }
 
@@ -2670,19 +2749,27 @@ fn spawn_server(
     layout_path: Option<&Path>,
 ) -> io::Result<()> {
     log::info!(
-        "spawning session server for {name} (config={config_path:?} layout={layout_path:?})"
+        event = "client.server.spawn",
+        session = name,
+        config:? = config_path.map(crate::logging::redact_path),
+        layout:? = layout_path.map(crate::logging::redact_path);
+        "spawning session server"
     );
     let result = crate::platform::DaemonLauncher::launch(name, config_path, layout_path);
     match &result {
-        Ok(()) => log::info!("session server for {name} reported ready"),
-        Err(error) => log::error!("session server for {name} failed to start: {error}"),
+        Ok(()) => {
+            log::info!(event = "client.server.ready", session = name; "session server reported ready");
+        }
+        Err(error) => {
+            log::error!(event = "client.server.failure", session = name, error:% = error; "session server failed to start");
+        }
     }
     result
 }
 
 fn wait_for_server(name: &str) -> io::Result<(crate::ipc::RecordReader, SharedWriter)> {
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(3);
+    let deadline = started + SERVER_START_WAIT;
     let mut last_error = None;
     let mut attempts = 0_u32;
     while Instant::now() < deadline {
@@ -2690,18 +2777,27 @@ fn wait_for_server(name: &str) -> io::Result<(crate::ipc::RecordReader, SharedWr
         match crate::server::connect(name) {
             Ok(connection) => {
                 log::debug!(
-                    "connected to new server {name} after {attempts} attempt(s), {:?}",
-                    started.elapsed()
+                    event = "client.server.connected",
+                    session = name,
+                    attempts = attempts,
+                    elapsed_ms = started.elapsed().as_millis() as u64;
+                    "connected to new server"
                 );
                 return Ok(connection);
             }
             Err(error) => last_error = Some(error),
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(SERVER_START_POLL);
     }
     let error = last_error
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "server startup timed out"));
-    log::error!("gave up connecting to new server {name} after {attempts} attempt(s): {error}");
+    log::error!(
+        event = "client.server.timeout",
+        session = name,
+        attempts = attempts,
+        error:% = error;
+        "gave up connecting to new server"
+    );
     Err(error)
 }
 
@@ -2715,7 +2811,7 @@ fn is_missing_session(error: &io::Error) -> bool {
 fn send_client(writer: &SharedWriter, message: &ClientMessage) -> io::Result<()> {
     writer
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .send_client(message)
 }
 
@@ -2724,7 +2820,7 @@ fn send_client(writer: &SharedWriter, message: &ClientMessage) -> io::Result<()>
 fn write_output(output: &Arc<Mutex<Box<dyn Write + Send>>>, parts: &[&[u8]]) -> io::Result<()> {
     let mut output = output
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for part in parts {
         output.write_all(part)?;
     }
@@ -2800,7 +2896,7 @@ const OUTPUT_QUEUE_BYTES: usize = MAX_ATOMIC_RENDER_BYTES;
 impl TerminalOutput {
     fn spawn(output: Arc<Mutex<Box<dyn Write + Send>>>, writer: SharedWriter) -> io::Result<Self> {
         let queue = Arc::new((Mutex::new(OutputQueue::default()), Condvar::new()));
-        let worker = queue.clone();
+        let worker = Arc::clone(&queue);
         thread::Builder::new()
             .name("vvmux-terminal-output".into())
             .spawn(move || run_terminal_output(&output, &writer, &worker))?;
@@ -2815,7 +2911,9 @@ impl TerminalOutput {
     /// server to resynchronize with a full redraw.
     fn enqueue_frame(&self, frame_id: u64, full: bool, last: bool, bytes: Vec<u8>) -> bool {
         let (lock, signal) = &*self.queue;
-        let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut queue = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A full redraw makes every earlier diff irrelevant, so it is the one point where the
         // backlog can be discarded without losing screen state.
         if full {
@@ -2844,7 +2942,9 @@ impl TerminalOutput {
 
     fn push(&self, job: OutputJob) {
         let (lock, signal) = &*self.queue;
-        let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut queue = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let OutputJob::Control(bytes) = &job {
             queue.bytes = queue.bytes.saturating_add(bytes.len());
         }
@@ -2855,7 +2955,7 @@ impl TerminalOutput {
     fn stop(&self) {
         let (lock, signal) = &*self.queue;
         lock.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .stopped = true;
         signal.notify_all();
     }
@@ -2869,7 +2969,9 @@ fn run_terminal_output(
     let (lock, signal) = &**queue;
     loop {
         let job = {
-            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
                 if let Some(job) = state.jobs.pop_front() {
                     let (OutputJob::Frame { bytes, .. } | OutputJob::Control(bytes)) = &job;
@@ -2881,7 +2983,7 @@ fn run_terminal_output(
                 }
                 state = signal
                     .wait(state)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         };
         match job {
@@ -3025,12 +3127,12 @@ mod tests {
         #[derive(Clone, Default)]
         struct Capture(Arc<Mutex<Vec<u8>>>);
         impl Write for Capture {
-            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 self.0
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .extend_from_slice(buffer);
-                Ok(buffer.len())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
             }
             fn flush(&mut self) -> io::Result<()> {
                 Ok(())
@@ -3044,7 +3146,7 @@ mod tests {
         let (_reader, writer) = client_establish.join().unwrap().unwrap();
 
         let capture = Capture::default();
-        let written = capture.0.clone();
+        let written = Arc::clone(&capture.0);
         let output: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(capture)));
 
         let queue = Arc::new((Mutex::new(OutputQueue::default()), Condvar::new()));
@@ -3059,7 +3161,7 @@ mod tests {
                 bytes: b"repaint".to_vec(),
             });
             state.stopped = true;
-        }
+        };
         run_terminal_output(&output, &writer, &queue);
 
         let bytes = written.lock().unwrap().clone();
@@ -3161,7 +3263,7 @@ mod tests {
     fn a_discarded_retained_body_reports_failure_once_and_timed_media_does_not() {
         let (sender, receiver) = mpsc::channel();
         let writer = BridgeClientSender::new(move |message| {
-            sender.send(message).map_err(|_| {
+            sender.send(message).map_err(|_closed| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "test message receiver closed")
             })
         });
@@ -3184,7 +3286,7 @@ mod tests {
 
         reject_retained_body(&writer, 9, &media(0, false));
         reject_retained_body(&writer, 9, &media(17, true));
-        assert!(receiver.try_recv().is_err());
+        receiver.try_recv().unwrap_err();
 
         reject_retained_body(&writer, 9, &media(0, true));
         assert!(matches!(
@@ -3195,12 +3297,12 @@ mod tests {
                 delivered: false,
             } if source == key
         ));
-        assert!(receiver.try_recv().is_err());
+        receiver.try_recv().unwrap_err();
     }
 
     fn test_surface(key: BridgeSourceKey) -> BridgeSurface {
         BridgeSurface {
-            key: crate::ipc::BridgeSurfaceKey {
+            key: vivid_sdk::presenter::BridgeSurfaceKey {
                 producer: key.producer,
                 context: key.context,
                 surface: key.surface,
@@ -3210,7 +3312,7 @@ mod tests {
             logical_width: 16,
             logical_height: 16,
             capture_policy: 0,
-            descriptor: crate::ipc::BridgeSourceDescriptor {
+            descriptor: vivid_sdk::presenter::BridgeSourceDescriptor {
                 role: 1,
                 title: "test surface".into(),
                 content_revision: 1,
@@ -3222,13 +3324,13 @@ mod tests {
 
     #[test]
     fn presenter_cell_size_survives_terminal_grid_polling() {
-        let presenter = crate::ipc::DisplayMetrics {
+        let presenter = vivid_sdk::presenter::DisplayMetrics {
             columns: 120,
             rows: 42,
             cell_width: 10,
             cell_height: 25,
         };
-        let mut terminal_resize = crate::ipc::DisplayMetrics {
+        let mut terminal_resize = vivid_sdk::presenter::DisplayMetrics {
             columns: 121,
             rows: 43,
             cell_width: 9,
@@ -3270,7 +3372,7 @@ mod tests {
             &writer,
             JoinOptions::default(),
             crate::ipc::AttachmentTarget::Session,
-            crate::ipc::DisplayMetrics {
+            vivid_sdk::presenter::DisplayMetrics {
                 columns: 80,
                 rows: 24,
                 cell_width: 10,
@@ -3374,7 +3476,7 @@ mod tests {
     #[test]
     fn recreated_playing_video_trace_orders_decoder_recreation_before_play() {
         let messages = Arc::new(Mutex::new(Vec::new()));
-        let captured = messages.clone();
+        let captured = Arc::clone(&messages);
         let sender = BridgeClientSender::new(move |message| {
             captured.lock().unwrap().push(message);
             Ok(())
@@ -3415,7 +3517,7 @@ mod tests {
             playing: true,
             eos_epoch: None,
             causation_id: None,
-            play_request: crate::ipc::BridgePlayRequest {
+            play_request: vivid_sdk::presenter::BridgePlayRequest {
                 start_pts_us: 8_033_333,
                 minimum_buffer_us: 33_000,
                 maximum_latency_us: 500_000,
@@ -3616,13 +3718,13 @@ mod tests {
         struct StalledTerminal(Arc<(Mutex<bool>, Condvar)>);
 
         impl Write for StalledTerminal {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 let (lock, signal) = &*self.0;
                 let mut released = lock.lock().unwrap();
                 while !*released {
                     released = signal.wait(released).unwrap();
                 }
-                Ok(bytes.len())
+                Ok(buf.len())
             }
 
             fn flush(&mut self) -> io::Result<()> {
@@ -3632,7 +3734,7 @@ mod tests {
 
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let output: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(Box::new(StalledTerminal(gate.clone()))));
+            Arc::new(Mutex::new(Box::new(StalledTerminal(Arc::clone(&gate)))));
         let writer = crate::ipc::test_shared_writer(Box::new(io::sink()));
         let terminal = TerminalOutput::spawn(output, writer).unwrap();
 
@@ -3681,9 +3783,9 @@ mod tests {
             media_wakeup: Some(media_wakeup),
             queue_records_per_track: 1,
             snapshot: Arc::new(Mutex::new(None)),
-            dropped: dropped.clone(),
+            dropped: Arc::clone(&dropped),
             generation: 1,
-            queue_drops: queue_drops.clone(),
+            queue_drops: Arc::clone(&queue_drops),
             stopped: Arc::new(AtomicBool::new(false)),
             thread: None,
         };
@@ -3723,7 +3825,7 @@ mod tests {
         assert!(
             dropped
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&11)
         );
         receiver.try_recv().unwrap();
@@ -3731,7 +3833,7 @@ mod tests {
             worker
                 .media
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pop()
                 .unwrap()
                 .generation,
@@ -3763,7 +3865,7 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let mut bridge = crate::bridge::OuterBridge::builder(
+        let mut bridge = vivid_gateway::OuterBridge::builder(
             Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
@@ -3789,7 +3891,7 @@ mod tests {
             height: 1_i64 << 32,
             z_index: 0,
             visible: true,
-            clip: crate::ipc::BridgeClipRect {
+            clip: vivid_sdk::presenter::BridgeClipRect {
                 x: 0,
                 y: 0,
                 width,
@@ -3827,7 +3929,7 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let mut bridge = crate::bridge::OuterBridge::builder(
+        let mut bridge = vivid_gateway::OuterBridge::builder(
             Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
@@ -3865,7 +3967,7 @@ mod tests {
         };
         presenter.update_metrics(7, 80, 22, (10, 20));
         let secret = presenter.issue_pane_capability(7).unwrap();
-        let mut bridge = crate::bridge::OuterBridge::builder(
+        let mut bridge = vivid_gateway::OuterBridge::builder(
             Secret32::from_hex(&secret).unwrap(),
             DisplayMetrics::default(),
         )
@@ -3876,16 +3978,14 @@ mod tests {
         presenter.update_metrics(7, 120, 40, (9, 18));
         let deadline = Instant::now() + Duration::from_secs(1);
         let resized = loop {
-            match bridge.service_session_events().unwrap() {
-                Some(display) => break display,
-                None => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "outer TARGET_CHANGED was not applied"
-                    );
-                    thread::sleep(Duration::from_millis(1));
-                }
+            if let Some(display) = bridge.service_session_events().unwrap() {
+                break display;
             }
+            assert!(
+                Instant::now() < deadline,
+                "outer TARGET_CHANGED was not applied"
+            );
+            thread::sleep(Duration::from_millis(1));
         };
         assert_eq!(
             resized,
@@ -3914,7 +4014,7 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let bridge = crate::bridge::OuterBridge::builder(
+        let bridge = vivid_gateway::OuterBridge::builder(
             Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
@@ -3970,7 +4070,7 @@ mod tests {
             playing: false,
             eos_epoch: None,
             causation_id: None,
-            play_request: crate::ipc::BridgePlayRequest {
+            play_request: vivid_sdk::presenter::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
                 maximum_latency_us: 500_000,
@@ -3992,7 +4092,7 @@ mod tests {
             height: 1_i64 << 32,
             z_index: 0,
             visible: true,
-            clip: crate::ipc::BridgeClipRect {
+            clip: vivid_sdk::presenter::BridgeClipRect {
                 x: 0,
                 y: 0,
                 width: 2_i64 << 32,
@@ -4063,7 +4163,7 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let bridge = crate::bridge::OuterBridge::builder(
+        let bridge = vivid_gateway::OuterBridge::builder(
             Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
@@ -4074,7 +4174,7 @@ mod tests {
         let mut worker = BridgeWorker::spawn_with_sender(
             bridge,
             BridgeClientSender::new(move |message| {
-                message_sender.send(message).map_err(|_| {
+                message_sender.send(message).map_err(|_closed| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "test message receiver closed")
                 })
             }),
@@ -4106,7 +4206,7 @@ mod tests {
             playing: false,
             eos_epoch: None,
             causation_id: None,
-            play_request: crate::ipc::BridgePlayRequest {
+            play_request: vivid_sdk::presenter::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
                 maximum_latency_us: 500_000,
@@ -4128,7 +4228,7 @@ mod tests {
             height: 1_i64 << 32,
             z_index: 0,
             visible: true,
-            clip: crate::ipc::BridgeClipRect {
+            clip: vivid_sdk::presenter::BridgeClipRect {
                 x: 0,
                 y: 0,
                 width: 2_i64 << 32,
@@ -4322,7 +4422,7 @@ mod tests {
             playing: false,
             eos_epoch: None,
             causation_id: None,
-            play_request: crate::ipc::BridgePlayRequest {
+            play_request: vivid_sdk::presenter::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
                 maximum_latency_us: 500_000,
@@ -4348,7 +4448,7 @@ mod tests {
             height: 4_i64 << 32,
             z_index: 0,
             visible: true,
-            clip: crate::ipc::BridgeClipRect {
+            clip: vivid_sdk::presenter::BridgeClipRect {
                 x: 0,
                 y: 0,
                 width: 8_i64 << 32,
@@ -4384,7 +4484,7 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let bridge = crate::bridge::OuterBridge::builder(
+        let bridge = vivid_gateway::OuterBridge::builder(
             Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
@@ -4537,7 +4637,7 @@ mod tests {
         };
         let token = presenter.issue_pane_capability(7).unwrap();
         presenter.update_metrics(7, 80, 22, (10, 20));
-        let bridge = crate::bridge::OuterBridge::builder(
+        let bridge = vivid_gateway::OuterBridge::builder(
             Secret32::from_hex(&token).unwrap(),
             DisplayMetrics::default(),
         )
@@ -4599,7 +4699,7 @@ mod tests {
             playing: false,
             eos_epoch: None,
             causation_id: None,
-            play_request: crate::ipc::BridgePlayRequest {
+            play_request: vivid_sdk::presenter::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 100_000,
                 maximum_latency_us: 500_000,
@@ -4633,7 +4733,7 @@ mod tests {
             playing: false,
             eos_epoch: None,
             causation_id: None,
-            play_request: crate::ipc::BridgePlayRequest {
+            play_request: vivid_sdk::presenter::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
                 maximum_latency_us: 500_000,
@@ -4707,7 +4807,7 @@ mod tests {
         assert_eq!(requests[0].source, video_key);
         assert_eq!(
             requests[0].reason,
-            crate::bridge::KEYFRAME_REASON_TRANSPORT_LOSS
+            vivid_sdk::presenter::KEYFRAME_REASON_TRANSPORT_LOSS
         );
         let outer_audio = outer_media_receiver
             .recv_timeout(Duration::from_secs(1))
@@ -4788,12 +4888,16 @@ mod tests {
         let (initial_outer_video, initial_outer_audio) = loop {
             let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
             let video = snapshot.sources.iter().find(|source| {
-                matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
-                    && source.playing
+                matches!(
+                    source.descriptor,
+                    vivid_sdk::presenter::SourceDescriptor::Video(_)
+                ) && source.playing
             });
             let audio = snapshot.sources.iter().find(|source| {
-                matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_))
-                    && source.playing
+                matches!(
+                    source.descriptor,
+                    vivid_sdk::presenter::SourceDescriptor::Audio(_)
+                ) && source.playing
             });
             if let (Some(video), Some(audio)) = (video, audio) {
                 break (video.key, audio.key);
@@ -4892,10 +4996,16 @@ mod tests {
         loop {
             let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
             let replacement_video = snapshot.sources.iter().find(|source| {
-                matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
+                matches!(
+                    source.descriptor,
+                    vivid_sdk::presenter::SourceDescriptor::Video(_)
+                )
             });
             let replacement_audio = snapshot.sources.iter().find(|source| {
-                matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_))
+                matches!(
+                    source.descriptor,
+                    vivid_sdk::presenter::SourceDescriptor::Audio(_)
+                )
             });
             if replacement_video.is_some_and(|source| source.key != initial_outer_video)
                 && replacement_audio.is_some_and(|source| source.key != initial_outer_audio)
@@ -5015,8 +5125,8 @@ mod tests {
                     source.key.track != 0
                         && matches!(
                             source.descriptor,
-                            crate::media::SourceDescriptor::Video(_)
-                                | crate::media::SourceDescriptor::Audio(_)
+                            vivid_sdk::presenter::SourceDescriptor::Video(_)
+                                | vivid_sdk::presenter::SourceDescriptor::Audio(_)
                         )
                 })
                 .collect::<Vec<_>>();
@@ -5047,8 +5157,10 @@ mod tests {
         loop {
             let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
             if snapshot.sources.iter().any(|source| {
-                matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_))
-                    && source.audio_gain == Some(quieter_gain)
+                matches!(
+                    source.descriptor,
+                    vivid_sdk::presenter::SourceDescriptor::Audio(_)
+                ) && source.audio_gain == Some(quieter_gain)
             }) {
                 break;
             }
@@ -5066,19 +5178,29 @@ mod tests {
         let current_outer_video = snapshot
             .sources
             .iter()
-            .find(|source| matches!(source.descriptor, crate::media::SourceDescriptor::Video(_)))
+            .find(|source| {
+                matches!(
+                    source.descriptor,
+                    vivid_sdk::presenter::SourceDescriptor::Video(_)
+                )
+            })
             .unwrap()
             .key;
         let current_outer_audio = snapshot
             .sources
             .iter()
-            .find(|source| matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_)))
+            .find(|source| {
+                matches!(
+                    source.descriptor,
+                    vivid_sdk::presenter::SourceDescriptor::Audio(_)
+                )
+            })
             .unwrap()
             .key;
         let _ = presenter.request_keyframe(
             current_outer_video,
             None,
-            crate::bridge::KEYFRAME_REASON_DECODER_ERROR,
+            vivid_sdk::presenter::KEYFRAME_REASON_DECODER_ERROR,
         );
         let requests = keyframe_receiver
             .recv_timeout(Duration::from_secs(1))
@@ -5087,7 +5209,7 @@ mod tests {
         assert_eq!(requests[0].source, video_key);
         assert_eq!(
             requests[0].reason,
-            crate::bridge::KEYFRAME_REASON_DECODER_ERROR
+            vivid_sdk::presenter::KEYFRAME_REASON_DECODER_ERROR
         );
 
         // This projection was queued before the server processed BridgeNeedKeyframes. Its empty
@@ -5151,12 +5273,16 @@ mod tests {
         }
         let snapshot = presenter.projection_snapshot(&HashSet::from([7]));
         assert!(snapshot.sources.iter().any(|source| {
-            matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
-                && source.key == current_outer_video
+            matches!(
+                source.descriptor,
+                vivid_sdk::presenter::SourceDescriptor::Video(_)
+            ) && source.key == current_outer_video
         }));
         assert!(snapshot.sources.iter().any(|source| {
-            matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_))
-                && source.key == current_outer_audio
+            matches!(
+                source.descriptor,
+                vivid_sdk::presenter::SourceDescriptor::Audio(_)
+            ) && source.key == current_outer_audio
         }));
     }
 
@@ -5177,7 +5303,7 @@ mod tests {
             };
             let token = presenter.issue_pane_capability(7).unwrap();
             presenter.update_metrics(7, 80, 22, (10, 20));
-            let bridge = crate::bridge::OuterBridge::builder(
+            let bridge = vivid_gateway::OuterBridge::builder(
                 Secret32::from_hex(&token).unwrap(),
                 DisplayMetrics::default(),
             )
@@ -5189,7 +5315,7 @@ mod tests {
             let mut worker = BridgeWorker::spawn_with_sender(
                 bridge,
                 BridgeClientSender::new(move |message| {
-                    message_sender.send(message).map_err(|_| {
+                    message_sender.send(message).map_err(|_closed| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "test message receiver closed")
                     })
                 }),
@@ -5233,7 +5359,7 @@ mod tests {
                 surface: 7,
                 track: 8,
             };
-            let play_request = crate::ipc::BridgePlayRequest {
+            let play_request = vivid_sdk::presenter::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 33_000,
                 maximum_latency_us: 500_000,
@@ -5298,7 +5424,7 @@ mod tests {
                 playing: false,
                 eos_epoch: None,
                 causation_id: None,
-                play_request: crate::ipc::BridgePlayRequest {
+                play_request: vivid_sdk::presenter::BridgePlayRequest {
                     minimum_buffer_us: 0,
                     ..play_request
                 },
@@ -5314,19 +5440,22 @@ mod tests {
                 height: i64::from(video_rect.height) << 32,
                 z_index: 0,
                 visible: true,
-                clip: crate::ipc::BridgeClipRect {
+                clip: vivid_sdk::presenter::BridgeClipRect {
                     x: i64::from(video_rect.x) << 32,
                     y: i64::from(video_rect.y) << 32,
                     width: i64::from(video_rect.width) << 32,
                     height: i64::from(video_rect.height) << 32,
                 },
             };
-            let outer_video = |snapshot: &crate::media::ProjectionSnapshot| {
+            let outer_video = |snapshot: &vivid_sdk::presenter::ProjectionSnapshot| {
                 snapshot
                     .sources
                     .iter()
                     .find(|source| {
-                        matches!(source.descriptor, crate::media::SourceDescriptor::Video(_))
+                        matches!(
+                            source.descriptor,
+                            vivid_sdk::presenter::SourceDescriptor::Video(_)
+                        )
                     })
                     .map(|source| (source.key, source.playing))
             };
@@ -5535,7 +5664,7 @@ mod tests {
                 playing: false,
                 eos_epoch: None,
                 causation_id: None,
-                play_request: crate::ipc::BridgePlayRequest {
+                play_request: vivid_sdk::presenter::BridgePlayRequest {
                     start_pts_us: 0,
                     minimum_buffer_us: 0,
                     maximum_latency_us: 500_000,
@@ -5557,7 +5686,7 @@ mod tests {
                 height: i64::from(image_rect.height) << 32,
                 z_index: 0,
                 visible: true,
-                clip: crate::ipc::BridgeClipRect {
+                clip: vivid_sdk::presenter::BridgeClipRect {
                     x: i64::from(image_rect.x) << 32,
                     y: i64::from(image_rect.y) << 32,
                     width: i64::from(image_rect.width) << 32,
@@ -5721,7 +5850,7 @@ mod tests {
             let expected_recovery = BridgeKeyframeRequest {
                 source: video_key,
                 minimum_epoch: None,
-                reason: crate::bridge::KEYFRAME_REASON_TRANSPORT_LOSS,
+                reason: vivid_sdk::presenter::KEYFRAME_REASON_TRANSPORT_LOSS,
             };
             let recovery_requested = return_messages
                 .iter()
@@ -5745,7 +5874,7 @@ mod tests {
             // Vivi's fixed recovery behavior re-bases PLAY to the same-epoch recovery keyframe before
             // submitting that packet. The worker must apply that playback-only update before media.
             let recovery_pts_us = 8_033_333;
-            let recovery_play = crate::ipc::BridgePlayRequest {
+            let recovery_play = vivid_sdk::presenter::BridgePlayRequest {
                 start_pts_us: recovery_pts_us,
                 ..play_request
             };
@@ -5898,7 +6027,10 @@ mod tests {
             assert!(
                 restored.sources.iter().any(|source| {
                     source.key == recovery_clocks[0]
-                        && matches!(source.descriptor, crate::media::SourceDescriptor::Audio(_))
+                        && matches!(
+                            source.descriptor,
+                            vivid_sdk::presenter::SourceDescriptor::Audio(_)
+                        )
                 }),
                 "recovery PLAY must name linked audio so the physical output is configured and restarted"
             );
@@ -5914,7 +6046,10 @@ mod tests {
             }
             assert!(
                 restored.sources.iter().all(|source| {
-                    !matches!(source.descriptor, crate::media::SourceDescriptor::Image(_))
+                    !matches!(
+                        source.descriptor,
+                        vivid_sdk::presenter::SourceDescriptor::Image(_)
+                    )
                 }),
                 "the hidden image tab must not remain in the outer projection"
             );
@@ -5938,7 +6073,7 @@ mod tests {
         let video = |playing| BridgeSource {
             decoder_reset_serial: 1,
             key: video_key,
-            kind: crate::ipc::BridgeSourceKind::Video {
+            kind: vivid_sdk::presenter::BridgeSourceKind::Video {
                 codec_string: None,
                 decoder_config: None,
                 codec: "h264".into(),
@@ -5965,7 +6100,7 @@ mod tests {
             playing,
             eos_epoch: None,
             causation_id: None,
-            play_request: crate::ipc::BridgePlayRequest {
+            play_request: vivid_sdk::presenter::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 100_000,
                 maximum_latency_us: 500_000,
@@ -5979,7 +6114,7 @@ mod tests {
         let audio = BridgeSource {
             decoder_reset_serial: 1,
             key: audio_key,
-            kind: crate::ipc::BridgeSourceKind::Audio {
+            kind: vivid_sdk::presenter::BridgeSourceKind::Audio {
                 codec_string: None,
                 linked_video: Some(video_key),
                 codec: "aac".into(),
@@ -5999,7 +6134,7 @@ mod tests {
             playing: false,
             eos_epoch: None,
             causation_id: None,
-            play_request: crate::ipc::BridgePlayRequest {
+            play_request: vivid_sdk::presenter::BridgePlayRequest {
                 start_pts_us: 0,
                 minimum_buffer_us: 0,
                 maximum_latency_us: 500_000,
@@ -6119,7 +6254,7 @@ mod tests {
             height: 2_i64 << 32,
             z_index: 0,
             visible: true,
-            clip: crate::ipc::BridgeClipRect {
+            clip: vivid_sdk::presenter::BridgeClipRect {
                 x: x << 32,
                 y: 0,
                 width: 4_i64 << 32,

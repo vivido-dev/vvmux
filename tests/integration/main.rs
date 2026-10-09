@@ -7,7 +7,10 @@
 //! keeps the platform and feature gate it needs, so a target that cannot build a module still
 //! builds the binary.
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "each platform and feature subset uses a different part of the shared harness"
+)]
 mod common;
 
 mod automation_contract;
@@ -37,6 +40,7 @@ mod search;
 mod startup_layout;
 mod sync_input;
 mod tab_sidebar;
+#[cfg(feature = "server-capability")]
 mod tunnel_connect;
 mod unix_focus_reporting;
 mod unix_resize;

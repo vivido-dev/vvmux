@@ -2,12 +2,17 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::{Action, Axis, Direction, DisplayMetrics};
+use crate::ipc::{Action, Axis, Direction};
+use vivid_sdk::presenter::DisplayMetrics;
 
+/// VVWS protocol version spoken by this gateway.
 pub(crate) const VERSION: u16 = 1;
 pub(crate) const SUBPROTOCOL: &str = "vvmux.v1";
+/// Largest VVWS control message, in bytes.
 pub(crate) const MAX_CONTROL_BYTES: usize = 64 * 1024;
+/// Largest VVWS input message, in bytes, matching what one paste may reasonably carry.
 pub(crate) const MAX_INPUT_BYTES: usize = 64 * 1024;
+/// Largest VVWS frame, in bytes.
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -330,17 +335,15 @@ mod tests {
             decode_control(r#"{"type":"list_sessions","request_id":7}"#).unwrap(),
             ClientControl::ListSessions { request_id: 7 }
         );
-        assert!(decode_control(r#"{"type":"list_sessions","request_id":7,"extra":true}"#).is_err());
-        assert!(
-            WireDisplay {
-                columns: 9,
-                rows: 24,
-                cell_width: 8,
-                cell_height: 16,
-            }
-            .validate()
-            .is_err()
-        );
+        decode_control(r#"{"type":"list_sessions","request_id":7,"extra":true}"#).unwrap_err();
+        WireDisplay {
+            columns: 9,
+            rows: 24,
+            cell_width: 8,
+            cell_height: 16,
+        }
+        .validate()
+        .unwrap_err();
     }
 
     #[test]
@@ -365,13 +368,11 @@ mod tests {
             WireAction::ToggleSyncInput.into_ipc().unwrap(),
             Action::ToggleSyncInput
         );
-        assert!(
-            WireAction::CopyInput {
-                bytes: vec![0; MAX_INPUT_BYTES + 1],
-            }
-            .into_ipc()
-            .is_err()
-        );
+        WireAction::CopyInput {
+            bytes: vec![0; MAX_INPUT_BYTES + 1],
+        }
+        .into_ipc()
+        .unwrap_err();
         assert_eq!(
             WireAction::Plugin {
                 reference: "plugin:dev.example/run".into(),
@@ -384,11 +385,9 @@ mod tests {
 
     #[test]
     fn outbound_controls_are_limited_after_json_escaping() {
-        assert!(
-            encode_control(&ServerControl::Clipboard {
-                text: "\\".repeat(MAX_CONTROL_BYTES),
-            })
-            .is_err()
-        );
+        encode_control(&ServerControl::Clipboard {
+            text: "\\".repeat(MAX_CONTROL_BYTES),
+        })
+        .unwrap_err();
     }
 }

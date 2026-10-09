@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use vivid_protocol::cbor::Value;
 use vivid_protocol::media;
 use vivid_protocol::track::{
-    KindConfiguration, RasterConfiguration, TrackConfiguration, TrackMode,
+    KindConfiguration, RasterConfiguration, TrackConfiguration, TrackDirection, TrackMode,
 };
 use vivid_sdk::{
     CoordinateModel, Fit, LaneClass, MILESTONE_OUTPUT_READY, ProducerConfig, RequestMetadata,
@@ -31,7 +31,7 @@ fn run() -> io::Result<()> {
         .map(|value| {
             value
                 .parse::<u64>()
-                .map_err(|_| invalid("VVMUX_MEDIA_SOAK_SECONDS is not an unsigned integer"))
+                .map_err(|_invalid| invalid("VVMUX_MEDIA_SOAK_SECONDS is not an unsigned integer"))
         })
         .transpose()?
         .unwrap_or(DEFAULT_DURATION_SECONDS);
@@ -97,7 +97,7 @@ fn run() -> io::Result<()> {
     let maximum_record_body = media::rgba8_raw_frame_body_len(1, 1).map_err(io::Error::other)?;
     let track = client.create_track(
         TrackConfiguration {
-            direction: Default::default(),
+            direction: TrackDirection::default(),
             context_id: context,
             surface_id,
             track_id,

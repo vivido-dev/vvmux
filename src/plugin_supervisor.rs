@@ -19,12 +19,20 @@ use vvmux_plugin_api::{Activation, Event, EventHook, HostCall, Permission};
 use crate::ipc::{AutomationError, PluginEventEnvelope};
 use crate::session::{ActorEvent, AutomationReplyTarget};
 
+/// Capacity of the supervisor's command channel from the session actor, which only ever uses
+/// `try_send`.
 const COMMAND_QUEUE: usize = 32;
+/// Capacity of each plugin worker's message channel.
 const PLUGIN_QUEUE: usize = 128;
+/// Most plugin jobs running at once in a session.
 const MAX_SESSION_JOBS: usize = 16;
+/// Most jobs one plugin may run at once, so one plugin cannot take every session slot.
 const MAX_PLUGIN_JOBS: usize = 4;
+/// Completed jobs kept for `plugin jobs` queries.
 const MAX_RETAINED_JOBS: usize = 200;
+/// Log output kept per completed job.
 const MAX_RETAINED_LOG_BYTES: usize = 256 * 1024;
+/// Event-triggered workflows one plugin may have queued.
 const MAX_PENDING_EVENT_WORKFLOWS_PER_PLUGIN: usize = 128;
 
 #[derive(Clone)]
@@ -96,12 +104,12 @@ impl HostBroker {
         let cause = Arc::new(Mutex::new(None));
         self.tokens
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 token.clone(),
                 BrokerIdentity {
                     scope: scope.clone(),
-                    cause: cause.clone(),
+                    cause: Arc::clone(&cause),
                 },
             );
         Ok(BrokerLease {
@@ -122,14 +130,14 @@ impl HostBroker {
         let cause = self
             .tokens
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(token)
             .filter(|registered| registered.scope == *scope)
             .map(|registered| {
                 registered
                     .cause
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone()
             });
         let Some(cause) = cause else {
@@ -250,7 +258,7 @@ impl BrokerLease {
         *self
             .cause
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PluginCause {
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PluginCause {
             source: format!(
                 "plugin:{}:{}",
                 self.scope.plugin_id, self.scope.plugin_instance
@@ -261,7 +269,7 @@ impl BrokerLease {
             pane_id: context.pane_id,
             tab_id: context.tab_id,
         });
-        CauseReset(self.cause.clone())
+        CauseReset(Arc::clone(&self.cause))
     }
 }
 
@@ -270,7 +278,7 @@ impl Drop for CauseReset {
         *self
             .0
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -279,7 +287,7 @@ impl Drop for BrokerLease {
         self.broker
             .tokens
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.token);
     }
 }
@@ -691,7 +699,7 @@ impl PluginSupervisor {
     ) -> io::Result<(Self, u64, Arc<crate::agent::AgentCatalog>)> {
         let initial_registry = scan_registry();
         let agent_catalog_generation = initial_registry.generation;
-        let agent_catalog = initial_registry.agent_catalog.clone();
+        let agent_catalog = Arc::clone(&initial_registry.agent_catalog);
         let (sender, receiver) = mpsc::sync_channel(COMMAND_QUEUE);
         let broker = HostBroker {
             actor: actor.clone(),
@@ -701,9 +709,9 @@ impl PluginSupervisor {
         };
         let manager_sender = sender.clone();
         let reload_requested = Arc::new(AtomicBool::new(false));
-        let manager_reload_requested = reload_requested.clone();
+        let manager_reload_requested = Arc::clone(&reload_requested);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let manager_shutdown_requested = shutdown_requested.clone();
+        let manager_shutdown_requested = Arc::clone(&shutdown_requested);
         let manager_session_name = session_name.clone();
         let manager_session_instance = session_instance.clone();
         let event_gap = Arc::new(Mutex::new(None));
@@ -897,7 +905,7 @@ impl PluginSupervisor {
         let pending_gap = self
             .event_gap
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some((from_sequence, to_sequence)) = pending_gap
             && self
@@ -911,14 +919,15 @@ impl PluginSupervisor {
             *self
                 .event_gap
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((from_sequence, sequence));
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((from_sequence, sequence));
             return;
         }
         if self.sender.try_send(Message::PublishEvent(event)).is_err() {
             let mut gap = self
                 .event_gap
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(gap) = gap.as_mut() {
                 gap.1 = sequence;
             } else {
@@ -951,7 +960,7 @@ fn run_manager(inputs: ManagerInputs) {
     let mut registry = initial_registry;
     let _ = actor.send(ActorEvent::AgentCatalogApplied {
         generation: registry.generation,
-        catalog: registry.agent_catalog.clone(),
+        catalog: Arc::clone(&registry.agent_catalog),
     });
     let (generation, keybindings, link_handlers) =
         crate::plugin::effective_registrations(registry.generation, &registry.plugins);
@@ -1027,12 +1036,10 @@ fn run_manager(inputs: ManagerInputs) {
                 match result {
                     Ok(job) => {
                         if let Err(error) = sender.try_send(Message::Invoke(job)) {
-                            let job = match error {
-                                mpsc::TrySendError::Full(Message::Invoke(job))
-                                | mpsc::TrySendError::Disconnected(Message::Invoke(job)) => job,
-                                _ => unreachable!(
-                                    "dependency submission queues only invocation jobs"
-                                ),
+                            let (mpsc::TrySendError::Full(Message::Invoke(job))
+                            | mpsc::TrySendError::Disconnected(Message::Invoke(job))) = error
+                            else {
+                                unreachable!("dependency submission queues only invocation jobs")
                             };
                             deliver(
                                 &actor,
@@ -1120,7 +1127,7 @@ fn run_manager(inputs: ManagerInputs) {
                     };
                     let run_id = job.id;
                     let public_id = job.public_id.clone();
-                    let cancel = job.cancel.clone();
+                    let cancel = Arc::clone(&job.cancel);
                     let mut timeout = std::time::Duration::from_millis(workflow.timeout_ms);
                     if let Some(context_deadline) = job
                         .context
@@ -1238,7 +1245,7 @@ fn run_manager(inputs: ManagerInputs) {
                 let active_job = ActiveJob {
                     plugin_id: job.plugin_id.clone(),
                     client_id,
-                    cancel: job.cancel.clone(),
+                    cancel: Arc::clone(&job.cancel),
                     public_id: job.public_id.clone(),
                 };
                 let job_id = job.id;
@@ -1247,15 +1254,17 @@ fn run_manager(inputs: ManagerInputs) {
                         mpsc::TrySendError::Full(WorkerMessage::Invoke(job)) => (job, false),
                         mpsc::TrySendError::Disconnected(WorkerMessage::Invoke(job)) => (job, true),
                         mpsc::TrySendError::Full(
-                            WorkerMessage::Shutdown | WorkerMessage::Activate,
+                            WorkerMessage::Shutdown
+                            | WorkerMessage::Activate
+                            | WorkerMessage::Event { .. }
+                            | WorkerMessage::WorkflowStep(_),
                         )
                         | mpsc::TrySendError::Disconnected(
-                            WorkerMessage::Shutdown | WorkerMessage::Activate,
-                        )
-                        | mpsc::TrySendError::Full(WorkerMessage::Event { .. })
-                        | mpsc::TrySendError::Disconnected(WorkerMessage::Event { .. })
-                        | mpsc::TrySendError::Full(WorkerMessage::WorkflowStep(_))
-                        | mpsc::TrySendError::Disconnected(WorkerMessage::WorkflowStep(_)) => {
+                            WorkerMessage::Shutdown
+                            | WorkerMessage::Activate
+                            | WorkerMessage::Event { .. }
+                            | WorkerMessage::WorkflowStep(_),
+                        ) => {
                             unreachable!("the supervisor only submits invocation messages here")
                         }
                     };
@@ -1998,7 +2007,10 @@ fn restore_pending_event_workflow(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the supervisor loop's independently borrowed state"
+)]
 fn drain_pending_event_workflows(
     pending: &mut BTreeMap<(String, String), PendingEventWorkflow>,
     queued: &mut BTreeSet<(String, String)>,
@@ -2072,8 +2084,10 @@ fn drain_pending_event_workflows(
                 queued.insert(key);
                 *next_id = next_id.checked_add(1).unwrap_or(1_u64 << 63);
             }
-            Err(mpsc::TrySendError::Full(Message::Invoke(_))) => break,
-            Err(mpsc::TrySendError::Disconnected(Message::Invoke(_))) => break,
+            Err(
+                mpsc::TrySendError::Full(Message::Invoke(_))
+                | mpsc::TrySendError::Disconnected(Message::Invoke(_)),
+            ) => break,
             Err(_) => unreachable!("event workflows queue only invocation jobs"),
         }
     }
@@ -2130,7 +2144,10 @@ fn flush_plugin_event_gap(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the supervisor loop's independently borrowed state"
+)]
 fn resolve_dependency_invocation(
     registry: &AppliedRegistry,
     transitions: &BTreeSet<String>,
@@ -2269,7 +2286,7 @@ fn spawn_worker(
 ) -> io::Result<(mpsc::SyncSender<WorkerMessage>, Arc<AtomicBool>)> {
     let (sender, receiver) = mpsc::sync_channel(PLUGIN_QUEUE);
     let shutdown = Arc::new(AtomicBool::new(false));
-    let worker_shutdown = shutdown.clone();
+    let worker_shutdown = Arc::clone(&shutdown);
     let plugin_id = plugin.id.clone();
     let digest = plugin.digest.clone();
     let session_name = session_name.to_owned();
@@ -2288,7 +2305,7 @@ fn spawn_worker(
                         let result = runtime.invoke(
                             &job.reference,
                             job.input.clone(),
-                            job.cancel.clone(),
+                            Arc::clone(&job.cancel),
                             job.context.clone(),
                         );
                         let logs = runtime.take_logs();
@@ -2303,7 +2320,7 @@ fn spawn_worker(
                         let result = runtime.invoke(
                             &step.reference,
                             step.input.clone(),
-                            step.cancel.clone(),
+                            Arc::clone(&step.cancel),
                             step.context.clone(),
                         );
                         let logs = runtime.take_logs();
@@ -2325,7 +2342,7 @@ fn spawn_worker(
                     WorkerMessage::Event { hook, event } => {
                         let context = event.context.clone();
                         if runtime
-                            .on_event(&hook, event, worker_shutdown.clone())
+                            .on_event(&hook, event, Arc::clone(&worker_shutdown))
                             .is_err_and(|error| error.to_string().starts_with("runtime_crashed"))
                         {
                             let _ = manager.send(Message::RuntimeCrashed {
@@ -2344,7 +2361,10 @@ fn spawn_worker(
     Ok((sender, shutdown))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the supervisor loop's independently borrowed state"
+)]
 fn advance_all_workflows(
     workflows: &mut HashMap<u64, WorkflowRun>,
     registry: &AppliedRegistry,
@@ -2379,7 +2399,10 @@ fn advance_all_workflows(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the supervisor loop's independently borrowed state"
+)]
 fn advance_workflow(
     run_id: u64,
     workflows: &mut HashMap<u64, WorkflowRun>,
@@ -2516,7 +2539,7 @@ fn advance_workflow(
             reference: step.reference.clone(),
             input,
             context: run.job.context.clone(),
-            cancel: run.job.cancel.clone(),
+            cancel: Arc::clone(&run.job.cancel),
             started_ms,
             plugin_id: plugin_id.to_owned(),
             plugin_version: plugin.version.clone(),
@@ -2655,14 +2678,14 @@ fn spawn_registry_load(
     completions: Vec<ReloadCompletion>,
 ) -> Result<(), (AutomationError, Vec<ReloadCompletion>)> {
     let shared_completions = Arc::new(Mutex::new(Some(completions)));
-    let thread_completions = shared_completions.clone();
+    let thread_completions = Arc::clone(&shared_completions);
     thread::Builder::new()
         .name("vvmux-plugin-registry-load".into())
         .spawn(move || {
             let result = crate::plugin::load_registry_candidate();
             let completions = thread_completions
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
                 .unwrap_or_default();
             let _ = manager.send(Message::ReloadLoaded {
@@ -2674,7 +2697,7 @@ fn spawn_registry_load(
         .map_err(|error| {
             let completions = shared_completions
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
                 .unwrap_or_default();
             (
@@ -2723,18 +2746,15 @@ fn apply_registry_candidate(
             });
         }
         if changed {
-            match next {
-                Some(plugin) => {
-                    registry.plugins.insert(id.clone(), plugin.clone());
-                    registry.catalog.insert(
-                        id.clone(),
-                        candidate.catalog.get(&id).cloned().unwrap_or_default(),
-                    );
-                }
-                None => {
-                    registry.plugins.remove(&id);
-                    registry.catalog.remove(&id);
-                }
+            if let Some(plugin) = next {
+                registry.plugins.insert(id.clone(), plugin.clone());
+                registry.catalog.insert(
+                    id.clone(),
+                    candidate.catalog.get(&id).cloned().unwrap_or_default(),
+                );
+            } else {
+                registry.plugins.remove(&id);
+                registry.catalog.remove(&id);
             }
         }
         let worker_needs_stop = workers.get(&id).is_some_and(|worker| {
@@ -2771,7 +2791,7 @@ fn apply_registry_candidate(
         registry.agent_catalog = candidate.agent_catalog;
         let _ = actor.send(ActorEvent::AgentCatalogApplied {
             generation: registry.generation,
-            catalog: registry.agent_catalog.clone(),
+            catalog: Arc::clone(&registry.agent_catalog),
         });
     }
     registry.failures = candidate.failed;
@@ -3077,7 +3097,7 @@ mod tests {
                 sender
             },
             session_instance: "session-a".into(),
-            tokens: tokens.clone(),
+            tokens: Arc::clone(&tokens),
         };
         let lease = broker
             .issue("dev.example", "instance-a", &[Permission::PaneRead])

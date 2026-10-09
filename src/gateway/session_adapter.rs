@@ -5,8 +5,11 @@ use std::thread;
 
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::ipc::{ClientMessage, DisplayMetrics, ServerMessage};
+use crate::ipc::{ClientMessage, ServerMessage};
+use vivid_sdk::presenter::DisplayMetrics;
 
+/// Messages queued toward the session writer thread for one gateway client; senders block when it
+/// is full.
 const WRITER_QUEUE_MESSAGES: usize = 256;
 
 pub(crate) struct SessionAdapter {
@@ -77,7 +80,7 @@ impl SessionAdapter {
             };
             writer
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .send(&ClientMessage::Attach {
                     replace: takeover,
                     target: crate::ipc::AttachmentTarget::Session,
@@ -112,14 +115,14 @@ impl SessionAdapter {
         let cancel = reader.cancel_handle();
         let reader_cancel = cancel.clone();
         let (writer_sender, writer_receiver) = mpsc::sync_channel(WRITER_QUEUE_MESSAGES);
-        let writer_thread = writer.clone();
+        let writer_thread = Arc::clone(&writer);
         thread::Builder::new()
             .name("vvmux-gateway-ipc-writer".into())
             .spawn(move || {
                 while let Ok(message) = writer_receiver.recv() {
                     if writer_thread
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .send_client(&message)
                         .is_err()
                     {
@@ -132,8 +135,8 @@ impl SessionAdapter {
         let (event_sender, event_receiver) = tokio_mpsc::channel(maximum_messages);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let overloaded = Arc::new(AtomicBool::new(false));
-        let reader_overloaded = overloaded.clone();
-        let reader_bytes = queued_bytes.clone();
+        let reader_overloaded = Arc::clone(&overloaded);
+        let reader_bytes = Arc::clone(&queued_bytes);
         let media_writer = writer_sender.clone();
         thread::Builder::new()
             .name("vvmux-gateway-ipc-reader".into())
@@ -151,13 +154,10 @@ impl SessionAdapter {
                         reader_cancel.cancel();
                         break;
                     }
-                    let (message, size) = match store_message(message, outbound_queue_bytes) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            reader_overloaded.store(true, Ordering::Release);
-                            reader_cancel.cancel();
-                            break;
-                        }
+                    let Ok((message, size)) = store_message(message, outbound_queue_bytes) else {
+                        reader_overloaded.store(true, Ordering::Release);
+                        reader_cancel.cancel();
+                        break;
                     };
                     if !reserve_bytes(&reader_bytes, size, outbound_queue_bytes) {
                         reader_overloaded.store(true, Ordering::Release);
@@ -167,7 +167,7 @@ impl SessionAdapter {
                     let queued = QueuedServerMessage {
                         message: Some(message),
                         size,
-                        queued_bytes: reader_bytes.clone(),
+                        queued_bytes: Arc::clone(&reader_bytes),
                     };
                     if event_sender.try_send(queued).is_err() {
                         reader_overloaded.store(true, Ordering::Release);
@@ -247,25 +247,16 @@ enum StoredMessage {
 }
 
 fn store_message(message: ServerMessage, maximum: usize) -> io::Result<(StoredMessage, usize)> {
-    let overhead = std::mem::size_of::<ServerMessage>() + 256;
-    if let ServerMessage::Render { bytes, .. } | ServerMessage::MediaRecord { bytes, .. } = &message
-    {
-        let size = overhead
-            .checked_add(bytes.capacity())
-            .filter(|size| *size <= maximum)
-            .ok_or_else(|| io::Error::other("gateway message exceeds queue budget"))?;
-        return Ok((StoredMessage::Binary(Box::new(message)), size));
-    }
     struct Bounded {
         bytes: Vec<u8>,
         maximum: usize,
     }
     impl std::io::Write for Bounded {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             let next = self
                 .bytes
                 .len()
-                .checked_add(bytes.len())
+                .checked_add(buf.len())
                 .filter(|next| *next <= self.maximum)
                 .ok_or_else(|| io::Error::other("gateway message exceeds queue budget"))?;
             if next > self.bytes.capacity() {
@@ -276,12 +267,21 @@ fn store_message(message: ServerMessage, maximum: usize) -> io::Result<(StoredMe
                     .try_reserve_exact(capacity - self.bytes.len())
                     .map_err(io::Error::other)?;
             }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+    let overhead = std::mem::size_of::<ServerMessage>() + 256;
+    if let ServerMessage::Render { bytes, .. } | ServerMessage::MediaRecord { bytes, .. } = &message
+    {
+        let size = overhead
+            .checked_add(bytes.capacity())
+            .filter(|size| *size <= maximum)
+            .ok_or_else(|| io::Error::other("gateway message exceeds queue budget"))?;
+        return Ok((StoredMessage::Binary(Box::new(message)), size));
     }
     let mut encoded = Bounded {
         bytes: Vec::new(),

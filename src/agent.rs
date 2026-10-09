@@ -1,6 +1,6 @@
 //! Passive and explicitly reported AI-agent state for terminal panes.
 //!
-//! Process discovery and terminal rules are adapted from HerdR commit
+//! Process discovery and terminal rules are adapted from `HerdR` commit
 //! 6c6ddcd49384d6ea9f0ee2e63bf7b2643dfd5bcf (Apache-2.0). See
 //! `agent/PROVENANCE.md` for the source inventory and adaptation notes.
 
@@ -18,6 +18,7 @@ use vvmux_terminal::pty::PtyControl;
 
 use crate::layout::PaneId;
 
+/// Longest `source` an agent report may carry, in bytes.
 pub const MAX_REPORT_SOURCE_BYTES: usize = 128;
 /// Distinct reporting sources one pane retains sequence state for.
 ///
@@ -32,11 +33,15 @@ pub const MAX_AGENT_SESSION_BYTES: usize = 256;
 pub const MAX_AGENT_ALIAS_BYTES: usize = 32;
 /// Display-only tokens one pane retains.
 pub const MAX_METADATA_TOKENS: usize = 16;
+/// Longest metadata token key, in bytes.
 pub const MAX_METADATA_KEY_BYTES: usize = 32;
+/// Longest metadata token value or state label, in bytes; these are shown in the tab bar.
 pub const MAX_METADATA_VALUE_BYTES: usize = 128;
 /// Custom status names, one per [`AgentStatus`].
 pub const MAX_METADATA_STATE_LABELS: usize = 4;
+/// Longest display name an integration may set for its agent, in bytes.
 pub const MAX_DISPLAY_AGENT_BYTES: usize = 64;
+/// Longest agent title an integration may set, in bytes.
 pub const MAX_AGENT_TITLE_BYTES: usize = 128;
 /// Matches the automation timeout ceiling, so a TTL cannot outlive what a caller can wait for.
 pub const MAX_METADATA_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -44,13 +49,47 @@ pub const MAX_METADATA_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_DETECTION_BYTES: usize = 64 * 1024;
 /// Region excerpt returned per rule by `agent-explain`.
 const MAX_REGION_PREVIEW_BYTES: usize = 256;
+/// Consecutive idle observations needed before a working agent is reported idle. Agents redraw
+/// briefly idle-looking screens between steps; requiring repeats avoids flapping.
 const IDLE_CONFIRMATIONS: u8 = 3;
+/// Longest the idle confirmation may take; after this the idle state is accepted even without
+/// [`IDLE_CONFIRMATIONS`] observations, so a quiet screen is not stuck as working.
 const IDLE_CONFIRMATION_LIMIT: Duration = Duration::from_millis(700);
+/// How soon to re-examine the screen while an idle confirmation is pending, so confirmation does
+/// not wait for the next output.
 const IDLE_CONFIRMATION_RECHECK: Duration = Duration::from_millis(100);
+/// Time after an agent is identified during which it is reported idle regardless of its screen,
+/// while it draws its first frames.
 const STARTUP_GRACE: Duration = Duration::from_secs(3);
+/// How often a pane's whole process tree is re-scanned for agents, as a fallback to the cheaper
+/// foreground check.
 const FULL_PROCESS_RECHECK: Duration = Duration::from_secs(5);
+/// How often the process detector wakes without a command, to re-check panes' foreground jobs.
+///
+/// Short enough that starting an agent is noticed within a moment; each wake is a cheap
+/// foreground-group check per pane.
+const DETECTOR_POLL_INTERVAL: Duration = Duration::from_millis(400);
+/// How often a pane with no agent identified is re-examined, so a newly started agent is found
+/// quickly while panes with a known agent use the slower [`FULL_PROCESS_RECHECK`].
+const UNIDENTIFIED_PROCESS_RECHECK: Duration = Duration::from_millis(500);
+/// Most bytes of one process's command line read during agent detection.
 #[cfg(unix)]
 const MAX_PROCESS_ARGV_BYTES: usize = 64 * 1024;
+
+/// Most processes listed from one foreground process group on macOS.
+///
+/// A terminal job rarely has more than a handful of processes; 4096 bounds a pathological group
+/// while keeping the PID buffer at 16 KiB. A larger group is truncated, which only limits agent
+/// detection to the first processes listed.
+#[cfg(target_os = "macos")]
+const MAX_GROUP_PROCESSES: usize = 4096;
+
+/// Most processes read from one Windows process snapshot.
+///
+/// Larger than any realistic desktop process table, so detection sees every candidate; the bound
+/// keeps a hostile or broken snapshot from growing the scan without limit.
+#[cfg(windows)]
+const MAX_SNAPSHOT_PROCESSES: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema)]
 pub struct AgentId(String);
@@ -78,8 +117,8 @@ impl AgentId {
 }
 
 impl fmt::Display for AgentId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -150,8 +189,8 @@ impl AgentAlias {
 }
 
 impl fmt::Display for AgentAlias {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -323,9 +362,8 @@ impl AgentSessionRef {
 /// Redacted on purpose. This type exists to be withheld, and a derived `Debug` would leak it
 /// through any diagnostic that formats a pane, a runtime, or an actor event.
 impl fmt::Debug for AgentSessionRef {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AgentSessionRef")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentSessionRef")
             .field("id", &self.id.is_some())
             .field("path", &self.path.is_some())
             .finish()
@@ -334,7 +372,7 @@ impl fmt::Debug for AgentSessionRef {
 
 /// Display-only annotations an integration attaches to a pane.
 ///
-/// Adapted from HerdR's `src/metadata_tokens.rs` (Apache-2.0); see `agent/PROVENANCE.md`.
+/// Adapted from `HerdR`'s `src/metadata_tokens.rs` (Apache-2.0); see `agent/PROVENANCE.md`.
 ///
 /// Deliberately outside [`AgentSnapshot`]: these are presentation details that can change on every
 /// tool call ("indexing 42 files"), while a snapshot is the lifecycle fact that waiters and
@@ -357,6 +395,10 @@ struct MetadataToken {
 /// One display-only metadata update. A `None` value clears that field; a field absent from the
 /// patch is left alone, so an integration can update one token without restating the rest.
 #[derive(Debug, Clone, Default)]
+#[expect(
+    clippy::option_option,
+    reason = "the outer `Option` is presence in the patch, the inner one a value or a clear"
+)]
 pub struct AgentMetadataPatch {
     pub tokens: Vec<(String, Option<String>)>,
     pub ttl: Option<Duration>,
@@ -487,7 +529,7 @@ impl AgentMetadata {
         for (status, label) in patch.state_labels {
             match label {
                 Some(label) => {
-                    changed |= self.state_labels.insert(status, label.clone()) != Some(label)
+                    changed |= self.state_labels.insert(status, label.clone()) != Some(label);
                 }
                 None => changed |= self.state_labels.remove(&status).is_some(),
             }
@@ -1087,6 +1129,7 @@ struct CompiledAgent {
 }
 
 impl AgentCatalog {
+    /// Most agent definitions enabled at once across all installed packages.
     pub const MAX_ENABLED_AGENTS: usize = 64;
 
     pub fn compile(sources: Vec<AgentCatalogSource>) -> Result<Self, String> {
@@ -1699,7 +1742,7 @@ pub fn start_detector(
             let mut cached =
                 BTreeMap::<PaneId, (Option<u32>, Option<AgentIdentity>, Instant)>::new();
             loop {
-                match receiver.recv_timeout(Duration::from_millis(400)) {
+                match receiver.recv_timeout(DETECTOR_POLL_INTERVAL) {
                     Ok(DetectorCommand::Targets(next)) => targets = next,
                     Ok(DetectorCommand::Catalog(next)) => {
                         catalog = next;
@@ -1735,7 +1778,7 @@ pub fn start_detector(
                                         >= if old_kind.is_some() {
                                             FULL_PROCESS_RECHECK
                                         } else {
-                                            Duration::from_millis(500)
+                                            UNIDENTIFIED_PROCESS_RECHECK
                                         }
                             });
                     if !needs_full {
@@ -1785,7 +1828,6 @@ fn identify_foreground_agent(
 /// actor — see `SessionActor::probe_agent_foreground`.
 // Reached once `agent-start` and `agent-prompt` land; the probe path that calls it is already
 // wired through the actor.
-#[allow(dead_code)]
 pub fn foreground_job(
     catalog: &AgentCatalog,
     child_pid: u32,
@@ -1814,7 +1856,6 @@ struct ProcessInfo {
     /// child PID must treat that as "not the child" rather than a match.
     ///
     /// Read only through `foreground_job`, which the agent-drive features consume.
-    #[allow(dead_code)]
     pid: u32,
     name: String,
     argv: Vec<String>,
@@ -1885,9 +1926,8 @@ fn python_script_argument(argv: &[String]) -> Option<&str> {
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-c" => return None,
-            "-m" => return arguments.next().map(String::as_str),
-            "--" => return arguments.next().map(String::as_str),
-            value if value.starts_with('-') => continue,
+            "-m" | "--" => return arguments.next().map(String::as_str),
+            value if value.starts_with('-') => {}
             _ => return Some(argument),
         }
     }
@@ -1933,7 +1973,7 @@ fn powershell_command_argument(argv: &[String]) -> Option<&str> {
             | "-version" | "-windowstyle" | "-workingdirectory" => {
                 let _ = arguments.next();
             }
-            value if value.starts_with('-') || value.starts_with('/') => continue,
+            value if value.starts_with('-') || value.starts_with('/') => {}
             _ => return Some(argument),
         }
     }
@@ -2037,11 +2077,15 @@ fn foreground_processes(_child_pid: u32, group: Option<u32>) -> Vec<ProcessInfo>
 
 #[cfg(target_os = "macos")]
 fn foreground_processes(_child_pid: u32, group: Option<u32>) -> Vec<ProcessInfo> {
+    /// `proc_listpids` selector for "processes in this process group" (`<sys/proc_info.h>`).
     const PROC_PGRP_ONLY: u32 = 2;
     let Some(group) = group else {
         return Vec::new();
     };
-    let mut pids = vec![0 as libc::pid_t; 4096];
+    let mut pids: Vec<libc::pid_t> = vec![0; MAX_GROUP_PROCESSES];
+    // SAFETY: the buffer is the live `pids` allocation, and the size passed is its exact length
+    // in bytes, so the kernel writes at most that many bytes of PIDs into it. The result is the
+    // number of bytes written.
     let bytes = unsafe {
         libc::proc_listpids(
             PROC_PGRP_ONLY,
@@ -2071,12 +2115,14 @@ fn foreground_processes(_child_pid: u32, group: Option<u32>) -> Vec<ProcessInfo>
 fn macos_argv(pid: u32) -> Option<Vec<String>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let mut size = 0;
+    // SAFETY: `mib` is a live three-element name array, and a null output buffer asks only for
+    // the required size, which is written to the live `size` local.
     if unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
             3,
             std::ptr::null_mut(),
-            &mut size,
+            &raw mut size,
             std::ptr::null_mut(),
             0,
         )
@@ -2087,12 +2133,14 @@ fn macos_argv(pid: u32) -> Option<Vec<String>> {
         return None;
     }
     let mut bytes = vec![0_u8; size];
+    // SAFETY: the output buffer is the live `bytes` allocation of exactly `size` bytes, and
+    // `sysctl` writes at most `size` bytes and updates `size` with the length written.
     if unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
             3,
             bytes.as_mut_ptr().cast(),
-            &mut size,
+            &raw mut size,
             std::ptr::null_mut(),
             0,
         )
@@ -2131,6 +2179,8 @@ fn foreground_processes(child_pid: u32, _group: Option<u32>) -> Vec<ProcessInfo>
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
+    // SAFETY: `CreateToolhelp32Snapshot` takes plain values and returns a new handle or an
+    // invalid-handle sentinel.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Vec::new();
@@ -2140,8 +2190,10 @@ fn foreground_processes(child_pid: u32, _group: Option<u32>) -> Vec<ProcessInfo>
         ..Default::default()
     };
     let mut rows = Vec::new();
-    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
-    while ok && rows.len() < 16_384 {
+    // SAFETY: `snapshot` is open, and `entry` is a live structure whose `dwSize` is set as the
+    // API requires.
+    let mut ok = unsafe { Process32FirstW(snapshot, &raw mut entry) } != 0;
+    while ok && rows.len() < MAX_SNAPSHOT_PROCESSES {
         let length = entry
             .szExeFile
             .iter()
@@ -2153,8 +2205,10 @@ fn foreground_processes(child_pid: u32, _group: Option<u32>) -> Vec<ProcessInfo>
             String::from_utf16_lossy(&entry.szExeFile[..length]),
             windows_command_line(entry.th32ProcessID),
         ));
-        ok = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        // SAFETY: as for `Process32FirstW` above.
+        ok = unsafe { Process32NextW(snapshot, &raw mut entry) } != 0;
     }
+    // SAFETY: `snapshot` was opened above and is closed exactly once.
     unsafe { CloseHandle(snapshot) };
     let mut children = HashMap::<u32, Vec<(u32, String, Vec<String>)>>::new();
     let mut root = None;
@@ -2233,24 +2287,39 @@ fn windows_command_line(pid: u32) -> Option<String> {
         environment: *mut c_void,
     }
 
+    /// Copy one `T` out of another process's address space.
+    ///
+    /// The foreign memory is untrusted: pointers inside the copied value are only ever used as
+    /// addresses for further `ReadProcessMemory` calls, never dereferenced in this process.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be plain old data that is valid for every bit pattern: `#[repr(C)]` and built only
+    /// from integers, raw pointers, and arrays or structs of those. `process` must be an open
+    /// handle with `PROCESS_VM_READ` access.
     unsafe fn read_value<T: Copy>(process: HANDLE, address: *const c_void) -> Option<T> {
         if address.is_null() {
             return None;
         }
         let mut value = MaybeUninit::<T>::uninit();
         let mut read = 0;
+        // SAFETY: the destination is the live `value` buffer of exactly `size_of::<T>()` bytes,
+        // and `read` is a live local; the caller guarantees `process` has read access.
         let ok = unsafe {
             ReadProcessMemory(
                 process,
                 address,
                 value.as_mut_ptr().cast(),
                 size_of::<T>(),
-                &mut read,
+                &raw mut read,
             )
         } != 0;
+        // SAFETY: a complete read initialized every byte, and the caller guarantees that any bit
+        // pattern is a valid `T`.
         (ok && read == size_of::<T>()).then(|| unsafe { value.assume_init() })
     }
 
+    // SAFETY: `OpenProcess` takes plain values and returns a new handle or null.
     let process =
         unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
     if process.is_null() {
@@ -2258,6 +2327,8 @@ fn windows_command_line(pid: u32) -> Option<String> {
     }
     let result = (|| {
         let mut basic = MaybeUninit::<PROCESS_BASIC_INFORMATION>::uninit();
+        // SAFETY: `process` is open with query access, and the buffer is the live `basic` value
+        // with its exact size.
         let status = unsafe {
             NtQueryInformationProcess(
                 process,
@@ -2270,8 +2341,12 @@ fn windows_command_line(pid: u32) -> Option<String> {
         if status != STATUS_SUCCESS as NTSTATUS {
             return None;
         }
+        // SAFETY: the successful query initialized the whole structure.
         let basic = unsafe { basic.assume_init() };
+        // SAFETY: `Peb` is `#[repr(C)]` plain old data of integers and raw pointers, and
+        // `process` was opened with `PROCESS_VM_READ`.
         let peb = unsafe { read_value::<Peb>(process, basic.PebBaseAddress.cast()) }?;
+        // SAFETY: as above, for `ProcessParameters`.
         let parameters =
             unsafe { read_value::<ProcessParameters>(process, peb.process_parameters.cast()) }?;
         let command = parameters.command_line;
@@ -2280,17 +2355,20 @@ fn windows_command_line(pid: u32) -> Option<String> {
         }
         let mut buffer = vec![0_u16; usize::from(command.Length / 2)];
         let mut read = 0;
+        // SAFETY: the destination is the live `buffer` of exactly `command.Length` bytes, and the
+        // source address is only read through the kernel, never dereferenced here.
         let ok = unsafe {
             ReadProcessMemory(
                 process,
                 command.Buffer.cast(),
                 buffer.as_mut_ptr().cast(),
                 usize::from(command.Length),
-                &mut read,
+                &raw mut read,
             )
         } != 0;
         (ok && read == usize::from(command.Length)).then(|| String::from_utf16_lossy(&buffer))
     })();
+    // SAFETY: `process` was opened above and is closed exactly once.
     unsafe { CloseHandle(process) };
     result
 }
@@ -2914,10 +2992,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
             runtime.report_metadata(
                 "hook",
                 2,
-                token_patch(
-                    &[("late", Some("x"))],
-                    Some(Duration::from_secs(25 * 60 * 60))
-                ),
+                token_patch(&[("late", Some("x"))], Some(Duration::from_hours(25))),
                 now
             ),
             Err("metadata TTL must be from 1ms through 24h")
@@ -3036,7 +3111,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         let mut runtime = AgentRuntime::new();
         runtime.identity = Some(identity(catalog, agent));
         // Past the startup grace, so classification is what decides rather than the grace window.
-        runtime.identified_at = Instant::now() - STARTUP_GRACE;
+        runtime.identified_at = Instant::now().checked_sub(STARTUP_GRACE).unwrap();
         runtime
     }
 
@@ -3268,7 +3343,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         let catalog = catalog();
         let mut runtime = AgentRuntime::new();
         runtime.identity = Some(identity(&catalog, "codex"));
-        runtime.identified_at = Instant::now() - STARTUP_GRACE;
+        runtime.identified_at = Instant::now().checked_sub(STARTUP_GRACE).unwrap();
         runtime.commit(AgentState::Working, AgentSource::Screen, false);
         runtime.commit(AgentState::Idle, AgentSource::Screen, false);
         assert_eq!(runtime.snapshot().unwrap().status, AgentStatus::Done);
@@ -3482,7 +3557,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         let alias = AgentAlias::new("reviewer").unwrap();
 
         // Nothing detected: an alias would name whatever ran next, so it is refused.
-        assert!(runtime.set_alias(Some(alias.clone())).is_err());
+        runtime.set_alias(Some(alias.clone())).unwrap_err();
         assert!(runtime.alias().is_none());
 
         runtime.observe_process(Some(7), Some(identity(&catalog, "claude")), Instant::now());
@@ -3580,7 +3655,7 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         let mut runtime = AgentRuntime::new();
         // An already-running pane: the detector saw its shell long ago and classified nothing.
         runtime.process_group = Some(4);
-        runtime.identified_at = now - STARTUP_GRACE * 10;
+        runtime.identified_at = now.checked_sub(STARTUP_GRACE * 10).unwrap();
         runtime
             .report(
                 AgentReport {
@@ -3664,15 +3739,13 @@ process = { executables = ["openclaw", "openclaw-cli"], argv_contains = ["@openc
         assert!(runtime.alias().is_none());
         // Cleared with the rest, so the next integration to report on this pane is not refused for
         // reusing a sequence the previous agent had already spent.
-        assert!(
-            runtime
-                .report(
-                    state_report(identity(&catalog, "codex"), AgentState::Idle, "hook", 1),
-                    false,
-                    now,
-                )
-                .is_ok()
-        );
+        runtime
+            .report(
+                state_report(identity(&catalog, "codex"), AgentState::Idle, "hook", 1),
+                false,
+                now,
+            )
+            .unwrap();
     }
 
     /// Process group IDs are per-machine and reused freely, so two panes routinely observe the same

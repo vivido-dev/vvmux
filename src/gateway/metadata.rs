@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc};
 
+/// How long a completed metadata request's result is kept for retrieval.
 const RETENTION: Duration = Duration::from_secs(600);
+/// Completed metadata results kept at once.
 const MAX_RESULTS: usize = 256;
 struct Operation {
     account: String,
@@ -79,7 +81,10 @@ impl MetadataService {
             slots: Arc::new(Semaphore::new(4)),
         })
     }
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the metadata request fields arrive individually from the decoded control frame"
+    )]
     pub(super) fn dispatch(
         self: &Arc<Self>,
         request_id: String,
@@ -112,14 +117,14 @@ impl MetadataService {
             reply(json!({"error":"invalid_request"}));
             return;
         }
-        let Ok(permit) = self.slots.clone().try_acquire_owned() else {
+        let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
             reply(json!({"error":"capacity"}));
             return;
         };
         let begin = self
             .results
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .begin(&owner, &operation_id, &account, &action, name.as_deref());
         match begin {
             Ok(Begin::Cached(result)) => {
@@ -132,7 +137,7 @@ impl MetadataService {
             }
             Ok(Begin::Run) => {}
         }
-        let service = self.clone();
+        let service = Arc::clone(self);
         // The worker is deliberately owned beyond the requesting tunnel: dropping a response
         // cannot roll back a dispatched create, and reconnect can query its retained result.
         tokio::spawn(async move {
@@ -160,7 +165,7 @@ impl MetadataService {
                 && let Some(entry) = service
                     .results
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .entries
                     .get_mut(&(owner, operation_id))
             {
@@ -242,21 +247,17 @@ mod tests {
     fn pending_mutations_cannot_be_evicted_to_admit_more_work() {
         let mut results = Results::default();
         for i in 0..MAX_RESULTS {
-            assert!(
-                results
-                    .begin("owner", &i.to_string(), "account", "create", Some("name"))
-                    .is_ok()
-            );
+            results
+                .begin("owner", &i.to_string(), "account", "create", Some("name"))
+                .unwrap();
         }
         assert!(
             results
                 .begin("owner", "overflow", "account", "create", Some("name"))
                 .is_err()
         );
-        assert!(
-            results
-                .begin("owner", "list", "account", "list", None)
-                .is_ok()
-        );
+        results
+            .begin("owner", "list", "account", "list", None)
+            .unwrap();
     }
 }

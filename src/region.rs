@@ -1,5 +1,6 @@
 use crate::layout::Rect;
 
+/// The value 1.0 in signed 32.32 fixed point, the Vivid geometry format.
 pub const FIXED_ONE: i64 = 1_i64 << 32;
 
 /// A validated signed 32.32 rectangle. Width and height are positive and both far edges are
@@ -203,8 +204,8 @@ mod tests {
         fn next(&mut self, bound: u64) -> u64 {
             self.0 = self
                 .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             (self.0 >> 32) % bound
         }
     }

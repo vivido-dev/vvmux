@@ -44,7 +44,11 @@ const TERMINAL_ENTER: &[u8] =
 const TERMINAL_LEAVE: &[u8] =
     b"\x1b[0m\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l";
 
+/// How long a new gateway connection has to authenticate before it is closed.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Housekeeping tick of each attached gateway socket loop: it expires float-edit mode and checks
+/// client liveness. 25 ms keeps a float-edit timeout from feeling late to a typing user.
+const SOCKET_TICK: Duration = Duration::from_millis(25);
 /// How long an attached client may stay silent, once another client is waiting for its session.
 const CLIENT_STALL_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long to keep flushing an outbound queue after the connection loop has finished with it.
@@ -108,7 +112,7 @@ pub(crate) struct TunnelContext {
     pub allow_kill: bool,
 }
 
-fn tunnel_capabilities(tunnel: &Option<TunnelContext>) -> &'static [&'static str] {
+fn tunnel_capabilities(tunnel: Option<&TunnelContext>) -> &'static [&'static str] {
     match tunnel {
         None => CAPABILITIES,
         Some(ctx) if ctx.allow_kill => TUNNEL_CAPABILITIES_KILL,
@@ -180,8 +184,7 @@ pub(crate) fn run(
     let auth_file = overrides
         .auth_file
         .or_else(|| config.server.auth_file.clone())
-        .map(Ok)
-        .unwrap_or_else(auth::default_auth_path)?;
+        .map_or_else(auth::default_auth_path, Ok)?;
     auth::validate_record(&auth_file).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -222,7 +225,7 @@ async fn websocket_upgrade(
     if !state.allowed_origins.contains(origin) {
         return (StatusCode::FORBIDDEN, "WebSocket Origin is not allowed").into_response();
     }
-    let Ok(permit) = state.connections.clone().try_acquire_owned() else {
+    let Ok(permit) = Arc::clone(&state.connections).try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway connection limit reached",
@@ -338,7 +341,7 @@ async fn vivid_upgrade(
             return (status, message).into_response();
         }
     };
-    let Ok(permit) = state.connections.clone().try_acquire_owned() else {
+    let Ok(permit) = Arc::clone(&state.connections).try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway connection limit reached",
@@ -363,22 +366,17 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     permit: Option<OwnedSemaphorePermit>,
     tunnel: Option<TunnelContext>,
 ) -> io::Result<()> {
-    let authorization = match authenticate_connection(&mut stream, &state, tunnel.as_ref()).await {
-        Ok(authorization) => authorization,
-        Err(_) => {
-            let _ = close_socket(&mut sink, 1008, "authentication failed").await;
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "gateway authentication failed",
-            ));
-        }
+    let Ok(authorization) = authenticate_connection(&mut stream, &state, tunnel.as_ref()).await
+    else {
+        let _ = close_socket(&mut sink, 1008, "authentication failed").await;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "gateway authentication failed",
+        ));
     };
-    let broker = match vivid::VividBroker::new() {
-        Ok(broker) => broker,
-        Err(_) => {
-            let _ = close_socket(&mut sink, 1011, "could not initialize Vivid routing").await;
-            return Err(io::Error::other("Vivid routing unavailable"));
-        }
+    let Ok(broker) = vivid::VividBroker::new() else {
+        let _ = close_socket(&mut sink, 1011, "could not initialize Vivid routing").await;
+        return Err(io::Error::other("Vivid routing unavailable"));
     };
     let registered = state.vivid_sessions.lock().is_ok_and(|mut sessions| {
         if sessions.len() >= state.config.server.max_connections
@@ -386,7 +384,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
         {
             false
         } else {
-            sessions.insert(broker.id().to_owned(), broker.clone());
+            sessions.insert(broker.id().to_owned(), Arc::clone(&broker));
             true
         }
     });
@@ -395,8 +393,8 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
         return Err(io::Error::other("Vivid route capacity reached"));
     }
     let _vivid_registration = VividRegistration {
-        sessions: state.vivid_sessions.clone(),
-        broker: broker.clone(),
+        sessions: Arc::clone(&state.vivid_sessions),
+        broker: Arc::clone(&broker),
     };
     let vivid_token = broker.encoded_token();
     if send_control_socket(
@@ -404,7 +402,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
         &ServerControl::Hello {
             protocol: VERSION,
             server_version: env!("CARGO_PKG_VERSION"),
-            capabilities: tunnel_capabilities(&tunnel),
+            capabilities: tunnel_capabilities(tunnel.as_ref()),
             vivid: VividAccess {
                 endpoint: "/v1/vivid",
                 subprotocol: vivid::SUBPROTOCOL,
@@ -443,7 +441,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
     let mut float_mode = None;
     let mut session: Option<SessionAdapter> = None;
     let mut bridge: Option<BridgeWorker> = None;
-    let mut tick = tokio::time::interval(Duration::from_millis(25));
+    let mut tick = tokio::time::interval(SOCKET_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_seen = Instant::now();
     let mut last_ping = Instant::now();
@@ -480,18 +478,15 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
             }
             Incoming::Socket(Some(Err(error))) => Err(error),
             Incoming::Socket(None) => break,
-            Incoming::Session(Some(event)) => {
-                handle_session_message(
-                    &writer,
-                    event,
-                    &mut session,
-                    &mut bridge,
-                    &mut input,
-                    &mut float_scanner,
-                    &mut float_mode,
-                )
-                .await
-            }
+            Incoming::Session(Some(event)) => handle_session_message(
+                &writer,
+                event,
+                &mut session,
+                &mut bridge,
+                &mut input,
+                &mut float_scanner,
+                &mut float_mode,
+            ),
             Incoming::Session(None) => {
                 let overloaded = session.as_ref().is_some_and(SessionAdapter::overloaded);
                 let _ = writer.send(Frame::Binary(Payload::from_static(TERMINAL_LEAVE)));
@@ -509,7 +504,7 @@ async fn handle_connection<Si: FrameSink, St: FrameStream>(
                 )
             }
             Incoming::Tick => {
-                match expire_float_mode(&session, &mut float_scanner, &mut float_mode) {
+                match expire_float_mode(session.as_ref(), &mut float_scanner, &mut float_mode) {
                     Ok(()) => check_client_liveness(
                         &writer,
                         &state,
@@ -568,7 +563,7 @@ async fn authenticate_connection<St: FrameStream>(
 ) -> io::Result<auth::Authorization> {
     let first = tokio::time::timeout(AUTH_TIMEOUT, stream.next_frame())
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "authentication timed out"))?
+        .map_err(|_elapsed| io::Error::new(io::ErrorKind::TimedOut, "authentication timed out"))?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"))??;
     let Frame::Text(text) = first else {
         return Err(io::Error::new(
@@ -625,7 +620,10 @@ async fn authenticate_connection<St: FrameStream>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is independent per-connection state owned by the socket loop"
+)]
 async fn handle_socket_message(
     writer: &ClientWriter,
     message: Frame,
@@ -878,11 +876,10 @@ async fn handle_socket_message(
                                 // only the selected presenter receives audio/video.
                                 let browser_bridge = if vivid && !text_only {
                                     let root_secret = broker.root_secret();
-                                    let connection_factory: Arc<
-                                        dyn crate::bridge::ConnectionFactory,
-                                    > = broker.clone();
+                                    let connection_factory: Arc<dyn vivid_sdk::ConnectionFactory> =
+                                        Arc::<crate::gateway::vivid::VividBroker>::clone(broker);
                                     match tokio::task::spawn_blocking(move || {
-                                        crate::bridge::OuterBridge::builder(root_secret, display)
+                                        vivid_gateway::OuterBridge::builder(root_secret, display)
                                             .connection_factory(connection_factory)
                                             .build()
                                     })
@@ -1068,7 +1065,7 @@ async fn handle_socket_message(
     Ok(())
 }
 
-async fn handle_session_message(
+fn handle_session_message(
     writer: &ClientWriter,
     mut event: QueuedServerMessage,
     session: &mut Option<SessionAdapter>,
@@ -1140,10 +1137,13 @@ async fn handle_session_message(
         }
         // Browser input is already normalized by the web client and does not use the host TTY's
         // Kitty keyboard encoder.
-        ServerMessage::InputMode { .. } | ServerMessage::PluginKeymap { .. } => {}
+        ServerMessage::InputMode { .. }
+        | ServerMessage::PluginKeymap { .. }
+        | ServerMessage::Notify { .. }
+        | ServerMessage::Pong
+        | ServerMessage::PluginEvent { .. } => {}
         // Dropped rather than forwarded: VVWS has no notification record, and a browser tab is not
         // the terminal these escapes are meant for. Browser attach gets no desktop notification.
-        ServerMessage::Notify { .. } => {}
         ServerMessage::Detached { reason } => {
             writer.send(Frame::Binary(Payload::from_static(TERMINAL_LEAVE)))?;
             send_control(writer, &ServerControl::Detached { reason })?;
@@ -1158,7 +1158,6 @@ async fn handle_session_message(
             *session = None;
             release_bridge(bridge);
         }
-        ServerMessage::Pong => {}
         ServerMessage::MediaRole { presenter: false } => {
             // Keep the Vivid route: the next projection removes exclusive tracks while retaining
             // shared images and rasters.
@@ -1171,12 +1170,12 @@ async fn handle_session_message(
             ));
         }
         ServerMessage::MediaSnapshot {
-            microphones: _,
             revision,
             surfaces,
             tracks,
             nodes,
             videos_needing_keyframes,
+            ..
         } => {
             let Some(bridge) = bridge.as_mut() else {
                 return Err(io::Error::new(
@@ -1255,7 +1254,6 @@ async fn handle_session_message(
         // Event subscriptions stream indefinitely and have no frame to carry them yet. Dropped
         // rather than forwarded as something else, so a caller never mistakes silence for a
         // subscription that is working.
-        ServerMessage::PluginEvent { .. } => {}
     }
     Ok(())
 }
@@ -1303,7 +1301,7 @@ fn dispatch_parsed(adapter: &SessionAdapter, parsed: Vec<ParsedInput>) -> io::Re
 }
 
 fn expire_float_mode(
-    session: &Option<SessionAdapter>,
+    session: Option<&SessionAdapter>,
     scanner: &mut FloatEditScanner,
     mode_id: &mut Option<u64>,
 ) -> io::Result<()> {
@@ -1554,9 +1552,13 @@ mod tests {
             let mut guard = sessions.lock().expect("fresh lock");
             guard.insert(
                 "stale".into(),
-                Instant::now() - CONTENTION_WINDOW - Duration::from_secs(1),
-            );
-        }
+                Instant::now()
+                    .checked_sub(CONTENTION_WINDOW)
+                    .unwrap()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap(),
+            )
+        };
         assert_eq!(
             contended_since(&sessions, "stale"),
             None,
@@ -1580,7 +1582,11 @@ mod tests {
     #[test]
     fn a_silent_holder_only_loses_its_session_once_someone_is_waiting() {
         let sessions: Mutex<HashMap<String, Instant>> = Mutex::new(HashMap::new());
-        let silent = Instant::now() - CLIENT_STALL_TIMEOUT - Duration::from_secs(1);
+        let silent = Instant::now()
+            .checked_sub(CLIENT_STALL_TIMEOUT)
+            .unwrap()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
 
         let stalled = |sessions: &Mutex<HashMap<String, Instant>>, last_seen: Instant| {
             last_seen.elapsed() >= CLIENT_STALL_TIMEOUT
@@ -1603,9 +1609,13 @@ mod tests {
             let mut guard = sessions.lock().expect("lock");
             guard.insert(
                 "work".into(),
-                Instant::now() - CLIENT_STALL_TIMEOUT - Duration::from_secs(1),
-            );
-        }
+                Instant::now()
+                    .checked_sub(CLIENT_STALL_TIMEOUT)
+                    .unwrap()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap(),
+            )
+        };
         assert!(
             stalled(&sessions, silent),
             "a holder that stayed silent while another client waited gives the session up"
@@ -1618,11 +1628,11 @@ mod tests {
 
     #[test]
     fn origins_are_exact_and_web_only() {
-        assert!(validate_origins(Vec::new()).is_err());
-        assert!(validate_origins(vec!["*".into()]).is_err());
-        assert!(validate_origins(vec!["null".into()]).is_err());
-        assert!(validate_origins(vec!["file://local".into()]).is_err());
-        assert!(validate_origins(vec!["http://localhost:3000/path".into()]).is_err());
+        validate_origins(Vec::new()).unwrap_err();
+        validate_origins(vec!["*".into()]).unwrap_err();
+        validate_origins(vec!["null".into()]).unwrap_err();
+        validate_origins(vec!["file://local".into()]).unwrap_err();
+        validate_origins(vec!["http://localhost:3000/path".into()]).unwrap_err();
         assert!(
             validate_origins(vec!["http://localhost:3000".into()])
                 .unwrap()
@@ -1642,7 +1652,10 @@ mod tests {
     #[test]
     fn vivid_protocol_parameters_must_be_present_once() {
         fn offered(values: &[&str]) -> Vec<String> {
-            values.iter().map(|value| value.to_string()).collect()
+            values
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect()
         }
         let base = offered(&[
             "vvmux.vivid.v1",
@@ -1658,21 +1671,21 @@ mod tests {
         // A duplicate connection parameter is rejected, as are empty ones.
         let mut duplicate = base.clone();
         duplicate.push("vvmux.connection.again".to_owned());
-        assert!(parse_vivid_parameters(&duplicate).is_err());
+        parse_vivid_parameters(&duplicate).unwrap_err();
 
         let mut empty = base.clone();
         empty.push("vvmux.kind.".to_owned());
         // An empty remainder is not a second parameter; the kind is still "2".
-        assert!(parse_vivid_parameters(&empty).is_ok());
+        parse_vivid_parameters(&empty).unwrap();
 
         // Lane (1) and unknown kinds are rejected.
         let mut lane = base.clone();
         lane[3] = "vvmux.kind.1".to_owned();
-        assert!(parse_vivid_parameters(&lane).is_err());
+        parse_vivid_parameters(&lane).unwrap_err();
 
         // The marker subprotocol is required.
         let mut missing = base.clone();
         missing[0] = "vvmux.vivid.v2".to_owned();
-        assert!(parse_vivid_parameters(&missing).is_err());
+        parse_vivid_parameters(&missing).unwrap_err();
     }
 }
