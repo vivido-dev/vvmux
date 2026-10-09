@@ -97,7 +97,7 @@ fn enroll_machine(
                 .windows(code.len())
                 .any(|window| window == code.as_bytes())
         );
-    }
+    };
 
     let mut stdin = child.stdin.take().unwrap();
     writeln!(stdin, "{code}").unwrap();

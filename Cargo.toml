@@ -240,3 +240,7 @@ struct_excessive_bools = "allow"
 similar_names = "allow"
 # Duplicate versions come from transitive dependencies outside this workspace's control.
 multiple_crate_versions = "allow"
+# Tests assert emptiness on huge or implementation-chosen buffers; `assert!` states that
+# directly, while `assert_eq!` against a typed empty literal needs an ascription per site
+# (new in clippy 1.99, pedantic).
+assert_is_empty = "allow"

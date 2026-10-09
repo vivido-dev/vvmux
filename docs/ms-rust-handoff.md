@@ -66,6 +66,37 @@ can differ slightly where tests are platform-gated. What to actually watch:
   skip path); AGENTS.md requires rerunning them un-sandboxed if they skip.
 - `tests/integration/overlay_python.rs` needs a Python on PATH; it should skip cleanly otherwise.
 
+## 2a. Linux record (2026-10-09)
+
+Linux ran every gate in §2 including all the optional extras. Results:
+
+- fmt, clippy default, clippy no-default, tests: **662 passed / 0 failed / 3 ignored** across 8
+  suites, identical to macOS; the only ignored tests are the three intentional
+  `*_producer_child` re-execution harness tests, so no socket test skipped. The
+  `agent_start…`/`a_detected_agent…`/`a_restored_agent_pane…` families and the
+  `gateway_*`/auth (`peer_uid`) tests all pass unmodified — the `/proc` and `SO_PEERCRED`
+  implementations were correct as written.
+- Doctests, rustdoc `-D warnings -D missing_docs`, feature powerset, audit, udeps, both MSRV
+  pins, the three wasm32-wasip2 checks, and Miri (lib suite, 50 passed / 6 `pty::` filtered):
+  all green.
+
+Two fixes fell out, both from **stable clippy 1.99.0**, which is newer than the toolchain the
+macOS run used (`assert_is_empty` and the Linux-only `semicolon_outside_block` site were
+invisible there):
+
+1. `Cargo.toml` — the workspace lint table now allows `clippy::assert_is_empty` with a reason
+   (pedantic, new in 1.99; rewriting every `assert!(x.is_empty())` would need a typed empty
+   literal per site). If your Windows clippy is ≥ 1.99 you inherit this automatically via the
+   shared table.
+2. `tests/integration/tunnel_connect.rs` — the Linux-only `#[cfg]` `/proc` block moved its `;`
+   outside the brace (`semicolon_outside_block`); macOS never compiles that block, which is why
+   macOS clippy passed. First confirmation of the handoff's cross-target lint warning, in
+   reverse: this one only fires on Linux.
+
+Also fixed for CI: `.github/workflows/vvmux-ci.yml` now installs `rust-src` alongside `miri` —
+`cargo miri test` otherwise prompts interactively for `rust-src` on first use, which fails a
+non-TTY runner. All changes are uncommitted, per §5.
+
 ## 3. Windows
 
 This is the real debt: `src/platform/windows.rs`, `vvmux-terminal/src/pty/windows.rs`, and the
