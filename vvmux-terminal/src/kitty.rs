@@ -8,6 +8,10 @@ use base64::Engine;
 use crate::event::KittyGraphicsCommand;
 use crate::marker::{find_bytes, partial_prefix_len};
 
+mod cursor;
+pub(crate) use cursor::DIACRITICS;
+pub(crate) use cursor::{CursorGraphics, GraphicsOutput};
+
 /// Largest single Kitty graphics escape sequence accepted, in bytes; larger packets are discarded.
 pub(crate) const KITTY_PACKET_MAX_BYTES: usize = 8 * 1024;
 /// Largest base64 payload in one Kitty graphics chunk, as the protocol specifies for chunked
@@ -18,7 +22,7 @@ pub(crate) const KITTY_DECODED_TRANSFER_MAX_BYTES: u32 = 64 * 1024 * 1024;
 
 pub(crate) enum KittyChunk {
     Bytes(Vec<u8>),
-    Command(KittyGraphicsCommand),
+    Packet(Vec<u8>),
 }
 
 #[derive(Default)]
@@ -62,10 +66,7 @@ impl KittyGraphicsScanner {
                 continue;
             }
             let raw = &self.pending[start..end];
-            match validate_kitty_command(&self.pending[body_start..terminator], raw) {
-                Some(command) => chunks.push(KittyChunk::Command(command)),
-                None => push_kitty_bytes(&mut chunks, raw),
-            }
+            chunks.push(KittyChunk::Packet(raw.to_vec()));
             cursor = end;
         }
         self.pending.drain(..cursor);
@@ -105,28 +106,35 @@ pub(crate) fn validate_kitty_command(body: &[u8], raw: &[u8]) -> Option<KittyGra
         }
     }
     let number = |key: &str| fields.get(key).and_then(|value| value.parse::<u32>().ok());
+    let quiet = number("q").unwrap_or(0);
+    let reject = |error| {
+        if quiet == 2 {
+            return None;
+        }
+        Some(KittyGraphicsCommand::Rejected {
+            image_id: number("i").filter(|id| *id != 0)?,
+            placement_id: number("p").filter(|id| *id != 0),
+            error,
+        })
+    };
+    if fields.contains_key("q") && (number("q").is_none() || quiet > 2) {
+        return reject("EINVAL:invalid reply suppression");
+    }
+    if fields.get("a").copied() == Some("q") {
+        return validate_query(&fields, payload)
+            .or_else(|| reject("ENOTSUP:query requires one complete direct RGB or RGBA packet"));
+    }
+    // Host forwarding remains quiet. Replies cannot safely be routed by host image ID:
+    // independent panes can reuse the same ID, and an attachment can change before a reply.
+    if quiet != 2 {
+        return reject("ENOTSUP:use quiet direct uploads and Unicode placements");
+    }
     let more = number("m").unwrap_or(0);
-    if more > 1 || number("q") != Some(2) {
+    if more > 1 {
         return None;
     }
 
     match fields.get("a").copied() {
-        Some("q") => {
-            if !keys_are(&fields, &["a", "i", "s", "v", "t", "f", "q"])
-                || number("i") == Some(0)
-                || number("i").is_none()
-                || number("s") != Some(1)
-                || number("v") != Some(1)
-                || number("f") != Some(24)
-                || fields.get("t").copied() != Some("d")
-                || payload != b"AAAA"
-            {
-                return None;
-            }
-            Some(KittyGraphicsCommand::Query {
-                image_id: number("i")?,
-            })
-        }
         Some("T" | "t") => {
             let action = fields.get("a").copied()?;
             let allowed = if action == "T" {
@@ -165,6 +173,7 @@ pub(crate) fn validate_kitty_command(body: &[u8], raw: &[u8]) -> Option<KittyGra
                 bytes: raw.to_vec(),
                 starts_transfer: true,
                 more: more == 1,
+                reply: None,
             })
         }
         Some("p") => {
@@ -181,6 +190,7 @@ pub(crate) fn validate_kitty_command(body: &[u8], raw: &[u8]) -> Option<KittyGra
                 bytes: raw.to_vec(),
                 starts_transfer: true,
                 more: false,
+                reply: None,
             })
         }
         Some("d") => {
@@ -195,6 +205,7 @@ pub(crate) fn validate_kitty_command(body: &[u8], raw: &[u8]) -> Option<KittyGra
                 bytes: raw.to_vec(),
                 starts_transfer: true,
                 more: false,
+                reply: None,
             })
         }
         None => {
@@ -209,10 +220,58 @@ pub(crate) fn validate_kitty_command(body: &[u8], raw: &[u8]) -> Option<KittyGra
                 bytes: raw.to_vec(),
                 starts_transfer: false,
                 more: more == 1,
+                reply: None,
             })
         }
         _ => None,
     }
+}
+
+fn validate_query(fields: &BTreeMap<&str, &str>, payload: &[u8]) -> Option<KittyGraphicsCommand> {
+    let number = |key: &str, default: u32| {
+        fields
+            .get(key)
+            .map_or(Some(default), |value| value.parse::<u32>().ok())
+    };
+    let image_id = number("i", 0)?;
+    let width = number("s", 0)?;
+    let height = number("v", 0)?;
+    let format = number("f", 32)?;
+    let quiet = number("q", 0)?;
+    let bytes_per_pixel = match format {
+        24 => 3,
+        32 => 4,
+        _ => return None,
+    };
+    let expected = width.checked_mul(height)?.checked_mul(bytes_per_pixel)?;
+    if !keys_are(fields, &["a", "i", "s", "v", "t", "f", "q", "m"])
+        || fields.get("t").is_some_and(|transport| *transport != "d")
+        || image_id == 0
+        || width == 0
+        || height == 0
+        || expected > KITTY_DECODED_TRANSFER_MAX_BYTES
+        || number("m", 0)? != 0
+        || !valid_base64_payload(payload, false)
+    {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
+    if decoded.len() != usize::try_from(expected).ok()? {
+        return None;
+    }
+    // Preserve the probe used by released kitim and the vvmux-aware kitpdf mode. Other queries
+    // honor standard suppression, including q=2, without changing the quiet upload contract.
+    let legacy_probe =
+        quiet == 2 && width == 1 && height == 1 && format == 24 && payload == b"AAAA";
+    if quiet == 2 && !legacy_probe {
+        return None;
+    }
+    Some(KittyGraphicsCommand::Query {
+        image_id,
+        quiet: if legacy_probe { 0 } else { quiet as u8 },
+    })
 }
 
 pub(crate) fn keys_are(fields: &BTreeMap<&str, &str>, allowed: &[&str]) -> bool {

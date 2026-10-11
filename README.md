@@ -786,7 +786,7 @@ The reply means the agent is running, not that the command was typed: it resolve
 accept anything. Failures are named rather than left to a timeout — `invalid_agent_kind` for an
 agent that is not enabled, `agent_not_launchable` for a detection-only provider that declares no
 launch command, `agent_kind_mismatch` when a different agent appears, and `agent_start_failed` when
-the pane exits or nothing starts before `--timeout` (3s–300s, default 30s).
+the pane is removed or nothing starts before `--timeout` (3s–300s, default 30s).
 
 Providers declare their launch command in the manifest:
 
@@ -1336,10 +1336,28 @@ terminal use continues without media and the client emits a single status/title 
 
 Vvmux has one deliberately narrow exception to its normal rule that media bytes do not cross a
 pane PTY. A pane may emit bounded Kitty graphics APC packets using direct transmission (`t=d`),
-quiet mode (`q=2`), and Unicode virtual placements (`U=1`). Vvmux validates and assembles the
-complete transfer, then writes it atomically before the full terminal repaint containing the
-`U+10EEEE` placeholder cells. File and shared-memory transports, cursor-positioned placements,
-animation commands, malformed packets, and more than 64 MiB of live transfer data are rejected.
+quiet mode (`q=2`), and Unicode virtual placements (`U=1`). It also accepts standard direct RGB
+and RGBA uploads, cursor placements, and source rectangles (`x,y,w,h`). These images are cached
+within the pane; each placement uploads its cropped pixels as a quiet virtual image and writes
+`U+10EEEE` placeholder cells into the pane grid. Pane clipping, tab visibility, and composition
+therefore apply to both placement styles. `C=1` preserves the cursor; otherwise it advances by
+the placement dimensions. Explicit placement IDs replace matching placements.
+
+Standard single-packet direct support queries accept omitted or explicit `q=0`, transport and
+format defaults, and `m=0`. Replies precede a following device-attributes sentinel and return to
+the requesting pane. `q=1` suppresses success and `q=2` suppresses replies; the original vvmux
+one-pixel RGB `q=2` probe still receives a reply for existing kitim/kitpdf compatibility. Unsupported
+transport probes return `ENOTSUP` so clients can fall back to direct transmission. Cursor uploads
+are acknowledged after validation and admission to the host output queue. File and shared-memory
+transports, PNG/compression, animation, relative placements, pixel offsets, and z-index are not
+supported.
+
+Raw cached pixels, including incomplete cursor uploads, share a 64 MiB process budget. Each pane
+can cache 256 images with up to 256 placements per image; placement dimensions are limited to
+297 cells per axis. Encoded transfers share the existing 64 MiB session queue. Complete transfers
+are written atomically before the repaint containing their placeholders. Explicit image, placement,
+range, and global deletes are scoped to that pane's cursor images. The existing quiet Unicode
+passthrough keeps application-provided image IDs; its applications must continue to avoid collisions.
 
 The native Unix client advertises this exception for exact `TERM=xterm-kitty` and
 `TERM=xterm-ghostty` hosts. For `TERM=vivido`, or a host with outer Vivid credentials, it first
@@ -1354,7 +1372,8 @@ placeholders suppressed. Uploads precede synchronized repaint brackets so large 
 exhaust the host's update buffer. Graphics bytes belong to the presenter's physical attachment and
 are discarded when it detaches or another client claims the role. The client deletes host images
 before leaving the alternate screen, and a demoted presenter clears them before its next repaint.
-Nothing is retained or replayed on reattach. Unix pane PTYs receive cell and pixel dimensions so
+Host images are not replayed on reattach; cursor-image source pixels remain cached until explicitly
+deleted or the pane is removed. Unix pane PTYs receive cell and pixel dimensions so
 applications can choose the correct image size. This behavior is private to vvmux and does not alter
 Vivid media or the public Vivid protocol.
 

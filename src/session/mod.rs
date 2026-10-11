@@ -759,12 +759,13 @@ impl KittyTransferBuffer {
     }
 }
 
-fn kitty_query_response(capable: bool, image_id: u32) -> Vec<u8> {
-    if capable {
-        format!("\x1b_Gi={image_id};OK\x1b\\").into_bytes()
-    } else {
-        format!("\x1b_Gi={image_id};ENOTSUP\x1b\\").into_bytes()
+fn kitty_query_response(capable: bool, image_id: u32, quiet: u8) -> Option<Vec<u8>> {
+    vvmux_terminal::KittyGraphicsReply {
+        image_id,
+        placement_id: None,
+        quiet,
     }
+    .encode((!capable).then_some("ENOTSUP:attachment has no Kitty graphics"))
 }
 
 /// How one pane's process should be started.
@@ -1201,6 +1202,23 @@ fn queue_pane_input(pane: &mut Pane, bytes: &[u8]) -> Option<InputFailure> {
         warn,
         close: error.kind() == io::ErrorKind::BrokenPipe,
     })
+}
+
+/// Keep a support reply and its DA sentinel in the same bounded PTY write when possible.
+fn terminal_reply_batches(replies: Vec<Vec<u8>>, mut send: impl FnMut(&[u8])) {
+    let mut batch = Vec::new();
+    for reply in replies {
+        for chunk in reply.chunks(PTY_OUTPUT_BATCH_BYTES) {
+            if batch.len() + chunk.len() > PTY_OUTPUT_BATCH_BYTES {
+                send(&batch);
+                batch.clear();
+            }
+            batch.extend_from_slice(chunk);
+        }
+    }
+    if !batch.is_empty() {
+        send(&batch);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2853,7 +2871,11 @@ impl SessionActor {
         let mut input_warning = false;
         let mut input_closed = false;
         let mut changed_screen_sequence = None;
-        let mut kitty_commands = Vec::new();
+        let kitty_capable = self
+            .presenter_client()
+            .is_some_and(|client| client.kitty_graphics);
+        let kitty_cell_size =
+            vivid_cell_size(self.last_display.cell_width, self.last_display.cell_height);
         let mut clipboard_store = None;
         let mut clipboard_load = None;
         // Selection-relevant output, folded into the pane's mouse selection once the pane borrow
@@ -2862,11 +2884,14 @@ impl SessionActor {
         let mut screen_switched = false;
         let mut history_len = 0;
         if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.terminal
+                .set_kitty_graphics(kitty_capable, kitty_cell_size.0, kitty_cell_size.1);
             let old_cells = pane.terminal.cells().to_vec();
             let old_cursor = pane.terminal.cursor();
             let old_modes = pane.terminal.modes();
             let old_screen = pane.terminal.alternate_screen();
             let events = produce(&mut pane.terminal);
+            let mut replies = Vec::new();
             selection_events = events
                 .iter()
                 .filter(|event| {
@@ -2880,10 +2905,7 @@ impl SessionActor {
             for event in events {
                 match event {
                     TerminalEvent::PtyWrite(bytes) => {
-                        if let Some(failure) = queue_pane_input(pane, &bytes) {
-                            input_warning |= failure.warn;
-                            input_closed |= failure.close;
-                        }
+                        replies.push(bytes);
                     }
                     TerminalEvent::Title(next_title) if focused => {
                         title = next_title;
@@ -2905,7 +2927,48 @@ impl SessionActor {
                         self.vivid
                             .observe_marker(pane_id, &marker, row as i32, column, alternate);
                     }
-                    TerminalEvent::KittyGraphics(command) => kitty_commands.push(command),
+                    TerminalEvent::KittyGraphics(command) => {
+                        // Keep graphics replies ahead of a following device-attributes sentinel.
+                        // A reply belongs to the producing pane, regardless of current focus.
+                        let response = match command {
+                            KittyGraphicsCommand::Query { image_id, quiet } => {
+                                kitty_query_response(kitty_capable, image_id, quiet)
+                            }
+                            KittyGraphicsCommand::Rejected {
+                                image_id,
+                                placement_id,
+                                error,
+                            } => vvmux_terminal::KittyGraphicsReply {
+                                image_id,
+                                placement_id,
+                                quiet: 0,
+                            }
+                            .encode(Some(error)),
+                            KittyGraphicsCommand::Packet {
+                                bytes,
+                                starts_transfer,
+                                more,
+                                reply,
+                            } => {
+                                let accepted = kitty_capable
+                                    && self.kitty_transfers.push(
+                                        pane_id,
+                                        bytes,
+                                        starts_transfer,
+                                        more,
+                                    );
+                                reply.and_then(|reply| {
+                                    reply.encode(
+                                        (!accepted)
+                                            .then_some("ENOSPC:graphics transfer queue is full"),
+                                    )
+                                })
+                            }
+                        };
+                        if let Some(bytes) = response {
+                            replies.push(bytes);
+                        }
+                    }
                     TerminalEvent::GridScroll {
                         lines, alternate, ..
                     } => {
@@ -2931,6 +2994,12 @@ impl SessionActor {
                     _ => {}
                 }
             }
+            terminal_reply_batches(replies, |bytes| {
+                if let Some(failure) = queue_pane_input(pane, bytes) {
+                    input_warning |= failure.warn;
+                    input_closed |= failure.close;
+                }
+            });
             screen_switched = old_screen != pane.terminal.alternate_screen();
             history_len = pane.terminal.history_len();
             let semantic_changed = old_cells != pane.terminal.cells()
@@ -2967,9 +3036,6 @@ impl SessionActor {
             screen_switched,
             history_len,
         );
-        for command in kitty_commands {
-            self.handle_kitty_graphics(pane_id, command);
-        }
         if let Some((selection, text)) = clipboard_store {
             self.handle_clipboard_store(focused, selection, text);
         }
@@ -3028,32 +3094,6 @@ impl SessionActor {
             .collect();
         for pane_id in expired {
             self.drive_pane_terminal(pane_id, vvmux_terminal::Terminal::flush_synchronized_update);
-        }
-    }
-
-    fn handle_kitty_graphics(&mut self, pane_id: PaneId, command: KittyGraphicsCommand) {
-        // Graphics are media: only the presenter's terminal is offered them.
-        let capable = self
-            .presenter_client()
-            .is_some_and(|client| client.kitty_graphics);
-        match command {
-            KittyGraphicsCommand::Query { image_id } => {
-                let response = kitty_query_response(capable, image_id);
-                if let Some(pane) = self.panes.get_mut(&pane_id) {
-                    let _ = queue_pane_input(pane, &response);
-                }
-            }
-            KittyGraphicsCommand::Packet {
-                bytes,
-                starts_transfer,
-                more,
-            } => {
-                if !capable {
-                    return;
-                }
-                self.kitty_transfers
-                    .push(pane_id, bytes, starts_transfer, more);
-            }
         }
     }
 

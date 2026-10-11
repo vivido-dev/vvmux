@@ -1,5 +1,13 @@
 # Kitty graphics on every outer terminal — plan and notes
 
+> Follow-up (2026-10-11): the implementation now also accepts standard single-packet direct
+> queries and returns unsupported-transport errors in pane output order. Direct RGB/RGBA cursor
+> uploads and pixel cropping are translated to quiet Unicode placements using a bounded pane
+> image cache. Explicit deletes are pane-local for those images. Shared memory, animation,
+> relative placements, and general lifecycle/replay remain outside the implementation. The
+> historical plan below describes the original quiet-passthrough scope; see README and
+> ARCHITECTURE for the current contract.
+
 Written 2026-10-11. Implemented in vvmux on 2026-10-11. Planning baselines: `vvmux` `771ab37`, `vivido`
 `5ea8058` (first Vivido with Kitty graphics), `vvte` `c4b3f66`.
 

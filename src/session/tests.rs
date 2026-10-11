@@ -452,8 +452,43 @@ fn clearing_kitty_transfers_drops_attachment_pixels() {
 
 #[test]
 fn kitty_support_query_reports_attachment_capability() {
-    assert_eq!(kitty_query_response(true, 31), b"\x1b_Gi=31;OK\x1b\\");
-    assert_eq!(kitty_query_response(false, 31), b"\x1b_Gi=31;ENOTSUP\x1b\\");
+    assert_eq!(
+        kitty_query_response(true, 31, 0),
+        Some(b"\x1b_Gi=31;OK\x1b\\".to_vec())
+    );
+    assert_eq!(
+        kitty_query_response(false, 31, 0),
+        Some(b"\x1b_Gi=31;ENOTSUP:attachment has no Kitty graphics\x1b\\".to_vec())
+    );
+    assert_eq!(kitty_query_response(true, 31, 1), None);
+    assert!(kitty_query_response(false, 31, 1).is_some());
+    assert_eq!(kitty_query_response(false, 31, 2), None);
+}
+
+#[test]
+fn graphics_probe_and_sentinel_share_a_write_and_reply_batches_stay_bounded() {
+    let query = kitty_query_response(true, 31, 0).unwrap();
+    let sentinel = b"\x1b[?62;22c".to_vec();
+    let mut writes = Vec::new();
+    terminal_reply_batches(vec![query.clone(), sentinel.clone()], |bytes| {
+        writes.push(bytes.to_vec());
+    });
+    assert_eq!(
+        writes,
+        [query.iter().chain(&sentinel).copied().collect::<Vec<_>>()]
+    );
+    let large = vec![b'x'; PTY_OUTPUT_BATCH_BYTES * 2 + 17];
+    writes.clear();
+    terminal_reply_batches(
+        vec![query.clone(), large.clone(), sentinel.clone()],
+        |bytes| writes.push(bytes.to_vec()),
+    );
+    assert!(
+        writes
+            .iter()
+            .all(|bytes| bytes.len() <= PTY_OUTPUT_BATCH_BYTES)
+    );
+    assert_eq!(writes.concat(), [query, large, sentinel].concat());
 }
 
 #[test]

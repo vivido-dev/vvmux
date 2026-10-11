@@ -34,7 +34,7 @@ mod terminal;
 #[doc(inline)]
 pub use cell::{Cell, TerminalColor, TerminalHyperlink, UnderlineStyle};
 #[doc(inline)]
-pub use event::{KittyGraphicsCommand, TerminalEvent, TerminalModes};
+pub use event::{KittyGraphicsCommand, KittyGraphicsReply, TerminalEvent, TerminalModes};
 #[doc(inline)]
 pub use osc::{ShellIntegration, ShellPhase};
 #[doc(inline)]

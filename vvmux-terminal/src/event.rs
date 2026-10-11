@@ -101,14 +101,61 @@ pub enum KittyGraphicsCommand {
     Query {
         /// The image ID the reply must carry.
         image_id: u32,
+        /// Reply suppression: zero replies always, one replies only on failure.
+        ///
+        /// The original vvmux `q=2` one-pixel probe is normalized to zero for compatibility.
+        quiet: u8,
+    },
+    /// A command rejected locally, without forwarding it to the host terminal.
+    Rejected {
+        /// The image ID the reply must carry.
+        image_id: u32,
+        /// An optional placement ID to echo in the error response.
+        placement_id: Option<u32>,
+        /// A bounded, printable protocol error and explanation.
+        error: &'static str,
     },
     /// A packet safe to forward to a directly attached Kitty-compatible host.
     Packet {
-        /// The complete escape sequence.
+        /// Complete escape sequences, including all chunks of a translated cursor placement.
         bytes: Vec<u8>,
         /// Whether this packet begins a new image transfer.
         starts_transfer: bool,
         /// Whether more chunks of the same transfer follow (`m=1`).
         more: bool,
+        /// Acknowledgement sent only after the session accepts the complete packet.
+        reply: Option<KittyGraphicsReply>,
     },
+}
+
+/// A pane-local acknowledgement for an accepted graphics command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KittyGraphicsReply {
+    /// The application's image ID, independent of the host image ID.
+    pub image_id: u32,
+    /// The application's placement ID, if specified.
+    pub placement_id: Option<u32>,
+    /// Zero replies always; one replies on error; two suppresses replies.
+    pub quiet: u8,
+}
+
+impl KittyGraphicsReply {
+    /// Encode a success or a caller-supplied protocol error.
+    #[must_use]
+    pub fn encode(self, error: Option<&str>) -> Option<Vec<u8>> {
+        if self.image_id == 0 || self.quiet == 2 || (self.quiet == 1 && error.is_none()) {
+            return None;
+        }
+        let placement = self
+            .placement_id
+            .map_or_else(String::new, |id| format!(",p={id}"));
+        Some(
+            format!(
+                "\x1b_Gi={}{placement};{}\x1b\\",
+                self.image_id,
+                error.unwrap_or("OK")
+            )
+            .into_bytes(),
+        )
+    }
 }

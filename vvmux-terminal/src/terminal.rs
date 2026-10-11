@@ -16,7 +16,7 @@ use vvte::ansi::{
 use crate::cell::{Cell, TerminalColor, TerminalHyperlink, UnderlineStyle};
 use crate::dcs::{DcsChunk, DcsRequest, DcsScanner, DcsState};
 use crate::event::{TerminalEvent, TerminalModes};
-use crate::kitty::{KittyChunk, KittyGraphicsScanner};
+use crate::kitty::{CursorGraphics, DIACRITICS, GraphicsOutput, KittyChunk, KittyGraphicsScanner};
 use crate::marker::{VividChunk, VividMarkerScanner};
 use crate::osc::{AgentOscTracker, OscState, ShellIntegration};
 
@@ -130,6 +130,9 @@ pub struct Terminal {
     tab_stops_customized: bool,
     marker_scanner: VividMarkerScanner,
     kitty_scanner: KittyGraphicsScanner,
+    kitty_images: CursorGraphics,
+    kitty_capable: bool,
+    kitty_cell_size: (u16, u16),
     dcs_scanner: DcsScanner,
     agent_osc: AgentOscTracker,
     keyboard_mode_stack: Vec<KeyboardModes>,
@@ -191,6 +194,9 @@ impl Terminal {
             tab_stops_customized: false,
             marker_scanner: VividMarkerScanner::default(),
             kitty_scanner: KittyGraphicsScanner::default(),
+            kitty_images: CursorGraphics::default(),
+            kitty_capable: false,
+            kitty_cell_size: (8, 16),
             dcs_scanner: DcsScanner::default(),
             agent_osc: AgentOscTracker::default(),
             keyboard_mode_stack: Vec::new(),
@@ -298,8 +304,17 @@ impl Terminal {
                     let dcs = self.dcs_scanner.push(&bytes);
                     self.process_dcs_chunks(dcs);
                 }
-                KittyChunk::Command(command) => {
-                    self.events.push(TerminalEvent::KittyGraphics(command));
+                KittyChunk::Packet(bytes) => {
+                    // Applications can await a graphics ACK inside a synchronized update.
+                    // Apply preceding VT bytes now: otherwise a buffered clear/cursor move
+                    // would run after the placement, or the ACK would wait for its own ESU.
+                    let mut processor = mem::take(&mut self.processor);
+                    processor.stop_sync(self);
+                    self.processor = processor;
+                    let output =
+                        self.kitty_images
+                            .process(&bytes, self.kitty_capable, self.kitty_cell_size);
+                    self.apply_kitty_output(output);
                 }
             }
         }
@@ -308,6 +323,77 @@ impl Terminal {
             self.process_vivid_chunks(vivid);
         }
         self.finish_events(damage)
+    }
+
+    /// Set attachment capability and cell dimensions before processing graphics output.
+    pub fn set_kitty_graphics(&mut self, capable: bool, cell_width: u16, cell_height: u16) {
+        self.kitty_capable = capable;
+        self.kitty_cell_size = (cell_width.max(1), cell_height.max(1));
+    }
+
+    fn apply_kitty_output(&mut self, output: GraphicsOutput) {
+        if !output.clear.is_empty() {
+            for row in self.grid.iter_mut().chain(&mut self.alternate_grid) {
+                for cell in row {
+                    if cell.ch != '\u{10eeee}' {
+                        continue;
+                    }
+                    let TerminalColor::Rgb(r, g, b) = cell.foreground else {
+                        continue;
+                    };
+                    let high = cell
+                        .combining
+                        .chars()
+                        .nth(2)
+                        .and_then(|mark| DIACRITICS.iter().position(|c| *c == mark))
+                        .unwrap_or(0) as u32;
+                    let id =
+                        (high << 24) | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+                    if output.clear.contains(&id) {
+                        *cell = Cell::default();
+                    }
+                }
+            }
+            self.damage();
+        }
+        if let Some(placement) = output.placement {
+            let id = placement.host_id;
+            let color = TerminalColor::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8);
+            let start_column = self.cursor_col.min(self.cols - 1);
+            for (row, row_mark) in DIACRITICS
+                .iter()
+                .enumerate()
+                .take(placement.rows.min(self.rows - self.cursor_row))
+            {
+                for (col, col_mark) in DIACRITICS
+                    .iter()
+                    .enumerate()
+                    .take(placement.columns.min(self.cols - start_column))
+                {
+                    self.invalidate_tab_at(self.cursor_row + row, start_column + col);
+                    self.grid[self.cursor_row + row][start_column + col] = Cell {
+                        ch: '\u{10eeee}',
+                        foreground: color,
+                        background: self.template.background,
+                        combining: [*row_mark, *col_mark, DIACRITICS[(id >> 24) as usize]]
+                            .into_iter()
+                            .collect(),
+                        ..Cell::default()
+                    };
+                }
+            }
+            if !placement.keep_cursor {
+                self.cursor_row = (self.cursor_row + placement.rows).min(self.rows - 1);
+                self.cursor_col = (start_column + placement.columns).min(self.cols - 1);
+            }
+            self.damage();
+        }
+        self.events.extend(
+            output
+                .commands
+                .into_iter()
+                .map(TerminalEvent::KittyGraphics),
+        );
     }
 
     fn process_dcs_chunks(&mut self, chunks: Vec<DcsChunk>) {
@@ -1745,6 +1831,7 @@ mod tests {
                     bytes: packet.to_vec(),
                     starts_transfer: true,
                     more: false,
+                    reply: None,
                 }
             )));
             assert!(terminal.cells().iter().flatten().all(|cell| cell.ch == ' '));
@@ -1804,6 +1891,7 @@ mod tests {
                 bytes: first.to_vec(),
                 starts_transfer: true,
                 more: true,
+                reply: None,
             }
         )));
         assert!(events.contains(&TerminalEvent::KittyGraphics(
@@ -1811,11 +1899,13 @@ mod tests {
                 bytes: last.to_vec(),
                 starts_transfer: false,
                 more: false,
+                reply: None,
             }
         )));
         assert!(
             events.contains(&TerminalEvent::KittyGraphics(KittyGraphicsCommand::Query {
-                image_id: 31
+                image_id: 31,
+                quiet: 0
             }))
         );
         assert!(
@@ -1823,6 +1913,115 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, TerminalEvent::VividMarker { .. }))
         );
+    }
+
+    #[test]
+    fn standard_graphics_queries_precede_device_attributes_at_every_split() {
+        let bytes = b"\x1b_Ga=q,i=31,f=24,s=1,v=1,m=0;AAAA\x1b\\\x1b[c";
+        for split in 0..=bytes.len() {
+            let mut terminal = Terminal::new(2, 4, 0);
+            let mut events = terminal.feed(&bytes[..split]);
+            events.extend(terminal.feed(&bytes[split..]));
+            let query = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        TerminalEvent::KittyGraphics(KittyGraphicsCommand::Query {
+                            image_id: 31,
+                            quiet: 0
+                        })
+                    )
+                })
+                .unwrap();
+            let attributes = events
+                .iter()
+                .position(|event| matches!(event, TerminalEvent::PtyWrite(_)))
+                .unwrap();
+            assert!(query < attributes);
+        }
+        let mut terminal = Terminal::new(2, 4, 0);
+        assert!(
+            terminal
+                .feed(b"\x1b_Ga=q,i=32,f=32,s=1,v=1;AAAAAA==\x1b\\")
+                .contains(&TerminalEvent::KittyGraphics(KittyGraphicsCommand::Query {
+                    image_id: 32,
+                    quiet: 0
+                }))
+        );
+        assert!(
+            terminal
+                .feed(b"\x1b_Ga=q,t=s,i=33,f=24,s=1,v=1;L25hbWU=\x1b\\")
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    TerminalEvent::KittyGraphics(KittyGraphicsCommand::Rejected {
+                        image_id: 33,
+                        ..
+                    })
+                ))
+        );
+    }
+
+    #[test]
+    fn cursor_placements_apply_in_stream_order_preserving_style_and_cursor_policy() {
+        let mut terminal = Terminal::new(4, 6, 0);
+        terminal.set_kitty_graphics(true, 8, 16);
+        terminal.feed(b"\x1b[31m\x1b[2;3H\x1b_Ga=T,i=1,f=24,s=1,v=1,c=2,r=2,C=1;AAAA\x1b\\Z");
+        assert_eq!(terminal.cursor(), (1, 3));
+        assert_eq!(
+            terminal.cells()[1][2].ch,
+            'Z',
+            "text after the placement wins"
+        );
+        assert_eq!(terminal.cells()[1][2].foreground, TerminalColor::Indexed(1));
+        assert_eq!(terminal.cells()[2][3].ch, '\u{10eeee}');
+        assert_eq!(terminal.cells()[2][3].combining.chars().count(), 3);
+        terminal.feed(b"\x1b[1;1H\x1b_Ga=p,i=1,p=9,c=1,r=1\x1b\\");
+        assert_eq!(terminal.cursor(), (1, 1));
+        terminal.feed(b"\x1b_Ga=d,d=I,i=1\x1b\\");
+        assert_eq!(terminal.cells()[1][2].ch, 'Z');
+        assert!(
+            terminal
+                .cells()
+                .iter()
+                .flatten()
+                .all(|cell| cell.ch != '\u{10eeee}')
+        );
+    }
+
+    #[test]
+    fn cursor_placements_clip_to_pane_edges_without_wrapping() {
+        let mut terminal = Terminal::new(2, 3, 0);
+        terminal.set_kitty_graphics(true, 8, 16);
+        terminal.feed(b"\x1b[2;3H\x1b_Ga=T,i=1,f=24,s=1,v=1,c=3,r=3,C=1;AAAA\x1b\\");
+        assert_eq!(terminal.cursor(), (1, 2));
+        assert_eq!(
+            terminal
+                .cells()
+                .iter()
+                .flatten()
+                .filter(|cell| cell.ch == '\u{10eeee}')
+                .count(),
+            1
+        );
+        assert_eq!(terminal.history_len(), 0);
+    }
+
+    #[test]
+    fn cursor_upload_inside_synchronized_update_runs_after_buffered_clear_and_cursor_move() {
+        let mut terminal = Terminal::new(4, 6, 0);
+        terminal.set_kitty_graphics(true, 8, 16);
+        terminal.feed(b"old text\x1b[?2026h\x1b[2J\x1b[2;3H");
+        let events = terminal.feed(b"\x1b_Ga=T,i=1,f=24,s=1,v=1,c=2,r=2,C=1;AAAA\x1b\\");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::KittyGraphics(KittyGraphicsCommand::Packet { reply: Some(_), .. })
+        )));
+        assert_eq!(terminal.cells()[1][2].ch, '\u{10eeee}');
+        terminal.feed(b"\x1b[?2026l");
+        assert_eq!(terminal.cells()[1][2].ch, '\u{10eeee}');
+        assert_eq!(terminal.cursor(), (1, 2));
     }
 
     #[test]

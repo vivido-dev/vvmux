@@ -272,15 +272,33 @@ for the probe's image ID enables the capability; the sentinel ends the wait, cap
 A restoring raw-mode guard protects every exit, typed-ahead bytes seed the normal input parser,
 and a bounded one-shot reply filter continues across the deadline. Other hosts receive no probe;
 nested vvmux, Windows and gateway clients keep the capability false. The terminal parser recognizes
-bounded fragmented APC packets beside the Vivid marker scanner, accepts only direct quiet uploads, Unicode virtual placements, targeted deletion,
-and support queries, and accounts in-progress plus ready transfers against a 64 MiB session bound.
+bounded fragmented APC packets beside the Vivid marker scanner. Quiet Unicode virtual placements
+keep their existing passthrough path. Standard direct RGB/RGBA cursor uploads are assembled into a
+pane-local pixel cache, with 64 MiB charged process-wide before allocation, including incomplete
+uploads. Placement requests crop those pixels locally, assign a fresh host ID, and produce quiet
+virtual-image uploads plus placeholder cells at the pane cursor. Explicit application placement
+IDs replace their previous host images; image and range/global deletes enumerate only that pane's
+cursor images. Ordinary grid composition clips and hides the placeholders. This is a compatibility
+translation with no general image layering or automatic graphics lifecycle/recovery implementation.
+Per-pane image counts, per-image placement counts, and Unicode dimensions are bounded. Encoded
+in-progress plus ready transfers remain accounted against the 64 MiB session bound.
+Standard direct single-packet queries and unsupported-transport errors are answered in output-event
+order, ahead of a following device-attributes sentinel. Cursor-upload acknowledgements follow
+queue admission and carry application IDs, never host IDs. All replies use the producing pane's
+bounded PTY input queue. Host uploads stay quiet, so no host replies need routing across panes.
+Replies from one output batch are coalesced into bounded writes, keeping a query and its sentinel
+together when possible. Before interpreting a graphics packet, preceding synchronized VT output
+is flushed: a producer can await a graphics acknowledgement before sending ESU, and a buffered
+clear or cursor move must precede the placement.
 Completed packets are prepended to a forced-full screen render, and the foreground client
 reassembles all VVMX render chunks before one queue admission, making upload-before-placeholder
 ordering atomic. Leading graphics packets are written before synchronized-update brackets, with
 only the repaint inside them, so uploads cannot exhaust the host update buffer. Placeholder cells
 remain ordinary grid cells through composition and scrollback, but are blanked for incapable
-attachments. Transfer state is cleared whenever the physical client
-detaches or the presenter changes and is never part of retained session state. A demoted capable
+attachments. Encoded transfer state is cleared whenever the physical client
+detaches or the presenter changes and is never part of retained session state. Cursor source pixels
+remain in the pane cache until explicitly deleted or the pane is removed; they are not automatically
+replayed to a replacement presenter. A demoted capable
 client receives a one-shot host-image reset before its next repaint; reset output survives frame
 supersession and resynchronization. Capable clients also reset their alternate-screen image store
 before teardown, leaving the primary screen's images intact. On Unix, PTY resize propagation includes
