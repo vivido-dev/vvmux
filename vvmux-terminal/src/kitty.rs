@@ -106,7 +106,9 @@ pub(crate) fn validate_kitty_command(body: &[u8], raw: &[u8]) -> Option<KittyGra
         }
     }
     let number = |key: &str| fields.get(key).and_then(|value| value.parse::<u32>().ok());
-    let quiet = number("q").unwrap_or(0);
+    // Continuations inherit q=2 from the admitted upload. The session drops orphan chunks.
+    let continuation = !fields.contains_key("a") && keys_are(&fields, &["q", "m"]);
+    let quiet = number("q").unwrap_or(if continuation { 2 } else { 0 });
     let reject = |error| {
         if quiet == 2 {
             return None;
@@ -164,8 +166,9 @@ pub(crate) fn validate_kitty_command(body: &[u8], raw: &[u8]) -> Option<KittyGra
             if action == "T"
                 && (number("i").is_none_or(|value| value == 0)
                     || number("U") != Some(1)
-                    || number("c").is_none_or(|value| value == 0)
-                    || number("r").is_none_or(|value| value == 0))
+                    || ["c", "r"]
+                        .iter()
+                        .any(|key| fields.contains_key(*key) && number(key).is_none()))
             {
                 return None;
             }
@@ -180,8 +183,9 @@ pub(crate) fn validate_kitty_command(body: &[u8], raw: &[u8]) -> Option<KittyGra
             if !keys_are(&fields, &["a", "i", "c", "r", "U", "C", "q"])
                 || number("i").is_none_or(|value| value == 0)
                 || number("U") != Some(1)
-                || number("c").is_none_or(|value| value == 0)
-                || number("r").is_none_or(|value| value == 0)
+                || ["c", "r"]
+                    .iter()
+                    .any(|key| fields.contains_key(*key) && number(key).is_none())
                 || !payload.is_empty()
             {
                 return None;

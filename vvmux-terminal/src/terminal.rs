@@ -1873,6 +1873,59 @@ mod tests {
     }
 
     #[test]
+    fn unicode_placements_accept_default_dimensions_used_by_yazi() {
+        for dimensions in ["", ",c=0,r=0", ",c=1", ",r=1"] {
+            for action in ["T", "p"] {
+                let (transmission, payload) = if action == "T" {
+                    (",f=24,s=2,v=1,m=1", ";AAAA")
+                } else {
+                    ("", "")
+                };
+                let packet = format!(
+                    "\x1b_Gq=2,a={action},C=1,U=1,i=42{dimensions}{transmission}{payload}\x1b\\"
+                );
+                for split in 0..=packet.len() {
+                    let mut terminal = Terminal::new(2, 4, 0);
+                    let mut events = terminal.feed(&packet.as_bytes()[..split]);
+                    events.extend(terminal.feed(&packet.as_bytes()[split..]));
+                    assert!(events.contains(&TerminalEvent::KittyGraphics(
+                        KittyGraphicsCommand::Packet {
+                            bytes: packet.as_bytes().to_vec(),
+                            starts_transfer: true,
+                            more: action == "T",
+                            reply: None,
+                        }
+                    )));
+                    if action == "T" {
+                        let last = b"\x1b_Gm=0;AAAA\x1b\\";
+                        assert!(terminal.feed(last).contains(&TerminalEvent::KittyGraphics(
+                            KittyGraphicsCommand::Packet {
+                                bytes: last.to_vec(),
+                                starts_transfer: false,
+                                more: false,
+                                reply: None,
+                            }
+                        )));
+                    }
+                    terminal.feed("\x1b[38;2;0;0;42m\u{10EEEE}\u{305}\u{305}".as_bytes());
+                    assert_eq!(terminal.cells()[0][0].ch, '\u{10EEEE}');
+                    assert_eq!(terminal.cells()[0][0].combining, "\u{305}\u{305}");
+                }
+            }
+        }
+        for dimension in ["c=-1", "r=invalid", "c=4294967296"] {
+            let mut terminal = Terminal::new(2, 4, 0);
+            let packet = format!("\x1b_Ga=p,U=1,i=42,q=2,{dimension}\x1b\\");
+            assert!(
+                terminal
+                    .feed(packet.as_bytes())
+                    .iter()
+                    .all(|event| !matches!(event, TerminalEvent::KittyGraphics(_)))
+            );
+        }
+    }
+
+    #[test]
     fn kitty_chunks_queries_and_vivid_markers_coexist() {
         let first = b"\x1b_Ga=T,i=1,f=32,s=1,v=1,c=1,r=1,U=1,q=2,m=1;AAAA\x1b\\";
         let last = b"\x1b_Gq=2,m=0;AAAA\x1b\\";

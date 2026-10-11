@@ -1342,6 +1342,9 @@ within the pane; each placement uploads its cropped pixels as a quiet virtual im
 `U+10EEEE` placeholder cells into the pane grid. Pane clipping, tab visibility, and composition
 therefore apply to both placement styles. `C=1` preserves the cursor; otherwise it advances by
 the placement dimensions. Explicit placement IDs replace matching placements.
+Quiet Unicode placements may omit `c,r` or set them to zero to use the host's natural image
+dimensions, as yazi does for image previews. Continuation chunks inherit quiet mode from the
+initial upload, so only that first packet needs `q=2`.
 
 Standard single-packet direct support queries accept omitted or explicit `q=0`, transport and
 format defaults, and `m=0`. Replies precede a following device-attributes sentinel and return to

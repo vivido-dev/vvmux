@@ -273,7 +273,10 @@ A restoring raw-mode guard protects every exit, typed-ahead bytes seed the norma
 and a bounded one-shot reply filter continues across the deadline. Other hosts receive no probe;
 nested vvmux, Windows and gateway clients keep the capability false. The terminal parser recognizes
 bounded fragmented APC packets beside the Vivid marker scanner. Quiet Unicode virtual placements
-keep their existing passthrough path. Standard direct RGB/RGBA cursor uploads are assembled into a
+keep their existing passthrough path, including omitted or zero `c,r` dimensions that the host
+derives from the image's natural size. Continuations may omit the initial packet's `q=2`; the
+session accepts them only within an admitted transfer from the same pane.
+Standard direct RGB/RGBA cursor uploads are assembled into a
 pane-local pixel cache, with 64 MiB charged process-wide before allocation, including incomplete
 uploads. Placement requests crop those pixels locally, assign a fresh host ID, and produce quiet
 virtual-image uploads plus placeholder cells at the pane cursor. Explicit application placement
