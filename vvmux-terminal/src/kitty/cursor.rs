@@ -32,7 +32,7 @@ struct Pixels {
 impl Pixels {
     fn new(bytes: usize) -> Result<Self> {
         PIXEL_BYTES
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes)
                     .filter(|total| *total <= KITTY_DECODED_TRANSFER_MAX_BYTES as usize)
             })
@@ -462,7 +462,7 @@ impl CursorGraphics {
             .filter(|n| *n <= MAX_ENCODED_BYTES)
             .ok_or("ENOSPC:encoded image exceeds transfer budget")?;
         let host_id = NEXT_IMAGE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_error| "ENOSPC:host image IDs exhausted")?;
         let mut bytes = Vec::with_capacity(packet_size);
         let mut chunk = Vec::with_capacity(3072);
