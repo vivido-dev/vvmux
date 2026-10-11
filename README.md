@@ -1341,14 +1341,22 @@ complete transfer, then writes it atomically before the full terminal repaint co
 `U+10EEEE` placeholder cells. File and shared-memory transports, cursor-positioned placements,
 animation commands, malformed packets, and more than 64 MiB of live transfer data are rejected.
 
-The native client advertises this exception only when the attaching terminal's exact `TERM` is
-`xterm-kitty` or `xterm-ghostty`; `TERM_PROGRAM` is never used as evidence. Hosted attachments,
-including Vivido, advertise no Kitty capability, and placeholder glyphs are suppressed there.
+The native Unix client advertises this exception for exact `TERM=xterm-kitty` and
+`TERM=xterm-ghostty` hosts. For `TERM=vivido`, or a host with outer Vivid credentials, it first
+sends a standard Kitty query and a device-attributes sentinel, waiting at most one second before
+attachment. Only an `OK` reply enables graphics; older Vivido finishes immediately at the sentinel
+without enabling it. Other terminals receive no probe, and `TERM_PROGRAM` is never evidence.
+Nested vvmux, Windows consoles, and browser/VVWS gateways do not advertise the capability.
+Typed-ahead input is preserved, and delayed probe replies are filtered out of pane input.
+
 Kitty transfers remain exclusive to the session's presenter; every other client sees the
-placeholders suppressed. Graphics bytes belong only to the presenter's physical attachment and are
-discarded when it detaches or another client claims the role, rather than retained or replayed. Unix pane PTYs receive cell and pixel dimensions so applications can
-choose the correct image size. This behavior is private to vvmux and does not alter Vivid media or
-the public Vivid protocol.
+placeholders suppressed. Uploads precede synchronized repaint brackets so large images cannot
+exhaust the host's update buffer. Graphics bytes belong to the presenter's physical attachment and
+are discarded when it detaches or another client claims the role. The client deletes host images
+before leaving the alternate screen, and a demoted presenter clears them before its next repaint.
+Nothing is retained or replayed on reattach. Unix pane PTYs receive cell and pixel dimensions so
+applications can choose the correct image size. This behavior is private to vvmux and does not alter
+Vivid media or the public Vivid protocol.
 
 ## Current scope
 
@@ -1359,8 +1367,8 @@ composition, mouse focus/move/resize/forwarding, status line, truecolor theming,
 live reload, command panes with hold-on-exit, bounded TOML startup layouts, VVMX IPC, exact
 fragment-aware pane media occlusion, static rehydration, timed-media headless semantics,
 full-duplex outer control, linked A/V projection, bounded scrollback search, tab-local synchronized
-input, optional bulk-media endpoint discovery, and validated Kitty/Ghostty graphics passthrough for
-Unicode virtual placements.
+input, optional bulk-media endpoint discovery, and validated Kitty/Ghostty and probed Vivido graphics passthrough
+for Unicode virtual placements.
 
 Intentionally absent: an in-terminal marketplace, a bundled web UI, direct non-loopback/TLS serving,
 arbitrary action sockets, stacked panes, pane-class conversion, multi-pane selection, scrollback

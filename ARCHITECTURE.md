@@ -264,16 +264,26 @@ terminates raster delta chains into a retained latest framebuffer; restoration r
 composed pixels as a hop-local full frame, so an interactive canvas does not fall back to its old
 pre-drawing full frame. Mixed VVMX versions are rejected with restart guidance.
 
-Version 20 also carries an attachment-scoped Kitty graphics capability. Only a native attachment
-whose exact host `TERM` is `xterm-kitty` or `xterm-ghostty` sets it; gateway and Vivido attachments
-leave it false. The terminal parser recognizes bounded fragmented APC packets beside the Vivid
-marker scanner, accepts only direct quiet uploads, Unicode virtual placements, targeted deletion,
+Version 20 also carries an attachment-scoped Kitty graphics capability, without a wire change for
+host probing. Native Unix clients trust exact `TERM=xterm-kitty` and `TERM=xterm-ghostty` hosts.
+`TERM=vivido` and outer Vivid credentials select candidates for a standard Kitty query followed by
+a primary device-attributes sentinel before attachment and alternate-screen entry. An `OK` reply
+for the probe's image ID enables the capability; the sentinel ends the wait, capped at one second.
+A restoring raw-mode guard protects every exit, typed-ahead bytes seed the normal input parser,
+and a bounded one-shot reply filter continues across the deadline. Other hosts receive no probe;
+nested vvmux, Windows and gateway clients keep the capability false. The terminal parser recognizes
+bounded fragmented APC packets beside the Vivid marker scanner, accepts only direct quiet uploads, Unicode virtual placements, targeted deletion,
 and support queries, and accounts in-progress plus ready transfers against a 64 MiB session bound.
 Completed packets are prepended to a forced-full screen render, and the foreground client
 reassembles all VVMX render chunks before one queue admission, making upload-before-placeholder
-ordering atomic. Placeholder cells remain ordinary grid cells through composition and scrollback,
-but are blanked for incapable attachments. Transfer state is cleared whenever the physical client
-detaches and is never part of retained session state. On Unix, PTY resize propagation includes
+ordering atomic. Leading graphics packets are written before synchronized-update brackets, with
+only the repaint inside them, so uploads cannot exhaust the host update buffer. Placeholder cells
+remain ordinary grid cells through composition and scrollback, but are blanked for incapable
+attachments. Transfer state is cleared whenever the physical client
+detaches or the presenter changes and is never part of retained session state. A demoted capable
+client receives a one-shot host-image reset before its next repaint; reset output survives frame
+supersession and resynchronization. Capable clients also reset their alternate-screen image store
+before teardown, leaving the primary screen's images intact. On Unix, PTY resize propagation includes
 checked pixel dimensions; Windows accepts the same internal call and continues using ConPTY cells.
 This is the sole scoped PTY media exception in vvmux and does not change the Vivid wire stack.
 

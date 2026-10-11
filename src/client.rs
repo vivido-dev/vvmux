@@ -217,19 +217,30 @@ pub fn attach(
     };
     let vivid = outer.is_some();
     let host_term = std::env::var_os("TERM");
-    let kitty_graphics = host_supports_kitty_graphics(host_term.as_deref());
+    let host = crate::host_probe::classify(host_term.as_deref(), vivid);
+    // Validate the terminal before writing even a candidate probe. The probe's raw-mode guard
+    // restores it before IPC admission; the alternate screen still starts only after acceptance.
+    let display = crate::platform::current_display_metrics()?;
+    let probe = if cfg!(windows) || host == crate::host_probe::Host::Ask {
+        crate::platform::probe_kitty_graphics(Instant::now() + crate::host_probe::PROBE_TIMEOUT)?
+    } else {
+        crate::host_probe::Probe::known(host == crate::host_probe::Host::Known)
+    };
+    let kitty_graphics = probe.supported;
+    let mut typed_ahead = probe.input;
+    let mut host_replies = probe.replies;
     log::debug!(
         event = "client.attach.outer",
         vivid = vivid,
         term:? = host_term,
         kitty_graphics = kitty_graphics,
+        kitty_host:? = host,
         control_endpoint = std::env::var_os("VIVID_ENDPOINT_CONTROL").is_some();
         "outer terminal capabilities"
     );
     // Negotiate the attachment before entering raw/alternate-screen mode. A rejected attach must
     // remain an ordinary command error: changing terminal state here would visibly clear the
     // caller's Vivido window, and the later terminal teardown would hide the server's diagnostic.
-    let display = crate::platform::current_display_metrics()?;
     let presenter_cell_size = Arc::new(AtomicU32::new(pack_cell_size(display)));
     let presenter = request_attachment(
         &mut reader,
@@ -242,7 +253,7 @@ pub fn attach(
         outer_identity(vivid, display),
     )?;
     log::info!(event = "client.attach.success", presenter = presenter; "attach accepted by server");
-    let terminal = ClientTerminal::enter()?;
+    let terminal = ClientTerminal::enter(kitty_graphics)?;
 
     let stopped = Arc::new(AtomicBool::new(false));
     let ipc_cancel = reader.cancel_handle();
@@ -255,7 +266,7 @@ pub fn attach(
     let (plugin_keymap_sender, plugin_keymap_receiver) = mpsc::sync_channel(8);
     let output = terminal.output()?;
     let output = Arc::new(Mutex::new(output));
-    let output_thread = TerminalOutput::spawn(output, Arc::clone(&writer))?;
+    let mut output_thread = TerminalOutput::spawn(output, Arc::clone(&writer))?;
     if !(vivid && presenter) {
         write_media_role_title(
             &output_thread,
@@ -673,18 +684,37 @@ pub fn attach(
             let mut bytes = [0_u8; 4096];
             // A held bare Escape has to reach the pane on its own timescale, not on the idle poll
             // interval, or a modal editor appears to swallow the first press.
-            let poll = if parser.holds_bare_escape() || float_scanner.holds_bare_escape() {
+            let poll = if parser.holds_bare_escape()
+                || float_scanner.holds_bare_escape()
+                || host_replies.holds_escape()
+            {
                 client_input::ESCAPE_DELAY
             } else {
                 INPUT_POLL_INTERVAL
             };
-            if let Some(read) = terminal.read_input(&mut bytes, poll)? {
+            let initial_input = !typed_ahead.is_empty();
+            let read = if initial_input {
+                Some(typed_ahead.len())
+            } else {
+                terminal.read_input(&mut bytes, poll)?
+            };
+            let input = if let Some(read) = read {
                 if read == 0 {
                     let _ = send_client(&writer, &ClientMessage::Detach);
                     detach_requested_at = Some(Instant::now());
                     continue;
                 }
-                let input = win32_input.decode(&bytes[..read]);
+                Some(if initial_input {
+                    std::mem::take(&mut typed_ahead)
+                } else {
+                    host_replies.feed(&bytes[..read])
+                })
+            } else {
+                let expired = host_replies.expire(Instant::now());
+                (!expired.is_empty()).then_some(expired)
+            };
+            if let Some(input) = input {
+                let input = win32_input.decode(&input);
                 let parsed = if let Some(mode_id) = float_mode {
                     // Scan edit keys before the ordinary prefix/mouse parser. In particular, that
                     // parser buffers ESC while deciding whether it begins SGR mouse input, which
@@ -768,13 +798,6 @@ pub fn attach(
     workers.stop();
     drop(terminal);
     result
-}
-
-fn host_supports_kitty_graphics(term: Option<&std::ffi::OsStr>) -> bool {
-    matches!(
-        term.and_then(std::ffi::OsStr::to_str),
-        Some("xterm-kitty" | "xterm-ghostty")
-    )
 }
 
 /// What this client can say about the Vivido window presenting it, with nothing sensitive in it.
@@ -2884,6 +2907,7 @@ struct OutputQueue {
 /// text. Frames now queue here and the reader thread returns immediately.
 struct TerminalOutput {
     queue: Arc<(Mutex<OutputQueue>, Condvar)>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 /// Bound on queued terminal bytes.
@@ -2897,10 +2921,13 @@ impl TerminalOutput {
     fn spawn(output: Arc<Mutex<Box<dyn Write + Send>>>, writer: SharedWriter) -> io::Result<Self> {
         let queue = Arc::new((Mutex::new(OutputQueue::default()), Condvar::new()));
         let worker = Arc::clone(&queue);
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("vvmux-terminal-output".into())
             .spawn(move || run_terminal_output(&output, &writer, &worker))?;
-        Ok(Self { queue })
+        Ok(Self {
+            queue,
+            worker: Some(worker),
+        })
     }
 
     fn enqueue_control(&self, bytes: Vec<u8>) {
@@ -2909,11 +2936,21 @@ impl TerminalOutput {
 
     /// Queue one frame chunk. Returns false when the queue overflowed and the caller must ask the
     /// server to resynchronize with a full redraw.
-    fn enqueue_frame(&self, frame_id: u64, full: bool, last: bool, bytes: Vec<u8>) -> bool {
+    fn enqueue_frame(&self, frame_id: u64, full: bool, last: bool, mut bytes: Vec<u8>) -> bool {
         let (lock, signal) = &*self.queue;
         let mut queue = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The actor sends cleanup once. Preserve it as control output even if a newer full
+        // repaint supersedes this frame or output backpressure requests a resynchronization.
+        if bytes.starts_with(crate::host_probe::RESET_GRAPHICS) {
+            queue.jobs.retain(|job| !matches!(job, OutputJob::Control(bytes) if bytes == crate::host_probe::RESET_GRAPHICS));
+            queue.bytes = queue.jobs.iter().map(output_job_len).sum();
+            let reset = crate::host_probe::RESET_GRAPHICS.to_vec();
+            bytes.drain(..reset.len());
+            queue.bytes = queue.bytes.saturating_add(reset.len());
+            queue.jobs.push_back(OutputJob::Control(reset));
+        }
         // A full redraw makes every earlier diff irrelevant, so it is the one point where the
         // backlog can be discarded without losing screen state.
         if full {
@@ -2926,8 +2963,9 @@ impl TerminalOutput {
             queue.bytes = queue.jobs.iter().map(output_job_len).sum();
         }
         if queue.bytes.saturating_add(bytes.len()) > OUTPUT_QUEUE_BYTES {
-            queue.jobs.clear();
-            queue.bytes = 0;
+            queue.jobs.retain(|job| matches!(job, OutputJob::Control(bytes) if bytes == crate::host_probe::RESET_GRAPHICS));
+            queue.bytes = queue.jobs.iter().map(output_job_len).sum();
+            signal.notify_one();
             return false;
         }
         queue.bytes = queue.bytes.saturating_add(bytes.len());
@@ -2952,12 +2990,23 @@ impl TerminalOutput {
         signal.notify_one();
     }
 
-    fn stop(&self) {
+    fn stop(&mut self) {
         let (lock, signal) = &*self.queue;
         lock.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .stopped = true;
         signal.notify_all();
+        // No queued upload may reach the primary screen after ClientTerminal's cleanup. Wait
+        // for the sole writer before the input loop drops the alternate-screen guard.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for TerminalOutput {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -2996,9 +3045,16 @@ fn run_terminal_output(
                 // whole diff at once instead of showing it being painted cell by cell. A frame
                 // reaches this queue whole — `RenderAssembler` rejoins the server's chunks before
                 // it is enqueued — so the closing bracket can never be separated from the opening
-                // one by a discarded job. A frame larger than the outer terminal's update buffer
-                // degrades to one mid-frame flush, which is what happens today without brackets.
-                if write_output(output, &[SYNC_UPDATE_BEGIN, &bytes, SYNC_UPDATE_END]).is_err() {
+                // one by a discarded job. Uploads precede the bracket: large images must not fill
+                // the host's synchronized-update buffer and force a flush halfway through repaint.
+                // Virtual placements show nothing until their placeholder cells are repainted.
+                let (uploads, repaint) = crate::host_probe::split_uploads(&bytes);
+                if write_output(
+                    output,
+                    &[uploads, SYNC_UPDATE_BEGIN, repaint, SYNC_UPDATE_END],
+                )
+                .is_err()
+                {
                     return;
                 }
                 // Acknowledge only after the bytes reached the terminal. The server uses this as
@@ -3160,6 +3216,11 @@ mod tests {
                 last: true,
                 bytes: b"repaint".to_vec(),
             });
+            state.jobs.push_back(OutputJob::Frame {
+                frame_id: 2,
+                last: true,
+                bytes: b"\x1b_Gfirst\x1b\\\x1b_Gsecond\x1b\\placeholders".to_vec(),
+            });
             state.stopped = true;
         };
         run_terminal_output(&output, &writer, &queue);
@@ -3167,7 +3228,7 @@ mod tests {
         let bytes = written.lock().unwrap().clone();
         assert_eq!(
             bytes,
-            b"\x1b]2;title\x1b\\\x1b[?2026hrepaint\x1b[?2026l".to_vec(),
+            b"\x1b]2;title\x1b\\\x1b[?2026hrepaint\x1b[?2026l\x1b_Gfirst\x1b\\\x1b_Gsecond\x1b\\\x1b[?2026hplaceholders\x1b[?2026l".to_vec(),
             "a repaint is bracketed; unrelated control bytes are not"
         );
         // Any opening bracket the outer terminal sees must be matched, or it stays buffering until
@@ -3184,9 +3245,72 @@ mod tests {
     }
 
     #[test]
+    fn stopping_output_waits_for_the_terminal_write_before_screen_teardown() {
+        struct GatedOutput {
+            started: Option<mpsc::SyncSender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Write for GatedOutput {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if let Some(started) = self.started.take() {
+                    started.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (started, writing) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let output: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(GatedOutput {
+                started: Some(started),
+                release: released,
+            })));
+        let writer = crate::ipc::test_shared_writer(Box::new(io::sink()));
+        let mut terminal = TerminalOutput::spawn(output, writer).unwrap();
+        terminal.enqueue_control(b"upload still being written".to_vec());
+        writing.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (finished, completion) = mpsc::sync_channel(1);
+        let stop = thread::spawn(move || {
+            terminal.stop();
+            finished.send(()).unwrap();
+        });
+        assert!(matches!(
+            completion.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release.send(()).unwrap();
+        completion.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop.join().unwrap();
+    }
+
+    #[test]
+    fn host_graphics_reset_survives_superseding_frames_and_backpressure() {
+        let output = TerminalOutput {
+            queue: Arc::new((Mutex::new(OutputQueue::default()), Condvar::new())),
+            worker: None,
+        };
+        let mut bytes = crate::host_probe::RESET_GRAPHICS.to_vec();
+        bytes.extend_from_slice(b"demoted repaint");
+        assert!(output.enqueue_frame(1, true, true, bytes));
+        assert!(output.enqueue_frame(2, true, true, b"new repaint".to_vec()));
+        assert!(!output.enqueue_frame(3, false, true, vec![0; OUTPUT_QUEUE_BYTES]));
+        let state = output.queue.0.lock().unwrap();
+        assert_eq!(state.jobs.len(), 1);
+        assert!(
+            matches!(state.jobs.front(), Some(OutputJob::Control(bytes)) if bytes == crate::host_probe::RESET_GRAPHICS)
+        );
+        assert_eq!(state.bytes, crate::host_probe::RESET_GRAPHICS.len());
+    }
+
+    #[test]
     fn discarding_superseded_frames_keeps_the_queue_accounting_honest() {
         let output = TerminalOutput {
             queue: Arc::new((Mutex::new(OutputQueue::default()), Condvar::new())),
+            worker: None,
         };
         output.enqueue_control(b"ctl".to_vec());
         assert!(output.enqueue_frame(1, false, true, b"superseded".to_vec()));
@@ -3238,23 +3362,6 @@ mod tests {
             assembler.push(3, 2, false, true, b"b".to_vec()),
             RenderAssembly::Rejected
         ));
-    }
-
-    #[test]
-    fn kitty_host_capability_uses_only_exact_term_values() {
-        use std::ffi::OsStr;
-
-        assert!(host_supports_kitty_graphics(Some(OsStr::new(
-            "xterm-kitty"
-        ))));
-        assert!(host_supports_kitty_graphics(Some(OsStr::new(
-            "xterm-ghostty"
-        ))));
-        assert!(!host_supports_kitty_graphics(Some(OsStr::new("vvmux"))));
-        assert!(!host_supports_kitty_graphics(Some(OsStr::new(
-            "xterm-kitty-256color"
-        ))));
-        assert!(!host_supports_kitty_graphics(None));
     }
 
     /// A discarded retained body must reach the session as a failed result, or the presenter's
@@ -3736,7 +3843,7 @@ mod tests {
         let output: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(Box::new(StalledTerminal(Arc::clone(&gate)))));
         let writer = crate::ipc::test_shared_writer(Box::new(io::sink()));
-        let terminal = TerminalOutput::spawn(output, writer).unwrap();
+        let mut terminal = TerminalOutput::spawn(output, writer).unwrap();
 
         // The writer thread is parked inside the first frame's write.
         assert!(terminal.enqueue_frame(1, true, true, vec![b'a'; 16]));

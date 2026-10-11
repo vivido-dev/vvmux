@@ -113,10 +113,10 @@ impl Client {
         });
         // A developer running the suite inside Vivido must not hand a text client their own
         // window's capability.
-        let scrub = if vivid.is_empty() {
-            "env -u VIVID_ENDPOINT_CONTROL -u VIVID_ROOT_SECRET "
-        } else {
+        let scrub = if vivid.iter().any(|(key, _)| key == "VIVID_ENDPOINT_CONTROL") {
             ""
+        } else {
+            "env -u VIVID_ENDPOINT_CONTROL -u VIVID_ROOT_SECRET "
         };
         parts
             .input
@@ -136,6 +136,36 @@ impl Client {
             columns,
             rows,
         }
+    }
+
+    fn answer_graphics_probe(&mut self, supported: bool, typed_ahead: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !self.transcript.windows(3).any(|bytes| bytes == b"\x1b[c") {
+            assert!(
+                Instant::now() < deadline,
+                "client never sent a graphics probe"
+            );
+            if let Ok(bytes) = self.receiver.recv_timeout(Duration::from_millis(10)) {
+                self.transcript.extend(bytes);
+            }
+        }
+        let start = self
+            .transcript
+            .windows(5)
+            .position(|bytes| bytes == b"\x1b_Gi=")
+            .unwrap()
+            + 5;
+        let id = self.transcript[start..]
+            .split(|byte| *byte == b',')
+            .next()
+            .unwrap();
+        let id = std::str::from_utf8(id).unwrap();
+        let graphics = if supported {
+            format!("\x1b_Gi={id};OK\x1b\\")
+        } else {
+            String::new()
+        };
+        self.send(format!("{typed_ahead}{graphics}\x1b[?62;4c").as_bytes());
     }
 
     fn send(&self, bytes: &[u8]) {
@@ -314,6 +344,120 @@ fn create_detached(runtime: &Path, config: &Path, session: &str) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+const KITTY_RESET: &[u8] = b"\x1b_Ga=d,d=R,x=1,y=4294967295,q=2\x1b\\";
+
+fn reset_count(client: &mut Client) -> usize {
+    let _ = client.screen_text();
+    client
+        .transcript
+        .windows(KITTY_RESET.len())
+        .filter(|bytes| *bytes == KITTY_RESET)
+        .count()
+}
+
+#[test]
+fn vivido_probe_preserves_typed_ahead_and_sentinel_only_hosts_stay_incapable() {
+    let directory = temporary_runtime("vvqp-");
+    let runtime = directory.path().to_path_buf();
+    let config = write_echo_session(&runtime, "");
+    let session = unique("probe");
+    create_detached(&runtime, &config, &session);
+    let _guard = SessionGuard {
+        runtime: runtime.clone(),
+        name: session.clone(),
+    };
+    let candidate = [("TERM".to_owned(), "vivido".to_owned())];
+    let mut first = Client::attach(&runtime, &session, 90, 20, "", &candidate);
+    first.answer_graphics_probe(true, "typed-during-positive-probe\n");
+    first.wait_for_text("OUT:typed-during-positive-probe");
+    let mut second = Client::attach(&runtime, &session, 90, 20, "", &candidate);
+    second.answer_graphics_probe(false, "typed-during-negative-probe\n");
+    second.wait_for_text("OUT:typed-during-negative-probe");
+    let listing = wait_for_clients(
+        &runtime,
+        &config,
+        &session,
+        "both probed clients",
+        |listing| client_ids(listing).len() == 2,
+    );
+    assert_eq!(listing["clients"][0]["kitty_graphics"], true);
+    assert_eq!(listing["clients"][1]["kitty_graphics"], false);
+    let text = pane_text(&runtime, &config, &session, "1");
+    assert!(
+        !text.contains("62;4c"),
+        "the sentinel leaked into pane input: {text}"
+    );
+    assert!(
+        !text.contains(";OK"),
+        "the graphics response leaked into pane input: {text}"
+    );
+}
+
+#[test]
+fn kitty_presenter_demotion_resets_only_its_host_once_and_other_clients_keep_working() {
+    let directory = temporary_runtime("vvkg-");
+    let runtime = directory.path().to_path_buf();
+    let config = write_echo_session(&runtime, "");
+    let session = unique("kitty");
+    create_detached(&runtime, &config, &session);
+    let _guard = SessionGuard {
+        runtime: runtime.clone(),
+        name: session.clone(),
+    };
+    let kitty = [("TERM".to_owned(), "xterm-kitty".to_owned())];
+    let mut first = Client::attach(&runtime, &session, 90, 20, "", &kitty);
+    first.wait_for_text("READY");
+    let mut second = Client::attach(&runtime, &session, 90, 20, "", &kitty);
+    second.wait_for_text("READY");
+    assert_eq!(reset_count(&mut first), 0);
+    assert_eq!(reset_count(&mut second), 0);
+    // A non-candidate has no output between the shell's exec echo and alternate-screen entry.
+    let mut text = Client::attach(&runtime, &session, 90, 20, "", &[]);
+    text.wait_for_text("READY");
+    let alternate = text
+        .transcript
+        .windows(b"\x1b[?1049h".len())
+        .position(|bytes| bytes == b"\x1b[?1049h")
+        .unwrap();
+    assert!(
+        !text.transcript[..alternate]
+            .windows(3)
+            .any(|bytes| bytes == b"\x1b_G")
+    );
+
+    second.send(b"\x02M");
+    wait_for_clients(
+        &runtime,
+        &config,
+        &session,
+        "claimed Kitty presenter",
+        |listing| {
+            let clients = listing["clients"].as_array().unwrap();
+            clients.len() == 3 && listing["presenter_client_id"] == clients[1]["client_id"]
+        },
+    );
+    second.send(b"after-claim\n");
+    first.wait_for_text("OUT:after-claim");
+    second.wait_for_text("OUT:after-claim");
+    text.wait_for_text("OUT:after-claim");
+    assert_eq!(reset_count(&mut first), 1);
+    assert_eq!(reset_count(&mut second), 0);
+    assert_eq!(reset_count(&mut text), 0);
+    second.send(b"next-repaint\n");
+    first.wait_for_text("OUT:next-repaint");
+    assert_eq!(reset_count(&mut first), 1);
+
+    second.send(b"\x02d");
+    second.wait_for("Kitty teardown", |screen| !screen.alternate_screen());
+    assert_eq!(reset_count(&mut second), 1);
+    first.send(b"unrelated-client-alive\n");
+    first.wait_for_text("OUT:unrelated-client-alive");
+    text.wait_for_text("OUT:unrelated-client-alive");
+    text.send(b"\x02d");
+    text.wait_for("text teardown", |screen| !screen.alternate_screen());
+    assert_eq!(reset_count(&mut text), 0);
 }
 
 #[test]

@@ -165,6 +165,11 @@ impl SessionActor {
         let Some(client) = self.clients.get_mut(&id) else {
             return;
         };
+        if std::mem::take(&mut client.reset_host_graphics) {
+            let mut reset = crate::host_probe::RESET_GRAPHICS.to_vec();
+            reset.extend_from_slice(&kitty_prefix);
+            kitty_prefix = reset;
+        }
         let frame_full = client.force_full || !kitty_prefix.is_empty();
         client.frame_id = client.frame_id.wrapping_add(1);
         // Mutated only by the Windows bracketed-paste prepend below.

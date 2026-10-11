@@ -612,6 +612,8 @@ struct AttachedClient {
     media_enabled: bool,
     shared_visuals: SharedVisualState,
     kitty_graphics: bool,
+    /// Clear the demoted presenter's host store once, before its next terminal repaint.
+    reset_host_graphics: bool,
     read_only: bool,
     /// Whether this client's host terminal holds focus. Assumed true at attach, because a client
     /// attaches into a focused window.

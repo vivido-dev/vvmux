@@ -19,6 +19,7 @@ mod config;
 mod config_watch;
 #[cfg(feature = "server-capability")]
 mod gateway;
+mod host_probe;
 mod ipc;
 mod layout;
 mod layout_file;

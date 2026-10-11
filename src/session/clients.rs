@@ -115,6 +115,7 @@ impl SessionActor {
                         media_enabled: media != crate::ipc::MediaRequest::Never,
                         shared_visuals: SharedVisualState::default(),
                         kitty_graphics,
+                        reset_host_graphics: false,
                         read_only,
                         focused: true,
                         activity: self.client_activity,
@@ -1058,6 +1059,8 @@ impl SessionActor {
         }
         let previous = std::mem::replace(&mut self.presenter, next);
         if let Some(client) = previous.and_then(|id| self.clients.get_mut(&id)) {
+            client.reset_host_graphics |= client.kitty_graphics;
+            client.render_pending = true;
             client.shared_visuals = SharedVisualState {
                 bridge_instance: self.bridge_instance_id,
                 ..SharedVisualState::default()

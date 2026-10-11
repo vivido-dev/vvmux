@@ -446,9 +446,42 @@ fn update_close_on_exec(descriptor: RawFd, enabled: bool) -> io::Result<()> {
 }
 
 pub struct ClientTerminal {
-    original: libc::termios,
+    _raw: RawMode,
     output: File,
     messages: Option<MessageBlock>,
+    kitty_graphics: bool,
+}
+
+/// Restore the original terminal modes on every return path, including I/O errors.
+struct RawMode {
+    fd: RawFd,
+    original: libc::termios,
+}
+
+impl RawMode {
+    fn enter(fd: RawFd) -> io::Result<Self> {
+        // SAFETY: `termios` is plain old data for which all-zero bytes are a valid value.
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        // SAFETY: `tcgetattr` writes one `termios` into the live local.
+        if unsafe { libc::tcgetattr(fd, &raw mut original) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut raw = original;
+        // SAFETY: `cfmakeraw` modifies the initialized `termios` copy in place.
+        unsafe { libc::cfmakeraw(&raw mut raw) };
+        // SAFETY: `tcsetattr` reads the initialized local; invalid descriptors yield an error.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const raw) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd, original })
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        // SAFETY: the guard borrows a live descriptor and owns the initialized saved termios.
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.original) };
+    }
 }
 
 /// Write access that `mesg n` removed from the terminal device, so it can be given back.
@@ -497,44 +530,21 @@ impl MessageBlock {
 }
 
 impl ClientTerminal {
-    pub fn enter() -> io::Result<Self> {
+    pub fn enter(kitty_graphics: bool) -> io::Result<Self> {
         require_interactive_terminal()?;
-        // SAFETY: `termios` is plain old data for which all-zero bytes are a valid value.
-        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
-        // SAFETY: `tcgetattr` writes one `termios` into the live local.
-        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &raw mut original) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut raw = original;
-        // SAFETY: `cfmakeraw` modifies the initialized `termios` copy in place.
-        unsafe { libc::cfmakeraw(&raw mut raw) };
-        // SAFETY: `tcsetattr` reads one initialized `termios` from the live local.
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const raw) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut output = match duplicate_fd(libc::STDOUT_FILENO) {
-            Ok(output) => output,
-            Err(error) => {
-                // SAFETY: `original` is the initialized `termios` read from stdin above.
-                unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const original) };
-                return Err(error);
-            }
-        };
-        if let Err(error) = output
+        let raw = RawMode::enter(libc::STDIN_FILENO)?;
+        let mut output = duplicate_fd(libc::STDOUT_FILENO)?;
+        output
             .write_all(
                 b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h",
             )
-            .and_then(|()| output.flush())
-        {
-            // SAFETY: `original` is the initialized `termios` read from stdin above.
-            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const original) };
-            return Err(error);
-        }
+            .and_then(|()| output.flush())?;
         let messages = MessageBlock::engage(libc::STDOUT_FILENO);
         Ok(Self {
-            original,
+            _raw: raw,
             output,
             messages,
+            kitty_graphics,
         })
     }
 
@@ -555,28 +565,89 @@ impl ClientTerminal {
         reason = "the Windows client keeps per-terminal state here, so both platforms share the method"
     )]
     pub fn read_input(&self, buffer: &mut [u8], timeout: Duration) -> io::Result<Option<usize>> {
-        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-        let mut poll_fd = libc::pollfd {
-            fd: libc::STDIN_FILENO,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `poll` reads and writes exactly one `pollfd`, the live local passed with a count
-        // of one.
-        let result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_ms) };
-        if result == -1 {
+        read_terminal_input(libc::STDIN_FILENO, buffer, timeout)
+    }
+}
+
+fn read_terminal_input(
+    fd: RawFd,
+    buffer: &mut [u8],
+    timeout: Duration,
+) -> io::Result<Option<usize>> {
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll` reads and writes exactly one `pollfd`, the live local passed with a count
+    // of one.
+    let result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_ms) };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            Ok(None)
+        } else {
+            Err(error)
+        }
+    } else if result == 0 || poll_fd.revents & libc::POLLIN == 0 {
+        Ok(None)
+    } else {
+        // SAFETY: `read` writes at most the provided slice length into its live allocation.
+        let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read == -1 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
                 Ok(None)
             } else {
                 Err(error)
             }
-        } else if result == 0 || poll_fd.revents & libc::POLLIN == 0 {
-            Ok(None)
         } else {
-            io::stdin().read(buffer).map(Some)
+            Ok(Some(read as usize))
         }
     }
+}
+
+/// Query a candidate host before attachment, restoring all terminal modes before returning.
+pub fn probe_kitty_graphics(deadline: Instant) -> io::Result<crate::host_probe::Probe> {
+    let mut output = duplicate_fd(libc::STDOUT_FILENO)?;
+    probe_kitty_graphics_on(libc::STDIN_FILENO, &mut output, deadline)
+}
+
+fn probe_kitty_graphics_on(
+    input: RawFd,
+    output: &mut impl Write,
+    deadline: Instant,
+) -> io::Result<crate::host_probe::Probe> {
+    let _raw = RawMode::enter(input)?;
+    let mut seed = [0_u8; 4];
+    getrandom::fill(&mut seed).map_err(|error| io::Error::other(error.to_string()))?;
+    let image_id = u32::from_ne_bytes(seed).max(1);
+    let mut replies = crate::host_probe::Replies::new(image_id);
+    output.write_all(&crate::host_probe::query(image_id))?;
+    output.flush()?;
+    let mut input_bytes = Vec::new();
+    while !replies.done() && input_bytes.len() < crate::host_probe::PROBE_INPUT_LIMIT {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut bytes = [0_u8; 4096];
+        let capacity = bytes
+            .len()
+            .min(crate::host_probe::PROBE_INPUT_LIMIT - input_bytes.len());
+        if let Some(read) = read_terminal_input(input, &mut bytes[..capacity], remaining)? {
+            if read == 0 {
+                break;
+            }
+            input_bytes.extend(replies.feed(&bytes[..read]));
+        }
+    }
+    Ok(crate::host_probe::Probe {
+        supported: replies.supported(),
+        input: input_bytes,
+        replies,
+    })
 }
 
 /// Query and validate the host terminal without changing any of its modes.
@@ -627,6 +698,9 @@ fn require_interactive_terminal() -> io::Result<()> {
 
 impl Drop for ClientTerminal {
     fn drop(&mut self) {
+        if self.kitty_graphics {
+            let _ = self.output.write_all(crate::host_probe::RESET_GRAPHICS);
+        }
         let _ = self.output.write_all(
             b"\x1b[0m\x1b[=0u\x1b[?2004l\x1b[?1004l\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?25h\x1b[?1049l",
         );
@@ -634,8 +708,7 @@ impl Drop for ClientTerminal {
         if let Some(messages) = &self.messages {
             messages.release();
         }
-        // SAFETY: `original` is the initialized `termios` that `enter` read from stdin.
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const self.original) };
+        // The raw-mode guard restores termios after the alternate-screen teardown.
     }
 }
 
@@ -848,6 +921,163 @@ fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
 mod tests {
     use super::*;
     use std::os::fd::IntoRawFd;
+
+    fn pty_pair() -> (File, File) {
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            // SAFETY: both descriptor outputs are live locals; optional configuration is null.
+            unsafe {
+                libc::openpty(
+                    &raw mut master,
+                    &raw mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        // SAFETY: openpty returned fresh descriptors; ownership transfers once to each File.
+        unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+    }
+
+    fn modes(fd: RawFd) -> libc::termios {
+        // SAFETY: termios accepts zero initialization, and tcgetattr fills the live local.
+        let mut modes = unsafe { std::mem::zeroed::<libc::termios>() };
+        // SAFETY: the output points to the initialized local.
+        assert_eq!(unsafe { libc::tcgetattr(fd, &raw mut modes) }, 0);
+        modes
+    }
+
+    fn assert_modes_restored(before: &libc::termios, fd: RawFd) {
+        let after = modes(fd);
+        assert_eq!(before.c_iflag, after.c_iflag);
+        assert_eq!(before.c_oflag, after.c_oflag);
+        assert_eq!(before.c_cflag, after.c_cflag);
+        // The kernel sets PENDIN when canonical mode resumes to reprocess buffered input.
+        // It is transient line-discipline state, rather than a changed terminal mode.
+        assert_eq!(
+            before.c_lflag & !libc::PENDIN,
+            after.c_lflag & !libc::PENDIN
+        );
+        assert_eq!(before.c_cc, after.c_cc);
+        // SAFETY: both calls read initialized termios structures.
+        assert_eq!(unsafe { libc::cfgetispeed(before) }, unsafe {
+            libc::cfgetispeed(&raw const after)
+        });
+        // SAFETY: both calls read initialized termios structures.
+        assert_eq!(unsafe { libc::cfgetospeed(before) }, unsafe {
+            libc::cfgetospeed(&raw const after)
+        });
+    }
+
+    #[test]
+    fn graphics_probe_uses_a_real_pty_and_restores_modes_on_every_outcome() {
+        for graphics_reply in [Some("OK"), Some("ENOTSUP"), None] {
+            let (mut master, slave) = pty_pair();
+            let before = modes(slave.as_raw_fd());
+            let host = std::thread::spawn(move || {
+                let mut query = Vec::new();
+                let mut bytes = [0; 128];
+                while !query.ends_with(b"\x1b[c") {
+                    let count = master.read(&mut bytes).unwrap();
+                    query.extend_from_slice(&bytes[..count]);
+                }
+                let query = String::from_utf8(query).unwrap();
+                let id = query
+                    .strip_prefix("\x1b_Gi=")
+                    .unwrap()
+                    .split(',')
+                    .next()
+                    .unwrap();
+                let graphics = graphics_reply
+                    .map_or_else(String::new, |reply| format!("\x1b_Gi={id};{reply}\x1b\\"));
+                master
+                    .write_all(format!("before{graphics}between\x1b[?62;4cafter").as_bytes())
+                    .unwrap();
+                // Keep the master alive until the probe has restored the slave.
+                master
+            });
+            let result = probe_kitty_graphics_on(
+                slave.as_raw_fd(),
+                &mut slave.try_clone().unwrap(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            let _master = host.join().unwrap();
+            assert_eq!(result.supported, graphics_reply == Some("OK"));
+            assert_eq!(result.input, b"beforebetweenafter");
+            assert_modes_restored(&before, slave.as_raw_fd());
+        }
+    }
+
+    #[test]
+    fn silent_graphics_probe_obeys_the_deadline_and_restores_modes() {
+        let (_master, slave) = pty_pair();
+        let before = modes(slave.as_raw_fd());
+        let start = Instant::now();
+        let result = probe_kitty_graphics_on(
+            slave.as_raw_fd(),
+            &mut slave.try_clone().unwrap(),
+            start + Duration::from_millis(30),
+        )
+        .unwrap();
+        assert!(!result.supported);
+        assert!(start.elapsed() >= Duration::from_millis(30));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_modes_restored(&before, slave.as_raw_fd());
+    }
+
+    #[test]
+    fn a_failed_probe_write_restores_terminal_modes() {
+        struct FailingOutput;
+        impl Write for FailingOutput {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected write failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (_master, slave) = pty_pair();
+        let before = modes(slave.as_raw_fd());
+        let error = probe_kitty_graphics_on(
+            slave.as_raw_fd(),
+            &mut FailingOutput,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_modes_restored(&before, slave.as_raw_fd());
+    }
+
+    #[test]
+    fn teardown_resets_only_graphics_capable_hosts_before_leaving_the_screen() {
+        for capable in [false, true] {
+            let (master, slave) = pty_pair();
+            let before = modes(slave.as_raw_fd());
+            let terminal = ClientTerminal {
+                _raw: RawMode::enter(slave.as_raw_fd()).unwrap(),
+                output: slave.try_clone().unwrap(),
+                messages: None,
+                kitty_graphics: capable,
+            };
+            drop(terminal);
+            assert_modes_restored(&before, slave.as_raw_fd());
+            let mut output = [0; 512];
+            let count =
+                read_terminal_input(master.as_raw_fd(), &mut output, Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap();
+            let output = &output[..count];
+            assert_eq!(
+                output.starts_with(crate::host_probe::RESET_GRAPHICS),
+                capable
+            );
+            assert!(output.ends_with(b"\x1b[?1049l"));
+        }
+    }
 
     fn writer_for(descriptor: OwnedFd) -> (ReadinessWriter, RawFd) {
         let descriptor = descriptor.into_raw_fd();

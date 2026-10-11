@@ -203,7 +203,7 @@ pub struct ClientTerminal {
 }
 
 impl ClientTerminal {
-    pub fn enter() -> io::Result<Self> {
+    pub fn enter(_kitty_graphics: bool) -> io::Result<Self> {
         // SAFETY: `GetStdHandle` takes a plain constant and returns a borrowed handle or a
         // sentinel, which is checked before use.
         let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
@@ -369,6 +369,11 @@ impl ClientTerminal {
     }
 }
 
+/// ConPTY does not reliably carry graphics APCs, so Windows never probes the host.
+pub fn probe_kitty_graphics(_deadline: Instant) -> io::Result<crate::host_probe::Probe> {
+    Ok(crate::host_probe::Probe::known(false))
+}
+
 /// Query the attached console without borrowing `ClientTerminal`, allowing the Windows client to
 /// observe viewport changes on a thread that cannot be stalled by console input semantics.
 pub fn current_display_metrics() -> io::Result<DisplayMetrics> {
@@ -508,7 +513,8 @@ pub fn console_restoration_self_test() -> io::Result<()> {
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let unwind = std::panic::catch_unwind(move || {
-            let _terminal = ClientTerminal::enter().expect("console self-test could not enter");
+            let _terminal =
+                ClientTerminal::enter(false).expect("console self-test could not enter");
             unwind_entered.store(true, Ordering::Release);
             panic!("injected console restoration self-test panic");
         });
