@@ -369,7 +369,11 @@ impl ClientTerminal {
     }
 }
 
-/// ConPTY does not reliably carry graphics APCs, so Windows never probes the host.
+/// `ConPTY` does not reliably carry graphics APCs, so Windows never probes the host.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the fallible Unix platform interface"
+)]
 pub fn probe_kitty_graphics(_deadline: Instant) -> io::Result<crate::host_probe::Probe> {
     Ok(crate::host_probe::Probe::known(false))
 }

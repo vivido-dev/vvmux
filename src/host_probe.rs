@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 /// Remote hosts get one second; local hosts normally finish at the DA reply immediately.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Bound typed-ahead storage even when the terminal continuously sends unrelated input.
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub(crate) const PROBE_INPUT_LIMIT: usize = 64 * 1024;
 /// Replies are tiny; this cap also bounds an unterminated or malformed reply candidate.
 const REPLY_LIMIT: usize = 1024;
