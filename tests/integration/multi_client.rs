@@ -39,7 +39,7 @@ fn image_producer_child() {
     let mut pane = vivid_sdk::PaneSession::from_env().unwrap();
     pane.show_encoded_image(&png).unwrap();
     println!("{SHOWN}");
-    std::thread::sleep(Duration::from_secs(60));
+    std::thread::sleep(Duration::from_mins(1));
     let _ = pane.close();
 }
 
@@ -739,7 +739,7 @@ fn raster_producer_child() {
         producers.push(Some((session, surface, node, channel)));
     }
     println!("RASTERS-READY");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let mut updated = [false; 2];
     let mut after_close = false;
     while Instant::now() < deadline {
