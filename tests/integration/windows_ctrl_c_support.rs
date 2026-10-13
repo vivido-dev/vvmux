@@ -84,7 +84,11 @@ impl Console {
     pub fn interrupt_ping(&mut self) {
         // Clear the old prompt so only a prompt printed after interruption can satisfy the test.
         // A single Enter avoids leaving an extra blank command queued behind ping.
-        self.input.send(b"cls & ping -n 30 127.0.0.1\r").unwrap();
+        // Installer environments may omit System32 from PATH. Resolve ping explicitly and
+        // clear PATH in this shell so both Ctrl+C tests exercise that environment.
+        self.input
+            .send(b"cls & set \"PATH=\" & \"%SystemRoot%\\System32\\ping.exe\" -n 30 127.0.0.1\r")
+            .unwrap();
         assert!(
             self.wait(Duration::from_secs(10), |terminal| {
                 let text = terminal.visible_text(0);
