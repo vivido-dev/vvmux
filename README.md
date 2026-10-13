@@ -49,6 +49,34 @@ below `%LOCALAPPDATA%\vvmux\runtime`. Pane shells receive an exact `127.0.0.1` v
 and `VIVID_ANCHOR_TRANSPORT=conpty`. Remote Unix applications may still need the supplied
 `terminfo/vvmux.info` installed on the remote host.
 
+### Installing the vivido terminfo entry on a vvmux-only host
+
+vvmux runs under any terminal and needs no Vivido install beside it. But when the terminal you
+attach from is Vivido — typically over SSH — that session announces `TERM=vivido`, and the login
+shell you type `vvmux` in, plus any curses tool started there, looks the `vivido` entry up on that
+host. A vvmux-only install does not carry it. Pane shells are unaffected: they get `TERM=vvmux`
+when the supplied `terminfo/vvmux.info` is installed (above), otherwise `TERM=xterm-256color`.
+
+Install the entry one of two ways. From a shell inside your local Vivido window, push the compiled
+entry over SSH:
+
+```sh
+infocmp -x vivido | ssh remote-host tic -x -
+```
+
+Or on the vvmux host itself, compile the published source description into your user terminfo
+directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vivido-dev/vivido/master/extra/vivido.info -o vivido.info
+tic -x -e vivido,vivido-direct -o "$HOME/.terminfo" vivido.info
+```
+
+`sudo tic -x -e vivido,vivido-direct -o /usr/share/terminfo vivido.info` installs it system-wide,
+which also covers environment boundaries such as `sudo`. Until the entry is installed, remote
+ncurses tools in the outer shell report an unknown terminal; a one-off fallback for a single
+session is `TERM=xterm-256color`.
+
 ## Commands
 
 ```text
