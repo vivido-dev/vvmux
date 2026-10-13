@@ -1446,10 +1446,10 @@ verifies the release manifest with the public key compiled into the binary, then
 size and SHA-256 before an atomic same-directory replacement. It never sends credentials and does
 not restart live session daemons. Windows remains managed by the Vivido Suite installer.
 
-Official release automation requires the repository variable `VVMUX_UPDATE_PUBLIC_KEY_HEX` and
-the matching secret `VVMUX_UPDATE_SIGNING_KEY_PEM`; local builds intentionally carry a fail-closed
-development key. `vvmux api schema --json` emits a deterministic Draft 2020-12 document tagged with
-the exact VVMX version for client/tooling discovery.
+Official builds inject the update public key with `VVMUX_UPDATE_PUBLIC_KEY_HEX` at compile time;
+local builds intentionally carry a fail-closed development key. `vvmux api schema --json` emits a
+deterministic Draft 2020-12 document tagged with the exact VVMX version for client/tooling
+discovery.
 
 ## Diagnostic log
 

@@ -132,9 +132,8 @@ Rust parts of `vvmux_terminal` and rely on native integration tests for the plat
 
 ### G04 — No check-in gates exist for vvmux
 
-**Evidence:** [.github/workflows/unix-release.yml](../.github/workflows/unix-release.yml) is the
-only vvmux workflow; it runs `cargo build --release` on tag push or manual dispatch for four Unix
-targets. The root repository's workflows cover Vivido, vvdesk, and vvweb, but not vvmux.
+**Evidence:** vvmux has no workflow of its own; releases are built locally. The root repository's
+workflows cover Vivido, vvdesk, and vvweb, but not vvmux.
 
 Nothing runs `cargo fmt`, `cargo test`, Clippy, rustdoc, cargo-audit, cargo-hack, or Miri on push
 or pull request. The Windows implementation (`src/platform/windows.rs`, 2,036 lines;
