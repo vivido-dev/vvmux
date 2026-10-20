@@ -1,10 +1,12 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::{self, BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -235,17 +237,18 @@ fn recursive_git_dependencies_and_bounded_workflows_execute_end_to_end() {
     assert!(!timed_out.status.success());
     assert!(String::from_utf8_lossy(&timed_out.stderr).contains("timeout"));
 
-    let events = replay_events(binary, &runtime, &config_home, &name);
-    assert!(
-        events
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .any(|event| {
-                event["name"] == "plugin.job_completed"
-                    && event["payload"]["action"] == "dev.bundle/on-open"
-                    && event["payload"]["status"] == "succeeded"
-            })
-    );
+    // Subscribe before the flood: bounded replay can evict completed jobs between polls.
+    let events = EventStream::start(binary, &runtime, &config_home, &name);
+    let deadline = Instant::now() + Duration::from_secs(9);
+    loop {
+        let event = events.next(deadline);
+        if event["name"] == "plugin.job_completed"
+            && event["payload"]["action"] == "dev.bundle/on-open"
+            && event["payload"]["status"] == "succeeded"
+        {
+            break;
+        }
+    }
 
     fs::write(directory.path().join("start-workflow-firehose"), b"start").unwrap();
     for action in ["list-panes", "reload-config"] {
@@ -261,7 +264,7 @@ fn recursive_git_dependencies_and_bounded_workflows_execute_end_to_end() {
             "event workflow firehose delayed {action}"
         );
     }
-    let event_workflow_jobs = wait_for_event_workflow_jobs(binary, &runtime, &config_home, &name);
+    let event_workflow_jobs = wait_for_event_workflow_jobs(binary, &runtime, &config_home, &events);
     assert!(
         event_workflow_jobs.len() <= 4,
         "coalescing admitted too many event workflows: {event_workflow_jobs:?}"
@@ -691,55 +694,103 @@ fn wait_for_job(
     }
 }
 
-fn replay_events(binary: &str, runtime: &Path, config_home: &Path, name: &str) -> String {
-    let mut stream = command(binary, runtime, config_home)
-        .args(["plugin", "events", "--target", name, "--after", "0"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    thread::sleep(Duration::from_millis(300));
-    stream.kill().unwrap();
-    String::from_utf8(stream.wait_with_output().unwrap().stdout).unwrap()
+struct EventStream {
+    child: Child,
+    events: Option<Receiver<io::Result<Value>>>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+
+impl EventStream {
+    fn start(binary: &str, runtime: &Path, config_home: &Path, name: &str) -> Self {
+        let mut child = command(binary, runtime, config_home)
+            .args(["plugin", "events", "--target", name, "--after", "0"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        // Drain screen events continuously so status commands cannot back up the subscription.
+        // Only job completions, gaps, and read errors occupy the bounded test queue.
+        let (sender, events) = mpsc::sync_channel(64);
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let event = line.and_then(|line| {
+                    serde_json::from_str::<Value>(&line).map_err(io::Error::other)
+                });
+                if let Ok(event) = &event
+                    && event["type"] == "event"
+                    && event["name"] != "plugin.job_completed"
+                {
+                    continue;
+                }
+                let failed = event.is_err();
+                if sender.send(event).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            events: Some(events),
+            reader: Some(reader),
+        }
+    }
+
+    fn next(&self, deadline: Instant) -> Value {
+        self.events
+            .as_ref()
+            .unwrap()
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("plugin event stream ended or timed out")
+            .expect("read plugin event JSON")
+    }
+}
+
+impl Drop for EventStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // Release a reader blocked on a full channel before joining it, including on panic.
+        drop(self.events.take());
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
 }
 
 fn wait_for_event_workflow_jobs(
     binary: &str,
     runtime: &Path,
     config_home: &Path,
-    name: &str,
+    events: &EventStream,
 ) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(9);
+    let mut jobs = Vec::new();
+    let mut has_gap = false;
     loop {
-        let events = replay_events(binary, runtime, config_home, name);
-        let jobs = events
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|event| {
-                event["name"] == "plugin.job_completed"
-                    && event["payload"]["action"] == "dev.bundle/on-screen"
-            })
-            .filter_map(|event| event["payload"]["job_id"].as_str().map(str::to_owned))
-            .collect::<Vec<_>>();
-        let has_gap = jobs.iter().any(|job_id| {
-            let status = command(binary, runtime, config_home)
-                .args(["plugin", "job", "status", job_id])
-                .output()
-                .unwrap();
-            status.status.success()
-                && serde_json::from_slice::<Value>(&status.stdout).is_ok_and(|status| {
-                    status["trace"]["steps"]
-                        .as_array()
-                        .is_some_and(|steps| steps.iter().any(|step| step["kind"] == "event_gap"))
-                })
-        });
-        if jobs.len() >= 2 && has_gap {
-            return jobs;
+        let event = events.next(deadline);
+        assert_ne!(
+            event["type"], "gap",
+            "live workflow subscription lost events: {event}"
+        );
+        if event["name"] == "plugin.job_completed"
+            && event["payload"]["action"] == "dev.bundle/on-screen"
+        {
+            let job_id = event["payload"]["job_id"].as_str().unwrap().to_owned();
+            let status = json_command(
+                command(binary, runtime, config_home).args(["plugin", "job", "status", &job_id]),
+            );
+            jobs.push(job_id);
+            has_gap |= status["trace"]["steps"]
+                .as_array()
+                .is_some_and(|steps| steps.iter().any(|step| step["kind"] == "event_gap"));
+            if jobs.len() >= 2 && has_gap {
+                return jobs;
+            }
         }
         assert!(
             Instant::now() < deadline,
-            "event workflow did not finish a coalesced successor: {events}"
+            "event workflow did not finish a coalesced successor: {event}"
         );
-        thread::sleep(Duration::from_millis(50));
     }
 }
 
