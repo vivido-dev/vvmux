@@ -1,6 +1,6 @@
 [package]
 name = "vvmux"
-version = "0.5.4"
+version = "0.5.5"
 authors.workspace = true
 edition.workspace = true
 # The locked wasmtime 49 / cranelift 0.136 line requires Rust 1.96.
