@@ -3142,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "vvte"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "bitflags",
  "cursor-icon",
