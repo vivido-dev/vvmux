@@ -405,12 +405,7 @@ fn authenticated_gateway_creates_lists_attaches_and_drives_a_session() {
         ));
         let server_nonce = [2; auth::NONCE_BYTES];
         let session_tag = [1; messages::SESSION_TAG_BYTES];
-        let prk = auth::extract_handshake_prk(
-            &root_secret,
-            &vivid_hello.client_nonce,
-            &server_nonce,
-            &[0; 32],
-        );
+        let prk = auth::extract_handshake_prk(&root_secret, &vivid_protocol::auth::HandshakeNonces { client: vivid_hello.client_nonce, server: server_nonce }, &[0; 32]);
         let mut contract = ResourceContract::denied();
         for resource in [
             Resource::Surfaces,

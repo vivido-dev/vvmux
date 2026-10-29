@@ -4217,8 +4217,22 @@ mod tests {
         });
 
         let frames = [
-            media::raster_frame_body(1, 1, 2, 1, &[255, 0, 0, 255, 0, 0, 0, 255]).unwrap(),
-            media::raster_frame_body(1, 2, 2, 1, &[0, 255, 0, 255, 0, 0, 0, 255]).unwrap(),
+            media::raster_frame_body(&vivid_protocol::media::RasterFrame {
+                epoch: 1,
+                frame_id: 1,
+                width: 2,
+                height: 1,
+                rgba: &[255, 0, 0, 255, 0, 0, 0, 255],
+            })
+            .unwrap(),
+            media::raster_frame_body(&vivid_protocol::media::RasterFrame {
+                epoch: 1,
+                frame_id: 2,
+                width: 2,
+                height: 1,
+                rgba: &[0, 255, 0, 255, 0, 0, 0, 255],
+            })
+            .unwrap(),
         ];
         for (index, frame) in frames.iter().enumerate() {
             let delivery_id = 41 + index as u64;
@@ -4375,7 +4389,14 @@ mod tests {
             } if recreated_retained_sources == std::slice::from_ref(&key)
         ));
         let pixels = [0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff];
-        let canvas = media::raster_frame_body(1, 9, 2, 1, &pixels).unwrap();
+        let canvas = media::raster_frame_body(&vivid_protocol::media::RasterFrame {
+            epoch: 1,
+            frame_id: 9,
+            width: 2,
+            height: 1,
+            rgba: &pixels,
+        })
+        .unwrap();
         assert!(worker.queue_media(BridgeMedia {
             generation: 0,
             delivery_id: 41,
@@ -4506,7 +4527,14 @@ mod tests {
 
     #[cfg(unix)]
     fn page_frame_body(frame_id: u64, shade: u8) -> Vec<u8> {
-        media::raster_frame_body(1, frame_id, PAGE_WIDTH, PAGE_HEIGHT, &page_pixels(shade)).unwrap()
+        media::raster_frame_body(&vivid_protocol::media::RasterFrame {
+            epoch: 1,
+            frame_id,
+            width: PAGE_WIDTH,
+            height: PAGE_HEIGHT,
+            rgba: &page_pixels(shade),
+        })
+        .unwrap()
     }
 
     #[cfg(unix)]
@@ -4671,21 +4699,23 @@ mod tests {
         // outer link must not carry raw either.
         let band = vec![0x40_u8; (PAGE_WIDTH * PAGE_HEIGHT / 2 * 4) as usize];
         let delta = media::raster_delta_frame_body(
-            1,
-            2,
-            1,
-            0,
-            0,
-            PAGE_WIDTH,
-            PAGE_HEIGHT,
-            PAGE_DELTA_OPERATIONS,
-            &[media::RasterDeltaOperation::Overwrite {
-                x: 0,
-                y: 0,
+            &vivid_protocol::media::RasterDeltaFrame {
+                epoch: 1,
+                frame_id: 2,
+                base_frame_id: 1,
+                pts_us: 0,
+                duration_us: 0,
                 width: PAGE_WIDTH,
-                height: PAGE_HEIGHT / 2,
-                rgba: &band,
-            }],
+                height: PAGE_HEIGHT,
+                operations: &[media::RasterDeltaOperation::Overwrite {
+                    x: 0,
+                    y: 0,
+                    width: PAGE_WIDTH,
+                    height: PAGE_HEIGHT / 2,
+                    rgba: &band,
+                }],
+            },
+            PAGE_DELTA_OPERATIONS,
             false,
         )
         .unwrap();

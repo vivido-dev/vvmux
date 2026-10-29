@@ -4786,13 +4786,13 @@ fn send_media_body(
 }
 
 fn retained_raster_body(raster: &vivid_sdk::presenter::RetainedRaster) -> io::Result<Vec<u8>> {
-    vivid_protocol::media::raster_frame_body(
-        raster.epoch,
-        raster.frame_id,
-        raster.width,
-        raster.height,
-        &raster.pixels,
-    )
+    vivid_protocol::media::raster_frame_body(&vivid_protocol::media::RasterFrame {
+        epoch: raster.epoch,
+        frame_id: raster.frame_id,
+        width: raster.width,
+        height: raster.height,
+        rgba: &raster.pixels,
+    })
     .map_err(io::Error::from)
 }
 
