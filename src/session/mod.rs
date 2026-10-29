@@ -4793,6 +4793,7 @@ fn retained_raster_body(raster: &vivid_sdk::presenter::RetainedRaster) -> io::Re
         raster.height,
         &raster.pixels,
     )
+    .map_err(io::Error::from)
 }
 
 /// Mark media/projection work pending and enqueue at most one coalesced actor wake.
