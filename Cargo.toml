@@ -1,6 +1,6 @@
 [package]
 name = "vvmux"
-version = "0.5.5"
+version = "0.5.6"
 authors.workspace = true
 edition.workspace = true
 # The locked wasmtime 49 / cranelift 0.136 line requires Rust 1.96.
@@ -31,7 +31,7 @@ getrandom = "0.4"
 hex = "0.4"
 httpdate = "1"
 image = { version = "0.25", default-features = false }
-jsonschema = { version = "0.58", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
 libc = "0.2"
 log = "0.4"
 mimalloc = { version = "0.1", default-features = false }
@@ -56,7 +56,7 @@ unicode-width = "0.2"
 ureq = { version = "3.4", default-features = false }
 url = { version = "2", default-features = false }
 vivid_gateway = { version = "1.5", path = "../vivid_gateway" }
-vivid_protocol = { version = "1.5.12", path = "../vivid_protocol" }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol" }
 vivid_sdk = { version = "1.5", path = "../vivid_sdk" }
 vvmux-plugin-api = { version = "0.5.5", path = "vvmux-plugin-api" }
 vvmux-plugin-sdk = { version = "0.1.0", path = "vvmux-plugin-sdk" }
@@ -65,11 +65,11 @@ vvte = { version = "0.15", path = "../vvte", default-features = false }
 # host surfaces are where security fixes land, and falling behind is how this pin previously
 # ended up on a release with open advisories. `wasmtime` and `wasmtime-wasi` are one versioned
 # surface and must move together; their locked line sets the `vvmux` MSRV.
-wasmtime = { version = "49", default-features = false }
-wasmtime-wasi = { version = "49", default-features = false }
+wasmtime = { version = "50", default-features = false }
+wasmtime-wasi = { version = "50", default-features = false }
 wat = "1"
 windows-sys = "0.61"
-wit-bindgen = "0.62"
+wit-bindgen = "0.63"
 zeroize = "1.9"
 
 [lib]

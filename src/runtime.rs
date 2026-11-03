@@ -4,7 +4,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -688,31 +688,25 @@ fn validate_parent(path: &Path, uid: u32, label: &str) -> io::Result<()> {
 
 #[cfg(unix)]
 fn ensure_private_directory(path: &Path, uid: u32) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || metadata.uid() != uid
-                || metadata.mode() & 0o077 != 0
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("unsafe vvmux runtime directory {}", path.display()),
-                ));
-            }
-        }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-            let metadata = fs::symlink_metadata(path)?;
-            if metadata.file_type().is_symlink() || metadata.uid() != uid {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "runtime directory ownership changed during creation",
-                ));
+            // Create it privately from the start so another caller never sees a wider mode.
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => {}
+                // Another caller may have created it after our metadata lookup.
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
             }
+            fs::symlink_metadata(path)?
         }
         Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("unsafe vvmux runtime directory {}", path.display()),
+        ));
     }
     Ok(())
 }
@@ -829,6 +823,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_private_directory_is_created_locked_down_and_refused_when_widened() {
+        use std::os::unix::fs::PermissionsExt;
+
         let parent = tempfile::TempDir::new().unwrap();
         let uid = crate::platform::effective_uid();
         let directory = parent.path().join("vvmux");
@@ -850,6 +846,25 @@ mod tests {
         std::os::unix::fs::symlink(&directory, &link).unwrap();
         let error = ensure_private_directory(&link, uid).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_first_use_creates_a_shared_private_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let directory = parent.path().join("vvmux");
+        let uid = crate::platform::effective_uid();
+        let callers = 8;
+        let start = std::sync::Barrier::new(callers);
+
+        std::thread::scope(|scope| {
+            for _ in 0..callers {
+                scope.spawn(|| {
+                    start.wait();
+                    ensure_private_directory(&directory, uid).unwrap();
+                });
+            }
+        });
     }
 
     #[test]
