@@ -12,7 +12,8 @@ follow-up runtime target.
 
 ## Build and install
 
-With rustup, `rust-toolchain.toml` selects Rust 1.97.0 automatically inside this checkout,
+With rustup, `rust-toolchain.toml` selects Rust 1.97.0 automatically inside this checkout
+and installs the `wasm32-wasip2` target required by the Component conformance test,
 including when the default toolchain is older. An explicit `RUSTUP_TOOLCHAIN` environment
 variable or rustup directory override can select another compiler; use
 `cargo +1.97.0 build --release` to select the required compiler explicitly.
@@ -1445,8 +1446,8 @@ actions receive no broker token.
 Rust Component authors implement `vvmux_plugin_sdk::component::Guest` and export it with the SDK's
 generated `component::export!` macro. Build those crates for `wasm32-wasip2`; the SDK owns the
 release-matched WIT bindings and JSON/host-call/storage/log helpers. The full vvmux test gate builds
-the real Rust conformance guest, so development environments need
-`rustup target add wasm32-wasip2` once.
+the real Rust conformance guest. The checkout's rustup toolchain file includes the required target;
+when selecting another toolchain explicitly, run `rustup target add wasm32-wasip2` for that toolchain.
 
 `vvmux plugin invoke ID/ACTION --target SESSION --detach` returns a session-bound job ID. Use
 `vvmux plugin job status JOB`, `cancel JOB`, and `logs JOB` to inspect or stop it. Sessions retain
