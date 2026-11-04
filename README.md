@@ -5,7 +5,7 @@ shell PTYs, terminal grids, scrollback, layout, and virtual Vivid producer state
 client owns the current terminal and the outer Vivido capability, so detaching never gives a
 background daemon access to a window token.
 
-The implementation requires Rust 1.88 or newer and supports macOS, Linux, Windows 11, and Windows
+The implementation requires Rust 1.97 or newer and supports macOS, Linux, Windows 11, and Windows
 10 version 1809/build 17763 or newer on `x86_64-pc-windows-msvc`. It does not import or depend on
 the untracked Zellij or Alacritty reference trees. Windows ARM64 is compile-checked but remains a
 follow-up runtime target.
