@@ -12,6 +12,11 @@ follow-up runtime target.
 
 ## Build and install
 
+With rustup, `rust-toolchain.toml` selects Rust 1.97.0 automatically inside this checkout,
+including when the default toolchain is older. An explicit `RUSTUP_TOOLCHAIN` environment
+variable or rustup directory override can select another compiler; use
+`cargo +1.97.0 build --release` to select the required compiler explicitly.
+
 ```sh
 cd vvmux
 cargo build --release
