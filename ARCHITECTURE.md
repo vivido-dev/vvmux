@@ -47,8 +47,13 @@ only that viewer. Read-only snapshot inspection cannot change the timed projecti
 
 One client, the presenter, still owns live audio/video, all timed tracks, vector overlays, host
 services, microphone routing, and Kitty transfers. Only its playback acknowledgements and feedback
-can change that shared state. The role moves by explicit claim and stays vacant on detach. Role
-changes reset the exclusive projection, but each client keeps its bridge and shared visuals.
+can change that shared state. The role moves by explicit claim and stays vacant on detach.
+
+Plain text measurements and retained-layout batches bypass queued media for their
+surface and use the bounded outer host-service workers. Neither kind describes
+a displayed scene, so waiting for media would unnecessarily stall layout.
+
+Role changes reset the exclusive projection, but each client keeps its bridge and shared visuals.
 `set_presenter` sends nothing to the promoted client and neither relayouts nor syncs, because an
 attach must put `Attached` on the stream before any projection.
 

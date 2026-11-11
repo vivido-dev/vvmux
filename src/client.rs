@@ -1,3 +1,4 @@
+// Rust guideline compliant 2026-10-07
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -2200,16 +2201,19 @@ fn run_bridge_worker(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let index = queues.host_requests.iter().position(|request| {
                 bridge.can_service_overlay_host_request(request)
-                    && (request.record_type == vivid_protocol::messages::MEASURE_OVERLAY_TEXT_BATCH
-                        || (!queues
-                            .tracks
-                            .keys()
-                            .chain(deferred.iter().map(|media| &media.source))
-                            .any(|source| {
-                                source.producer == request.surface.producer
-                                    && source.context == request.surface.context
-                                    && source.surface == request.surface.surface
-                            })))
+                    && (matches!(
+                        request.record_type,
+                        vivid_protocol::messages::MEASURE_OVERLAY_TEXT
+                            | vivid_protocol::messages::MEASURE_OVERLAY_TEXT_BATCH
+                    ) || (!queues
+                        .tracks
+                        .keys()
+                        .chain(deferred.iter().map(|media| &media.source))
+                        .any(|source| {
+                            source.producer == request.surface.producer
+                                && source.context == request.surface.context
+                                && source.surface == request.surface.surface
+                        })))
             });
             index.and_then(|index| queues.host_requests.remove(index))
         };
