@@ -2186,6 +2186,7 @@ impl SessionActor {
 
     pub(super) fn automation_session_inspect(&self) -> serde_json::Value {
         let queue = self.relay_metrics();
+        let (pending_actions, claimed_actions) = self.window_actions.pending_counts();
         serde_json::json!({
             "schema_version": 1,
             "session": self.name,
@@ -2206,6 +2207,8 @@ impl SessionActor {
             "bridge_instance_id": self.bridge_instance_id,
             "bridge_local_revision": self.bridge_local_revision,
             "pending": {
+                "window_actions": pending_actions,
+                "claimed_window_actions": claimed_actions,
                 "actor_work": self.pending_actor_work.len(),
                 "automation_waiters": self.automation_waiters.len(),
                 "media_projections": self.pending_media_projections.len(),

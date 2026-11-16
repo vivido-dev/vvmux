@@ -584,6 +584,7 @@ impl SessionActor {
                     continue;
                 };
                 let message = ServerMessage::MediaSnapshot {
+                    overlay_input_epochs: Vec::new(),
                     microphones: Vec::new(),
                     revision,
                     surfaces: surfaces
@@ -698,6 +699,8 @@ impl SessionActor {
             .values()
             .any(|client| client.vivid && client.media_enabled)
         {
+            self.native_presentations.reset(&self.vivid);
+            self.input_epochs.reset();
             self.vivid.deactivate_bridge();
             self.shared_visual_sources.clear();
             return;
@@ -708,6 +711,8 @@ impl SessionActor {
             .map(|client| Arc::clone(&client.writer));
         let projections = self.attached_projections(self.content_area());
         if projections.is_empty() {
+            self.native_presentations
+                .reconcile(&self.vivid, &HashSet::new());
             return;
         }
         let pane_priority = if self.direct_pane().is_some() {
@@ -936,6 +941,8 @@ impl SessionActor {
             .iter()
             .map(|source| source.key)
             .collect::<HashSet<_>>();
+        self.native_presentations
+            .reconcile(&self.vivid, &projected_source_keys);
         let projected_decoder_reset_serials = sources
             .iter()
             .map(|source| (source.key, source.decoder_reset_serial))
@@ -945,7 +952,9 @@ impl SessionActor {
             .iter()
             .filter(|source| {
                 source.first_visible_presented
-                    && (source.retained.is_some() || source.retained_raster.is_some())
+                    && (source.retained.is_some()
+                        || source.retained_raster.is_some()
+                        || !source.retained_vector.is_empty())
             })
             .map(|source| bridge_key(source.key))
             .collect::<HashSet<_>>();
@@ -957,6 +966,9 @@ impl SessionActor {
             &writer,
             &ServerMessage::MediaSnapshot {
                 microphones: self.vivid.microphone_requests(),
+                overlay_input_epochs: self
+                    .input_epochs
+                    .projection(&self.window_actions.route, &surfaces),
                 revision: projection_revision,
                 surfaces: surfaces.clone(),
                 tracks: sources.clone(),
@@ -1051,10 +1063,16 @@ impl SessionActor {
                         )
                     })
                 }
-                vivid_sdk::presenter::SourceDescriptor::VectorScene(_) => source
-                    .retained_vector
-                    .iter()
-                    .all(|(kind, body)| send_media_body(&writer, 0, source_key, *kind, body)),
+                vivid_sdk::presenter::SourceDescriptor::VectorScene(_) => {
+                    source.retained_vector.iter().all(|(kind, body)| {
+                        if *kind == vivid_protocol::messages::VECTOR_FRAME {
+                            self.submit_native_frame(0, source_key, Arc::clone(body));
+                            true
+                        } else {
+                            send_media_body(&writer, 0, source_key, *kind, body)
+                        }
+                    })
+                }
                 _ => continue,
             };
             if !sent {

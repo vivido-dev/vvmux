@@ -253,7 +253,7 @@ tracks a monotonic outer compatibility revision and apply sequence; the current 
 reports its own instance ID and local revision. Replacing a bridge cannot move compatibility state
 backward or perturb pane-owned virtual revisions.
 
-Private VVMX version 21 is a hard cutover. In addition to complete track identity and binary media,
+Private VVMX version 25 is a hard cutover. In addition to complete track identity and binary media,
 it retains deterministic outer/rendered completion waits, stable tab-ID selection, correlated
 diagnostics, PTY-write reports, and process-anchored recovery traces. Its binary media header carries complete track identity
 and bounded binary render/media records,
@@ -314,7 +314,7 @@ checked pixel dimensions; Windows accepts the same internal call and continues u
 This is the sole scoped PTY media exception in vvmux and does not change the Vivid wire stack.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 21 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 26 → outer vvmux producer → Vivido
 ```
 
 
@@ -326,6 +326,165 @@ scene identities. Clipboard, accessibility and typography are only offered inwar
 by that host. Pointer capture uses the interactive lane; its native pointer, key, text/IME,
 geometry and focus events return to the owning pane. Kitty key messages retain the original bytes
 alongside decoded physical keys so declined overlay input reaches the PTY unchanged.
+
+Original vector presentation is distinct from media write completion. Before any
+producer authenticates, the hidden server installs the SDK presentation route and
+retains its opaque original receipts. VVMX 26 retains the 64-byte media header:
+a separate nonzero correlation is valid only on vector frames. The foreground
+bridge reserves a bounded external report, then returns `BridgePresentation`
+metadata after a physical outcome or abandonment. No original grant or outer
+credential crosses this boundary. The actor validates the presenter client,
+bridge instance, complete source key and unique correlation before completing
+that exact SDK receipt, whose writer/resume/channel/origin checks remain authoritative.
+Write/flow ACKs retain their existing meaning and never resolve these originals.
+
+The actor never waits for presentation credit. At most 64 forwarded copies and
+64 pending source handoffs are retained; pending encoded bytes are bounded by
+`media.ipc_queue_bytes`, with one newest unsent handoff per source. SDK copy credit
+also enforces four per owner and 64 globally. Attempts pin the original occurrence
+before queueing. Opaque occurrence comparison suppresses retained/live duplicates
+without confusing equal numeric revisions after channel/owner replacement. Client
+queues preserve per-source ordering and peer service under correlated pressure.
+Attachment/source retirement abandons only the affected copies and replays current
+retained content; stale outcomes cannot retarget a newer scene or bridge.
+
+The actual macOS two-owner Metal probe now passes with the original assertions:
+both scenes remain pending before explicit native display admission, closing one
+owner preserves its same-ID peer, and the peer's repaint waits for its own frame.
+This is headless native rendering/readback with explicit admission. Ordinary
+AppKit mux windows, physical input/device transitions, document
+forwarding and broader recovery/load distributions remain unqualified.
+[Actual mux original outcomes](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-mux-original-outcomes-macos.json).
+A second actual-mux probe qualifies two foreground replacements: graceful
+`Ctrl+b d` detach/reattach, then SIGKILL of only the fixture-owned client followed
+by explicit media claim. Both producers and the hidden server remain alive.
+Each detached interval holds source receipts pending for 100 ms, and old image
+callbacks cannot acknowledge the replacement's frame. Source/channel identities
+and the compositor pane epoch remain stable while client/bridge instances change.
+Native pixels follow the peer's window move by eight pixels, then another eight
+after the other owner closes. Each new original scene waits for its exact native
+frame admission. Metadata comes from the public, sanitized `list-clients` and
+`inspect-media` commands; terminal contents and capabilities are never retained.
+This is finite headless Metal qualification. At that checkpoint, documents, ordinary
+AppKit mux windows, physical input/devices, leases/input-lane replacement and
+sustained or arbitrary recovery/load remain open.
+[Actual mux replacement](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-mux-replacement-macos.json).
+Input incarnation now crosses the process boundary independently from scene
+presentation. The actor retains each SDK `OverlayInputEpoch` and assigns a
+checked, monotonic, nonzero correlation to its complete source key. At most 64
+entries are published with the authoritative projection. No SDK stamp or grant
+is serialized. The foreground configures the gateway's external epoch table
+before reconciliation; changed stamps retire only their physical window roles
+and queued input. `take_overlay_input_with_epochs` returns the correlation bound
+to that physical role, while the untagged drain is refused. Returned VVMX 26
+input must match the current presenter, bridge and actor correlation, and
+`relay_overlay_input_at_epoch` atomically checks the original SDK incarnation.
+A lane change racing ahead of actor projection therefore still rejects old input.
+Malformed/oversized tables fail closed; original write/display ACKs remain separate.
+
+The real two-owner macOS Metal probe preserves source/channel IDs and the same
+client/bridge through canonical lane generation 1→2. Old admitted-target pointer,
+key and text are refused, while its same-ID peer keeps old-target pointer input.
+Fresh display admission enables new input; one producer then disconnects and its
+peer commits a real generic `UPDATE_NODE` and window move. The frozen old mux
+still accepts `stale` text under the identical final assertion. These are finite
+synthetic input/display checks, with no physical input or AppKit claim. Pane-side
+lease creation currently returns `UNSUPPORTED_PROFILE` (3), so leased source
+resume remains an adoption gap rather than a qualified mux path.
+[Actual mux input-lane evidence](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-mux-input-lane-macos.json).
+A further actual-mux probe uses only the two original revision-one scenes through
+three focus changes and canonical input-lane replacement. Native host-produced
+images refresh input eligibility without a producer repaint. Stale input is
+rejected, peer old-target input progresses, and each fresh key/text batch is sent
+once. Test-only physical source metadata prevents an identical old image from
+being mistaken for the replacement role. An ordered read-only host observation
+permits an already-current focused image to remain in use; it grants no display,
+focus or input authority. Original outcomes stay exactly once. After source loss,
+the peer's actual generic `UPDATE_NODE` and native window move still succeed.
+The hidden server/client/bridge and original channels remain unchanged. This
+adds development-only qualification; no production mux or IPC behavior changes.
+Ordinary AppKit mux windows, leased source resume, documents and
+broader recovery/load/physical/platform/device acceptance remain open.
+[Retained mux focus evidence](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-mux-static-focus-macos.json).
+The gateway now exposes a bounded external window-action admission primitive for
+this process split. It retains the exact independent physical address while an
+`ExternalActionClaim` awaits an original-server decision. The original SDK action
+receipt remains on the server; only its non-authoritative owner-window barrier
+and captured Center rectangle may cross IPC. At that API checkpoint, an adapter still needed to bind each
+claim/reply to the current presenter client, bridge incarnation and unique request
+correlation, preserve the original deadline, and retire queued or drained claims
+on attachment loss. The gateway itself bounds admission waits, shares the existing
+worker limits, and retires physical claims on source/session replacement.
+The six socket regressions pass with real original SDK claims and same-ID peer
+node updates, including a real unanswered ten-second claim hold with peer
+updates and both input lanes live. Their decision handoff was in-process; production mux adoption was still open
+at that API checkpoint, which used VVMX 25.
+[External action API evidence](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-external-actions-macos.json).
+
+The actual macOS mux now forwards producer-requested Focus, Raise, Lower,
+Center and Close through VVMX 26. The hidden server installs the SDK action route
+before producer authentication and retains every original opaque request. Only
+bounded request/barrier metadata and Q32.32 Center bounds cross IPC. Claims and
+outcomes must match the current presenter client, bridge incarnation and request
+ID. Attachment replacement retires the original scope; generic host replies cannot
+complete a typed action. The aggregate inner window limit is 32, fitting one outer
+owner. Admission shares the gateway's 16-global/four-per-owner workers and keeps
+control/input/media polling live.
+
+`OverlayActionRequest::remaining_lifetime` observes the original deadline even
+after its one-shot claim. The foreground subtracts the entire claim round trip
+from the server's remaining lifetime before `ExternalActionClaim::complete_before`;
+the worker rechecks that deadline before dispatch. A delayed positive decision
+cannot start a fresh lifetime. The real SDK socket regression rejects wrong
+client/bridge/request, duplicate claims/replies and retired attachments, and proves
+a same-ID peer can still perform a real `UPDATE_NODE` after owner loss.
+
+The direct-versus-actual-mux Metal probe verifies all five actions with exact
+native pixels. Focus raises the requested window and receives once-only key/text;
+Raise and Lower change overlap while preserving focus. Center uses the original
+pane bounds: mux-local `(55,23,16,16)` becomes physical `(56,24,16,16)`, while the
+direct host centers at `(504,504,16,16)`. Close removes only the requested role
+before its producer transport closes. Both scenes remain revision one with single
+original outcomes through these actions; the surviving same-ID owner's subsequent
+node update and yellow repaint succeed on the same client/bridge. The final probe
+fails at physical Focus on the frozen pre-adoption mux, with its runtime live and
+no keys sent, and passes on the new mux.
+
+A copied-executable control exposed a fixture error: its generic node commit
+missed a target-generation announcement and was rejected with code 15. The fixture
+now consumes authenticated target announcements and replans only an aborted
+generic commit once, following SDK `PaneSession`; keys, typed actions, vector media
+and successful commits are never replayed. The copied executable passes after
+this correction. Redacted diagnostics retain only error kind and presenter code.
+
+This qualifies finite headless Metal checks with synthetic display/key/text events.
+Already-claimed typed actions under foreground replacement, mixed saturation and broader
+recovery still need native acceptance. Document forwarding, generic/font-only
+routes, mux lease issuance/resume (`UNSUPPORTED_PROFILE`, code 3), ordinary AppKit
+mux windows, physical focus/IME/secure input/accessibility/scanout, display-scale
+and device transitions, other platforms/GPUs/devices and broader sustained/fault
+matrices remain open. Restart both mux server and client for private VVMX 26;
+Vivid 1.5 wire/profile/registry and dependencies are unchanged.
+[Mux window-action evidence](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-mux-window-actions-macos.json).
+
+A queued window action now also passes actual-mux foreground replacement.
+Only the fixture-owned client is stopped with SIGSTOP. Public server diagnostics
+prove one original Center is pending and unclaimed while its same-ID peer commits
+a real node update. SIGKILL and explicit reattachment retire that request; it is
+refused, both revision-one scenes replay without repaint, and the old Center does
+not move the replacement window. A fresh Center then succeeds with the original
+pane geometry. Source/channel identities and the hidden server/producer survive;
+after owner loss the peer commits another real node update and native repaint.
+The six mux probes and three-route Metal winding regression pass. This qualifies
+that queued, unclaimed abrupt-loss case only. Already-claimed RPCs during
+replacement, mixed saturation and ordinary AppKit/physical/platform/device gates
+remain explicit. No additional feature work is included in this qualification.
+[Queued action replacement evidence](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-mux-pending-action-macos.json).
+
+
+The earlier negative probe and API-only checkpoint remain historical evidence:
+[Receipt gap](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-mux-receipt-gap-macos.json),
+[External outcome API](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-external-outcomes-macos.json).
 
 ## Plugin boundary
 

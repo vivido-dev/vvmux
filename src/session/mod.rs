@@ -59,12 +59,15 @@ mod automation;
 mod clients;
 mod commands;
 mod input;
+mod input_epochs;
 mod overlays;
 mod pane_ops;
 mod panes;
 mod persistence;
+mod presentations;
 mod render;
 mod waiters;
+mod window_actions;
 
 pub(crate) use input::copy_action_bytes;
 
@@ -2039,6 +2042,9 @@ struct SessionActor {
     exit_tombstones: VecDeque<ExitTombstone>,
     shutdown: Arc<AtomicBool>,
     vivid: VirtualVivid,
+    native_presentations: presentations::NativePresentations,
+    window_actions: window_actions::WindowActions,
+    input_epochs: input_epochs::InputEpochs,
     media_projection_pending: Arc<AtomicBool>,
     /// Coalesces config-change wakes from the watcher thread, as `media_projection_pending` does
     /// for media: one queued wake the actor has not yet observed makes another redundant.
@@ -2095,6 +2101,12 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
     let terminated = Arc::new(AtomicBool::new(false));
     let vivid =
         VirtualVivid::start_with_events(vivid_endpoint, config.media.clone(), Some(media_sender))?;
+    let native_presentations = presentations::NativePresentations::new(
+        vivid.attach_overlay_presentation_relay()?,
+        config.media.ipc_queue_bytes,
+    );
+    vivid.set_overlay_window_capacity(vivid_protocol::overlay::MAX_WINDOWS_PER_OWNER)?;
+    let window_actions = window_actions::WindowActions::new(vivid.attach_overlay_action_relay()?);
     let media_projection_pending = Arc::new(AtomicBool::new(false));
     {
         // Never block ingest on the actor's general queue. The atomic dirty bit makes a lost
@@ -2294,6 +2306,9 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         exit_tombstones: VecDeque::new(),
         shutdown: Arc::clone(&shutdown),
         vivid,
+        native_presentations,
+        window_actions,
+        input_epochs: input_epochs::InputEpochs::default(),
         media_projection_pending,
         config_reload_pending,
         plugin_reload_pending,
@@ -2453,10 +2468,23 @@ impl SessionActor {
     }
 
     fn sync_pending_media_projection(&mut self) {
+        self.service_native_presentations();
+        self.service_window_actions();
         if self.media_projection_pending.swap(false, Ordering::AcqRel) {
             self.sync_media(false);
             for request in self.vivid.take_overlay_host_requests() {
                 let id = request.id;
+                if request.record_type == vivid_protocol::messages::OVERLAY_ACTION {
+                    if let Some(client) = self.presenter_client().filter(|client| client.vivid) {
+                        self.window_actions.enqueue(&self.vivid, client.id, request);
+                    } else {
+                        self.vivid.complete_overlay_host_request(
+                            id,
+                            Err("no outer action host is attached".into()),
+                        );
+                    }
+                    continue;
+                }
                 let sent = self
                     .presenter_client()
                     .filter(|client| client.vivid)
@@ -2474,6 +2502,7 @@ impl SessionActor {
                     );
                 }
             }
+            self.service_window_actions();
         }
     }
 
@@ -2515,6 +2544,14 @@ impl SessionActor {
             .contains(&bridge_key(event.source))
         {
             self.vivid.release_bridge_delivery(event.delivery_id);
+            return;
+        }
+        if event.record_type == vivid_protocol::messages::VECTOR_FRAME {
+            self.submit_native_frame(
+                event.delivery_id,
+                bridge_key(event.source),
+                event.body.into(),
+            );
             return;
         }
         let sent = self

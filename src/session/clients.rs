@@ -600,6 +600,7 @@ impl SessionActor {
                         self.retained_replay_requests.clear();
                         self.retained_replay_inflight.clear();
                     }
+                    self.bind_native_presentations(id, bridge_instance_id);
                     self.bridge_instance_id = Some(bridge_instance_id);
                     self.outer_virtual_revision = virtual_revision;
                     self.bridge_local_revision = outer_revision;
@@ -631,6 +632,8 @@ impl SessionActor {
                             attachment_count,
                         },
                     );
+                    self.native_presentations
+                        .recreated(&recreated_retained_sources, virtual_revision);
                     let mut retry_retained = false;
                     if let Some(client) = self.clients.get_mut(&id) {
                         for source in &recreated_retained_sources {
@@ -699,6 +702,7 @@ impl SessionActor {
                             self.retained_replay_requests.clear();
                             self.retained_replay_inflight.clear();
                         }
+                        self.bind_native_presentations(id, bridge_instance_id);
                         self.bridge_instance_id = Some(bridge_instance_id);
                     }
                     if self.bridge_instance_id == Some(bridge_instance_id) {
@@ -711,14 +715,36 @@ impl SessionActor {
                     }
                 }
             }
+            ClientMessage::BridgePresentation {
+                bridge_instance_id,
+                correlation,
+                source,
+                outcome,
+            } => {
+                if self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    self.native_presentations.report(
+                        id,
+                        bridge_instance_id,
+                        correlation,
+                        source,
+                        outcome,
+                    );
+                }
+            }
             ClientMessage::OverlayInput {
                 bridge_instance_id,
+                correlation,
                 surface,
                 body,
             } => {
                 if self.is_presenter(id)
                     && self.bridge_instance_id == Some(bridge_instance_id)
-                    && self.vivid.relay_overlay_input(surface, &body)?
+                    && self.input_epochs.forward(
+                        &self.window_actions.route,
+                        correlation,
+                        surface,
+                        &body,
+                    )?
                     && let Some(pane) = self.vivid.pane_for_overlay_surface(surface)
                     && self.vivid.overlay_has_focus(pane)
                     && self.attached_focus_pane() != Some(pane)
@@ -757,9 +783,45 @@ impl SessionActor {
                 id: request_id,
                 response,
             } => {
-                if self.is_presenter(id) {
+                if self.is_presenter(id) && !self.window_actions.contains(request_id) {
                     self.vivid
                         .complete_overlay_host_request(request_id, response);
+                }
+            }
+            ClientMessage::WindowActionClaim {
+                bridge_instance_id,
+                id: request_id,
+            } => {
+                if self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    let (allowed, remaining_us) =
+                        self.window_actions
+                            .claim(id, bridge_instance_id, request_id);
+                    if let Some(client) = self.clients.get(&id) {
+                        crate::ipc::send(
+                            &client.writer,
+                            &ServerMessage::WindowActionDecision {
+                                bridge_instance_id,
+                                id: request_id,
+                                allowed,
+                                remaining_us,
+                            },
+                        )?;
+                    }
+                }
+            }
+            ClientMessage::WindowActionReply {
+                bridge_instance_id,
+                id: request_id,
+                response,
+            } => {
+                if self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id) {
+                    self.window_actions.reply(
+                        &self.vivid,
+                        id,
+                        bridge_instance_id,
+                        request_id,
+                        response,
+                    );
                 }
             }
             ClientMessage::BridgePosition {
@@ -1029,6 +1091,9 @@ impl SessionActor {
     /// nothing here may carry over. Timed ingress stays parked until a presenter applies its first
     /// authoritative projection.
     pub(super) fn release_presentation(&mut self) {
+        self.native_presentations.reset(&self.vivid);
+        self.window_actions.reset(&self.vivid);
+        self.input_epochs.reset();
         self.vivid.deactivate_bridge();
         self.vivid.revoke_microphones();
         self.microphone_recipient = None;

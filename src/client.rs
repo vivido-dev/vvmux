@@ -12,6 +12,9 @@ use vivid_gateway::{DeliveryOutcome, MediaChunk, MicrophonePacket};
 use vivid_protocol::auth::Secret32;
 use zeroize::Zeroizing;
 
+#[path = "client/window_actions.rs"]
+mod window_actions;
+
 #[cfg(test)]
 use crate::client_input::parse_configured_action;
 use crate::client_input::{
@@ -454,6 +457,7 @@ pub fn attach(
                         let _ = plugin_keymap_sender.send(bindings);
                     }
                     ServerMessage::MediaSnapshot {
+                        overlay_input_epochs,
                         microphones,
                         revision,
                         surfaces,
@@ -463,6 +467,7 @@ pub fn attach(
                     } => {
                         if let Some(bridge) = &mut bridge {
                             bridge.replace_snapshot(BridgeSnapshot {
+                                overlay_input_epochs,
                                 microphones,
                                 generation: 0,
                                 virtual_revision: revision,
@@ -478,7 +483,36 @@ pub fn attach(
                             bridge.queue_overlay_request(request);
                         }
                     }
+                    ServerMessage::WindowActionRequest(request) => {
+                        if let Some(bridge) = &mut bridge {
+                            bridge.queue_window_action(request);
+                        }
+                    }
+                    ServerMessage::WindowActionDecision {
+                        bridge_instance_id,
+                        id,
+                        allowed,
+                        remaining_us,
+                    } => {
+                        if let Some(bridge) = &mut bridge {
+                            bridge.queue_window_action_decision(
+                                bridge_instance_id,
+                                id,
+                                allowed,
+                                remaining_us,
+                            );
+                        }
+                    }
+                    ServerMessage::WindowActionRetired {
+                        bridge_instance_id,
+                        id,
+                    } => {
+                        if let Some(bridge) = &mut bridge {
+                            bridge.retire_window_action(bridge_instance_id, id);
+                        }
+                    }
                     ServerMessage::MediaRecord {
+                        presentation,
                         delivery_id,
                         source,
                         record_type,
@@ -489,6 +523,7 @@ pub fn attach(
                     } => {
                         if let Some(bridge) = &mut bridge {
                             bridge.queue_media(BridgeMedia {
+                                presentation,
                                 generation: 0,
                                 delivery_id,
                                 source,
@@ -919,6 +954,7 @@ impl Drop for ClientWorkers {
 }
 
 pub(crate) struct BridgeSnapshot {
+    pub(crate) overlay_input_epochs: Vec<(vivid_sdk::presenter::BridgeSurfaceKey, u64)>,
     pub(crate) microphones: Vec<vivid_sdk::presenter::MicrophoneRequest>,
     pub(crate) generation: u64,
     pub(crate) virtual_revision: u64,
@@ -931,6 +967,7 @@ pub(crate) struct BridgeSnapshot {
 pub(crate) struct BridgeMedia {
     pub(crate) generation: u64,
     pub(crate) delivery_id: u64,
+    pub(crate) presentation: u64,
     pub(crate) source: BridgeSourceKey,
     pub(crate) record_type: u16,
     pub(crate) offset: u32,
@@ -971,6 +1008,8 @@ const BRIDGE_QUEUE_SOURCES: usize = 1024;
 const BRIDGE_QUEUE_CHUNKS: usize = 4096;
 /// Most dropped delivery IDs remembered, so their late chunks are recognized and discarded.
 const BRIDGE_DROPPED_IDS: usize = 4096;
+// Match the SDK original-copy bound, including outcomes not yet consumed.
+const BRIDGE_PRESENTATIONS: usize = 64;
 
 pub(crate) struct BridgeWorker {
     admitted_sources: HashSet<BridgeSourceKey>,
@@ -994,6 +1033,8 @@ pub(crate) struct BridgeWorker {
 
 #[derive(Default)]
 struct TrackMediaQueues {
+    window_actions: window_actions::Queue,
+    dropped_presentations: HashMap<u64, BridgeSourceKey>,
     host_requests: VecDeque<vivid_sdk::presenter::OverlayHostRequest>,
     bytes: usize,
     chunks: usize,
@@ -1034,10 +1075,31 @@ impl TrackMediaQueues {
         &mut self,
         mut accepts: impl FnMut(BridgeSourceKey) -> bool,
     ) -> Option<BridgeMedia> {
+        self.pop_media_where(|media| accepts(media.source))
+    }
+
+    fn retry_front(&mut self, media: BridgeMedia, capacity: usize) -> Result<(), BridgeMedia> {
+        let key = media.source;
+        self.push(media, capacity)?;
+        let queue = self.tracks.get_mut(&key).expect("requeued source");
+        let media = queue.pop_back().expect("requeued chunk");
+        queue.push_front(media);
+        Ok(())
+    }
+
+    fn pop_media_where(
+        &mut self,
+        mut accepts: impl FnMut(&BridgeMedia) -> bool,
+    ) -> Option<BridgeMedia> {
         let ready = self.ready.len();
         for _ in 0..ready {
             let key = self.ready.pop_front()?;
-            if !accepts(key) {
+            if self
+                .tracks
+                .get(&key)
+                .and_then(|q| q.front())
+                .is_some_and(|media| !accepts(media))
+            {
                 self.ready.push_back(key);
                 continue;
             }
@@ -1110,11 +1172,12 @@ impl BridgeWorker {
     }
 
     fn spawn_inner(
-        bridge: vivid_gateway::OuterBridge,
+        mut bridge: vivid_gateway::OuterBridge,
         client_writer: BridgeClientSender,
         queue_records: usize,
         presenter_cell_size: Option<Arc<AtomicU32>>,
     ) -> io::Result<Self> {
+        bridge.set_external_overlay_input_epochs(&[])?;
         let bridge_cancel = bridge.cancel_handle();
         let client_cancel = Arc::clone(&client_writer.1);
         let release_cancel = bridge_cancel.clone();
@@ -1149,6 +1212,7 @@ impl BridgeWorker {
                     worker_stopped,
                     bridge_instance_id,
                     presenter_cell_size,
+                    queue_records,
                 );
             })?;
         Ok(Self {
@@ -1187,11 +1251,12 @@ impl BridgeWorker {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             while let Some(media) = queues.pop_where(|key| !self.admitted_sources.contains(&key)) {
-                retired.push(media.delivery_id);
+                retired.push(media);
             }
         }
-        for delivery in retired {
-            self.mark_dropped(delivery);
+        for media in retired {
+            self.mark_dropped(media.delivery_id);
+            self.mark_presentation_dropped(media.presentation, media.source);
         }
         snapshot.generation = self.generation;
         *self
@@ -1203,12 +1268,16 @@ impl BridgeWorker {
     pub(crate) fn queue_media(&mut self, mut media: BridgeMedia) -> bool {
         media.generation = self.generation;
         let delivery_id = media.delivery_id;
+        let presentation = media.presentation;
+        let source = media.source;
         if self.stopped.load(Ordering::Acquire) || !self.admitted_sources.contains(&media.source) {
             self.mark_dropped(delivery_id);
+            self.mark_presentation_dropped(presentation, source);
             return false;
         }
         let Some(wakeup) = &self.media_wakeup else {
             self.mark_dropped(delivery_id);
+            self.mark_presentation_dropped(presentation, source);
             return false;
         };
         let queued = self
@@ -1219,7 +1288,8 @@ impl BridgeWorker {
             .is_ok();
         if !queued {
             self.mark_dropped(delivery_id);
-            if delivery_id == 0 {
+            self.mark_presentation_dropped(presentation, source);
+            if delivery_id == 0 && presentation == 0 {
                 // A partial retained body cannot be resumed. Retire this attachment rather than
                 // leave its subscriber waiting forever for a completion that cannot arrive.
                 self.stopped.store(true, Ordering::Release);
@@ -1247,6 +1317,26 @@ impl BridgeWorker {
             return;
         }
         dropped.insert(delivery_id);
+    }
+
+    fn mark_presentation_dropped(&self, correlation: u64, source: BridgeSourceKey) {
+        if correlation == 0 {
+            return;
+        }
+        let mut queues = self
+            .media
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The server can hold only 64 original copies; duplicates are chunk IDs.
+        if queues.dropped_presentations.len() >= BRIDGE_PRESENTATIONS
+            && !queues.dropped_presentations.contains_key(&correlation)
+        {
+            drop(queues);
+            self.stopped.store(true, Ordering::Release);
+            (self.cancel)();
+            return;
+        }
+        queues.dropped_presentations.insert(correlation, source);
     }
 }
 
@@ -1502,6 +1592,7 @@ fn run_bridge_worker(
     stopped: Arc<AtomicBool>,
     mut bridge_instance_id: u64,
     presenter_cell_size: Option<Arc<AtomicU32>>,
+    queue_records_per_track: usize,
 ) {
     let trace_started = Instant::now();
     let mut diagnostic_generation = bridge.diagnostic_instance_generation();
@@ -1552,6 +1643,7 @@ fn run_bridge_worker(
     let mut observed_in_place_keyframe_recoveries = HashSet::<BridgeSourceKey>::new();
     let mut desynchronized_sources = HashSet::new();
     let mut force_sources = false;
+    let mut window_actions = window_actions::Actions::default();
     let mut force_replacement = false;
     let mut consecutive_projection_failures = 0_u32;
     let mut deferred: Option<BridgeMedia> = None;
@@ -1574,20 +1666,40 @@ fn run_bridge_worker(
                 });
             }
         }
-        if let Ok(events) = bridge.take_overlay_input() {
-            for (surface, body) in events {
-                let _ = client_writer.send(ClientMessage::OverlayInput {
-                    bridge_instance_id,
-                    surface,
-                    body,
-                });
-            }
-        } else {
+        let input = bridge.take_overlay_input_with_epochs();
+        if input.is_err() {
             force_sources = true;
             force_replacement = true;
             let _ = client_writer.send(ClientMessage::BridgeSnapshotRetry {
                 reset_outer_session: true,
             });
+        }
+        let mut reports = bridge.take_presentation_reports();
+        let dropped_reports = {
+            let mut queues = media_queues
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queues
+                .dropped_presentations
+                .drain()
+                .map(|(correlation, source)| vivid_gateway::PresentationReport {
+                    correlation,
+                    source,
+                    outcome: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        reports.extend(dropped_reports);
+        if forward_overlay_observations(
+            &client_writer,
+            bridge_instance_id,
+            reports,
+            input.unwrap_or_default(),
+        )
+        .is_err()
+        {
+            (client_writer.1)();
+            break;
         }
         if let Some(body) = bridge.take_overlay_environment() {
             let _ = client_writer.send(ClientMessage::OverlayEnvironment {
@@ -1768,6 +1880,16 @@ fn run_bridge_worker(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(mut pending) = pending {
+            if let Ok(changed) =
+                bridge.set_external_overlay_input_epochs(&pending.overlay_input_epochs)
+            {
+                force_sources |= changed;
+            } else {
+                if !stopped.load(Ordering::Acquire) {
+                    (client_writer.1)();
+                }
+                break;
+            }
             if let Err(error) = bridge.sync_microphones(&pending.microphones) {
                 log::warn!(
                     event = "client.microphone.failure",
@@ -2189,7 +2311,29 @@ fn run_bridge_worker(
             // producer is waiting on.
         }
 
+        if window_actions
+            .poll(
+                &mut bridge,
+                &media_queues,
+                &client_writer,
+                bridge_instance_id,
+            )
+            .is_err()
+        {
+            if !stopped.load(Ordering::Acquire) {
+                (client_writer.1)();
+            }
+            break;
+        }
         for (id, response) in bridge.take_overlay_host_replies() {
+            if let Some(binding) = window_actions.reply(&media_queues, id) {
+                let _ = client_writer.send(ClientMessage::WindowActionReply {
+                    bridge_instance_id: binding,
+                    id,
+                    response: response.map_err(|error| error.to_string()),
+                });
+                continue;
+            }
             let _ = client_writer.send(ClientMessage::OverlayHostReply {
                 id,
                 response: response.map_err(|error| error.to_string()),
@@ -2236,7 +2380,13 @@ fn run_bridge_worker(
             media_queues
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_where(|source| bridge.can_accept_media(source))
+                .pop_media_where(|media| {
+                    if media.presentation != 0 {
+                        bridge.can_accept_media_with_presentation(media.source)
+                    } else {
+                        bridge.can_accept_media(media.source)
+                    }
+                })
         }) else {
             match receiver.recv_timeout(BRIDGE_IDLE_WAIT) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -2257,11 +2407,8 @@ fn run_bridge_worker(
                 .copied()
                 .unwrap_or(0)
         {
-            if media.delivery_id == 0 {
-                reject_retained_body(&client_writer, bridge_instance_id, &media);
-            } else {
-                release_bridge_delivery(&client_writer, media.delivery_id);
-            }
+            reject_retained_body(&client_writer, bridge_instance_id, &media);
+            release_bridge_delivery(&client_writer, media.delivery_id);
             continue;
         }
         if media.generation > active_generation {
@@ -2269,13 +2416,18 @@ fn run_bridge_worker(
             reject_retained_body(&client_writer, bridge_instance_id, &media);
             continue;
         }
-        if media.delivery_id == 0
-            && !retained_rehydration.contains(&media.source)
-            && !(media.record_type == vivid_protocol::messages::RASTER_FRAME
+        let needs_retained = retained_rehydration.contains(&media.source)
+            || matches!(
+                media.record_type,
+                vivid_protocol::messages::VECTOR_FRAME
+                    | vivid_protocol::messages::VECTOR_ASSET
+                    | vivid_protocol::messages::VECTOR_ASSET_RELEASE
+            )
+            || (media.record_type == vivid_protocol::messages::RASTER_FRAME
                 && active_sources
                     .iter()
-                    .any(|source| source.key == media.source && source.live))
-        {
+                    .any(|source| source.key == media.source && source.live));
+        if media.delivery_id == 0 && !needs_retained {
             // Images are immutable, but live raster subscriptions carry successive complete
             // canvases. A redundant immutable body still completes the subscriber's pending send.
             if media.last {
@@ -2314,15 +2466,21 @@ fn run_bridge_worker(
         }
         let is_raster_delta =
             is_raster && raster_forms.get(&media.source).copied().unwrap_or_default();
-        match bridge.media_chunk(MediaChunk {
+        let chunk = MediaChunk {
             delivery_id: media.delivery_id,
             source: media.source,
             record_type: media.record_type,
             offset: media.offset,
             total: media.total,
             last: media.last,
-            bytes: media.bytes,
-        }) {
+            bytes: media.bytes.clone(),
+        };
+        let result = if media.presentation == 0 {
+            bridge.media_chunk(chunk)
+        } else {
+            bridge.media_chunk_with_presentation(chunk, media.presentation)
+        };
+        match result {
             Ok(true) => {
                 metrics.outer_media_records = metrics.outer_media_records.saturating_add(1);
                 metrics.outer_media_bytes =
@@ -2347,15 +2505,19 @@ fn run_bridge_worker(
                 }
             }
             Ok(false) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let retry = media_queues
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retry_front(media, queue_records_per_track);
+                if let Err(media) = retry {
+                    acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
+                    reject_retained_body(&client_writer, bridge_instance_id, &media);
+                }
+            }
             Err(_) => {
                 acknowledge_bridge_delivery(&client_writer, media.delivery_id, false);
-                if media.delivery_id == 0 {
-                    let _ = client_writer.send(ClientMessage::BridgeRetainedResult {
-                        bridge_instance_id,
-                        source: media.source,
-                        delivered: false,
-                    });
-                }
+                reject_retained_body(&client_writer, bridge_instance_id, &media);
                 force_sources = true;
             }
         }
@@ -2367,6 +2529,36 @@ fn run_bridge_worker(
         None,
         MediaTraceKind::BridgeClientDetached,
     );
+}
+
+/// Publish observed presentation before input authenticated against the resulting scene.
+fn forward_overlay_observations(
+    writer: &BridgeClientSender,
+    bridge_instance_id: u64,
+    reports: Vec<vivid_gateway::PresentationReport>,
+    input: Vec<vivid_gateway::ExternalOverlayInput>,
+) -> io::Result<()> {
+    for report in reports {
+        let outcome = report.outcome.map(|outcome| match outcome {
+            vivid_protocol::overlay::wire::PresentationOutcome::Presented => 0,
+            vivid_protocol::overlay::wire::PresentationOutcome::Superseded => 1,
+        });
+        writer.send(ClientMessage::BridgePresentation {
+            bridge_instance_id,
+            correlation: report.correlation,
+            source: report.source,
+            outcome,
+        })?;
+    }
+    for event in input {
+        writer.send(ClientMessage::OverlayInput {
+            bridge_instance_id,
+            correlation: event.correlation,
+            surface: event.surface,
+            body: event.body,
+        })?;
+    }
+    Ok(())
 }
 
 fn hydrates_retained_source(record_type: u16) -> bool {
@@ -2679,6 +2871,18 @@ fn reject_retained_body(
     bridge_instance_id: u64,
     media: &BridgeMedia,
 ) {
+    if media.presentation != 0
+        && client_writer
+            .send(ClientMessage::BridgePresentation {
+                bridge_instance_id,
+                correlation: media.presentation,
+                source: media.source,
+                outcome: None,
+            })
+            .is_err()
+    {
+        (client_writer.1)();
+    }
     if media.delivery_id == 0 && media.last {
         let _ = client_writer.send(ClientMessage::BridgeRetainedResult {
             bridge_instance_id,
@@ -3385,6 +3589,7 @@ mod tests {
             track: 4,
         };
         let media = |delivery_id, last| BridgeMedia {
+            presentation: 0,
             generation: 24,
             delivery_id,
             source: key,
@@ -3409,6 +3614,114 @@ mod tests {
             } if source == key
         ));
         receiver.try_recv().unwrap_err();
+    }
+
+    #[test]
+    fn display_reports_precede_input_and_failed_reports_stop_the_batch() {
+        let source = BridgeSourceKey {
+            producer: 1,
+            context: 2,
+            surface: 3,
+            track: 4,
+        };
+        let surface = vivid_sdk::presenter::BridgeSurfaceKey {
+            producer: source.producer,
+            context: source.context,
+            surface: source.surface,
+        };
+        let report = vivid_gateway::PresentationReport {
+            correlation: 9,
+            source,
+            outcome: Some(vivid_protocol::overlay::wire::PresentationOutcome::Presented),
+        };
+        let (sender, receiver) = mpsc::channel();
+        let writer =
+            BridgeClientSender::new(move |message| sender.send(message).map_err(io::Error::other));
+        forward_overlay_observations(
+            &writer,
+            8,
+            vec![report],
+            vec![vivid_gateway::ExternalOverlayInput {
+                correlation: 5,
+                surface,
+                body: vec![1],
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientMessage::BridgePresentation { correlation: 9, .. }
+        ));
+        assert!(
+            matches!(receiver.try_recv().unwrap(),ClientMessage::OverlayInput { surface:key, body, .. } if key==surface && body==[1])
+        );
+        let failed = BridgeClientSender::new(|message| {
+            assert!(
+                matches!(message, ClientMessage::BridgePresentation { .. }),
+                "input overtook failed presentation publication"
+            );
+            Err(io::ErrorKind::BrokenPipe.into())
+        });
+        assert_eq!(
+            forward_overlay_observations(
+                &failed,
+                8,
+                vec![report],
+                vec![vivid_gateway::ExternalOverlayInput {
+                    correlation: 5,
+                    surface,
+                    body: vec![1]
+                }]
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn correlated_chunks_keep_peer_service_and_front_retry_order() {
+        let a = BridgeSourceKey {
+            producer: 1,
+            context: 1,
+            surface: 1,
+            track: 1,
+        };
+        let b = BridgeSourceKey { producer: 2, ..a };
+        let chunk = |source, presentation, offset| BridgeMedia {
+            presentation,
+            generation: 1,
+            delivery_id: presentation,
+            source,
+            record_type: vivid_protocol::messages::VECTOR_FRAME,
+            offset,
+            total: 3,
+            last: offset == 2,
+            bytes: vec![0],
+        };
+        let mut queues = TrackMediaQueues::default();
+        assert!(queues.push(chunk(a, 1, 0), 3).is_ok());
+        assert!(queues.push(chunk(a, 1, 1), 3).is_ok());
+        assert!(queues.push(chunk(b, 2, 0), 3).is_ok());
+        let peer = queues.pop_media_where(|media| media.source != a).unwrap();
+        assert_eq!(peer.source, b);
+        let first = queues.pop().unwrap();
+        assert_eq!(first.offset, 0);
+        assert!(queues.retry_front(first, 3).is_ok());
+        assert_eq!(queues.pop().unwrap().offset, 0);
+        assert_eq!(queues.pop().unwrap().offset, 1);
+        assert_eq!((queues.bytes, queues.chunks), (0, 0));
+        let (sender, receiver) = mpsc::channel();
+        let writer =
+            BridgeClientSender::new(move |message| sender.send(message).map_err(io::Error::other));
+        reject_retained_body(&writer, 9, &peer);
+        assert!(
+            matches!(receiver.try_recv().unwrap(),ClientMessage::BridgePresentation {bridge_instance_id:9, correlation:2, source, outcome:None} if source==b)
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "display abandonment must not fabricate a write ACK"
+        );
     }
 
     fn test_surface(key: BridgeSourceKey) -> BridgeSurface {
@@ -3907,6 +4220,7 @@ mod tests {
             track: 7,
         };
         let record = || BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 11,
             source: key,
@@ -3922,6 +4236,7 @@ mod tests {
         let audio_key = BridgeSourceKey { track: 8, ..key };
         assert!(
             worker.queue_media(BridgeMedia {
+                presentation: 0,
                 generation: 0,
                 delivery_id: 12,
                 source: audio_key,
@@ -4211,6 +4526,7 @@ mod tests {
             },
         };
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 1,
@@ -4241,6 +4557,7 @@ mod tests {
         for (index, frame) in frames.iter().enumerate() {
             let delivery_id = 41 + index as u64;
             assert!(worker.queue_media(BridgeMedia {
+                presentation: 0,
                 generation: 0,
                 delivery_id,
                 source: key,
@@ -4361,6 +4678,7 @@ mod tests {
             },
         };
         let visible_snapshot = |virtual_revision| BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision,
@@ -4402,6 +4720,7 @@ mod tests {
         })
         .unwrap();
         assert!(worker.queue_media(BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 41,
             source: key,
@@ -4428,6 +4747,7 @@ mod tests {
         assert!(presenter.wait_for_retained_media(7, Duration::from_secs(2)));
 
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 2,
@@ -4478,6 +4798,7 @@ mod tests {
         assert!(blank.sources[0].retained_raster.is_none());
 
         assert!(worker.queue_media(BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 0,
             source: key,
@@ -4650,6 +4971,7 @@ mod tests {
             track: 7,
         };
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 1,
@@ -4663,6 +4985,7 @@ mod tests {
         // link its compression regardless of the form the inner hop happened to use.
         let frame = page_frame_body(1, 0x10);
         assert!(worker.queue_media(BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 41,
             source: key,
@@ -4724,6 +5047,7 @@ mod tests {
         )
         .unwrap();
         assert!(worker.queue_media(BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 42,
             source: key,
@@ -4886,6 +5210,7 @@ mod tests {
             },
         };
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 1,
@@ -4907,6 +5232,7 @@ mod tests {
         })
         .unwrap();
         assert!(worker.queue_media(BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 42,
             source: key,
@@ -4965,6 +5291,7 @@ mod tests {
         assert!(!presenter.complete_bridge_delivery(outer_audio.delivery_id, true));
         for virtual_revision in 2..=8 {
             worker.replace_snapshot(BridgeSnapshot {
+                overlay_input_epochs: Vec::new(),
                 microphones: Vec::new(),
                 generation: 0,
                 virtual_revision,
@@ -4984,6 +5311,7 @@ mod tests {
         let mut playing_video = video_source;
         playing_video.playing = true;
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 9,
@@ -5003,6 +5331,7 @@ mod tests {
         })
         .unwrap();
         assert!(worker.queue_media(BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 43,
             source: video_key,
@@ -5061,6 +5390,7 @@ mod tests {
         })
         .unwrap();
         assert!(worker.queue_media(BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 44,
             source: key,
@@ -5098,6 +5428,7 @@ mod tests {
         })
         .unwrap();
         assert!(worker.queue_media(BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 45,
             source: video_key,
@@ -5119,6 +5450,7 @@ mod tests {
         let mut paused_video = playing_video.clone();
         paused_video.playing = false;
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 10,
@@ -5180,6 +5512,7 @@ mod tests {
         })
         .unwrap();
         assert!(worker.queue_media(BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 46,
             source: key,
@@ -5216,6 +5549,7 @@ mod tests {
         })
         .unwrap();
         assert!(worker.queue_media(BridgeMedia {
+            presentation: 0,
             generation: 0,
             delivery_id: 47,
             source: video_key,
@@ -5248,6 +5582,7 @@ mod tests {
         let mut resumed_video = playing_video;
         resumed_video.play_request.start_pts_us = 10_000_000;
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 11,
@@ -5286,6 +5621,7 @@ mod tests {
         let quieter_gain = vivid_sdk::AudioGain::from_percent(35).unwrap();
         quieter_audio.audio_gain = Some(quieter_gain.raw());
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 12,
@@ -5356,6 +5692,7 @@ mod tests {
         // This projection was queued before the server processed BridgeNeedKeyframes. Its empty
         // recovery set must not clear the in-place classification before the rising edge arrives.
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 13,
@@ -5373,6 +5710,7 @@ mod tests {
             }
         }
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 14,
@@ -5396,6 +5734,7 @@ mod tests {
         let mut recovered_video = resumed_video;
         recovered_video.decoder_reset_serial += 1;
         worker.replace_snapshot(BridgeSnapshot {
+            overlay_input_epochs: Vec::new(),
             microphones: Vec::new(),
             generation: 0,
             virtual_revision: 15,
@@ -5635,6 +5974,7 @@ mod tests {
             // Tab 1 becomes visible with all three panes, but only pane 2 contributes media. Deliver
             // linked-audio pre-roll before the authoritative PLAY transition.
             worker.replace_snapshot(BridgeSnapshot {
+                overlay_input_epochs: Vec::new(),
                 microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: 1,
@@ -5676,6 +6016,7 @@ mod tests {
             project_outer_timed_sources(&presenter, 2);
             let initial_audio = audio_packet(1, 0);
             assert!(worker.queue_media(BridgeMedia {
+                presentation: 0,
                 generation: 0,
                 delivery_id: 10,
                 source: audio_key,
@@ -5702,6 +6043,7 @@ mod tests {
 
             let initial_play_start = seen.len();
             worker.replace_snapshot(BridgeSnapshot {
+                overlay_input_epochs: Vec::new(),
                 microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: 2,
@@ -5748,6 +6090,7 @@ mod tests {
             );
             let opening_keyframe = video_packet(1, 0, true);
             assert!(worker.queue_media(BridgeMedia {
+                presentation: 0,
                 generation: 0,
                 delivery_id: 11,
                 source: video_key,
@@ -5838,6 +6181,7 @@ mod tests {
             // Switching tabs atomically removes tab 1's video/audio projection and replaces it with
             // the image owned by pane 2 of tab 2.
             worker.replace_snapshot(BridgeSnapshot {
+                overlay_input_epochs: Vec::new(),
                 microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: 3,
@@ -5861,6 +6205,7 @@ mod tests {
                 },
             );
             assert!(worker.queue_media(BridgeMedia {
+                presentation: 0,
                 generation: 0,
                 delivery_id: 12,
                 source: image_key,
@@ -5897,6 +6242,7 @@ mod tests {
             // the applied acknowledgement, and the recreated attachment must request a keyframe.
             let return_start = seen.len();
             worker.replace_snapshot(BridgeSnapshot {
+                overlay_input_epochs: Vec::new(),
                 microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: 4,
@@ -6021,6 +6367,7 @@ mod tests {
             };
             let recovery_play_start = seen.len();
             worker.replace_snapshot(BridgeSnapshot {
+                overlay_input_epochs: Vec::new(),
                 microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: 5,
@@ -6067,6 +6414,7 @@ mod tests {
 
             let recovery_keyframe = video_packet(2, recovery_pts_us, true);
             assert!(worker.queue_media(BridgeMedia {
+                presentation: 0,
                 generation: 0,
                 delivery_id: 13,
                 source: video_key,
@@ -6093,6 +6441,7 @@ mod tests {
 
             let resumed_audio = audio_packet(2, recovery_pts_us + 7_000);
             assert!(worker.queue_media(BridgeMedia {
+                presentation: 0,
                 generation: 0,
                 delivery_id: 14,
                 source: audio_key,
@@ -6119,6 +6468,7 @@ mod tests {
 
             let resumed_delta = video_packet(3, recovery_pts_us + 33_000, false);
             assert!(worker.queue_media(BridgeMedia {
+                presentation: 0,
                 generation: 0,
                 delivery_id: 15,
                 source: video_key,

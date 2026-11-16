@@ -34,8 +34,8 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 ///
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
-/// Version 23 qualifies retained-delivery results with the bridge instance and success status.
-pub const VERSION: u16 = 23;
+/// Version 26 binds window action claims and replies to their original server and bridge.
+pub const VERSION: u16 = 26;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -62,7 +62,7 @@ const MICROPHONE_RECORD: u16 = 4;
 /// decimal number per byte, which measured at 3.57x for media and 3.29x for terminal frames, paid
 /// twice — once formatting on the session actor, once parsing on the client's reader thread. Both
 /// are single-threaded, so that cost is latency on the two hops least able to absorb it.
-const MEDIA_RECORD_HEADER: usize = 56;
+const MEDIA_RECORD_HEADER: usize = 64;
 /// Size of the fixed binary header of a `RENDER_RECORD` chunk, in bytes.
 const RENDER_RECORD_HEADER: usize = 24;
 /// Media chunk flag: this chunk completes its delivery.
@@ -81,6 +81,7 @@ const RENDER_CHUNK: usize = 256 * 1024;
 #[derive(Debug, Clone, Copy)]
 struct MediaChunk {
     delivery_id: u64,
+    presentation: u64,
     source: BridgeSourceKey,
     record_type: u16,
     offset: u32,
@@ -1400,8 +1401,18 @@ pub enum ClientMessage {
         id: u64,
         response: Result<Vec<u8>, String>,
     },
+    WindowActionClaim {
+        bridge_instance_id: u64,
+        id: u64,
+    },
+    WindowActionReply {
+        bridge_instance_id: u64,
+        id: u64,
+        response: Result<Vec<u8>, String>,
+    },
     OverlayInput {
         bridge_instance_id: u64,
+        correlation: u64,
         surface: BridgeSurfaceKey,
         body: Vec<u8>,
     },
@@ -1434,6 +1445,13 @@ pub enum ClientMessage {
     BridgeNeedFullFrames(Vec<BridgeSourceKey>),
     BridgeCapabilitiesChanged {
         reason_mask: u64,
+    },
+    /// Exact downstream outcome for a server-retained original copy; not a write ACK.
+    BridgePresentation {
+        bridge_instance_id: u64,
+        correlation: u64,
+        source: BridgeSourceKey,
+        outcome: Option<u8>,
     },
     BridgeMediaAck {
         delivery_id: u64,
@@ -1541,9 +1559,30 @@ pub enum AttachmentTarget {
     Agent { alias: crate::agent::AgentAlias },
 }
 
+/// Non-authoritative original window metadata; SDK action receipts stay on the server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowActionRequest {
+    pub bridge_instance_id: u64,
+    pub request: vivid_sdk::presenter::OverlayHostRequest,
+    pub preceding_windows: Vec<(BridgeSurfaceKey, u64, u64)>,
+    /// Original pane rectangle as exact Q32.32 scalars, not outer window coordinates.
+    pub centered_bounds: Option<[i64; 4]>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServerMessage {
     OverlayHostRequest(vivid_sdk::presenter::OverlayHostRequest),
+    WindowActionRequest(WindowActionRequest),
+    WindowActionDecision {
+        bridge_instance_id: u64,
+        id: u64,
+        allowed: bool,
+        remaining_us: u64,
+    },
+    WindowActionRetired {
+        bridge_instance_id: u64,
+        id: u64,
+    },
     Attached {
         session: String,
         /// This client holds the exclusive role. Other Vivid clients receive retained visuals.
@@ -1582,6 +1621,7 @@ pub enum ServerMessage {
         bindings: Vec<PluginKeybinding>,
     },
     MediaSnapshot {
+        overlay_input_epochs: Vec<(vivid_sdk::presenter::BridgeSurfaceKey, u64)>,
         microphones: Vec<vivid_sdk::presenter::MicrophoneRequest>,
         revision: u64,
         surfaces: Vec<BridgeSurface>,
@@ -1591,6 +1631,7 @@ pub enum ServerMessage {
     },
     MediaRecord {
         delivery_id: u64,
+        presentation: u64,
         source: BridgeSourceKey,
         record_type: u16,
         offset: u32,
@@ -1901,6 +1942,7 @@ impl RecordWriter {
         header[42..44].copy_from_slice(&if chunk.last { MEDIA_FLAG_LAST } else { 0 }.to_be_bytes());
         header[44..48].copy_from_slice(&chunk.offset.to_be_bytes());
         header[48..52].copy_from_slice(&chunk.total.to_be_bytes());
+        header[56..64].copy_from_slice(&chunk.presentation.to_be_bytes());
         self.write_raw_parts(MEDIA_RECORD, 0, &[&header, bytes])
     }
 
@@ -1963,6 +2005,18 @@ pub fn send_media_record(
     record_type: u16,
     body: &[u8],
 ) -> io::Result<()> {
+    send_media_record_with_presentation(writer, delivery_id, 0, source, record_type, body)
+}
+
+/// Send a vector copy correlation independently from its ingress/write delivery.
+pub fn send_media_record_with_presentation(
+    writer: &SharedWriter,
+    delivery_id: u64,
+    presentation: u64,
+    source: BridgeSourceKey,
+    record_type: u16,
+    body: &[u8],
+) -> io::Result<()> {
     let mut writer = writer
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1974,6 +2028,7 @@ pub fn send_media_record(
         .clamp(1, MEDIA_CHUNK);
     let mut header = MediaChunk {
         delivery_id,
+        presentation,
         source,
         record_type,
         offset: 0,
@@ -2081,6 +2136,10 @@ fn decode_media_record(mut body: Vec<u8>) -> io::Result<ServerMessage> {
     if u32::from_be_bytes(body[52..56].try_into().unwrap()) != 0 {
         return Err(invalid("VVMX media record reserved field is nonzero"));
     }
+    let presentation = u64::from_be_bytes(body[56..64].try_into().unwrap());
+    if presentation != 0 && record_type != vivid_protocol::messages::VECTOR_FRAME {
+        return Err(invalid("VVMX display correlation requires a vector frame"));
+    }
     if flags & !MEDIA_FLAG_LAST != 0 {
         return Err(invalid("VVMX media record uses reserved flags"));
     }
@@ -2099,6 +2158,7 @@ fn decode_media_record(mut body: Vec<u8>) -> io::Result<ServerMessage> {
     }
     Ok(ServerMessage::MediaRecord {
         delivery_id,
+        presentation,
         source: BridgeSourceKey {
             producer,
             context,
@@ -2285,7 +2345,7 @@ mod tests {
         preface[7] = 1;
         decode_preface(&preface).unwrap_err();
         preface = encode_preface(ChannelKind::Control, CONTROL_MAX_BODY);
-        preface[4..6].copy_from_slice(&VERSION.wrapping_add(1).to_be_bytes());
+        preface[4..6].copy_from_slice(&25_u16.to_be_bytes());
         let error = decode_preface(&preface).unwrap_err();
         assert!(error.to_string().contains("restart"));
     }
@@ -2428,6 +2488,7 @@ mod tests {
             .lock()
             .unwrap()
             .send(&ServerMessage::MediaRecord {
+                presentation: 0,
                 delivery_id: 1,
                 source,
                 record_type: 0x8001,
@@ -2482,7 +2543,15 @@ mod tests {
         let output = SharedBytes::default();
         let counters = IpcCounters::shared();
         let writer = test_writer(&output, &counters);
-        send_media_record(&writer, 42, source, 0x8003, &media).unwrap();
+        send_media_record_with_presentation(
+            &writer,
+            42,
+            99,
+            source,
+            vivid_protocol::messages::VECTOR_FRAME,
+            &media,
+        )
+        .unwrap();
         send_render_record(&writer, 5, 99, true, &frame).unwrap();
 
         let mut reader = test_reader(output.0.lock().unwrap().clone());
@@ -2492,6 +2561,7 @@ mod tests {
             match reader.recv_server().unwrap() {
                 ServerMessage::MediaRecord {
                     delivery_id,
+                    presentation,
                     source: key,
                     record_type,
                     offset,
@@ -2499,7 +2569,10 @@ mod tests {
                     last,
                     bytes,
                 } => {
-                    assert_eq!((delivery_id, key, record_type), (42, source, 0x8003));
+                    assert_eq!(
+                        (delivery_id, presentation, key, record_type),
+                        (42, 99, source, vivid_protocol::messages::VECTOR_FRAME)
+                    );
                     assert_eq!(offset as usize, media_seen.len());
                     assert_eq!(total as usize, media.len());
                     media_seen.extend_from_slice(&bytes);
@@ -2602,6 +2675,11 @@ mod tests {
         let mut reserved = good.clone();
         reserved[16 + 52] = 1;
         test_reader(reserved).recv_server().unwrap_err();
+
+        // A display correlation is never valid for a non-vector record.
+        let mut correlated = good.clone();
+        correlated[16 + 63] = 1;
+        test_reader(correlated).recv_server().unwrap_err();
 
         // Unknown flag bit set.
         let mut flags = good.clone();

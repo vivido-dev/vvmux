@@ -30,6 +30,7 @@ fn total_media_queue_has_source_and_byte_limits() {
             queue
                 .push(
                     BridgeMedia {
+                        presentation: 0,
                         generation: 1,
                         delivery_id: producer,
                         source: BridgeSourceKey {
@@ -50,6 +51,7 @@ fn total_media_queue_has_source_and_byte_limits() {
         );
     }
     let media = BridgeMedia {
+        presentation: 0,
         generation: 1,
         delivery_id: 9999,
         source: BridgeSourceKey {
@@ -71,6 +73,7 @@ fn total_media_queue_has_source_and_byte_limits() {
     let mut bytes = Vec::new();
     bytes.reserve_exact(BRIDGE_QUEUE_BYTES + 1);
     let media = BridgeMedia {
+        presentation: 0,
         generation: 1,
         delivery_id: 1,
         source: BridgeSourceKey {
@@ -178,6 +181,7 @@ fn bridge_drop_cancels_blocked_outer_request() {
         track: 1,
     };
     worker.replace_snapshot(BridgeSnapshot {
+        overlay_input_epochs: Vec::new(),
         microphones: vec![],
         generation: 0,
         virtual_revision: 1,

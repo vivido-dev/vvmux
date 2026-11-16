@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_protocol"
-version = "1.5.12"
+version = "1.5.13"
 dependencies = [
  "base64 0.23.1",
  "hmac",
@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_sdk"
-version = "1.5.12"
+version = "1.5.13"
 dependencies = [
  "getrandom 0.4.3",
  "log",
@@ -3425,7 +3425,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vvmux"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "axum",
  "base64 0.23.1",

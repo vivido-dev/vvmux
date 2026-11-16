@@ -1170,6 +1170,7 @@ fn handle_session_message(
             ));
         }
         ServerMessage::MediaSnapshot {
+            overlay_input_epochs,
             revision,
             surfaces,
             tracks,
@@ -1184,6 +1185,7 @@ fn handle_session_message(
                 ));
             };
             bridge.replace_snapshot(BridgeSnapshot {
+                overlay_input_epochs,
                 microphones: Vec::new(),
                 generation: 0,
                 virtual_revision: revision,
@@ -1198,7 +1200,31 @@ fn handle_session_message(
                 bridge.queue_overlay_request(request);
             }
         }
+        ServerMessage::WindowActionRequest(request) => {
+            if let Some(bridge) = bridge.as_mut() {
+                bridge.queue_window_action(request);
+            }
+        }
+        ServerMessage::WindowActionDecision {
+            bridge_instance_id,
+            id,
+            allowed,
+            remaining_us,
+        } => {
+            if let Some(bridge) = bridge.as_mut() {
+                bridge.queue_window_action_decision(bridge_instance_id, id, allowed, remaining_us);
+            }
+        }
+        ServerMessage::WindowActionRetired {
+            bridge_instance_id,
+            id,
+        } => {
+            if let Some(bridge) = bridge.as_mut() {
+                bridge.retire_window_action(bridge_instance_id, id);
+            }
+        }
         ServerMessage::MediaRecord {
+            presentation,
             delivery_id,
             source,
             record_type,
@@ -1214,6 +1240,7 @@ fn handle_session_message(
                 ));
             };
             bridge.queue_media(BridgeMedia {
+                presentation,
                 generation: 0,
                 delivery_id,
                 source,
