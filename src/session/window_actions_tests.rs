@@ -187,6 +187,84 @@ fn success() -> Vec<u8> {
 }
 
 #[test]
+fn replacement_rejects_claimed_actions_and_late_replies_while_a_peer_is_pending() {
+    let (vivid, mut manager) = fixture();
+    let first = Producer::new(&vivid, 1);
+    let mut peer = Producer::new(&vivid, 2);
+    assert_eq!(first.action().1.address, peer.action().1.address);
+    let writer = crate::ipc::test_shared_writer(Box::new(std::io::sink()));
+    for kind in [
+        WindowAction::Center,
+        WindowAction::Close,
+        WindowAction::Focus,
+        WindowAction::Raise,
+        WindowAction::Lower,
+    ] {
+        let (handle, mut action) = first.action();
+        action.action = kind;
+        manager.bind(&vivid, 7, 10);
+        std::thread::scope(|scope| {
+            let caller = scope.spawn(move || {
+                handle(
+                    messages::OVERLAY_ACTION,
+                    action.address.surface_id,
+                    action.payload().unwrap(),
+                )
+            });
+            let original = request(&vivid);
+            let id = original.id;
+            manager.enqueue(&vivid, 7, original);
+            manager.service(&vivid, Some((7, 10, Arc::clone(&writer))));
+            assert!(manager.claim(7, 10, id).0);
+            assert_eq!(manager.pending_counts(), (1, 1));
+            peer.node.z_index += 1;
+            peer.session
+                .update_node(&peer.node, &RequestMetadata::default())
+                .unwrap();
+            let snapshot = vivid.projection_snapshot(&HashSet::from([2]));
+            assert_eq!(snapshot.nodes.len(), 1);
+            assert_eq!(snapshot.nodes[0].producer, peer.session.info().session_id);
+            assert_eq!(snapshot.nodes[0].config.node.z_index, peer.node.z_index);
+
+            manager.bind(&vivid, 8, 11);
+            caller.join().unwrap().unwrap_err();
+            assert_eq!(manager.pending_counts(), (0, 0));
+            assert_eq!(first.action().1.expected_revision, action.expected_revision);
+            let (handle, fresh) = peer.action();
+            let peer_caller = scope.spawn(move || {
+                handle(
+                    messages::OVERLAY_ACTION,
+                    fresh.address.surface_id,
+                    fresh.payload().unwrap(),
+                )
+            });
+            let pending = request(&vivid);
+            let peer_id = pending.id;
+            assert_ne!(id, peer_id);
+            manager.enqueue(&vivid, 8, pending);
+            manager.service(&vivid, Some((8, 11, Arc::clone(&writer))));
+            assert!(manager.claim(8, 11, peer_id).0);
+            // A successful physical reply can reach the actor after replacement.
+            // Neither its stale correlation nor the old client resolves the peer.
+            for (client, bridge, old_id) in [(7, 10, id), (8, 11, id), (7, 10, peer_id)] {
+                assert!(!manager.reply(&vivid, client, bridge, old_id, Ok(success())));
+            }
+            assert_eq!(first.action().1.expected_revision, action.expected_revision);
+            assert_eq!(manager.pending_counts(), (1, 1));
+            assert!(manager.reply(&vivid, 8, 11, peer_id, Ok(success())));
+            peer_caller.join().unwrap().unwrap();
+            assert_eq!(
+                peer.action().1.expected_revision,
+                fresh.expected_revision + 1
+            );
+            assert_eq!(manager.pending_counts(), (0, 0));
+        });
+    }
+    first.session.close().unwrap();
+    peer.session.close().unwrap();
+}
+
+#[test]
 fn window_actions_require_exact_client_bridge_original_and_one_shot_claim() {
     let (vivid, mut manager) = fixture();
     let a = Producer::new(&vivid, 1);

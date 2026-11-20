@@ -314,9 +314,18 @@ checked pixel dimensions; Windows accepts the same internal call and continues u
 This is the sole scoped PTY media exception in vvmux and does not change the Vivid wire stack.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 26 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 27 → outer vvmux producer → Vivido
 ```
 
+
+VVMX 27 binds native desktop document publications, replies and edits to the
+foreground bridge instance. The hidden server retains the original SDK target
+under the host request ID, with up to 64 revisions for each of 32 windows. Each
+edit carries its full surface key, original editor and revision, and a sequence
+number. The native client and server share a monotonic clock. Serialization,
+IPC queueing and locking all consume the original one-second input lifetime.
+Clearing an excerpt retires its revisions. Detach and session replacement retire
+the attachment's grants and pending publications. Both binaries must use VVMX 27.
 
 Version 21 also carries bounded overlay host requests/replies and native input events. The inner
 presenter queues vector frames/assets as acknowledged media deliveries; retained rehydration
@@ -459,11 +468,11 @@ this correction. Redacted diagnostics retain only error kind and presenter code.
 
 This qualifies finite headless Metal checks with synthetic display/key/text events.
 Already-claimed typed actions under foreground replacement, mixed saturation and broader
-recovery still need native acceptance. Document forwarding, generic/font-only
+recovery still need native acceptance. Ordinary-window document editing, generic/font-only
 routes, mux lease issuance/resume (`UNSUPPORTED_PROFILE`, code 3), ordinary AppKit
 mux windows, physical focus/IME/secure input/accessibility/scanout, display-scale
 and device transitions, other platforms/GPUs/devices and broader sustained/fault
-matrices remain open. Restart both mux server and client for private VVMX 26;
+matrices remain open. The fixture originally used private VVMX 26;
 Vivid 1.5 wire/profile/registry and dependencies are unchanged.
 [Mux window-action evidence](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-mux-window-actions-macos.json).
 
@@ -480,6 +489,15 @@ that queued, unclaimed abrupt-loss case only. Already-claimed RPCs during
 replacement, mixed saturation and ordinary AppKit/physical/platform/device gates
 remain explicit. No additional feature work is included in this qualification.
 [Queued action replacement evidence](../vivid_compositor/docs/performance/2026-11-15-sdk-vector-mux-pending-action-macos.json).
+
+In the ordinary macOS compositor window, four trials held a server-confirmed
+claimed Center while an independent producer committed another scene. Graceful
+detach and forced frontend termination retired the request in every trial. The
+same source identities returned under a new bridge, the green window retained
+its original position and a fresh Center moved it. The socket regression also
+binds a replacement after a claim for each of Focus, Raise, Lower, Center and
+Close. Late successes cannot advance the old window revision or resolve a
+same-ID peer's pending request. The test then completes the peer's fresh Center.
 
 
 The earlier negative probe and API-only checkpoint remain historical evidence:

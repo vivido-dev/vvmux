@@ -382,6 +382,7 @@ impl super::SessionActor {
     pub(super) fn bind_native_presentations(&mut self, client: u64, bridge: u64) {
         self.window_actions.bind(&self.vivid, client, bridge);
         if self.bridge_instance_id.is_some_and(|old| old != bridge) {
+            self.documents.reset(&self.vivid);
             self.native_presentations.reset(&self.vivid);
         }
         self.native_presentations.bind(client, bridge);

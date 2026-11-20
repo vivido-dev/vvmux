@@ -522,6 +522,7 @@ impl SessionActor {
                         MediaTraceKind::SnapshotRetry,
                     );
                     if reset_outer_session {
+                        self.documents.reset(&self.vivid);
                         // Fragment and attachment identities are scoped to the outer session.
                         // Source-scoped recovery reuses that session and must preserve unrelated
                         // mappings; only a confirmed replacement invalidates all of them.
@@ -731,6 +732,11 @@ impl SessionActor {
                     );
                 }
             }
+            ClientMessage::DocumentInput(input) => {
+                if self.is_presenter(id) && self.bridge_instance_id == Some(input.bridge) {
+                    self.documents.forward(&self.vivid, input)?;
+                }
+            }
             ClientMessage::OverlayInput {
                 bridge_instance_id,
                 correlation,
@@ -760,7 +766,7 @@ impl SessionActor {
                 profiles,
             } => {
                 if self.is_presenter(id) && self.bridge_instance_id == Some(bridge_instance_id) {
-                    self.vivid.set_overlay_host_profiles(&profiles);
+                    self.vivid.set_overlay_document_host_profiles(&profiles);
                 }
             }
             ClientMessage::OverlayEnvironment {
@@ -780,12 +786,19 @@ impl SessionActor {
                 }
             }
             ClientMessage::OverlayHostReply {
+                bridge_instance_id,
                 id: request_id,
                 response,
             } => {
-                if self.is_presenter(id) && !self.window_actions.contains(request_id) {
-                    self.vivid
-                        .complete_overlay_host_request(request_id, response);
+                if self.is_presenter(id)
+                    && self.bridge_instance_id == Some(bridge_instance_id)
+                    && !self.window_actions.contains(request_id)
+                {
+                    let accepted = response.is_ok();
+                    let delivered = self
+                        .vivid
+                        .try_complete_overlay_host_request(request_id, response);
+                    self.documents.replied(request_id, accepted && delivered);
                 }
             }
             ClientMessage::WindowActionClaim {
@@ -1093,6 +1106,8 @@ impl SessionActor {
     pub(super) fn release_presentation(&mut self) {
         self.native_presentations.reset(&self.vivid);
         self.window_actions.reset(&self.vivid);
+        self.documents.reset(&self.vivid);
+        self.vivid.set_overlay_document_host_profiles(&[]);
         self.input_epochs.reset();
         self.vivid.deactivate_bridge();
         self.vivid.revoke_microphones();

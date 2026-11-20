@@ -298,7 +298,8 @@ pub fn attach(
                     })
                     .and_then(|secret| {
                         let mut builder = vivid_gateway::OuterBridge::builder(secret, display)
-                            .control_endpoint(outer.control.clone());
+                            .control_endpoint(outer.control.clone())
+                            .external_overlay_document_editing();
                         if let Some(endpoint) = &outer.realtime {
                             builder = builder.realtime_endpoint(endpoint.clone());
                         }
@@ -478,9 +479,12 @@ pub fn attach(
                             });
                         }
                     }
-                    ServerMessage::OverlayHostRequest(request) => {
+                    ServerMessage::OverlayHostRequest {
+                        bridge_instance_id,
+                        request,
+                    } => {
                         if let Some(bridge) = &mut bridge {
-                            bridge.queue_overlay_request(request);
+                            bridge.queue_overlay_request(bridge_instance_id, request);
                         }
                     }
                     ServerMessage::WindowActionRequest(request) => {
@@ -1035,7 +1039,7 @@ pub(crate) struct BridgeWorker {
 struct TrackMediaQueues {
     window_actions: window_actions::Queue,
     dropped_presentations: HashMap<u64, BridgeSourceKey>,
-    host_requests: VecDeque<vivid_sdk::presenter::OverlayHostRequest>,
+    host_requests: VecDeque<(u64, vivid_sdk::presenter::OverlayHostRequest)>,
     bytes: usize,
     chunks: usize,
     tracks: HashMap<BridgeSourceKey, VecDeque<BridgeMedia>>,
@@ -1131,6 +1135,7 @@ impl TrackMediaQueues {
 impl BridgeWorker {
     pub(crate) fn queue_overlay_request(
         &mut self,
+        bridge_instance_id: u64,
         request: vivid_sdk::presenter::OverlayHostRequest,
     ) {
         let mut queues = self.media.lock().unwrap();
@@ -1138,7 +1143,9 @@ impl BridgeWorker {
             (self.cancel)();
             return;
         }
-        queues.host_requests.push_back(request);
+        queues
+            .host_requests
+            .push_back((bridge_instance_id, request));
         if let Some(wakeup) = &self.media_wakeup {
             let _ = wakeup.try_send(());
         }
@@ -1645,6 +1652,7 @@ fn run_bridge_worker(
     let mut force_sources = false;
     let mut window_actions = window_actions::Actions::default();
     let mut force_replacement = false;
+    let mut document_sequence = 0_u64;
     let mut consecutive_projection_failures = 0_u32;
     let mut deferred: Option<BridgeMedia> = None;
     loop {
@@ -1698,6 +1706,27 @@ fn run_bridge_worker(
         )
         .is_err()
         {
+            (client_writer.1)();
+            break;
+        }
+        let documents = (|| -> io::Result<()> {
+            for input in bridge.take_overlay_document_input() {
+                if let Some(external) = input.into_external()? {
+                    document_sequence = document_sequence
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("document sequence exhausted"))?;
+                    if let Some(input) = crate::document_input::DocumentInput::encode(
+                        external,
+                        bridge_instance_id,
+                        document_sequence,
+                    )? {
+                        client_writer.send(ClientMessage::DocumentInput(input))?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if documents.is_err() {
             (client_writer.1)();
             break;
         }
@@ -2335,6 +2364,7 @@ fn run_bridge_worker(
                 continue;
             }
             let _ = client_writer.send(ClientMessage::OverlayHostReply {
+                bridge_instance_id,
                 id,
                 response: response.map_err(|error| error.to_string()),
             });
@@ -2343,7 +2373,10 @@ fn run_bridge_worker(
             let mut queues = media_queues
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let index = queues.host_requests.iter().position(|request| {
+            queues
+                .host_requests
+                .retain(|(binding, _)| *binding == bridge_instance_id);
+            let index = queues.host_requests.iter().position(|(_, request)| {
                 bridge.can_service_overlay_host_request(request)
                     && (matches!(
                         request.record_type,
@@ -2361,10 +2394,11 @@ fn run_bridge_worker(
             });
             index.and_then(|index| queues.host_requests.remove(index))
         };
-        if let Some(request) = host_request {
+        if let Some((_, request)) = host_request {
             let id = request.id;
             if let Err(error) = bridge.start_overlay_host_request(request) {
                 let _ = client_writer.send(ClientMessage::OverlayHostReply {
+                    bridge_instance_id,
                     id,
                     response: Err(error.to_string()),
                 });

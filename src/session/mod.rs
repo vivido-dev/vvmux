@@ -58,6 +58,7 @@ mod agents;
 mod automation;
 mod clients;
 mod commands;
+mod documents;
 mod input;
 mod input_epochs;
 mod overlays;
@@ -2044,6 +2045,7 @@ struct SessionActor {
     vivid: VirtualVivid,
     native_presentations: presentations::NativePresentations,
     window_actions: window_actions::WindowActions,
+    documents: documents::Documents,
     input_epochs: input_epochs::InputEpochs,
     media_projection_pending: Arc<AtomicBool>,
     /// Coalesces config-change wakes from the watcher thread, as `media_projection_pending` does
@@ -2308,6 +2310,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         vivid,
         native_presentations,
         window_actions,
+        documents: documents::Documents::default(),
         input_epochs: input_epochs::InputEpochs::default(),
         media_projection_pending,
         config_reload_pending,
@@ -2485,17 +2488,28 @@ impl SessionActor {
                     }
                     continue;
                 }
+                if request.record_type == vivid_protocol::messages::SET_OVERLAY_TEXT_CONTEXT
+                    && let Err(error) = self.documents.publish(&self.vivid, &request)
+                {
+                    self.vivid
+                        .complete_overlay_host_request(id, Err(error.to_string()));
+                    continue;
+                }
                 let sent = self
-                    .presenter_client()
-                    .filter(|client| client.vivid)
-                    .is_some_and(|client| {
+                    .bridge_instance_id
+                    .zip(self.presenter_client().filter(|client| client.vivid))
+                    .is_some_and(|(bridge_instance_id, client)| {
                         crate::ipc::send(
                             &client.writer,
-                            &ServerMessage::OverlayHostRequest(request),
+                            &ServerMessage::OverlayHostRequest {
+                                bridge_instance_id,
+                                request,
+                            },
                         )
                         .is_ok()
                     });
                 if !sent {
+                    self.documents.replied(id, false);
                     self.vivid.complete_overlay_host_request(
                         id,
                         Err("no outer overlay host is attached".into()),

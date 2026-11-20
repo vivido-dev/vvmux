@@ -17,6 +17,7 @@ mod client;
 mod client_input;
 mod config;
 mod config_watch;
+mod document_input;
 #[cfg(feature = "server-capability")]
 mod gateway;
 mod host_probe;

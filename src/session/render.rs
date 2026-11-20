@@ -700,6 +700,7 @@ impl SessionActor {
             .any(|client| client.vivid && client.media_enabled)
         {
             self.native_presentations.reset(&self.vivid);
+            self.documents.reset(&self.vivid);
             self.input_epochs.reset();
             self.vivid.deactivate_bridge();
             self.shared_visual_sources.clear();
@@ -711,6 +712,7 @@ impl SessionActor {
             .map(|client| Arc::clone(&client.writer));
         let projections = self.attached_projections(self.content_area());
         if projections.is_empty() {
+            self.documents.reconcile(&[]);
             self.native_presentations
                 .reconcile(&self.vivid, &HashSet::new());
             return;
@@ -958,6 +960,7 @@ impl SessionActor {
             })
             .map(|source| bridge_key(source.key))
             .collect::<HashSet<_>>();
+        self.documents.reconcile(&surfaces);
         let surface_count = u16::try_from(surfaces.len()).unwrap_or(u16::MAX);
         let track_count = u16::try_from(sources.len()).unwrap_or(u16::MAX);
         let node_count = u16::try_from(nodes.len()).unwrap_or(u16::MAX);

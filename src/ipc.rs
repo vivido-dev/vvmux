@@ -35,7 +35,8 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 /// A mixed pair is rejected by [`VERSION_MISMATCH`] rather than negotiated down: the two encodings
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
 /// Version 26 binds window action claims and replies to their original server and bridge.
-pub const VERSION: u16 = 26;
+/// Version 27 carries same-host monotonic deadlines and publication-bound document edits.
+pub const VERSION: u16 = 27;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -1398,6 +1399,7 @@ pub enum ClientMessage {
         keys: Vec<OverlayKeyInput>,
     },
     OverlayHostReply {
+        bridge_instance_id: u64,
         id: u64,
         response: Result<Vec<u8>, String>,
     },
@@ -1410,6 +1412,7 @@ pub enum ClientMessage {
         id: u64,
         response: Result<Vec<u8>, String>,
     },
+    DocumentInput(crate::document_input::DocumentInput),
     OverlayInput {
         bridge_instance_id: u64,
         correlation: u64,
@@ -1571,7 +1574,10 @@ pub struct WindowActionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServerMessage {
-    OverlayHostRequest(vivid_sdk::presenter::OverlayHostRequest),
+    OverlayHostRequest {
+        bridge_instance_id: u64,
+        request: vivid_sdk::presenter::OverlayHostRequest,
+    },
     WindowActionRequest(WindowActionRequest),
     WindowActionDecision {
         bridge_instance_id: u64,

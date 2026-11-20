@@ -1195,9 +1195,12 @@ fn handle_session_message(
                 videos_needing_keyframes,
             });
         }
-        ServerMessage::OverlayHostRequest(request) => {
+        ServerMessage::OverlayHostRequest {
+            bridge_instance_id,
+            request,
+        } => {
             if let Some(bridge) = bridge.as_mut() {
-                bridge.queue_overlay_request(request);
+                bridge.queue_overlay_request(bridge_instance_id, request);
             }
         }
         ServerMessage::WindowActionRequest(request) => {
