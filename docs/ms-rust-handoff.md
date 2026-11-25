@@ -64,7 +64,10 @@ can differ slightly where tests are platform-gated. What to actually watch:
   auth/identity/runtime/update call it. Its tests are the `gateway_*`/auth ones.
 - **Unix socket tests** must run where socket creation is allowed (no sandbox `PermissionDenied`
   skip path); AGENTS.md requires rerunning them un-sandboxed if they skip.
-- `tests/integration/overlay_python.rs` needs a Python on PATH; it should skip cleanly otherwise.
+- `tests/integration/overlay_counter.rs` re-executes the Cargo-built integration binary inside
+  a real Windows pane and checks drawing plus pointer-driven counter updates. Run it with
+  `cargo test --test integration overlay_counter::counter_draws -- --ignored --test-threads=1`.
+  It needs no Python, uv, sibling UI checkout, or manually rebuilt language binding.
 
 ## 2a. Linux record (2026-10-09)
 

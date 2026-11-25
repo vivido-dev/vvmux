@@ -25,7 +25,7 @@ mod image_probe;
 mod mouse_selection;
 mod multi_client;
 mod osc52_clipboard;
-mod overlay_python;
+mod overlay_counter;
 mod pane_menu;
 mod plugin_component_conformance;
 mod plugin_events;
