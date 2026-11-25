@@ -1,5 +1,11 @@
 # vvmux architecture
 
+Windows TCP transports use the SDK's `Transport::from_tcp` adapter for bounded
+readiness waits and cancellation. Named-pipe read deadlines cancel and await the
+specific overlapped operation before releasing its buffer or event. A completion
+that races the deadline retains its bytes, so polling cannot lose a partial VVMX
+record or leave the kernel writing into reused storage.
+
 ## Held and synchronized timed playback
 
 `timed-media-sync-v1` is negotiated independently on terminating hops. Removing a timed surface

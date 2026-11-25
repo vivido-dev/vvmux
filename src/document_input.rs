@@ -98,9 +98,10 @@ fn monotonic_us() -> io::Result<u64> {
     };
     let (mut ticks, mut frequency) = (0, 0);
     // SAFETY: both calls write to valid exclusive i64 storage.
-    if unsafe { QueryPerformanceFrequency(&raw mut frequency) } == 0
-        || unsafe { QueryPerformanceCounter(&raw mut ticks) } == 0
-    {
+    if unsafe {
+        QueryPerformanceFrequency(&raw mut frequency) == 0
+            || QueryPerformanceCounter(&raw mut ticks) == 0
+    } {
         return Err(io::Error::last_os_error());
     }
     let ticks = u128::try_from(ticks).map_err(io::Error::other)?;

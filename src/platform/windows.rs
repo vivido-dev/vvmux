@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::PathBuf;
@@ -1256,26 +1256,37 @@ impl Read for PipeReader {
             }
         };
         if complete != 0 {
-            Ok(transferred as usize)
-        } else if last_error_code() == ERROR_SEM_TIMEOUT {
-            // SAFETY: `overlapped` belongs to the read started above. Cancellation is only a
-            // request, so the blocking wait that follows keeps `overlapped` and its event alive
-            // until the kernel has finished with them; `transferred` is a live local.
-            unsafe {
-                CancelIoEx(self.handle.raw(), &raw const overlapped);
-                GetOverlappedResult(
-                    self.handle.raw(),
-                    &raw const overlapped,
-                    &raw mut transferred,
-                    1,
-                )
-            };
-            Err(io::Error::new(
+            return Ok(transferred as usize);
+        }
+        let error = io::Error::last_os_error();
+        let timed_out = matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(WAIT_TIMEOUT | ERROR_IO_INCOMPLETE | ERROR_SEM_TIMEOUT)
+        );
+        // SAFETY: cancellation targets this read. The buffer, operation and event
+        // remain alive until the blocking completion wait retires it, including
+        // a successful completion racing the timeout.
+        let finished = unsafe {
+            CancelIoEx(self.handle.raw(), &raw const overlapped);
+            GetOverlappedResult(
+                self.handle.raw(),
+                &raw const overlapped,
+                &raw mut transferred,
+                1,
+            )
+        };
+        if finished != 0 {
+            return Ok(transferred as usize);
+        }
+        if timed_out {
+            return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "named-pipe read timed out",
-            ))
-        } else {
-            pipe_read_error()
+            ));
+        }
+        match error.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED | ERROR_OPERATION_ABORTED) => Ok(0),
+            _ => Err(error),
         }
     }
 }
@@ -2066,22 +2077,7 @@ fn hex_prefix(bytes: &[u8], length: usize) -> String {
 }
 
 fn split_tcp(stream: TcpStream) -> io::Result<Transport> {
-    stream.set_nodelay(true)?;
-    let reader = stream.try_clone()?;
-    let timeout_stream = stream.try_clone()?;
-    let cancel_reader = reader.try_clone()?;
-    let cancel_writer = stream.try_clone()?;
-    let cancel = ConnectionCancel::new(move || {
-        let _ = cancel_reader.shutdown(Shutdown::Both);
-        let _ = cancel_writer.shutdown(Shutdown::Both);
-    });
-    let timeout = Arc::new(move |duration| timeout_stream.set_read_timeout(duration));
-    Ok(Transport::new(
-        Box::new(reader),
-        Box::new(stream),
-        cancel,
-        timeout,
-    ))
+    Transport::from_tcp(stream)
 }
 
 fn require_handle(handle: HANDLE, message: &'static str) -> io::Result<()> {
@@ -2306,6 +2302,9 @@ mod tests {
 
         let mut client = connect_session(&endpoint).unwrap();
         client.writer.write_all(b"abc").unwrap();
+        // Let multiple cancellation polls expire with half a record pending.
+        // Timed-out operations must retire before their buffers are reused.
+        std::thread::sleep(Duration::from_millis(600));
         client.writer.write_all(b"def").unwrap();
         let mut reply = [0; 5];
         client.reader.read_exact(&mut reply).unwrap();
