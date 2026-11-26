@@ -1531,12 +1531,21 @@ fn agent_start_refuses_a_pane_whose_foreground_is_not_its_shell() {
     // A pane running a foreground command is not at a prompt, so typing into it would feed the
     // command rather than start an agent. `sleep` is not an agent, so nothing else refuses first —
     // this is the availability check itself being tested.
+    //
+    // The marker comes from the job itself, not from the echo of the typed line: the echo appears
+    // before the shell has read the line and handed the terminal to the job, and probing then
+    // finds the shell still in front. The split quotes keep the echoed line from matching.
     assert_success(&command(
         &runtime,
         &name,
-        &["submit", "--pane-id", "1", "sleep 30"],
+        &[
+            "submit",
+            "--pane-id",
+            "1",
+            "sh -c 'echo BUSY-\"\"READY; exec sleep 30'",
+        ],
     ));
-    wait_text(&runtime, &name, 1, "sleep 30");
+    wait_text(&runtime, &name, 1, "BUSY-READY");
 
     let busy = error_code(command(
         &runtime,
