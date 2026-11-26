@@ -14,12 +14,17 @@ use serde_json::Value;
 
 const ADMITTED: &str = "PRODUCER-ADMITTED";
 const REFUSED: &str = "PRODUCER-REFUSED";
+/// Set only by the parent test on the producer's command line.
+///
+/// The pane's Vivid variables cannot serve as the marker: a test run from inside any Vivid
+/// terminal inherits them from that terminal, and the child would then connect to it.
+const PRODUCER_ENV: &str = "VVMUX_TEST_DETACHED_PRODUCER";
 
 /// Runs only inside a vvmux pane, where the pane's Vivid capability is in the environment.
 #[test]
 #[ignore = "re-executed inside a pane by a_detached_session_admits_a_vivid_producer"]
 fn producer_child() {
-    if std::env::var_os("VIVID_ENDPOINT_CONTROL").is_none() {
+    if std::env::var_os(PRODUCER_ENV).is_none() {
         return;
     }
     match vivid_sdk::Session::connect(vivid_sdk::ProducerConfig::default()) {
@@ -107,9 +112,12 @@ fn a_detached_session_admits_a_vivid_producer() {
     let executable = std::env::current_exe().unwrap();
     let executable = executable.to_str().unwrap();
     #[cfg(unix)]
-    let program = format!("'{}'", executable.replace('\'', r"'\''"));
+    let program = format!("{PRODUCER_ENV}=1 '{}'", executable.replace('\'', r"'\''"));
     #[cfg(windows)]
-    let program = format!("& '{}'", executable.replace('\'', "''"));
+    let program = format!(
+        "$env:{PRODUCER_ENV}='1'; & '{}'",
+        executable.replace('\'', "''")
+    );
     let command =
         format!("{program} --exact detached_producer::producer_child --ignored --nocapture");
     let opened = json(message(

@@ -25,12 +25,17 @@ use vvmux_terminal::Terminal;
 use vvmux_terminal::pty::{PtyControl, PtyProcess};
 
 const SHOWN: &str = "MULTI-CLIENT-IMAGE-SHOWN";
+/// Set only by the parent test on the producer's command line.
+///
+/// The pane's Vivid variables cannot serve as the marker: a test run from inside any Vivid
+/// terminal inherits them from that terminal, and the child would then connect to it.
+const IMAGE_PRODUCER_ENV: &str = "VVMUX_TEST_IMAGE_PRODUCER";
 
 /// Runs only inside a vvmux pane: shows one image and keeps it on screen.
 #[test]
 #[ignore = "re-executed inside a pane by retained_images_reach_all_clients_across_claim_and_detach"]
 fn image_producer_child() {
-    if std::env::var_os("VIVID_ENDPOINT_CONTROL").is_none() {
+    if std::env::var_os(IMAGE_PRODUCER_ENV).is_none() {
         return;
     }
     let png = base64::engine::general_purpose::STANDARD
@@ -990,8 +995,9 @@ fn retained_images_reach_all_clients_across_claim_and_detach() {
 
     let executable = std::env::current_exe().unwrap();
     let program = format!("'{}'", executable.to_str().unwrap().replace('\'', r"'\''"));
-    let command =
-        format!("{program} --exact multi_client::image_producer_child --ignored --nocapture");
+    let command = format!(
+        "{IMAGE_PRODUCER_ENV}=1 {program} --exact multi_client::image_producer_child --ignored --nocapture"
+    );
     let opened = json(message(
         &runtime,
         &config,
