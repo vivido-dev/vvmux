@@ -4089,6 +4089,7 @@ mod tests {
             (b"\x02r", Action::EnterFloatingResizeMode),
             (b"\x02a", Action::ToggleAgentNavigator),
             (b"\x02w", Action::ToggleTabNavigator),
+            (b"\x02i", Action::ShowPaneSummary),
             (b"\x02,", Action::BeginRenameTab),
             (b"\x02T", Action::CycleTabView),
         ] {

@@ -129,6 +129,9 @@ impl SessionActor {
                 history_len,
             );
             pane.mouse_selection = adjusted;
+            if let Some(copy) = &mut pane.copy {
+                copy.vi.adjust_marks(events, screen_switched, history_len);
+            }
         }
         if let Some(drag) = self
             .mouse_selection_drag
@@ -705,15 +708,7 @@ impl SessionActor {
             } else if mouse.kind == MouseKind::Wheel {
                 copy_view_render = true;
                 let previous_offset = pane.copy.as_ref().map_or(0, |copy| copy.offset);
-                let copy = pane.copy.get_or_insert(CopyState {
-                    offset: 0,
-                    row: 0,
-                    column: 0,
-                    selection_start: None,
-                    search: None,
-                    matches: Vec::new(),
-                    current: None,
-                });
+                let copy = pane.copy.get_or_insert_default();
                 if mouse.button == 0 {
                     copy.offset = (copy.offset + 3).min(pane.terminal.history_len());
                 } else {
@@ -1074,15 +1069,7 @@ impl SessionActor {
                 .and_then(|pane| pane.copy.as_ref())
                 .map_or(0, |copy| copy.offset);
             if let Some(pane) = self.panes.get_mut(&pane_id) {
-                let copy = pane.copy.get_or_insert(CopyState {
-                    offset: 0,
-                    row: 0,
-                    column: 0,
-                    selection_start: None,
-                    search: None,
-                    matches: Vec::new(),
-                    current: None,
-                });
+                let copy = pane.copy.get_or_insert_default();
                 if mouse.button == 0 {
                     copy.offset = (copy.offset + 3).min(pane.terminal.history_len());
                 } else {
@@ -1455,16 +1442,35 @@ impl SessionActor {
     }
 
     pub(super) fn copy_input(&mut self, pane_id: PaneId, bytes: &[u8]) {
-        let prompt_active = self.panes.get(&pane_id).is_some_and(|pane| {
-            pane.copy
-                .as_ref()
-                .and_then(|copy| copy.search.as_ref())
-                .is_some_and(|search| search.prompt.is_some())
-        });
+        let has_prompt = |actor: &Self| {
+            actor.panes.get(&pane_id).is_some_and(|pane| {
+                pane.copy
+                    .as_ref()
+                    .and_then(|copy| copy.search.as_ref())
+                    .is_some_and(|search| search.prompt.is_some())
+            })
+        };
+        let mut prompt_active = has_prompt(self);
+        let mut bytes = bytes;
         if !prompt_active && bytes.len() > 1 && matches!(bytes.first(), Some(b'/' | b'?')) {
             self.copy_input(pane_id, &bytes[..1]);
-            self.copy_input(pane_id, &bytes[1..]);
-            return;
+            bytes = &bytes[1..];
+            prompt_active = has_prompt(self);
+        }
+        if !prompt_active {
+            match copy_vi::command_batch(bytes) {
+                Ok(Some(text)) => {
+                    for ch in text.chars() {
+                        self.copy_input(pane_id, ch.encode_utf8(&mut [0; 4]).as_bytes());
+                    }
+                    return;
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    self.status(message);
+                    return;
+                }
+            }
         }
         let remapped = (!prompt_active)
             .then(|| copy_chord_name(bytes))
@@ -1557,109 +1563,124 @@ impl SessionActor {
         };
         let rows = pane.terminal.rows();
         let columns = pane.terminal.cols();
-        match bytes {
-            b"q" | b"\x1b" => pane.copy = None,
-            b"\x1b[A" => {
-                if copy.row == 0 {
-                    copy.offset = (copy.offset + 1).min(pane.terminal.history_len());
-                } else {
-                    copy.row -= 1;
-                }
-            }
-            b"\x1b[B" => {
-                if copy.row + 1 >= rows && copy.offset > 0 {
-                    copy.offset -= 1;
-                } else {
-                    copy.row = (copy.row + 1).min(rows.saturating_sub(1));
-                }
-            }
-            b"\x1b[C" => copy.column = (copy.column + 1).min(columns.saturating_sub(1)),
-            b"\x1b[D" => copy.column = copy.column.saturating_sub(1),
-            b"\x1b[5~" => {
-                copy.offset = (copy.offset + rows).min(pane.terminal.history_len());
-            }
-            b"\x1b[6~" => copy.offset = copy.offset.saturating_sub(rows),
-            b"/" | b"?" => {
-                copy.search = Some(CopySearch {
-                    prompt: Some(String::new()),
-                    direction: if bytes == b"/" {
-                        SearchDirection::Forward
-                    } else {
-                        SearchDirection::Backward
-                    },
-                    query: copy
-                        .search
-                        .as_ref()
-                        .map_or_else(String::new, |search| search.query.clone()),
-                });
-            }
-            b"n" | b"N" => {
-                let Some(search) = copy.search.as_ref() else {
-                    self.status("no search query");
-                    self.finish_copy_input(pane_id, previous);
-                    return;
-                };
-                if search.query.is_empty() {
-                    self.status("no search query");
-                    self.finish_copy_input(pane_id, previous);
-                    return;
-                }
-                let direction = if bytes == b"n" {
-                    search.direction
-                } else {
-                    search.direction.opposite()
-                };
-                let query = search.query.clone();
-                let current = copy.current;
-                let from = current.map_or(
-                    (copy.row as isize - copy.offset as isize, copy.column),
-                    |found| match direction {
-                        SearchDirection::Forward => (found.line, found.end_column),
-                        SearchDirection::Backward => {
-                            (found.line, found.start_column.saturating_sub(1))
-                        }
-                    },
-                );
-                let needs_compile = self
-                    .search_pattern
-                    .as_ref()
-                    .is_none_or(|(compiled, _)| compiled != &query);
-                if needs_compile {
-                    match crate::search::compile(&query, true, true) {
-                        Ok(pattern) => self.search_pattern = Some((query, pattern)),
-                        Err(error) => {
-                            self.status(&format!("invalid search pattern: {error}"));
-                            self.finish_copy_input(pane_id, previous);
-                            return;
-                        }
-                    }
-                }
-                let found = find_next(
-                    &pane.terminal,
-                    &self.search_pattern.as_ref().unwrap().1,
-                    from,
-                    direction,
-                    true,
-                );
-                if let Some(found) = found {
-                    copy_jump_to(pane, &self.search_pattern.as_ref().unwrap().1, found);
-                } else {
-                    search_not_found = true;
-                }
-            }
-            b" " => {
-                copy.selection_start =
-                    Some((copy.row as isize - copy.offset as isize, copy.column));
-            }
-            b"\r" | b"\n" => {
-                let end = (copy.row as isize - copy.offset as isize, copy.column);
-                let start = copy.selection_start.unwrap_or((-(copy.offset as isize), 0));
+        let character = std::str::from_utf8(bytes).ok().and_then(|text| {
+            let ch = text.chars().next()?;
+            (ch.len_utf8() == bytes.len()).then_some(ch)
+        });
+        let vi = character.map_or(copy_vi::ViInput::Unhandled, |ch| {
+            copy.vi_key(&pane.terminal, ch)
+        });
+        match (vi, bytes) {
+            (copy_vi::ViInput::Handled, _) => {}
+            (copy_vi::ViInput::Yank(start, end), _) => {
                 self.copy_buffer = extract_selection(&pane.terminal, start, end);
-                self.copy_buffer.truncate(COPY_BUFFER_LIMIT);
                 pane.copy = None;
                 copied = true;
             }
-            _ => {}
+            (copy_vi::ViInput::Unhandled, bytes) => match bytes {
+                b"q" | b"\x1b" => pane.copy = None,
+                b"\x1b[A" => {
+                    if copy.row == 0 {
+                        copy.offset = (copy.offset + 1).min(pane.terminal.history_len());
+                    } else {
+                        copy.row -= 1;
+                    }
+                }
+                b"\x1b[B" => {
+                    if copy.row + 1 >= rows && copy.offset > 0 {
+                        copy.offset -= 1;
+                    } else {
+                        copy.row = (copy.row + 1).min(rows.saturating_sub(1));
+                    }
+                }
+                b"\x1b[C" => copy.column = (copy.column + 1).min(columns.saturating_sub(1)),
+                b"\x1b[D" => copy.column = copy.column.saturating_sub(1),
+                b"\x1b[5~" => {
+                    copy.offset = (copy.offset + rows).min(pane.terminal.history_len());
+                }
+                b"\x1b[6~" => copy.offset = copy.offset.saturating_sub(rows),
+                b"/" | b"?" => {
+                    copy.search = Some(CopySearch {
+                        prompt: Some(String::new()),
+                        direction: if bytes == b"/" {
+                            SearchDirection::Forward
+                        } else {
+                            SearchDirection::Backward
+                        },
+                        query: copy
+                            .search
+                            .as_ref()
+                            .map_or_else(String::new, |search| search.query.clone()),
+                    });
+                }
+                b"n" | b"N" => {
+                    let Some(search) = copy.search.as_ref() else {
+                        self.status("no search query");
+                        self.finish_copy_input(pane_id, previous);
+                        return;
+                    };
+                    if search.query.is_empty() {
+                        self.status("no search query");
+                        self.finish_copy_input(pane_id, previous);
+                        return;
+                    }
+                    let direction = if bytes == b"n" {
+                        search.direction
+                    } else {
+                        search.direction.opposite()
+                    };
+                    let query = search.query.clone();
+                    let current = copy.current;
+                    let from = current.map_or(
+                        (copy.row as isize - copy.offset as isize, copy.column),
+                        |found| match direction {
+                            SearchDirection::Forward => (found.line, found.end_column),
+                            SearchDirection::Backward => {
+                                (found.line, found.start_column.saturating_sub(1))
+                            }
+                        },
+                    );
+                    let needs_compile = self
+                        .search_pattern
+                        .as_ref()
+                        .is_none_or(|(compiled, _)| compiled != &query);
+                    if needs_compile {
+                        match crate::search::compile(&query, true, true) {
+                            Ok(pattern) => self.search_pattern = Some((query, pattern)),
+                            Err(error) => {
+                                self.status(&format!("invalid search pattern: {error}"));
+                                self.finish_copy_input(pane_id, previous);
+                                return;
+                            }
+                        }
+                    }
+                    let found = find_next(
+                        &pane.terminal,
+                        &self.search_pattern.as_ref().unwrap().1,
+                        from,
+                        direction,
+                        true,
+                    );
+                    if let Some(found) = found {
+                        copy_jump_to(pane, &self.search_pattern.as_ref().unwrap().1, found);
+                    } else {
+                        search_not_found = true;
+                    }
+                }
+                b" " => {
+                    copy.vi.linewise = false;
+                    copy.selection_start =
+                        Some((copy.row as isize - copy.offset as isize, copy.column));
+                }
+                b"\r" | b"\n" => {
+                    let (start, end) = copy.selection(&pane.terminal);
+                    self.copy_buffer = extract_selection(&pane.terminal, start, end);
+                    self.copy_buffer.truncate(COPY_BUFFER_LIMIT);
+                    pane.copy = None;
+                    copied = true;
+                }
+                _ => {}
+            },
         }
         if let Some((query, pattern)) = &self.search_pattern
             && pane

@@ -13,7 +13,7 @@ use crate::session::PaneSpawn;
 /// Most tabs a layout file may declare.
 pub const MAX_LAYOUT_TABS: usize = 64;
 /// Most panes a layout file may declare.
-pub const MAX_LAYOUT_PANES: usize = 128;
+pub const MAX_LAYOUT_PANES: usize = 256;
 /// Most children one split may declare.
 const MAX_SPLIT_CHILDREN: usize = 16;
 /// Longest pane command in a layout file, in bytes.
@@ -237,11 +237,25 @@ impl LayoutFile {
             {
                 return Err(invalid(format!("tab {tab_number} has an empty name")));
             }
+            let remaining = MAX_LAYOUT_PANES - total_panes;
+            if tab.floating.len() > remaining {
+                return Err(pane_limit_error(tab_number));
+            }
+            let tiled_limit = remaining - tab.floating.len();
             let mut spawns = Vec::new();
             let mut labels = HashMap::new();
             let tiled = tab
                 .layout
-                .map(|node| lower_node(node, tab_number, home, &mut labels, &mut spawns))
+                .map(|node| {
+                    lower_node(
+                        node,
+                        tab_number,
+                        home,
+                        &mut labels,
+                        &mut spawns,
+                        tiled_limit,
+                    )
+                })
                 .transpose()?;
             let mut floating = Vec::with_capacity(tab.floating.len());
             for float in tab.floating {
@@ -296,12 +310,7 @@ impl LayoutFile {
                 })?),
                 None => None,
             };
-            total_panes = total_panes.saturating_add(spawns.len());
-            if total_panes > MAX_LAYOUT_PANES {
-                return Err(invalid(format!(
-                    "layout exceeds the {MAX_LAYOUT_PANES}-pane limit at tab {tab_number}"
-                )));
-            }
+            total_panes += spawns.len();
             planned.push(PlannedTab {
                 name: tab.name,
                 tiled,
@@ -455,13 +464,23 @@ pub fn resolve_save_path(value: &str) -> io::Result<PathBuf> {
         .join(name))
 }
 
+fn pane_limit_error(tab: usize) -> io::Error {
+    invalid(format!(
+        "layout exceeds the {MAX_LAYOUT_PANES}-pane limit at tab {tab}"
+    ))
+}
+
 fn lower_node(
     node: LayoutNode,
     tab: usize,
     home: Option<&Path>,
     labels: &mut HashMap<String, usize>,
     spawns: &mut Vec<PaneSpawn>,
+    limit: usize,
 ) -> io::Result<PlannedNode> {
+    if spawns.len() >= limit {
+        return Err(pane_limit_error(tab));
+    }
     let is_leaf = node.pane.is_some();
     let is_split = node.split.is_some() || !node.children.is_empty() || !node.sizes.is_empty();
     if is_leaf == is_split {
@@ -518,7 +537,7 @@ fn lower_node(
     let children = node
         .children
         .into_iter()
-        .map(|child| lower_node(child, tab, home, labels, spawns))
+        .map(|child| lower_node(child, tab, home, labels, spawns, limit))
         .collect::<io::Result<Vec<_>>>()?;
     Ok(PlannedNode::Split {
         axis: split.into(),
@@ -736,14 +755,27 @@ hold = true
                 .contains("64 tabs")
         );
 
-        let panes = (0..129)
+        let panes = (0..=MAX_LAYOUT_PANES)
             .map(|index| format!("[[tabs.floating]]\npane='p{index}'\n"))
             .collect::<Vec<_>>()
             .concat();
         let error = parse(&format!("[[tabs]]\n{panes}"))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("128-pane"), "{error}");
+        assert!(error.contains("256-pane"), "{error}");
+        for count in [200, MAX_LAYOUT_PANES] {
+            let source = format!(
+                "[[tabs]]\n{}",
+                &panes[..panes
+                    .match_indices("[[tabs.floating]]")
+                    .nth(count)
+                    .unwrap()
+                    .0]
+            );
+            let layout: LayoutFile = toml::from_str(&source).unwrap();
+            let restored = parse(&layout.render().unwrap()).unwrap();
+            assert_eq!(restored.tabs[0].spawns.len(), count);
+        }
     }
 
     #[test]

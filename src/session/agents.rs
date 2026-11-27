@@ -24,8 +24,34 @@ impl SessionActor {
                 "copy-mode input is not an automation action; use `vvmux msg key`",
             ));
         }
-        self.automation_focus(pane_id)?;
-        self.action(action);
+        if matches!(action, Action::NewTab) {
+            self.check_automation_tab_capacity()?;
+        }
+        if matches!(
+            action,
+            Action::NewTab | Action::Split(_) | Action::NewFloatingPane
+        ) {
+            self.check_session_pane_cap()?;
+        }
+        if matches!(action, Action::CollapsePane | Action::RestoreCollapsedPane) {
+            let index = self
+                .tabs
+                .iter()
+                .position(|tab| tab.contains(pane_id))
+                .ok_or_else(|| AutomationError::new("pane_not_found", "pane has no owning tab"))?;
+            let tab = &mut self.tabs[index];
+            match action {
+                Action::CollapsePane => tab.collapse_pane(pane_id),
+                _ => tab.restore_collapsed(),
+            }
+            .map_err(|reason| AutomationError::new("invalid_state", reason))?;
+            self.active_tab = index;
+            self.force_full = true;
+            self.relayout();
+        } else {
+            self.automation_focus(pane_id)?;
+            self.action(action);
+        }
         Ok(serde_json::json!({
             "pane_id": pane_id,
             "session_sequence": self.session_sequence,

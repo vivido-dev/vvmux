@@ -1255,20 +1255,12 @@ fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
     value
 }
 
-/// A tab's tiled panes at their unzoomed rectangles: the candidates for a pane-menu swap.
+/// Unzoomed, uncollapsed tiled candidates for a pane-menu swap.
 fn tiled_projections(tab: &Tab, area: Rect) -> Vec<PaneProjection> {
-    tab.tree.as_ref().map_or_else(Vec::new, |tree| {
-        tree.geometry(area)
-            .into_iter()
-            .map(|(pane_id, outer)| PaneProjection {
-                pane_id,
-                outer,
-                content: outer.content(),
-                layer: PaneLayer::Tiled,
-                focused: tab.focused == pane_id,
-            })
-            .collect()
-    })
+    navigation_projections(tab, area)
+        .into_iter()
+        .filter(|projection| projection.layer == PaneLayer::Tiled)
+        .collect()
 }
 
 fn tab_navigator_rect(area: Rect, row_count: usize) -> Option<Rect> {

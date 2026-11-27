@@ -244,7 +244,10 @@ impl SessionActor {
                     .terminal
                     .title()
                     .map_or_else(|| format!("pane {}", pane.id), ToOwned::to_owned);
-                let copy_suffix = pane.copy.as_ref().map_or("", |_| " [copy]");
+                let copy_suffix = pane
+                    .copy
+                    .as_ref()
+                    .map_or_else(String::new, |copy| copy.vi.label());
                 let search_suffix = pane
                     .copy
                     .as_ref()
@@ -280,6 +283,28 @@ impl SessionActor {
                     screen.fill_default_background(projection.outer, theme.pane_background);
                 }
                 if let Some(copy) = &pane.copy {
+                    if copy.selection_start.is_some() {
+                        let (a, b) = copy.selection(&pane.terminal);
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                        for y in 0..content.height {
+                            let line = isize::try_from(y).unwrap_or(isize::MAX) - offset as isize;
+                            if line < lo.0 || line > hi.0 {
+                                continue;
+                            }
+                            let width = usize::from(content.width);
+                            let start = if line == lo.0 { lo.1.min(width) } else { 0 };
+                            let end = if line == hi.0 {
+                                hi.1.saturating_add(1).min(width)
+                            } else {
+                                width
+                            };
+                            screen.invert(
+                                content.x.saturating_add(start as u16),
+                                content.y.saturating_add(y),
+                                end.saturating_sub(start) as u16,
+                            );
+                        }
+                    }
                     for found in &copy.matches {
                         let row = found.line + copy.offset as isize;
                         if row < 0 || row >= usize::from(content.height) as isize {
@@ -373,6 +398,33 @@ impl SessionActor {
                     .all(|later| !later.outer.contains(x, y))
                     .then_some((x, y))
             });
+        }
+        if session_view
+            && let Some(tab) = self.active_tab()
+            && let Some(row) = tab.dock_row(area)
+        {
+            let mut label = String::new();
+            let mut available = usize::from(area.width);
+            for id in &tab.collapsed {
+                if available == 0 {
+                    break;
+                }
+                let title = self
+                    .panes
+                    .get(id)
+                    .and_then(|pane| pane.terminal.title())
+                    .unwrap_or("");
+                let prefix = format!(" [collapsed {id}] ");
+                for ch in prefix
+                    .chars()
+                    .chain(title.chars().filter(|ch| !ch.is_control()))
+                    .take(available)
+                {
+                    label.push(ch);
+                    available -= 1;
+                }
+            }
+            screen.draw_text(area.x, row, &label, theme.status());
         }
         if with_ui && session_view && self.agent_navigator.is_some() {
             self.draw_agent_navigator(&mut screen, theme);

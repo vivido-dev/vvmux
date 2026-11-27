@@ -966,8 +966,8 @@ focus = "shell"
 ```
 
 Splits may nest and contain 2–16 children. `sizes` are relative integer weights from 1 through
-1000; omitting them gives every child equal weight. A layout may contain up to 64 tabs and 128
-panes total. Each pane label is tab-local and unique, and `focus` names one of those labels.
+1000; omitting them gives every child equal weight. A layout may contain up to 64 tabs and 256
+panes total. Automation checks those same limits before creating a pane or tab. Interactive keybindings can exceed them. Each pane label is tab-local and unique, and `focus` names one of those labels.
 Floating-only tabs are valid. `command` is one shell command line passed to `shell -c`, `cwd`
 accepts `~/`, and `hold = true` preserves command output after exit. If one pane cannot spawn, its
 leaf is removed and its siblings keep their exact owner-scoped layout; a layout where every pane
@@ -1126,6 +1126,7 @@ The prefix is `Ctrl-b`.
 | `Ctrl-b c`, `n`, `p` | Create/cycle tabs |
 | `Ctrl-b 1`–`9` | Select tabs 1–9 |
 | `Ctrl-b w` | Open or close the tab navigator |
+| `Ctrl-b i` | Briefly show total, tiled and floating pane counts across all tabs, the tab count and the focused pane ID |
 | `Ctrl-b ,` | Rename the active tab |
 | `Ctrl-b x`, then `y` / `n` | Confirm or cancel closing the focused pane |
 | `Ctrl-b z` | Toggle zoom |
@@ -1161,6 +1162,10 @@ highlighted and starts expanded. Clicking a tab switches to it; clicking a pane 
 and focuses it. The mouse wheel scrolls a sidebar taller than the host. Prompts and notices use the
 sidebar's bottom row. The hidden view gives the panes the whole host and shows a prompt over the
 bottom row only while it is being typed.
+
+Prefix `-` collapses the focused tiled pane into the bottom dock. Prefix `=` restores the most recently collapsed pane. A collapsed pane keeps running at its previous PTY size. Collapse is transient and the last visible tiled pane stays open. The configurable actions are `collapse-pane` and `restore-collapsed-pane`.
+
+Copy mode supports vi counts, `hjkl`, word motions (`wWbBeE`), line and history motions (`0^$`, `gg/G`, `{/}`), character searches (`fFtT`, `;,`), pane-local marks (`ma`, backtick or apostrophe plus the mark), `v/V` selections and `y` followed by a motion or another `y` to copy. Escape cancels a pending command. Marks expire when copy mode exits. Copy mode accepts up to 16 command keys in one input batch. Search prompts accept pasted text independently.
 
 Copy mode accepts arrows, Page Up/Down, Space to start selection, Enter to copy, and `q` or Escape
 to cancel. `/` and `?` open forward and backward smart-case regular-expression search; `n` repeats

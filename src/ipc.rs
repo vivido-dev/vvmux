@@ -1319,6 +1319,10 @@ pub enum Action {
     BeginSaveLayout,
     /// Move the tab list to the next view: bottom, top, left, right, hidden.
     CycleTabView,
+    CollapsePane,
+    RestoreCollapsedPane,
+    /// Show session-wide pane counts in the status row.
+    ShowPaneSummary,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

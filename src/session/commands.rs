@@ -53,6 +53,19 @@ impl SessionActor {
         }
         match action {
             Action::Split(axis) => self.split(axis),
+            Action::ShowPaneSummary => {
+                if let Some(tab) = self.active_tab() {
+                    let total = self.panes.len();
+                    let floating: usize =
+                        self.tabs.iter().map(|tab| tab.floating.panes().len()).sum();
+                    self.notice(format!(
+                        "Panes: {total} ({} tiled, {floating} floating) | Tabs: {} | Focus: {}",
+                        total - floating,
+                        self.tabs.len(),
+                        tab.focused
+                    ));
+                }
+            }
             Action::Focus(direction) => self.focus(direction),
             Action::Resize(direction) => self.resize(direction),
             Action::NewTab if self.new_tab().is_ok() => {
@@ -79,6 +92,19 @@ impl SessionActor {
                     self.close_pane(pane);
                 }
             }
+            Action::CollapsePane | Action::RestoreCollapsedPane => {
+                if let Some(tab) = self.active_tab_mut() {
+                    let result = if matches!(action, Action::CollapsePane) {
+                        tab.collapse_pane(tab.focused)
+                    } else {
+                        tab.restore_collapsed()
+                    };
+                    match result {
+                        Ok(()) => self.relayout(),
+                        Err(reason) => self.status(reason),
+                    }
+                }
+            }
             Action::ToggleZoom => {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.zoomed = if tab.zoomed.is_some() {
@@ -99,18 +125,13 @@ impl SessionActor {
                 }
             }
             Action::EnterCopyMode => {
-                let rows = self.content_area().height.saturating_sub(2) as usize;
                 if let Some(pane_id) = self.active_tab().map(|tab| tab.focused)
                     && let Some(pane) = self.panes.get_mut(&pane_id)
                 {
                     pane.copy = Some(CopyState {
                         offset: 0,
-                        row: rows.saturating_sub(1),
-                        column: 0,
-                        selection_start: None,
-                        search: None,
-                        matches: Vec::new(),
-                        current: None,
+                        row: pane.terminal.rows().saturating_sub(1),
+                        ..CopyState::default()
                     });
                     self.mark_pane_screen_change(pane_id, None);
                     self.schedule_render();

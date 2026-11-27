@@ -157,6 +157,7 @@ impl SessionActor {
                 tab_id
             }
             crate::ipc::RunPlacement::Tab => {
+                self.check_automation_tab_capacity()?;
                 let tab_id = self.next_tab_id;
                 self.spawn_pane(new_pane_id, tab_id, &spec)
                     .map_err(|error| AutomationError::new("spawn_failed", error.to_string()))?;
@@ -168,6 +169,7 @@ impl SessionActor {
                     focused: new_pane_id,
                     last_focused_tiled: Some(new_pane_id),
                     zoomed: None,
+                    collapsed: Vec::new(),
                     sync_input: false,
                 });
                 self.next_tab_id += 1;
@@ -307,30 +309,28 @@ impl SessionActor {
     /// answer that disappeared while a pane was zoomed would be describing the screen rather than
     /// the layout. Zoom is reported per pane instead.
     pub(super) fn topology_projections(tab: &Tab, area: Rect) -> Vec<PaneProjection> {
-        let mut projections = Vec::new();
-        if let Some(tree) = &tab.tree {
-            for (pane_id, outer) in tree.geometry(area) {
-                projections.push(PaneProjection {
-                    pane_id,
-                    outer,
-                    content: outer.content(),
-                    layer: PaneLayer::Tiled,
-                    focused: tab.focused == pane_id,
-                });
-            }
-        }
-        for float in tab.floating.panes() {
-            projections.push(PaneProjection {
-                pane_id: float.pane_id,
-                outer: float.rect,
-                content: float.rect.content(),
-                layer: if float.pinned {
-                    PaneLayer::Pinned
-                } else {
-                    PaneLayer::Floating
-                },
-                focused: tab.focused == float.pane_id,
-            });
+        let mut projections = navigation_projections(tab, area);
+        if !tab.collapsed.is_empty()
+            && let Some(tree) = &tab.tree
+        {
+            // Tiled entries are ordered by pane ID. Hidden tiles still report their original
+            // slot in the complete list, followed by the floating layer in stacking order.
+            let floats =
+                projections.split_off(projections.partition_point(|p| p.layer == PaneLayer::Tiled));
+            projections.extend(
+                tree.geometry(area)
+                    .into_iter()
+                    .filter(|(pane_id, _)| tab.collapsed.contains(pane_id))
+                    .map(|(pane_id, outer)| PaneProjection {
+                        pane_id,
+                        outer,
+                        content: outer.content(),
+                        layer: PaneLayer::Tiled,
+                        focused: tab.focused == pane_id,
+                    }),
+            );
+            projections.sort_unstable_by_key(|p| p.pane_id);
+            projections.extend(floats);
         }
         projections
     }
@@ -343,8 +343,8 @@ impl SessionActor {
     ///
     /// `neighbors` is the *navigation* graph, not a strict geometric one: each entry is where one
     /// step in that direction lands, computed by the same [`directional_focus`] that
-    /// `Action::Focus` uses. That is deliberate — `resolve_pane` and moving focus must agree, or an
-    /// agent resolves one pane and focuses another. It also means a direction can point at a pane
+    /// `Action::Focus` uses. Routes describe the unzoomed topology and include ordinary floats
+    /// while their layer is hidden. Collapsed tiles have no directional routes. It also means a direction can point at a pane
     /// that is not strictly on that side: from a full-height left pane, "up" lands on the upper of
     /// the two panes to its right, because that is where focus would go. Read `geometry` when the
     /// question is really about position on screen.
@@ -357,6 +357,11 @@ impl SessionActor {
             .enumerate()
             .map(|(index, tab)| {
                 let projections = Self::topology_projections(tab, area);
+                let navigation = projections
+                    .iter()
+                    .copied()
+                    .filter(|p| !tab.collapsed.contains(&p.pane_id))
+                    .collect::<Vec<_>>();
                 let panes = projections
                     .iter()
                     .map(|projection| {
@@ -372,7 +377,7 @@ impl SessionActor {
                             (
                                 name.to_owned(),
                                 serde_json::to_value(directional_focus(
-                                    &projections,
+                                    &navigation,
                                     pane_id,
                                     direction,
                                 ))
@@ -408,6 +413,7 @@ impl SessionActor {
                             "focused": projection.focused,
                             "visible": self.pane_is_visibly_present(pane_id),
                             "zoomed": tab.zoomed == Some(pane_id),
+                            "collapsed": tab.collapsed.contains(&pane_id),
                             "is_caller": caller == Some(pane_id),
                             "title": self
                                 .panes
@@ -508,7 +514,7 @@ impl SessionActor {
                 "the selected tab has no resolvable starting pane",
             ));
         }
-        let projections = Self::topology_projections(tab, self.content_area());
+        let projections = navigation_projections(tab, self.content_area());
         let mut current = start;
         let mut steps = Vec::with_capacity(path.len());
         for direction in path {
@@ -1474,7 +1480,7 @@ impl SessionActor {
         }
 
         if let Some(direction) = swap {
-            let projections = Self::topology_projections(&self.tabs[from_index], area);
+            let projections = navigation_projections(&self.tabs[from_index], area);
             let other = directional_focus(&projections, pane_id, direction).ok_or_else(|| {
                 AutomationError::new(
                     "pane_not_found",
@@ -1675,6 +1681,7 @@ impl SessionActor {
                             "floating panes cannot be zoomed",
                         ));
                     }
+                    self.tabs[tab_index].collapsed.retain(|id| *id != pane_id);
                     self.tabs[tab_index].zoomed = Some(pane_id);
                 } else if zoomed == Some(pane_id) {
                     self.tabs[tab_index].zoomed = None;
@@ -1802,11 +1809,7 @@ impl SessionActor {
         pane.copy = Some(CopyState {
             offset,
             row: rows.saturating_sub(1),
-            column: 0,
-            selection_start: None,
-            search: None,
-            matches: Vec::new(),
-            current: None,
+            ..CopyState::default()
         });
         self.mark_pane_screen_change(pane_id, None);
         self.schedule_render();
@@ -2015,7 +2018,10 @@ impl SessionActor {
         if revealed_floats {
             self.tabs[tab_index].floating.ordinary_visible = true;
         }
-        if tab_selected || unzoomed || revealed_floats {
+        let collapsed = &mut self.tabs[tab_index].collapsed;
+        let restored = collapsed.contains(&pane_id);
+        collapsed.retain(|id| *id != pane_id);
+        if tab_selected || unzoomed || revealed_floats || restored {
             self.relayout();
         }
         Ok(serde_json::json!({
@@ -2024,12 +2030,23 @@ impl SessionActor {
             "tab_selected": tab_selected,
             "unzoomed": unzoomed,
             "revealed_floats": revealed_floats,
+            "restored": restored,
             "visible": self.pane_is_visibly_present(pane_id),
             "focused": self.tabs[tab_index].focused == pane_id,
             // Stated rather than implied: the whole point of this method is that it does not.
             "focus_changed": false,
             "layout_sequence": self.layout_revision,
         }))
+    }
+
+    pub(super) fn check_automation_tab_capacity(&self) -> Result<(), AutomationError> {
+        if self.tabs.len() >= MAX_LAYOUT_TABS {
+            return Err(AutomationError::new(
+                "limit_exceeded",
+                format!("a session holds at most {MAX_LAYOUT_TABS} tabs"),
+            ));
+        }
+        Ok(())
     }
 
     /// Open a tab and report the IDs it was given.
@@ -2041,12 +2058,7 @@ impl SessionActor {
         name: Option<String>,
     ) -> Result<serde_json::Value, AutomationError> {
         let name = name.map(validated_tab_name).transpose()?;
-        if self.tabs.len() >= MAX_LAYOUT_TABS {
-            return Err(AutomationError::new(
-                "limit_exceeded",
-                format!("a session holds at most {MAX_LAYOUT_TABS} tabs"),
-            ));
-        }
+        self.check_automation_tab_capacity()?;
         self.check_session_pane_cap()?;
         self.new_tab()
             .map_err(|error| AutomationError::new("pty_spawn_failed", error.to_string()))?;

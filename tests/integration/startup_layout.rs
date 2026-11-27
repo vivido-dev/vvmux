@@ -1559,3 +1559,107 @@ fn tabs_are_addressable_and_renameable_by_name() {
         "the tab was not closed: {remaining}"
     );
 }
+
+#[test]
+fn tab_placement_admits_the_64th_tab_and_refuses_the_65th_before_spawn() {
+    let fixture = Fixture::new("tab-cap");
+    // Exited, held panes retain a real tab without keeping 63 long-running shells alive.
+    let source =
+        "[[tabs]]\n[tabs.layout]\npane = 'held'\ncommand = 'true'\nhold = true\n".repeat(63);
+    assert_success(&fixture.start(&fixture.write_layout("cap.toml", &source)));
+    assert_eq!(fixture.tabs().len(), 63);
+    assert_success(&fixture.msg(&[
+        "run",
+        "true",
+        "--placement",
+        "tab",
+        "--hold",
+        "--pane-id",
+        "1",
+    ]));
+    assert_eq!(fixture.tabs().len(), 64);
+    for args in [
+        &[
+            "run",
+            "true",
+            "--placement",
+            "tab",
+            "--hold",
+            "--pane-id",
+            "1",
+        ][..],
+        &["new-tab"],
+        &["action", "new-tab", "--pane-id", "1"],
+    ] {
+        let result = fixture.msg(args);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("at most 64 tabs"));
+    }
+    assert_eq!(fixture.tabs().len(), 64);
+    assert_eq!(fixture.panes().len(), 64);
+}
+
+#[test]
+fn collapsed_pane_retains_its_live_pty_and_leaves_other_sessions_untouched() {
+    let primary = Fixture::new("collapse");
+    let other = Fixture::new("other-owner");
+    for fixture in [&primary, &other] {
+        fixture.use_executing_shell();
+        assert_success(&fixture.start_without_layout());
+        assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
+        fixture.wait_text(2, "READY pane=2");
+        assert_success(&fixture.msg(&["submit", "owner_marker=retained", "--pane-id", "2"]));
+    }
+    let original = pane_identity(&primary.panes());
+    let other_original = pane_identity(&other.panes());
+    assert_success(&primary.msg(&["action", "collapse-pane", "--pane-id", "2"]));
+    let layout = json(primary.msg(&["layout"]));
+    assert_eq!(layout["tabs"][0]["panes"][1]["collapsed"], true);
+    assert_eq!(layout["tabs"][0]["focused_pane_id"], 1);
+    assert!(layout["tabs"][0]["panes"][0]["neighbors"]["right"].is_null());
+    let route = primary.msg(&["resolve-pane", "--path", "right"]);
+    assert!(!route.status.success());
+    assert!(String::from_utf8_lossy(&route.stderr).contains("no pane lies right"));
+    let last = primary.msg(&["action", "collapse-pane", "--pane-id", "1"]);
+    assert!(!last.status.success());
+    assert!(String::from_utf8_lossy(&last.stderr).contains("last visible tiled pane"));
+    let duplicate = primary.msg(&["action", "collapse-pane", "--pane-id", "2"]);
+    assert!(!duplicate.status.success());
+    let hidden = primary.panes();
+    assert_eq!(hidden[1]["columns"], original[1]["columns"]);
+    assert_eq!(hidden[1]["rows"], original[1]["rows"]);
+    assert!(hidden[0]["columns"].as_u64() > original[0]["columns"].as_u64());
+    // Output is produced in the original shell while it has no projection.
+    for fixture in [&primary, &other] {
+        assert_success(&fixture.msg(&["submit", "echo live-$owner_marker", "--pane-id", "2"]));
+        fixture.wait_text(2, "live-retained");
+    }
+    assert_success(&primary.msg(&["action", "restore-collapsed-pane", "--pane-id", "2"]));
+    assert_eq!(pane_identity(&primary.panes()), original);
+    let empty = primary.msg(&["action", "restore-collapsed-pane", "--pane-id", "1"]);
+    assert!(!empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("no collapsed panes"));
+    assert_eq!(pane_identity(&other.panes()), other_original);
+    primary.wait_text(2, "live-retained");
+}
+
+#[test]
+fn zoomed_panes_keep_their_unzoomed_navigation_neighbors() {
+    let fixture = Fixture::new("zoom-neighbors");
+    assert_success(&fixture.start_without_layout());
+    assert_success(&fixture.msg(&["split", "horizontal", "--pane-id", "1"]));
+    assert_success(&fixture.msg(&["action", "toggle-zoom", "--pane-id", "1"]));
+    let layout = json(fixture.msg(&["layout"]));
+    let panes = &layout["tabs"][0]["panes"];
+    assert_eq!(layout["tabs"][0]["zoomed_pane_id"], 1);
+    assert_eq!(panes[0]["neighbors"]["right"], 2);
+    assert_eq!(panes[1]["neighbors"]["left"], 1);
+    assert_eq!(
+        json(fixture.msg(&["inspect", "--pane-id", "1"]))["pane"]["neighbors"]["right"],
+        2
+    );
+    assert_eq!(
+        json(fixture.msg(&["resolve-pane", "--pane-id", "1", "--path", "right"]))["target"]["pane_id"],
+        2
+    );
+}

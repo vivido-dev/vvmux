@@ -1472,6 +1472,7 @@ fn tab_with_floats() -> Tab {
         focused: 1,
         last_focused_tiled: Some(1),
         zoomed: None,
+        collapsed: Vec::new(),
         sync_input: false,
     }
 }
@@ -1485,6 +1486,7 @@ fn status_tab(id: u64, name: Option<&str>) -> Tab {
         focused: id,
         last_focused_tiled: Some(id),
         zoomed: None,
+        collapsed: Vec::new(),
         sync_input: false,
     }
 }
@@ -1619,6 +1621,7 @@ fn sync_targets_include_hidden_live_panes_and_exclude_copy_mode() {
         focused: 99,
         last_focused_tiled: None,
         zoomed: None,
+        collapsed: Vec::new(),
         sync_input: true,
     };
     assert!(sync_targets(&empty, &|_| false).is_empty());
@@ -2297,4 +2300,38 @@ fn automation_raw_request_limits_are_enforced() {
         filter: MediaTraceFilter::default(),
     })
     .unwrap();
+}
+
+#[test]
+fn collapse_prunes_only_its_own_tiles_and_reserves_one_dock_row() {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 23,
+    };
+    let mut tab = tab_with_floats();
+    let other = tab_with_floats();
+    let original = visible_projections(&tab, area);
+    assert_eq!(tab.dock_row(area), None);
+    tab.collapse_pane(tab.focused).unwrap();
+    assert_eq!(tab.focused, 2);
+    assert_eq!(tab.dock_row(area), Some(22));
+    let projections = visible_projections(&tab, area);
+    assert!(!projections.iter().any(|pane| pane.pane_id == 1));
+    assert_eq!(projections[0].outer, Rect { height: 22, ..area });
+    assert!(
+        projections
+            .iter()
+            .all(|pane| pane.outer.y + pane.outer.height <= 22)
+    );
+    assert!(tab.collapse_pane(tab.focused).is_err());
+    tab.zoomed = Some(2);
+    assert_eq!(tab.dock_row(area), None);
+    assert_eq!(visible_projections(&tab, area)[0].outer, area);
+    tab.restore_collapsed().unwrap();
+    assert_eq!(visible_projections(&tab, area), original);
+    tab.set_focus(11);
+    assert!(tab.collapse_pane(tab.focused).is_err());
+    assert_eq!(visible_projections(&other, area), original);
 }

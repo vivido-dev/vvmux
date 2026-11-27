@@ -339,6 +339,7 @@ impl SessionActor {
             focused: pane_id,
             last_focused_tiled: Some(pane_id),
             zoomed: None,
+            collapsed: Vec::new(),
             sync_input: false,
         });
         self.next_tab_id += 1;
@@ -486,6 +487,7 @@ impl SessionActor {
                 focused,
                 last_focused_tiled,
                 zoomed,
+                collapsed: Vec::new(),
                 sync_input: tab_extras.is_some_and(|tab| tab.sync_input),
             });
         }
@@ -846,6 +848,9 @@ impl SessionActor {
             if tab.focused == pane_id {
                 tab.focused = new_id;
             }
+            if let Some(id) = tab.collapsed.iter_mut().find(|id| **id == pane_id) {
+                *id = new_id;
+            }
             if tab.zoomed == Some(pane_id) {
                 tab.zoomed = Some(new_id);
             }
@@ -1100,6 +1105,20 @@ impl SessionActor {
     }
 
     pub(super) fn relayout(&mut self) {
+        // Closing or moving the last visible tile exposes the newest remaining tile.
+        for tab in &mut self.tabs {
+            if !tab.collapsed.is_empty() {
+                tab.collapsed
+                    .retain(|id| tab.tree.as_ref().is_some_and(|tree| tree.contains(*id)));
+                if tab
+                    .tree
+                    .as_ref()
+                    .is_some_and(|tree| tree.pane_ids().len() == tab.collapsed.len())
+                {
+                    tab.collapsed.pop();
+                }
+            }
+        }
         self.invalidate_mouse_selection_state();
         self.mark_snapshot_dirty();
         self.layout_revision = self.layout_revision.wrapping_add(1);

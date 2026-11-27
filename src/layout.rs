@@ -522,7 +522,7 @@ fn offset_coordinate(value: u16, delta: i32) -> u16 {
 /// Clamp width and height first, then x and y. A host smaller than the minimum float size
 /// yields a float pinned to the area origin at the minimum size; the display normalization in
 /// the session keeps interactive hosts at least one minimal float large.
-fn clamp_rect(rect: Rect, area: Rect) -> Rect {
+pub(crate) fn clamp_rect(rect: Rect, area: Rect) -> Rect {
     let min_width = MIN_FLOAT_WIDTH.min(area.width).max(1);
     let min_height = MIN_FLOAT_HEIGHT.min(area.height).max(1);
     let width = rect.width.clamp(min_width, area.width.max(min_width));
@@ -835,8 +835,13 @@ impl TiledNode {
     }
 
     pub fn close(self, pane: PaneId) -> Option<Self> {
+        self.retain(&|id| id != pane)
+    }
+
+    /// Prune leaves, preserving split weights wherever both children survive.
+    pub(crate) fn retain(self, keep: &impl Fn(PaneId) -> bool) -> Option<Self> {
         match self {
-            Self::Leaf(id) => (id != pane).then_some(Self::Leaf(id)),
+            Self::Leaf(id) => keep(id).then_some(Self::Leaf(id)),
             Self::Split {
                 axis,
                 first,
@@ -844,8 +849,8 @@ impl TiledNode {
                 first_weight,
                 second_weight,
             } => {
-                let first = first.close(pane);
-                let second = second.close(pane);
+                let first = first.retain(keep);
+                let second = second.retain(keep);
                 match (first, second) {
                     (Some(first), Some(second)) => Some(Self::Split {
                         axis,

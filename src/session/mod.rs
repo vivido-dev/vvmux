@@ -28,8 +28,8 @@ use crate::ipc::{
     PluginEventEnvelope, ServerMessage, SharedWriter, TabSelector, TextSource,
 };
 use crate::layout::{
-    EdgeMask, FloatOrigin, FloatingLayer, PaneId, PaneLayer, PaneProjection, Rect, TiledNode,
-    directional_focus,
+    EdgeMask, FloatOrigin, FloatingLayer, FloatingPane, PaneId, PaneLayer, PaneProjection, Rect,
+    TiledNode, directional_focus,
 };
 use crate::layout_file::{
     LayoutFile, LayoutFloat, LayoutNode, LayoutPlan, LayoutTab, MAX_LAYOUT_PANES, MAX_LAYOUT_TABS,
@@ -58,6 +58,7 @@ mod agents;
 mod automation;
 mod clients;
 mod commands;
+mod copy_vi;
 mod documents;
 mod input;
 mod input_epochs;
@@ -118,9 +119,9 @@ const MAX_AUTOMATION_WAITERS: usize = 256;
 /// than queued without bound.
 const MAX_PENDING_ACTOR_WORK: usize = 256;
 /// Hard ceiling on live panes per session, enforced by every automation pane creator
-/// (`split`, `run` with placement, `new-tab`). Layout files keep their own lower
+/// (`split`, `run` with placement, `new-tab`). The same bound applies to the
 /// [`crate::layout_file::MAX_LAYOUT_PANES`] fork bound.
-const MAX_SESSION_PANES: usize = 256;
+const MAX_SESSION_PANES: usize = MAX_LAYOUT_PANES;
 /// How long shape changes coalesce before a snapshot is written.
 ///
 /// Long enough that dragging a split or opening several panes is one write, short enough that a
@@ -1225,8 +1226,9 @@ fn terminal_reply_batches(replies: Vec<Vec<u8>>, mut send: impl FnMut(&[u8])) {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CopyState {
+    vi: copy_vi::ViState,
     offset: usize,
     row: usize,
     column: usize,
@@ -1379,6 +1381,8 @@ struct Tab {
     focused: PaneId,
     last_focused_tiled: Option<PaneId>,
     zoomed: Option<PaneId>,
+    /// Tiled panes in collapse order, restored newest first.
+    collapsed: Vec<PaneId>,
     sync_input: bool,
 }
 
@@ -1536,17 +1540,65 @@ impl Tab {
         self.floating
             .focus_candidate()
             .or_else(|| {
-                self.last_focused_tiled
-                    .filter(|pane| self.tree.as_ref().is_some_and(|tree| tree.contains(*pane)))
+                self.last_focused_tiled.filter(|pane| {
+                    !self.collapsed.contains(pane)
+                        && self.tree.as_ref().is_some_and(|tree| tree.contains(*pane))
+                })
             })
             .or_else(|| {
-                self.tree
-                    .as_ref()
-                    .and_then(|tree| tree.pane_ids().into_iter().next())
+                self.tree.as_ref().and_then(|tree| {
+                    tree.pane_ids()
+                        .into_iter()
+                        .find(|id| !self.collapsed.contains(id))
+                        .or_else(|| {
+                            self.collapsed
+                                .iter()
+                                .rev()
+                                .copied()
+                                .find(|id| tree.contains(*id))
+                        })
+                })
             })
     }
 
+    fn collapse_pane(&mut self, pane: PaneId) -> Result<(), &'static str> {
+        let Some(tree) = self.tree.as_ref().filter(|tree| tree.contains(pane)) else {
+            return Err("only tiled panes can be collapsed");
+        };
+        if self.collapsed.contains(&pane) {
+            return Err("pane is already collapsed");
+        }
+        let Some(next) = tree
+            .pane_ids()
+            .into_iter()
+            .find(|id| *id != pane && !self.collapsed.contains(id))
+        else {
+            return Err("the last visible tiled pane cannot be collapsed");
+        };
+        self.zoomed = None;
+        self.collapsed.push(pane);
+        self.set_focus(next);
+        Ok(())
+    }
+
+    fn restore_collapsed(&mut self) -> Result<(), &'static str> {
+        let pane = self.collapsed.pop().ok_or("no collapsed panes")?;
+        self.zoomed = None;
+        self.set_focus(pane);
+        Ok(())
+    }
+
+    fn dock_row(&self, area: Rect) -> Option<u16> {
+        self.unzoomed_dock_row(area)
+            .filter(|_| self.zoomed.is_none())
+    }
+
+    fn unzoomed_dock_row(&self, area: Rect) -> Option<u16> {
+        (!self.collapsed.is_empty() && area.height > 1).then(|| area.y + (area.height - 1))
+    }
+
     fn set_focus(&mut self, pane: PaneId) {
+        self.collapsed.retain(|id| *id != pane);
         self.focused = pane;
         if self.tree.as_ref().is_some_and(|tree| tree.contains(pane)) {
             self.last_focused_tiled = Some(pane);
@@ -1636,8 +1688,37 @@ fn visible_projections(tab: &Tab, area: Rect) -> Vec<PaneProjection> {
             focused: tab.focused == zoomed,
         }];
     }
+    unzoomed_projections(tab, area, tab.floating.visible())
+}
+
+/// Automation routes and swaps see unzoomed siblings and hidden floats. A collapsed tile has no
+/// route until it is restored; the other tiles use the space it released.
+fn navigation_projections(tab: &Tab, area: Rect) -> Vec<PaneProjection> {
+    unzoomed_projections(tab, area, tab.floating.panes().iter())
+}
+
+fn unzoomed_projections<'a>(
+    tab: &Tab,
+    area: Rect,
+    floats: impl Iterator<Item = &'a FloatingPane>,
+) -> Vec<PaneProjection> {
+    let dock = tab.unzoomed_dock_row(area).is_some();
+    let area = Rect {
+        height: area.height - u16::from(dock),
+        ..area
+    };
+    let pruned;
+    let tree = if tab.collapsed.is_empty() {
+        tab.tree.as_ref()
+    } else {
+        pruned = tab
+            .tree
+            .clone()
+            .and_then(|tree| tree.retain(&|id| !tab.collapsed.contains(&id)));
+        pruned.as_ref()
+    };
     let mut projections = Vec::new();
-    if let Some(tree) = &tab.tree {
+    if let Some(tree) = tree {
         for (pane_id, outer) in tree.geometry(area) {
             projections.push(PaneProjection {
                 pane_id,
@@ -1648,11 +1729,16 @@ fn visible_projections(tab: &Tab, area: Rect) -> Vec<PaneProjection> {
             });
         }
     }
-    for float in tab.floating.visible() {
+    for float in floats {
+        let outer = if dock {
+            crate::layout::clamp_rect(float.rect, area)
+        } else {
+            float.rect
+        };
         projections.push(PaneProjection {
             pane_id: float.pane_id,
-            outer: float.rect,
-            content: float.rect.content(),
+            outer,
+            content: outer.content(),
             layer: if float.pinned {
                 PaneLayer::Pinned
             } else {
@@ -5689,6 +5775,11 @@ fn extract_selection(terminal: &Terminal, start: (isize, usize), end: (isize, us
             line_len
         };
         let row = extract_selection_row(terminal, line_index, first, last).unwrap_or_default();
+        let remaining = COPY_BUFFER_LIMIT - output.len();
+        if row.len() >= remaining {
+            output.push_str(&row[..row.floor_char_boundary(remaining)]);
+            break;
+        }
         output.push_str(&row);
         if line_index != end.0 && !terminal.line_wrapped(line_index).unwrap_or(false) {
             output.push('\n');

@@ -738,6 +738,8 @@ mod tests {
             "rename-tab",
             "confirm-close-pane",
             "close-pane",
+            "collapse-pane",
+            "restore-collapsed-pane",
             "toggle-zoom",
             "toggle-sync-input",
             "copy-mode",
@@ -751,6 +753,7 @@ mod tests {
             "agent-navigator",
             "save-layout",
             "cycle-tab-view",
+            "pane-summary",
         ];
         const DOCUMENTED_COPY_ACTIONS: &[&str] = &[
             "up",

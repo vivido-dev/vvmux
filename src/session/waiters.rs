@@ -22,27 +22,15 @@ impl SessionActor {
         let tab_index = self.tabs.iter().position(|tab| tab.contains(pane_id))?;
         let tab = &self.tabs[tab_index];
         let area = self.content_area();
-        let tiled_geometry = tab.tree.as_ref().and_then(|tree| {
-            tree.geometry(area)
-                .into_iter()
-                .find(|(pane, _)| *pane == pane_id)
-        });
-        let floating = tab.floating.get(pane_id);
-        let (layer, outer) = if let Some(floating) = floating {
-            (
-                if floating.pinned {
-                    "pinned"
-                } else {
-                    "floating"
-                },
-                floating.rect,
-            )
-        } else {
-            (
-                "tiled",
-                tiled_geometry.map_or(Rect::default(), |(_, rect)| rect),
-            )
+        let mut projections = Self::topology_projections(tab, area);
+        let projection = projections.iter().find(|p| p.pane_id == pane_id)?;
+        let outer = projection.outer;
+        let layer = match projection.layer {
+            PaneLayer::Tiled => "tiled",
+            PaneLayer::Floating => "floating",
+            PaneLayer::Pinned => "pinned",
         };
+        projections.retain(|p| !tab.collapsed.contains(&p.pane_id));
         let visible = self.pane_is_visibly_present(pane_id);
         let cursor = pane.terminal.cursor();
         let plugin = match &pane.role {
@@ -59,7 +47,6 @@ impl SessionActor {
             PaneRole::Plugin(owner) => Some(owner.title.as_str()),
             PaneRole::Core => None,
         });
-        let projections = Self::topology_projections(tab, area);
         let neighbors = [
             ("left", Direction::Left),
             ("right", Direction::Right),
@@ -87,6 +74,7 @@ impl SessionActor {
             "visible": visible,
             "layer": layer,
             "zoomed": tab.zoomed == Some(pane_id),
+            "collapsed": tab.collapsed.contains(&pane_id),
             "sync_input": tab.sync_input,
             "transparent": pane.transparent,
             "title": title,
