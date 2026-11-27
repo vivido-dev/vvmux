@@ -293,6 +293,82 @@ fn run_rejects_a_command_it_cannot_honor() {
     assert_eq!(fixture.pane_ids(), vec![1]);
 }
 
+#[test]
+fn reset_preserves_running_pty_and_history_and_respawn_replaces_only_on_success() {
+    let fixture = Fixture::start("lifecycle");
+    let command = r#"printf 'SAVE-ME\n'; i=0; while [ "$i" -lt 40 ]; do echo padding; i=$((i+1)); done; printf '\033[?1049h\033[?2004hWEDGED'; while IFS= read -r line; do printf 'alive:%s\n' "$line"; done"#;
+    let opened = json(fixture.msg(&["run", command, "--hold", "--pane-id", "1"]));
+    let pane = opened["pane_id"].as_u64().unwrap().to_string();
+    let inspect = |id: &str| json(fixture.msg(&["inspect", "--pane-id", id]))["pane"].clone();
+    let wait = |text: &str, id: &str| {
+        assert_success(&fixture.msg(&["wait", "text", text, "--pane-id", id, "--timeout", "5s"]));
+    };
+    wait("WEDGED", &pane);
+    assert_success(&fixture.msg(&["pane-rename", "--pane-id", &pane, "--name", "worker"]));
+    let before = inspect(&pane);
+    assert_eq!(before["screen"], "alternate");
+    let reset = json(fixture.msg(&["reset-pane", "--pane-id", &pane]));
+    assert_eq!(reset["pane_id"], opened["pane_id"]);
+    let after = inspect(&pane);
+    assert_eq!(after["screen"], "primary");
+    assert_eq!(after["history_size"], before["history_size"]);
+    assert_eq!(after["process"]["pid"], before["process"]["pid"]);
+    assert_eq!(after["geometry"], before["geometry"]);
+    let text = fixture.msg(&["get-text", "--rows", "200", "--pane-id", &pane]);
+    assert_success(&text);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("SAVE-ME"));
+    assert!(!String::from_utf8_lossy(&text.stdout).contains("WEDGED"));
+
+    let shell = fixture.directory.path().join("fixture-shell");
+    let unavailable = shell.with_extension("unavailable");
+    fs::rename(&shell, &unavailable).unwrap();
+    let failed = fixture.msg(&["respawn-pane", "--pane-id", &pane]);
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("spawn_failed"));
+    assert_eq!(inspect(&pane)["process"]["pid"], before["process"]["pid"]);
+    assert_success(&fixture.msg(&["submit", "original", "--pane-id", &pane]));
+    wait("alive:original", &pane);
+    fs::rename(&unavailable, &shell).unwrap();
+
+    let replaced = json(fixture.msg(&["respawn-pane", "--pane-id", &pane]));
+    assert_eq!(replaced["previous_pane_id"], opened["pane_id"]);
+    assert_ne!(replaced["pane_id"], replaced["previous_pane_id"]);
+    let fresh = replaced["pane_id"].as_u64().unwrap().to_string();
+    wait("WEDGED", &fresh);
+    assert_eq!(inspect(&fresh)["geometry"], before["geometry"]);
+    let named = json(fixture.msg(&["--pane-name", "worker", "inspect"]))["pane"].clone();
+    assert_eq!(named["pane_id"], replaced["pane_id"]);
+    assert!(
+        !fixture
+            .msg(&["inspect", "--pane-id", &pane])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn failed_respawn_keeps_a_held_exited_pane_inspectable() {
+    let fixture = Fixture::start("corpse");
+    let opened = json(fixture.msg(&["run", "echo final-mark; exit 7", "--hold", "--pane-id", "1"]));
+    let pane = opened["pane_id"].as_u64().unwrap().to_string();
+    assert_success(&fixture.msg(&["wait", "exit", "--pane-id", &pane, "--timeout", "5s"]));
+    let shell = fixture.directory.path().join("fixture-shell");
+    fs::rename(&shell, shell.with_extension("unavailable")).unwrap();
+    assert!(
+        !fixture
+            .msg(&["respawn-pane", "--pane-id", &pane])
+            .status
+            .success()
+    );
+    assert_eq!(
+        json(fixture.msg(&["inspect", "--pane-id", &pane]))["pane"]["process"]["exit"]["code"],
+        7
+    );
+    let text = fixture.msg(&["get-text", "--pane-id", &pane]);
+    assert_success(&text);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("final-mark"));
+}
+
 fn json(output: Output) -> Value {
     assert_success(&output);
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {

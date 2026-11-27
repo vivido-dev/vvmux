@@ -5,10 +5,8 @@
 //! `msg` invocation — and nothing carries a result from one step into the next, so a caller has to
 //! parse and re-pass every ID by hand.
 //!
-//! The schema is deliberately identical to Vivido's `run-plan` (`vivido/src/cli.rs`), so an agent
-//! that learned it there does not relearn it here. What differs is verification: vvmux has no GPU
-//! frame, so a step verifies against a pane's screen sequence or the attached client's render
-//! acknowledgement rather than against a presented frame.
+//! Plans share the step and assertion forms of Vivido's `run-plan`. Text checks address mux
+//! panes, and render verification waits for the attached client's acknowledgement.
 //!
 //! There are no loops, no conditionals beyond a single equality test, and no arithmetic. A plan is
 //! a bounded list of steps, which is what makes it safe to accept from an agent and possible to
@@ -21,6 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ipc::{AutomationMethod, AutomationRequest, METHOD_CAPABILITIES};
+
+mod report;
+use report::Report;
+pub(crate) use report::ReportFormat;
 
 /// The only plan version this release accepts.
 pub const PLAN_VERSION: u16 = 1;
@@ -59,6 +61,9 @@ pub struct PlanStep {
     pub on_error: PlanErrorPolicy,
     #[serde(default)]
     pub verify: Option<PlanVerification>,
+    /// Postconditions checked against the method's reply and the live pane.
+    #[serde(default)]
+    pub assert: Option<PlanAssertion>,
     /// Targeting and preconditions, exactly as the equivalent `msg` flags express them.
     #[serde(default)]
     pub pane_id: Option<Value>,
@@ -103,6 +108,81 @@ pub enum PlanErrorPolicy {
     Continue,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanAssertion {
+    pub text_contains: Option<String>,
+    /// Overrides the step's target for the text assertion.
+    pub pane_id: Option<Value>,
+    #[serde(default = "default_assert_timeout")]
+    pub timeout_ms: u64,
+    pub lines_from_bottom: Option<u16>,
+    pub result_pointer: Option<String>,
+    // An explicitly expected JSON null is distinct from an omitted equality check.
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub result_equals: Option<Value>,
+}
+
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+const fn default_assert_timeout() -> u64 {
+    5_000
+}
+
+impl PlanAssertion {
+    fn validate(&self, step: &PlanStep) -> io::Result<()> {
+        let invalid = |reason| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("step `{}` assertion: {reason}", step.id),
+            )
+        };
+        match (&self.result_pointer, &self.result_equals) {
+            (None, None) if self.text_contains.is_none() => {
+                return Err(invalid(
+                    "give text_contains or result_pointer with result_equals",
+                ));
+            }
+            (None, None) => {}
+            (Some(pointer), Some(_)) if pointer.is_empty() || pointer.starts_with('/') => {}
+            _ => return Err(invalid("give a JSON Pointer and result_equals together")),
+        }
+        if self.text_contains.as_ref().is_some_and(String::is_empty) {
+            return Err(invalid("text_contains must not be empty"));
+        }
+        if !(1..=MAX_VERIFY_TIMEOUT_MS).contains(&self.timeout_ms)
+            || matches!(self.lines_from_bottom, Some(0 | 1001..))
+        {
+            return Err(invalid(
+                "timeout_ms must be 1 through 86400000 and lines_from_bottom 1 through 1000",
+            ));
+        }
+        if self.text_contains.is_some()
+            && self.pane_id.is_none()
+            && step.pane_id.is_none()
+            && step.pane_name.is_none()
+            && step.alias.is_none()
+        {
+            return Err(invalid("text_contains requires a pane target"));
+        }
+        if let Some(id) = &self.pane_id
+            && id.as_u64().is_none()
+            && id.as_object().and_then(single_reference).is_none()
+        {
+            return Err(invalid("pane_id must be an integer or a bound reference"));
+        }
+        Ok(())
+    }
+}
+
 /// What a step must be able to observe before it counts as done.
 ///
 /// Vivido verifies against a presented GPU frame. vvmux has none, so the two things it can prove
@@ -141,6 +221,7 @@ pub struct PlanOptions {
     pub dry_run: bool,
     /// Run only the steps that observe, skipping every mutation.
     pub preflight: bool,
+    pub report: Option<(ReportFormat, std::path::PathBuf)>,
 }
 
 pub fn run(target: &str, file: Option<&std::path::Path>, options: PlanOptions) -> io::Result<()> {
@@ -168,6 +249,9 @@ pub fn run(target: &str, file: Option<&std::path::Path>, options: PlanOptions) -
         "execute"
     };
     let mut stdout = io::stdout().lock();
+    let mut report = options
+        .report
+        .map(|(format, path)| Report::new(format, path));
     emit(
         &mut stdout,
         &serde_json::json!({
@@ -180,80 +264,60 @@ pub fn run(target: &str, file: Option<&std::path::Path>, options: PlanOptions) -
 
     let mut aliases: BTreeMap<String, Value> = BTreeMap::new();
     let mut failures = 0_usize;
+    let mut aborted = false;
     for step in &plan.steps {
         let mutating = method_is_mutating(&step.method, &capabilities);
-        if options.dry_run {
-            emit(
-                &mut stdout,
-                &serde_json::json!({
-                    "type": "step",
-                    "id": step.id,
-                    "method": step.method,
-                    "mutating": mutating,
-                    "status": "planned",
+        let event = if options.dry_run {
+            serde_json::json!({
+                "type": "step", "id": step.id, "method": step.method,
+                "mutating": mutating, "status": "planned",
+            })
+        } else if options.preflight && mutating {
+            step_skipped(step, mutating, "preflight_mutation")
+        } else if let Some(missing) = missing_reference(step, &aliases) {
+            step_skipped(step, mutating, &format!("unresolved_reference:{missing}"))
+        } else if step
+            .when
+            .as_ref()
+            .is_some_and(|when| aliases.get(&when.reference) != Some(&when.equals))
+        {
+            step_skipped(step, mutating, "condition_false")
+        } else {
+            let result = execute_step(&mut reader, &writer, &mut next_id, step, &aliases).and_then(
+                |result| {
+                    bind_aliases(step, &result, &mut aliases).map_err(io::Error::other)?;
+                    Ok(result)
+                },
+            );
+            match result {
+                Ok(result) => serde_json::json!({
+                    "type": "step", "id": step.id, "method": step.method,
+                    "mutating": mutating, "status": "ok", "result": result,
                 }),
-            )?;
-            continue;
-        }
-        if options.preflight && mutating {
-            emit(
-                &mut stdout,
-                &step_skipped(step, mutating, "preflight_mutation"),
-            )?;
-            continue;
-        }
-        // A step whose inputs were bound by a step preflight skipped cannot run either. Reported
-        // as its own reason rather than as a failure: nothing is wrong, the dependency was skipped.
-        if let Some(missing) = missing_reference(step, &aliases) {
-            emit(
-                &mut stdout,
-                &step_skipped(step, mutating, &format!("unresolved_reference:{missing}")),
-            )?;
-            continue;
-        }
-        if let Some(when) = &step.when {
-            let actual = aliases.get(&when.reference).cloned().unwrap_or(Value::Null);
-            if actual != when.equals {
-                emit(
-                    &mut stdout,
-                    &step_skipped(step, mutating, "condition_false"),
-                )?;
-                continue;
-            }
-        }
-
-        match execute_step(&mut reader, &writer, &mut next_id, step, &aliases) {
-            Ok(result) => {
-                if let Err(error) = bind_aliases(step, &result, &mut aliases) {
+                Err(error) => {
                     failures += 1;
-                    emit(&mut stdout, &step_error(step, mutating, &error))?;
-                    if step.on_error == PlanErrorPolicy::Abort {
-                        return finish(&mut stdout, failures, true);
-                    }
-                    continue;
-                }
-                emit(
-                    &mut stdout,
-                    &serde_json::json!({
-                        "type": "step",
-                        "id": step.id,
-                        "method": step.method,
-                        "mutating": mutating,
-                        "status": "ok",
-                        "result": result,
-                    }),
-                )?;
-            }
-            Err(error) => {
-                failures += 1;
-                emit(&mut stdout, &step_error(step, mutating, &error.to_string()))?;
-                if step.on_error == PlanErrorPolicy::Abort {
-                    return finish(&mut stdout, failures, true);
+                    aborted = step.on_error == PlanErrorPolicy::Abort;
+                    step_error(step, mutating, &error.to_string())
                 }
             }
+        };
+        if let Some(report) = &mut report {
+            report.record(step, &event);
+        }
+        emit(&mut stdout, &event)?;
+        if aborted {
+            break;
         }
     }
-    finish(&mut stdout, failures, false)
+    finish(&mut stdout, failures, aborted)?;
+    if let Some(report) = report {
+        report.write(failures)?;
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{failures} plan step(s) failed")))
+    }
 }
 
 fn finish(stdout: &mut impl Write, failures: usize, aborted: bool) -> io::Result<()> {
@@ -269,12 +333,7 @@ fn finish(stdout: &mut impl Write, failures: usize, aborted: bool) -> io::Result
             "status": status,
             "failures": failures,
         }),
-    )?;
-    if failures == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("{failures} plan step(s) failed")))
-    }
+    )
 }
 
 fn emit(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
@@ -309,34 +368,22 @@ fn step_error(step: &PlanStep, mutating: bool, error: &str) -> Value {
 
 /// Read and parse a plan, from a file or from stdin.
 fn read_plan(file: Option<&std::path::Path>) -> io::Result<Plan> {
-    let source = match file {
-        Some(path) if path != std::path::Path::new("-") => {
-            let metadata = std::fs::metadata(path)?;
-            if metadata.len() > MAX_PLAN_BYTES as u64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("a plan holds at most {MAX_PLAN_BYTES} bytes"),
-                ));
-            }
-            std::fs::read_to_string(path)?
-        }
-        _ => {
-            use std::io::Read as _;
-            let mut source = String::new();
-            // Bounded even from a pipe, where there is no size to check first.
-            io::stdin()
-                .lock()
-                .take(MAX_PLAN_BYTES as u64 + 1)
-                .read_to_string(&mut source)?;
-            if source.len() > MAX_PLAN_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("a plan holds at most {MAX_PLAN_BYTES} bytes"),
-                ));
-            }
-            source
-        }
+    use std::io::Read as _;
+    let mut reader: Box<dyn io::Read> = match file {
+        Some(path) if path != std::path::Path::new("-") => Box::new(std::fs::File::open(path)?),
+        _ => Box::new(io::stdin().lock()),
     };
+    let mut source = String::new();
+    reader
+        .by_ref()
+        .take(MAX_PLAN_BYTES as u64 + 1)
+        .read_to_string(&mut source)?;
+    if source.len() > MAX_PLAN_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a plan holds at most {MAX_PLAN_BYTES} bytes"),
+        ));
+    }
     serde_json::from_str(&source).map_err(|error| {
         io::Error::new(io::ErrorKind::InvalidData, format!("invalid plan: {error}"))
     })
@@ -409,34 +456,10 @@ fn validate(plan: &Plan, capabilities: &Value) -> io::Result<()> {
         // Every reference this step makes must already be bound. Forward references are rejected
         // rather than deferred: a plan is a list, not a graph, and a step cannot use a value that
         // has not been produced.
-        let mut references = BTreeSet::new();
-        collect_references(&step.params, &mut references);
-        for value in [&step.pane_id, &step.pane_name, &step.alias]
-            .into_iter()
-            .flatten()
-        {
-            collect_references(value, &mut references);
+        if let Some(assertion) = &step.assert {
+            assertion.validate(step)?;
         }
-        if let Some(expect) = &step.expect {
-            for value in [
-                &expect.screen_sequence,
-                &expect.session_sequence,
-                &expect.layout_sequence,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                collect_references(value, &mut references);
-            }
-        }
-        if let Some(verify) = &step.verify
-            && let Some(pane_id) = &verify.pane_id
-        {
-            collect_references(pane_id, &mut references);
-        }
-        if let Some(when) = &step.when {
-            references.insert(when.reference.clone());
-        }
+        let references = step_references(step);
         for reference in &references {
             if !bound.contains(reference.as_str()) {
                 return Err(invalid(format!(
@@ -528,6 +551,12 @@ fn resolve_references(value: &Value, aliases: &BTreeMap<String, Value>) -> Value
 
 /// The first reference this step makes that is not bound, if any.
 fn missing_reference(step: &PlanStep, aliases: &BTreeMap<String, Value>) -> Option<String> {
+    step_references(step)
+        .into_iter()
+        .find(|reference| !aliases.contains_key(reference))
+}
+
+fn step_references(step: &PlanStep) -> BTreeSet<String> {
     let mut references = BTreeSet::new();
     collect_references(&step.params, &mut references);
     for value in [&step.pane_id, &step.pane_name, &step.alias]
@@ -536,9 +565,34 @@ fn missing_reference(step: &PlanStep, aliases: &BTreeMap<String, Value>) -> Opti
     {
         collect_references(value, &mut references);
     }
-    references
+    if let Some(expect) = &step.expect {
+        for value in [
+            &expect.screen_sequence,
+            &expect.session_sequence,
+            &expect.layout_sequence,
+        ]
         .into_iter()
-        .find(|reference| !aliases.contains_key(reference))
+        .flatten()
+        {
+            collect_references(value, &mut references);
+        }
+    }
+    if let Some(verify) = &step.verify
+        && let Some(pane_id) = &verify.pane_id
+    {
+        collect_references(pane_id, &mut references);
+    }
+    if let Some(when) = &step.when {
+        references.insert(when.reference.clone());
+    }
+    if let Some(target) = step
+        .assert
+        .as_ref()
+        .and_then(|assertion| assertion.pane_id.as_ref())
+    {
+        collect_references(target, &mut references);
+    }
+    references
 }
 
 fn bind_aliases(
@@ -658,7 +712,13 @@ fn execute_step(
                 .or(pane_id);
             match (named, pane_name.as_ref()) {
                 (Some(pane), _) => Some(pane),
-                (None, Some(name)) => Some(resolve_named_pane(reader, writer, next_id, name)?),
+                (None, Some(name)) => Some(resolve_named_pane(
+                    reader,
+                    writer,
+                    next_id,
+                    Some(name),
+                    None,
+                )?),
                 (None, None) => None,
             }
         }
@@ -677,6 +737,42 @@ fn execute_step(
         (None, _) => None,
     };
 
+    let mut text_wait = None;
+    if let Some(assertion) = &step.assert
+        && let Some(text) = &assertion.text_contains
+    {
+        let mut request = plain_request(
+            0,
+            AutomationMethod::WaitText {
+                text: text.clone(),
+                regex: false,
+                after_screen: None,
+                timeout_ms: assertion.timeout_ms,
+                lines_from_bottom: assertion.lines_from_bottom,
+            },
+        );
+        if let Some(target) = &assertion.pane_id {
+            request.pane_id = Some(resolve_references(target, aliases).as_u64().ok_or_else(
+                || {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "assertion pane_id did not resolve to an integer",
+                    )
+                },
+            )?);
+        } else if pane_id.is_some() {
+            request.pane_id = pane_id;
+        } else {
+            request.pane_id = Some(resolve_named_pane(
+                reader,
+                writer,
+                next_id,
+                pane_name.as_ref(),
+                alias.as_ref(),
+            )?);
+        }
+        text_wait = Some(request);
+    }
     let method = build_method(&step.method, params)?;
     let id = next_id();
     let request = AutomationRequest {
@@ -695,6 +791,24 @@ fn execute_step(
     crate::automation::send_request(writer, request)?;
     let action =
         crate::automation::response_result(crate::automation::receive_response(reader, id)?)?;
+
+    if let Some(assertion) = &step.assert
+        && let (Some(pointer), Some(expected)) =
+            (&assertion.result_pointer, &assertion.result_equals)
+        && action.pointer(pointer) != Some(expected)
+    {
+        // The action may return terminal text. Keep that content out of CI diagnostics.
+        return Err(io::Error::other(format!(
+            "assertion failed: result at {pointer:?} differs from result_equals or is absent"
+        )));
+    }
+    if let Some(mut request) = text_wait {
+        let id = next_id();
+        request.id = id;
+        crate::automation::send_request(writer, request)?;
+        crate::automation::response_result(crate::automation::receive_response(reader, id)?)
+            .map_err(|error| io::Error::other(format!("text assertion failed: {error}")))?;
+    }
 
     let (Some(verify), Some(pane), Some(before)) = (&step.verify, verify_pane, before) else {
         return Ok(action);
@@ -761,32 +875,30 @@ fn execute_step(
     }))
 }
 
-/// The pane a name currently refers to.
+/// Resolve the step's name before an action can rename or move its target.
 fn resolve_named_pane(
     reader: &mut crate::ipc::RecordReader,
     writer: &crate::ipc::SharedWriter,
     next_id: &mut impl FnMut() -> u64,
-    name: &crate::layout::PaneName,
+    name: Option<&crate::layout::PaneName>,
+    alias: Option<&crate::agent::AgentAlias>,
 ) -> io::Result<u64> {
     let id = next_id();
     crate::automation::send_request(
         writer,
         AutomationRequest {
             id,
-            pane_name: Some(name.clone()),
-            method: AutomationMethod::ResolvePane {
-                tab: None,
-                path: Vec::new(),
-            },
-            ..plain_request(id, AutomationMethod::Capabilities)
+            pane_name: name.cloned(),
+            agent: alias.cloned(),
+            ..plain_request(id, AutomationMethod::Inspect)
         },
     )?;
     let resolved =
         crate::automation::response_result(crate::automation::receive_response(reader, id)?)?;
-    resolved["target"]["pane_id"].as_u64().ok_or_else(|| {
+    resolved["pane"]["pane_id"].as_u64().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("`{name}` did not resolve to a pane"),
+            "target did not resolve to a pane",
         )
     })
 }

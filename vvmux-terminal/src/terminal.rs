@@ -204,6 +204,16 @@ impl Terminal {
         }
     }
 
+    /// Restores a blank primary screen and fresh parsers while retaining the scrollback and geometry.
+    pub fn reset_preserving_history(&mut self) {
+        let mut fresh = Self::new(self.rows, self.cols, self.history_limit);
+        fresh.history = mem::take(&mut self.history);
+        fresh.history_wrapped = mem::take(&mut self.history_wrapped);
+        fresh.kitty_capable = self.kitty_capable;
+        fresh.kitty_cell_size = self.kitty_cell_size;
+        *self = fresh;
+    }
+
     /// Process a chunk of pane output and return the events it produced.
     ///
     /// Escape sequences may be split across chunks at any byte. Bytes that could still be the
@@ -229,7 +239,13 @@ impl Terminal {
             self.processor = processor;
             return self.finish_events(!bytes.is_empty());
         }
+        let revision = self.agent_osc.directory_revision;
         self.agent_osc.observe(bytes);
+        if revision != self.agent_osc.directory_revision
+            && let Some(uri) = &self.agent_osc.directory_uri
+        {
+            self.events.push(TerminalEvent::Directory(uri.clone()));
+        }
         let chunks = self.kitty_scanner.push(bytes);
         self.process_kitty_chunks(chunks, !bytes.is_empty(), false)
     }
@@ -2849,6 +2865,23 @@ mod tests {
         );
         let events = terminal.feed(b"\x1b[?1049l");
         assert!(events.contains(&TerminalEvent::ScreenSwap { alternate: false }));
+    }
+
+    #[test]
+    fn administrative_reset_keeps_history_and_discards_an_incomplete_parser_sequence() {
+        let mut terminal = Terminal::new(2, 12, 20);
+        terminal.feed(b"old row\r\nsecond\r\nthird\x1b[?1049h\x1b[?2004hbad\x1b]2;partial");
+        assert!(terminal.alternate_screen());
+        assert!(terminal.modes().bracketed_paste);
+        terminal.reset_preserving_history();
+        assert!(!terminal.alternate_screen());
+        assert!(!terminal.modes().bracketed_paste);
+        assert_eq!(terminal.extract_rows(-1, 1), "old row");
+        assert_eq!(terminal.cursor(), (0, 0));
+        terminal.feed(b"fresh");
+        assert_eq!(terminal.extract_rows(0, 1), "fresh");
+        assert_eq!(terminal.rows(), 2);
+        assert_eq!(terminal.cols(), 12);
     }
 
     #[test]

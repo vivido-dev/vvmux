@@ -41,20 +41,7 @@ const NATIVE_CANCEL_GRACE: Duration = Duration::from_secs(2);
 const NATIVE_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 fn known_plugin_event(name: &str) -> bool {
-    matches!(
-        name,
-        "session.started"
-            | "pane.opened"
-            | "pane.exited"
-            | "pane.closed"
-            | "pane.screen_changed"
-            | "layout.changed"
-            | "focus.changed"
-            | "config.changed"
-            | "media.changed"
-            | "plugin.job_completed"
-            | "plugin.runtime_crashed"
-    )
+    vvmux_plugin_api::EVENT_KINDS.contains(&name)
 }
 
 #[derive(Debug, Subcommand)]

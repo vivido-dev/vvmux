@@ -235,7 +235,8 @@ a different session with different, possibly destructive, side effects.
 `run-plan` runs a bounded list of steps over **one** connection, with results flowing between them:
 
 ```sh
-vvmux msg run-plan --file work.json          # execute
+vvmux msg run-plan --file work.json               # execute
+vvmux msg run-plan --file work.json --report junit --output steps.xml
 vvmux msg run-plan --file work.json --preflight   # observations only, mutations skipped
 vvmux msg run-plan --file work.json --dry-run     # report what would run, connect for nothing else
 ```
@@ -247,7 +248,8 @@ vvmux msg run-plan --file work.json --dry-run     # report what would run, conne
     {"id": "split", "method": "split", "params": {"axis": "Horizontal"}, "pane_id": 1,
      "bind": {"right": "/new_pane_id"}},
     {"id": "name", "method": "pane_rename", "pane_id": {"$ref": "right"},
-     "params": {"name": "worker"}},
+     "params": {"name": "worker"},
+     "assert": {"result_pointer": "/pane_name", "result_equals": "worker"}},
     {"id": "run", "method": "submit_line", "pane_name": "worker",
      "params": {"text": "cargo test", "report": true},
      "verify": {"screen_changed": true, "capture": true, "timeout_ms": 5000}}
@@ -268,7 +270,14 @@ before the action. vvmux has no GPU frame, so a step verifies against the pane's
 (`screen_changed`) or the attached client's render acknowledgement (`rendered`) — neither of which
 is GPU presentation. Pair `rendered` with Vivido's own `wait frame` when that is what matters.
 
-Output is NDJSON: one `plan_started`, one line per step, one `plan_completed`. Exit is nonzero if
+Use `assert.text_contains` to wait for a literal in the displayed viewport. It inherits the step's
+pane or takes its own `pane_id`, including a bound reference. `lines_from_bottom` selects 1–1,000
+physical rows and `timeout_ms` defaults to 5,000. `result_pointer` and `result_equals` compare
+the original action reply with an exact JSON value. Each step may carry both checks.
+For CI, pass `--report junit|sarif --output PATH` to write the visited steps, including failures
+and skips. See the [detached CI recipe](skills/vvmux/references/commands.md#events-plans-leases-recording).
+
+Stdout contains one `plan_started` NDJSON record, one record per visited step and one `plan_completed`. Exit is nonzero if
 any step failed. There are no loops, no conditionals beyond one equality test, and no arithmetic —
 which is what makes a plan safe to accept and possible to preflight without running it.
 
@@ -288,8 +297,9 @@ targeted event is not hit-tested. `--route mux` gives the event to vvmux instead
 handles copy-mode selection, float drag and resize, and pane focus. Cells are the primary
 coordinate; `--x/--y` pixels need an attached client's cell metrics and are refused without one, and
 pass through exactly under SGR pixel mouse mode. `mouse path` sends one bounded press/move/release
-gesture over 2–1000 points, so a gesture cannot leave a button held down because a separate release
-call failed.
+gesture over 2–1000 points. Each `--point` accepts cells (`10,4`), physical pixels (`10,4px`) or
+relative fractions (`0.5,0.5rel`). `--duration` paces the path, `--timeout` bounds the request,
+and `--wait-rendered` waits for a subsequent mux render acknowledgement.
 
 `signal` reaches the pane's **foreground process group**, which typing `Ctrl+C` cannot promise: a
 shell running `cargo test` hands that job the terminal, and a signal aimed at the child would reach
@@ -334,7 +344,9 @@ case the Vivido automation socket is on another machine and `vivido msg` is not 
 `inspect` adds `outer_crop`, the pane's rectangle in that window's physical pixels, which is the
 crop to apply to a `vivido msg screenshot`. **None of it carries the outer Vivid endpoint or root
 secret**: those stay in the foreground client, which is what lets the daemon answer "which window"
-without ever holding "how to reach it".
+without ever holding "how to reach it". For a local window, the
+[attached-pane capture example](examples/capture_vivido_pane.py) adds the grid padding, validates
+the screenshot and rechecks the attachment and geometry before publishing the cropped PNG.
 
 `capabilities` is authoritative for a release and describes the surface rather than just naming it:
 
@@ -366,7 +378,7 @@ Available commands are:
 
 ```text
 capabilities
-run-plan [--file PATH] [--dry-run|--preflight]
+run-plan [--file PATH] [--dry-run|--preflight] [--report junit|sarif --output PATH]
 get-config
 reload-config
 reload-plugins
@@ -403,12 +415,15 @@ split horizontal|vertical [--pane-id ID]
 run COMMAND [--placement split|float|tab] [--axis horizontal|vertical] [--cwd DIR] [--hold] [--no-focus] [--pane-id ID]
 focus [--pane-id ID] [--wait outer|rendered] [--timeout DURATION]
 close-pane --pane-id ID
-mouse move|click|double-click|down|up|drag|scroll|path (--cell-column N --cell-row N | --x PX --y PX | --relative-x F --relative-y F) [--point COL,ROW]... [--button left|middle|right] [--route application|mux] [--mods Shift,Alt,Ctrl] [--scroll N] [--pane-id ID]
+reset-pane --pane-id ID
+respawn-pane --pane-id ID
+mouse move|click|double-click|down|up|drag|scroll|path (--cell-column N --cell-row N | --x PX --y PX | --relative-x F --relative-y F) [--point POINT]... [--duration DURATION] [--wait-rendered] [--timeout DURATION] [--button left|middle|right] [--route application|mux] [--mods Shift,Alt,Ctrl] [--scroll N] [--pane-id ID]
 signal INT|TERM|HUP|QUIT|TSTP|CONT|WINCH|KILL|STOP [--pane-id ID]
 resize-pane [--columns N] [--rows N] [--pane-id ID]
 move-pane (--to-tab ID|--to-tab-name NAME | --swap left|right|up|down | --to-layer tiled|floating) [--pane-id ID]
 set-flag zoom|pinned|transparent|copy-mode|floats-visible|sync-input (--on|--off) [--offset N] [--pane-id ID]
-transcript [--after-offset N] [--max-bytes N] [--base64] [--pane-id ID]
+transcript [--after-offset N] [--max-bytes N] [--base64|--raw] [--pane-id ID]
+get-selection [--pane-id ID]
 capture [--no-activate] [--after-screen SEQ] [--stable DURATION] [--rendered] [--grid] [--timeout DURATION] [--pane-id ID]
 shell-command COMMAND [--timeout DURATION] [--pane-id ID]
 lease acquire --scope observe|input|layout|process [--ttl DURATION] [--holder NAME] [--pane-id ID]
@@ -422,8 +437,8 @@ get-text [--rows N] [--source visible|recent|recent-unwrapped|detection] [--pane
 get-grid [--start-line LINE --row-count N | --since-screen SEQ] [--pane-id ID]
 search --pattern TEXT [--regex] [--direction forward|backward] [--start-line LINE --start-column COLUMN] [--limit N] [--pane-id ID]
 sync-input (--on|--off) [--pane-id ID]
-wait text TEXT [--regex] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
-wait output PATTERN [--regex] [--after-offset N] [--timeout DURATION] [--pane-id ID]
+wait text TEXT [--regex] [--lines-from-bottom N] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
+wait output PATTERN [--regex|--base64] [--after-offset N] [--timeout DURATION] [--pane-id ID]
 wait screen-change [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait screen-stable [--quiet DURATION] [--after-screen SEQ] [--timeout DURATION] [--pane-id ID]
 wait rendered --after-session SEQ [--timeout DURATION]
@@ -1009,6 +1024,11 @@ delta. Vivid media, pane frames, status lines, and other panes are intentionally
 scrollback rows; `--regex` enables regular expressions, `--direction` and `--start-line` choose the
 scan origin, and `--limit` reports truncation rather than growing an unbounded reply. Wrapped rows
 remain separate in this version, matching interactive copy-mode search.
+
+`reset-pane` returns the same pane ID after resetting terminal state and its Vivid scene.
+The existing PTY and scrollback survive. `respawn-pane` starts the saved command in the
+original slot and returns `{previous_pane_id, pane_id}`. Target the new `pane_id` after success.
+The old pane remains available if the replacement could not start.
 
 Structured observations and waits print JSON; `split` prints the new pane ID and committed session
 sequence. Input, focus, and close are silent on success. Waits default to 30 seconds and accept

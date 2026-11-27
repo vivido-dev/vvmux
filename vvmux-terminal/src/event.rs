@@ -32,6 +32,8 @@ pub enum TerminalEvent {
     Damage,
     /// The window title changed; `None` resets it.
     Title(Option<String>),
+    /// Latest validated file URI reported by the shell via OSC 7.
+    Directory(String),
     /// BEL.
     Bell,
     /// Bytes to write back to the pane, such as replies to status and capability queries.

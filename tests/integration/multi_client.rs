@@ -80,6 +80,18 @@ impl Client {
         arguments: &str,
         vivid: &[(String, String)],
     ) -> Self {
+        Self::attach_with_cell_size(directory, session, columns, rows, arguments, vivid, None)
+    }
+
+    fn attach_with_cell_size(
+        directory: &Path,
+        session: &str,
+        columns: u16,
+        rows: u16,
+        arguments: &str,
+        vivid: &[(String, String)],
+        cells: Option<(u16, u16)>,
+    ) -> Self {
         let mut environment = vec![
             (
                 "XDG_RUNTIME_DIR".to_owned(),
@@ -106,6 +118,12 @@ impl Client {
             &environment,
         )
         .unwrap();
+        if let Some((width, height)) = cells {
+            parts
+                .control
+                .resize_with_pixels(columns, rows, columns * width, rows * height)
+                .unwrap();
+        }
         let mut reader = parts.reader;
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1073,5 +1091,114 @@ fn retained_images_reach_all_clients_across_claim_and_detach() {
             "late viewer missed retained image"
         );
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn attached_pixel_path_delivers_exact_sgr_bytes_before_render_confirmation() {
+    let directory = temporary_runtime("vvmp-");
+    let runtime = directory.path();
+    let config = write_echo_session(runtime, "");
+    fs::write(
+        runtime.join("fixture-shell"),
+        r"#!/usr/bin/env python3
+import os,tty
+tty.setraw(0)
+os.write(1,b'\x1b[?1016hREADY\r\n')
+pending = b''
+while True:
+    part = os.read(0, 1)
+    if not part: break
+    pending += part
+    if part in (b'm',b'M'):
+        os.write(1,pending.hex().encode() + b'\r\n')
+        pending=b''
+",
+    )
+    .unwrap();
+    let session = unique("pixel");
+    create_detached(runtime, &config, &session);
+    let _guard = SessionGuard {
+        runtime: runtime.to_path_buf(),
+        name: session.clone(),
+    };
+    let mut client =
+        Client::attach_with_cell_size(runtime, &session, 90, 20, "", &[], Some((8, 16)));
+    client.wait_for_text("READY");
+    assert!(
+        message(
+            runtime,
+            &config,
+            &session,
+            &["action", "enter-copy-mode", "--pane-id", "1"]
+        )
+        .status
+        .success()
+    );
+    client.send(b"gg0v3l");
+    let end = Instant::now() + Duration::from_secs(3);
+    loop {
+        let selection = json(message(
+            runtime,
+            &config,
+            &session,
+            &["get-selection", "--pane-id", "1"],
+        ));
+        if selection["text"] == "READ" {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "missing active selection: {selection}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    client.send(b"q");
+    let result = json(message(
+        runtime,
+        &config,
+        &session,
+        &[
+            "mouse",
+            "path",
+            "--point",
+            "3,5px",
+            "--point",
+            "5,7px",
+            "--point",
+            "7,9px",
+            "--duration",
+            "100ms",
+            "--timeout",
+            "5s",
+            "--wait-rendered",
+            "--pane-id",
+            "1",
+        ],
+    ));
+    assert!(
+        result["rendered_session_sequence"].as_u64().unwrap()
+            > result["before_session_sequence"].as_u64().unwrap()
+    );
+    assert_eq!(result["events"], 3);
+    for report in [
+        b"\x1b[<0;4;6M".as_slice(),
+        b"\x1b[<32;6;8M",
+        b"\x1b[<0;8;10m",
+    ] {
+        json(message(
+            runtime,
+            &config,
+            &session,
+            &[
+                "wait",
+                "output",
+                &hex::encode(report),
+                "--timeout",
+                "3s",
+                "--pane-id",
+                "1",
+            ],
+        ));
     }
 }

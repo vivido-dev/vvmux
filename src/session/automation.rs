@@ -706,7 +706,9 @@ impl SessionActor {
                 ctrl,
                 scroll,
                 ref points,
-                ..
+                duration_ms,
+                wait_rendered,
+                timeout_ms,
             } => {
                 let pane_id = required_pane(pane_id);
                 let request = MouseRequest {
@@ -720,10 +722,14 @@ impl SessionActor {
                     scroll,
                     points: points.clone(),
                 };
-                match self.automation_mouse(pane_id, request) {
-                    Ok(result) => self.reply_automation(target, result),
-                    Err(error) => self.reply_automation_error(target, error),
-                }
+                self.start_mouse_request(
+                    target,
+                    pane_id,
+                    request,
+                    duration_ms,
+                    wait_rendered,
+                    timeout_ms,
+                );
             }
             AutomationMethod::Transcript {
                 after_offset,
@@ -736,13 +742,43 @@ impl SessionActor {
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
+            AutomationMethod::GetSelection => {
+                // Six-byte JSON escaping still fits the control record at this limit.
+                const SELECTION_REPLY_BYTES: usize = 64 * 1024;
+                let pane_id = required_pane(pane_id);
+                let pane = &self.panes[&pane_id];
+                let text = pane
+                    .copy
+                    .as_ref()
+                    .filter(|copy| copy.selection_start.is_some())
+                    .map(|copy| {
+                        let (a, b) = copy.selection(&pane.terminal);
+                        extract_selection(&pane.terminal, a, b)
+                    })
+                    .or_else(|| {
+                        pane.mouse_selection
+                            .map(|selection| extract_mouse_selection(&pane.terminal, selection))
+                    });
+                let text = text.as_deref().map(String::from_utf8_lossy);
+                let truncated = text
+                    .as_ref()
+                    .is_some_and(|s| s.len() > SELECTION_REPLY_BYTES);
+                let text = text
+                    .as_deref()
+                    .map(|s| &s[..s.floor_char_boundary(SELECTION_REPLY_BYTES.min(s.len()))]);
+                self.reply_automation(
+                    target,
+                    serde_json::json!({"pane_id": pane_id, "text": text, "truncated": truncated}),
+                );
+            }
             AutomationMethod::WaitOutput {
                 pattern,
+                base64,
                 regex,
                 after_offset,
                 timeout_ms,
             } => {
-                let pattern = match automation_text_pattern(pattern, regex) {
+                let pattern = match output_pattern(pattern, regex, base64) {
                     Ok(pattern) => pattern,
                     Err(error) => {
                         self.reply_automation_error(target, error);
@@ -873,6 +909,25 @@ impl SessionActor {
                         });
                         self.finish_selection(target, Some(wait), timeout_ms, before_outer, result);
                     }
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::ResetPane => {
+                let pane_id = required_pane(pane_id);
+                match self.reset_pane(pane_id) {
+                    Ok(()) => {
+                        self.reply_automation(target, serde_json::json!({"pane_id": pane_id}));
+                    }
+                    Err(error) => self.reply_automation_error(target, error),
+                }
+            }
+            AutomationMethod::RespawnPane => {
+                let pane_id = required_pane(pane_id);
+                match self.respawn_pane(pane_id) {
+                    Ok(new_id) => self.reply_automation(
+                        target,
+                        serde_json::json!({"previous_pane_id": pane_id, "pane_id": new_id}),
+                    ),
                     Err(error) => self.reply_automation_error(target, error),
                 }
             }
@@ -1181,13 +1236,24 @@ impl SessionActor {
                     after_sequence,
                     crate::ipc::EventFilter::default(),
                     true,
+                    caller
+                        .capabilities
+                        .contains(&vvmux_plugin_api::Permission::PaneRead),
                 );
             }
             AutomationMethod::Subscribe {
                 after_sequence,
                 filter,
             } => {
-                self.subscribe_plugin_events(target, after_sequence, filter, false);
+                self.subscribe_plugin_events(
+                    target,
+                    after_sequence,
+                    filter,
+                    false,
+                    caller
+                        .capabilities
+                        .contains(&vvmux_plugin_api::Permission::PaneRead),
+                );
             }
             AutomationMethod::Plugin(crate::ipc::PluginMethod::EventUnsubscribe {
                 subscription_id,
@@ -1244,6 +1310,7 @@ impl SessionActor {
             AutomationMethod::WaitText {
                 text,
                 regex,
+                lines_from_bottom,
                 after_screen,
                 timeout_ms,
             } => {
@@ -1290,6 +1357,7 @@ impl SessionActor {
                     deadline: deadline(timeout_ms),
                     kind: AutomationWaitKind::Text {
                         pattern,
+                        lines_from_bottom,
                         after_screen,
                     },
                 });
@@ -1535,6 +1603,7 @@ impl SessionActor {
         after_sequence: Option<u64>,
         filter: crate::ipc::EventFilter,
         require_plugins: bool,
+        can_read_panes: bool,
     ) {
         // `msg subscribe` deliberately does not require plugins: pane, layout, and agent events
         // describe the session, not the plugin system. The plugin-facing subscription keeps its
@@ -1611,7 +1680,7 @@ impl SessionActor {
                 self.plugin_event_sequence,
                 PLUGIN_EVENT_STREAM_QUEUE.saturating_sub(1),
             ) {
-                if !filter.accepts(&envelope) {
+                if !filter.accepts(&envelope, can_read_panes) {
                     continue;
                 }
                 if sender
@@ -1630,6 +1699,7 @@ impl SessionActor {
                 sender,
                 cancel: target.cancel,
                 filter,
+                can_read_panes,
             },
         );
     }
@@ -1695,7 +1765,10 @@ impl SessionActor {
         };
         self.plugin_event_journal.push(envelope.clone());
         self.plugin_event_subscriptions.retain(|_, subscription| {
-            if !subscription.filter.accepts(&envelope) {
+            if !subscription
+                .filter
+                .accepts(&envelope, subscription.can_read_panes)
+            {
                 return true;
             }
             let sent = subscription
@@ -1763,6 +1836,32 @@ fn automation_input_bytes(method: &AutomationMethod) -> Option<usize> {
         AutomationMethod::Mouse { .. } => Some(0),
         _ => None,
     }
+}
+
+fn output_pattern(
+    pattern: String,
+    regex: bool,
+    base64: bool,
+) -> Result<OutputPattern, AutomationError> {
+    if !base64 {
+        return automation_text_pattern(pattern, regex).map(OutputPattern::Text);
+    }
+    if regex || pattern.is_empty() {
+        return Err(AutomationError::new(
+            "invalid_params",
+            "base64 output waits require a nonempty literal",
+        ));
+    }
+    if pattern.len() > 12 * 1024 {
+        return Err(AutomationError::new(
+            "limit_exceeded",
+            "base64 pattern exceeds 12 KiB",
+        ));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(pattern)
+        .map(OutputPattern::Bytes)
+        .map_err(|_invalid| AutomationError::new("invalid_params", "invalid base64 output pattern"))
 }
 
 /// Build a text pattern from a literal or a bounded regular expression.

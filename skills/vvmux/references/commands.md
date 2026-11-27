@@ -21,8 +21,32 @@ is a property of the request, not of the verb:
 only |
 | `--lease ID` | act under a lease another caller would otherwise block |
 
-With no pane selector, a request targets the focused pane. `VVMUX_PANE_ID` is accepted only when it
-belongs to the target session.
+Commands that allow focus fallback can target the focused pane. Pane recovery and close commands
+require an explicit target or a same-session `VVMUX_PANE_ID`.
+
+## Output contract
+
+Structured reads and waits print one JSON value and a newline. Input commands such as `typing`,
+`key`, `paste` and `submit` are silent on success unless given `--report`. `get-text` writes the
+rendered UTF-8 pane text exactly, without adding a newline. `transcript --base64` returns a JSON
+object containing the retained PTY bytes in `base64` plus offsets. `transcript --raw` writes those
+bytes directly, including terminal control characters. Pipe raw output into a file or byte parser.
+Subscriptions and plans emit one complete JSON object per line. On failure the CLI exits nonzero.
+Server errors include the stable code and a human-readable message on stderr. Plan step errors
+also appear in their NDJSON step records. Read the server's codes from `msg capabilities`.
+
+## Local protocol
+
+`vvmux msg` opens the named session's private VVMX control endpoint. On Unix the runtime directory
+is owner-only, the socket has mode 0600, and both ends check the connected peer's UID. Windows
+uses a per-user named pipe. For the methods and row-scoped waits below, the native client and
+server use private VVMX version 28. Restart an older session server after upgrading. The 12-byte
+preface carries the wire version, channel kind and maximum
+record size. Each record has a 16-byte big-endian header with a sequence, type, flags and body
+length. Control bodies are capped at 1 MiB and bulk bodies at 64 MiB. Automation replies can span
+several control records up to 16 MiB in total. A server admits at most 32 concurrent client
+connections. These are transport limits from `src/ipc.rs` and `src/server.rs`; the live
+`capabilities.limits` lists method-specific bounds.
 
 ## Discovery
 
@@ -126,17 +150,28 @@ running job or a shell at its prompt.
 ```sh
 vvmux msg mouse click --cell-column 12 --cell-row 4 --pane-id 3
 vvmux msg mouse path --point 10,4 --point 12,6 --point 14,8 --button left --pane-id 3
-vvmux msg mouse scroll --cell-column 1 --cell-row 1 --pane-id 3
+vvmux msg mouse scroll --cell-column 1 --cell-row 1 --scroll -1 --pane-id 3
+vvmux msg mouse click --relative-x 0.5 --relative-y 0.5 --pane-id 3
+vvmux msg mouse path --point 12,20px --point 16,22px --duration 120ms --wait-rendered --timeout 2s --pane-id 3
 ```
 
-Actions: `move`, `click`, `double-click`, `down`, `up`, `drag`, `path`, `scroll`. Coordinates are
-**pane-local cells**, so no hit testing is needed and `--route application` reaches a pane that is
-hidden, on another tab, or under a zoom. `--route mux` is for vvmux's own handling — copy-mode
-selection, float drag, pane focus. Pixel coordinates (`--x`/`--y`) need an attached client and are
-refused without one.
+Use zero-based cells for a grid application. `--relative-x` and `--relative-y` take fractions
+from 0 to 1 and resolve to cells within the current pane. `--x` and `--y` take pane-local
+physical pixels. Applications requesting SGR 1016 receive sub-cell positions from pixel inputs.
+Path points accept `COLUMN,ROW`, `X,Ypx` or `X,Yrel`. A path takes 2 through 1,000 points and
+delivers press, motion and release. `--duration` paces the sequence, and `--timeout` bounds it.
+Use `--route application` to target the application even on another tab, or `--route mux` for mux
+selection, focus or floating-pane interactions. See `vvmux msg mouse --help`.
 
-Send a drag as one `mouse path` with `--point` repeated, never as separate down/move/up calls: a
-failure between them leaves a button held. Up to 1,000 points.
+| Operation | Attached | Detached |
+|---|---|---|
+| Cell and relative mouse input | Uses pane cell geometry | Uses pane cell geometry |
+| Physical pixel mouse input | Requires nonzero cell metrics | Refused |
+| `layout` visibility | Reports projected panes | Every pane reports `visible: false` |
+| `wait rendered`, `capture --rendered`, `verify.rendered`, `mouse --wait-rendered` | Waits for a mux client render acknowledgement | No attached client can acknowledge |
+| `get-text`, `get-grid`, `transcript`, `capture-media` | Read available mux state | Read available mux state |
+| `capture-media --scale N` above 1 | Requires `--force` to resize visible content | Allowed with a suitable producer |
+| Local Vivido pane screenshot | Requires a reachable local outer window and current crop | No outer window |
 
 ## Reading
 
@@ -144,7 +179,7 @@ failure between them leaves a button held. Up to 1,000 points.
 vvmux msg get-text --pane-id 3 --rows 200
 vvmux msg get-grid --pane-id 3
 vvmux msg transcript --pane-id 3 --after-offset "$offset" --max-bytes 65536
-vvmux msg search 'error' --pane-id 3
+vvmux msg search --pattern 'error' --pane-id 3
 vvmux msg capture --pane-id 3 --stable 500ms --no-activate
 ```
 
@@ -166,19 +201,42 @@ attached client to acknowledge a composite render, and `--grid` returns structur
 Read `inspect`'s `pane.output_offset` **before** submitting anything whose answer you intend to
 collect. It is the only way to ask for exactly the reply afterwards.
 
+`get-selection --pane-id ID` returns JSON with the selected text and a truncation flag. With no
+active copy-mode or mouse selection, `text` is null. The pane selection and the session's paste
+buffer have separate lifetimes. See `vvmux msg get-selection --help`.
+
+## Reset or respawn a pane
+
+`vvmux msg reset-pane --pane-id 3` restores a blank primary screen and default input modes.
+The running process, PTY, pane ID, name, slot and scrollback survive. The presenter retires that
+pane's Vivid sessions. Its running child can authenticate again using the existing pane root.
+
+`vvmux msg respawn-pane --pane-id 3` starts the retained command in its original working
+directory, then replaces the pane in the same slot. The replacement inherits the pane name,
+focus, zoom and transparency and starts with fresh history. Use the returned `pane_id` for the
+new process. The response also includes `previous_pane_id`. A spawn failure leaves the original
+pane and its output available, including a held pane whose process has exited. See
+`vvmux msg reset-pane --help` and `vvmux msg respawn-pane --help`.
+
 ## Waiting
 
 ```sh
-vvmux msg wait text 'ready' --pane-id 3
+vvmux msg wait text 'ready' --pane-id 3 --lines-from-bottom 4
+vvmux msg wait output 'AAE=' --base64 --pane-id 3 --after-offset "$offset"
 vvmux msg wait output 'test result' --pane-id 3 --after-offset "$offset"
 vvmux msg wait screen-change --pane-id 3 --after-screen "$screen"
 vvmux msg wait screen-stable --pane-id 3 --quiet 3s --ignore-bottom 2 --timeout 10m
 vvmux msg wait agent-state --pane-id 3 --until blocked,done
 vvmux msg wait exit --pane-id 3
-vvmux msg wait rendered --pane-id 3
+vvmux msg wait rendered --after-session "$session_sequence"
 vvmux msg wait media --pane-id 3
 vvmux msg wait media-track ...
 ```
+
+`wait output --base64` decodes a literal byte pattern; use `--regex` for a UTF-8 regular
+expression. To follow only new bytes, obtain `pane.output_offset` from `inspect` first. A wait
+whose requested offset has been evicted fails with `sequence_gap`. Read `transcript` for its
+`dropped_before_offset` and resume from a retained offset. See `vvmux msg wait output --help`.
 
 `wait media-track` needs the complete producer/context/surface/track identity. Use `focus` or
 `select-tab --wait outer` when media projection is the assertion and `--wait rendered` for the
@@ -193,11 +251,11 @@ vvmux msg new-tab
 vvmux msg select-tab --tab-id 2
 vvmux msg close-tab --tab-id 2
 vvmux msg close-pane --pane-id 3
-vvmux msg resize-pane --pane-id 3 --width 100
-vvmux msg move-pane --pane-id 3 --tab-id 2
+vvmux msg resize-pane --pane-id 3 --columns 100
+vvmux msg move-pane --pane-id 3 --to-tab 2
 vvmux msg set-flag zoom --on --pane-id 3
 vvmux msg sync-input --on --pane-id 3
-vvmux msg save-layout --name work
+vvmux msg save-layout --path work
 ```
 
 `split` takes its axis positionally (`horizontal` puts the new pane beside, `vertical` below, as tmux
@@ -228,6 +286,20 @@ landed, so retrying is worthwhile. `--scale N` asks viewport-sized producers (`v
 re-render denser; a producer whose raster is its own document (`vvpaint`) is already at full
 resolution. Scale is refused while a client is attached unless `--force`, since it visibly resizes
 the pane and changes it back.
+
+To capture the local Vivido window's terminal text and producer pixels together, run the shipped
+[attached-pane example](../../../examples/capture_vivido_pane.py) with `vvmux`, `vivido` and
+ImageMagick's `magick` on PATH:
+
+```sh
+python3 examples/capture_vivido_pane.py MUX_SESSION PANE_ID NEW.png --vivido-session OUTER_SESSION
+```
+
+Use `--after-frame N` to require a later Vivido frame. The helper adds window padding to
+`pane.outer_crop`, checks the frame metrics and rechecks the pane and attachment before writing.
+From a separate client, supply the known outer session when the mux omits its name. Detached
+sessions have no outer window. An outer client reached over vvssh must capture on the host
+running Vivido.
 
 ## Agents
 
@@ -287,23 +359,61 @@ finished.
 vvmux msg subscribe --name pane.screen_changed --name agent.status_changed
 vvmux msg run-plan --file plan.json --preflight
 vvmux msg lease acquire --scope input --pane-id 3 --holder my-name
-vvmux msg lease renew --lease ID
-vvmux msg lease release --lease ID
+vvmux msg lease renew ID
+vvmux msg lease release ID
 vvmux msg lease list
 vvmux msg record start recording.vvmux
 vvmux msg record stop
 vvmux replay recording.vvmux
 ```
 
-Event kinds include `session.started`, `pane.opened`, `pane.exited`, `pane.closed`,
-`pane.screen_changed`, `agent.status_changed`, `layout.changed`, and `focus.changed`; take the full
-list from `capabilities`.
+Get the complete event list with `vvmux msg capabilities | jq -r '.event_kinds[]'`. A filtered
+subscription still reports gaps when journal entries have been evicted. See `msg subscribe --help`.
 
-A plan runs over one connection, `bind` carries a result into a later step by JSON Pointer, and
-`{"$ref":"alias"}` substitutes it, so pane IDs never have to be parsed out and passed back by hand.
-References are backward-only and the whole plan is validated before any of it runs. `--preflight`
-runs only the observations; `verify` on a step puts a newer screen or an acknowledged render in the
-same transaction as the action.
+| Event | Payload fields |
+|---|---|
+| `pane.output` | `pane_id`, `from_offset`, exclusive `output_offset`, and `base64` for up to 64 KiB of raw PTY output |
+| `pane.title_changed` | `pane_id` and the new `title` or null |
+| `pane.directory_changed` | `pane_id` and the `uri` from a shell OSC 7 directory report |
+| `pane.bell` | `pane_id` and the number of bells in `count` |
+
+`inspect` still provides process cwd where available for shells that emit no OSC 7 directory reports.
+Output offsets are per pane. Journal sequence numbers from `subscribe --after` are per session.
+See the running server's `capabilities.event_kinds` for availability.
+
+A plan holds 1 through 256 steps, occupies at most 1 MiB and runs over one connection. `bind` saves an action result by JSON Pointer and
+`{"$ref":"alias"}` uses the value in a later step. `--preflight` skips mutations. A step's
+`verify` can wait for a newer screen or an acknowledged render. An `assert` checks the action
+reply, the pane viewport, or both. For example:
+
+```json
+{"version":1,"steps":[
+  {"id":"pane","method":"inspect","pane_id":1,
+   "assert":{"result_pointer":"/pane/pane_id","result_equals":1}},
+  {"id":"ready","method":"inspect","pane_id":1,
+   "assert":{"text_contains":"ready","lines_from_bottom":4,"timeout_ms":5000}}
+]}
+```
+
+Text checks default to the step's pane. `assert.pane_id` can select another pane by number or
+backward reference. Omitting `lines_from_bottom` searches the full displayed viewport. A window
+of 1 through 1,000 physical rows follows changes until the timeout (5 s by default, 24 h maximum).
+Result comparisons use exact JSON equality, including null, and an empty pointer addresses the
+whole action reply. A failed assertion obeys the step's `on_error` policy. A continuing plan
+still exits nonzero if any step failed.
+
+For a CI job with a fresh detached server, run the following in one shell. Use a plan whose checks
+match the pane's actual state. See `vvmux msg run-plan --help`.
+
+```sh
+session="plan-$$"
+vvmux new --detached --session "$session" || exit 1
+trap 'vvmux kill-session --target "$session" >/dev/null' EXIT
+vvmux msg --target "$session" run-plan --file plan.json --report junit --output steps.xml >steps.ndjson
+```
+
+`--report sarif --output steps.sarif` produces SARIF 2.1.0. Both formats include visited steps,
+including skips and the step that triggered an abort. The streaming NDJSON stays on stdout.
 
 Leases are advisory: an unleased pane is open to anyone. Every lease expires, so renew a long job
 rather than asking for a long TTL, and release it when done.

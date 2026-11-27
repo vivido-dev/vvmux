@@ -232,7 +232,7 @@ pub enum MsgCommand {
     /// Run a bounded multi-step plan over one connection.
     ///
     /// Results flow between steps by alias, so a plan does not have to be re-parsed and re-passed
-    /// by hand. Emits NDJSON: one `plan_started`, one line per step, one `plan_completed`.
+    /// by hand. Emits NDJSON with `plan_started`, each visited step, and `plan_completed`.
     RunPlan {
         /// The plan file. Omitted or `-` reads stdin.
         #[arg(long)]
@@ -243,6 +243,12 @@ pub enum MsgCommand {
         /// Run only the steps that observe, skipping every mutation.
         #[arg(long, conflicts_with = "dry_run")]
         preflight: bool,
+        /// Write a CI report alongside the NDJSON on stdout.
+        #[arg(long, value_enum, requires = "output", conflicts_with = "dry_run")]
+        report: Option<crate::plan::ReportFormat>,
+        /// Destination for the finished report.
+        #[arg(long, requires = "report")]
+        output: Option<std::path::PathBuf>,
     },
     /// Re-read the session's config file now, without waiting for the watcher.
     ReloadConfig,
@@ -323,9 +329,17 @@ pub enum MsgCommand {
         relative_x: Option<f32>,
         #[arg(long, requires = "relative_x")]
         relative_y: Option<f32>,
-        /// Gesture points for `path`, as `COLUMN,ROW` cells. Repeatable, 2 through 1000.
+        /// Path points: COLUMN,ROW cells, X,Ypx pixels, or X,Yrel fractions from 0 to 1.
         #[arg(long = "point", value_parser = parse_mouse_point)]
-        points: Vec<(u16, u16)>,
+        points: Vec<crate::ipc::MousePosition>,
+        /// Pace press, motion, and release over this duration.
+        #[arg(long, value_parser = parse_timeout)]
+        duration: Option<Duration>,
+        /// Wait until the attached client acknowledges a render after delivery.
+        #[arg(long)]
+        wait_rendered: bool,
+        #[arg(long, default_value = "30s", value_parser = parse_timeout)]
+        timeout: Duration,
         #[arg(long, value_enum, default_value_t = crate::ipc::MouseButton::Left)]
         button: crate::ipc::MouseButton,
         #[arg(long, value_enum, default_value_t = crate::ipc::MouseRoute::Application)]
@@ -394,11 +408,16 @@ pub enum MsgCommand {
         /// Return exact bytes, base64-encoded, instead of lossy text.
         #[arg(long)]
         base64: bool,
+        /// Write exact bytes to stdout.
+        #[arg(long, conflicts_with = "base64")]
+        raw: bool,
         #[arg(long)]
         max_bytes: Option<u32>,
         #[arg(long)]
         pane_id: Option<u64>,
     },
+    /// Read the active copy-mode or mouse selection for a pane as JSON.
+    GetSelection(PaneTarget),
     /// Give one pane an exact size instead of nudging it one step.
     ResizePane {
         #[arg(long)]
@@ -709,6 +728,10 @@ pub enum MsgCommand {
         #[arg(long, default_value = "30s", value_parser = parse_timeout)]
         timeout: Duration,
     },
+    /// Reset the terminal in its existing PTY, preserving its pane ID and scrollback.
+    ResetPane(PaneTarget),
+    /// Spawn the retained command in the same slot and return its fresh pane ID.
+    RespawnPane(PaneTarget),
     /// Close one explicitly identified pane.
     ClosePane {
         #[arg(long)]
@@ -879,6 +902,9 @@ pub enum WaitCommand {
         text: String,
         #[arg(long)]
         regex: bool,
+        /// Only search the last N physical rows of the current viewport.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        lines_from_bottom: Option<u16>,
         #[arg(long)]
         after_screen: Option<u64>,
         #[arg(long, default_value = "30s", value_parser = parse_timeout)]
@@ -889,6 +915,9 @@ pub enum WaitCommand {
     /// Wait for a pattern in a pane's output stream, which a screen wait can miss.
     Output {
         pattern: String,
+        /// Match the exact bytes of a base64-encoded pattern.
+        #[arg(long, conflicts_with = "regex")]
+        base64: bool,
         #[arg(long)]
         regex: bool,
         #[arg(long)]
@@ -1022,12 +1051,18 @@ pub fn run(
         file,
         dry_run,
         preflight,
+        report,
+        output,
     } = command
     {
         return crate::plan::run(
             &target,
             file.as_deref(),
-            crate::plan::PlanOptions { dry_run, preflight },
+            crate::plan::PlanOptions {
+                dry_run,
+                preflight,
+                report: report.zip(output),
+            },
         );
     }
     let (method, explicit_pane, allow_focused, output) = build_request(command)?;
@@ -1062,6 +1097,8 @@ pub fn run(
     if matches!(
         &method,
         AutomationMethod::ClosePane
+            | AutomationMethod::ResetPane
+            | AutomationMethod::RespawnPane
             | AutomationMethod::ReportAgent { .. }
             | AutomationMethod::ReportAgentSession { .. }
             | AutomationMethod::ClearAgentReport { .. }
@@ -1113,6 +1150,15 @@ pub fn run(
                 )
             })?;
             io::stdout().write_all(text.as_bytes())
+        }
+        Output::RawTranscript => {
+            let encoded = result["base64"].as_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "transcript omitted its bytes")
+            })?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            io::stdout().write_all(&bytes)
         }
         Output::Json => {
             serde_json::to_writer(io::stdout().lock(), &result).map_err(io::Error::other)?;
@@ -1250,22 +1296,43 @@ enum Output {
     Json,
     TraceFollow,
     EventStream,
+    RawTranscript,
 }
 
-/// A `COLUMN,ROW` gesture point.
-fn parse_mouse_point(value: &str) -> Result<(u16, u16), String> {
-    let (column, row) = value
-        .split_once(',')
-        .ok_or_else(|| format!("expected COLUMN,ROW, got `{value}`"))?;
-    Ok((
-        column
-            .trim()
-            .parse()
-            .map_err(|_invalid| format!("invalid column in `{value}`"))?,
-        row.trim()
-            .parse()
-            .map_err(|_invalid| format!("invalid row in `{value}`"))?,
-    ))
+/// Parse one pane-local gesture point.
+fn parse_mouse_point(value: &str) -> Result<crate::ipc::MousePosition, String> {
+    use crate::ipc::MousePosition;
+    let split = |value: &str| {
+        value
+            .split_once(',')
+            .map(|(a, b)| (a.trim().to_owned(), b.trim().to_owned()))
+            .ok_or_else(|| "expected a comma-separated point".to_owned())
+    };
+    if let Some(value) = value.strip_suffix("px") {
+        let (x, y) = split(value)?;
+        return Ok(MousePosition::Pixel {
+            x: x.parse().map_err(|_invalid| "invalid pixel x")?,
+            y: y.parse().map_err(|_invalid| "invalid pixel y")?,
+        });
+    }
+    if let Some(value) = value.strip_suffix("rel") {
+        let (x, y) = split(value)?;
+        return mouse_position(
+            None,
+            None,
+            None,
+            None,
+            Some(x.parse().map_err(|_invalid| "invalid relative x")?),
+            Some(y.parse().map_err(|_invalid| "invalid relative y")?),
+        )
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "missing relative point".to_owned());
+    }
+    let (x, y) = split(value)?;
+    Ok(MousePosition::Cell {
+        column: x.parse().map_err(|_invalid| "invalid column")?,
+        row: y.parse().map_err(|_invalid| "invalid row")?,
+    })
 }
 
 /// Exactly one coordinate form, converted to the wire's pane-local position.
@@ -1388,6 +1455,9 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             relative_x,
             relative_y,
             points,
+            duration,
+            wait_rendered,
+            timeout,
             button,
             route,
             mods,
@@ -1405,13 +1475,10 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                     alt,
                     ctrl,
                     scroll,
-                    points: points
-                        .into_iter()
-                        .map(|(column, row)| crate::ipc::MousePosition::Cell { column, row })
-                        .collect(),
-                    duration_ms: None,
-                    wait_rendered: false,
-                    timeout_ms: 30_000,
+                    points,
+                    duration_ms: duration.map(millis),
+                    wait_rendered,
+                    timeout_ms: millis(timeout),
                 },
                 pane_id,
                 true,
@@ -1517,20 +1584,28 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             true,
             Output::Json,
         ),
+        MsgCommand::GetSelection(PaneTarget { pane_id }) => {
+            (AutomationMethod::GetSelection, pane_id, true, Output::Json)
+        }
         MsgCommand::Transcript {
             after_offset,
             base64,
+            raw,
             max_bytes,
             pane_id,
         } => (
             AutomationMethod::Transcript {
                 after_offset,
-                base64,
+                base64: base64 || raw,
                 max_bytes,
             },
             pane_id,
             true,
-            Output::Json,
+            if raw {
+                Output::RawTranscript
+            } else {
+                Output::Json
+            },
         ),
         MsgCommand::ResizePane {
             columns,
@@ -1919,6 +1994,18 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 Output::Silent
             },
         ),
+        MsgCommand::ResetPane(pane) => (
+            AutomationMethod::ResetPane,
+            pane.pane_id,
+            false,
+            Output::Json,
+        ),
+        MsgCommand::RespawnPane(pane) => (
+            AutomationMethod::RespawnPane,
+            pane.pane_id,
+            false,
+            Output::Json,
+        ),
         MsgCommand::ClosePane { pane_id } => {
             (AutomationMethod::ClosePane, pane_id, false, Output::Silent)
         }
@@ -2087,6 +2174,7 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
         MsgCommand::Wait { command } => match command {
             WaitCommand::Output {
                 pattern,
+                base64,
                 regex,
                 after_offset,
                 timeout,
@@ -2101,6 +2189,7 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                 (
                     AutomationMethod::WaitOutput {
                         pattern,
+                        base64,
                         regex,
                         after_offset,
                         timeout_ms: millis(timeout),
@@ -2113,6 +2202,7 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
             WaitCommand::Text {
                 text,
                 regex,
+                lines_from_bottom,
                 after_screen,
                 timeout,
                 pane_id,
@@ -2127,6 +2217,7 @@ fn build_request(command: MsgCommand) -> io::Result<(AutomationMethod, Option<u6
                     AutomationMethod::WaitText {
                         text,
                         regex,
+                        lines_from_bottom,
                         after_screen,
                         timeout_ms: millis(timeout),
                     },

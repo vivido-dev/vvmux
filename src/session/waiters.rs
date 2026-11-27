@@ -662,6 +662,41 @@ impl SessionActor {
                     })
                 })
             }
+            AutomationWaitKind::MouseRendered {
+                client_id,
+                after_session,
+                result,
+            } => {
+                let Some(client) = self.clients.get(client_id) else {
+                    return Some(Err(AutomationError::new(
+                        "unsupported",
+                        "mouse render witness disconnected",
+                    )));
+                };
+                if waiter
+                    .pane_id
+                    .is_some_and(|id| !self.panes.contains_key(&id))
+                {
+                    return Some(Err(AutomationError::new(
+                        "pane_not_found",
+                        "mouse target closed",
+                    )));
+                }
+                if waiter
+                    .pane_id
+                    .is_some_and(|id| !self.pane_is_visibly_present(id))
+                {
+                    return Some(Err(AutomationError::new(
+                        "invalid_state",
+                        "mouse target became hidden before render acknowledgement",
+                    )));
+                }
+                (client.rendered_session_sequence >= *after_session).then(|| {
+                    let mut result = result.clone();
+                    result["rendered_session_sequence"] = client.rendered_session_sequence.into();
+                    Ok(result)
+                })
+            }
             AutomationWaitKind::Rendered { after_session } => {
                 let Some(client) = self.witness_client() else {
                     return Some(Err(AutomationError::new(
@@ -899,14 +934,23 @@ impl SessionActor {
                 match kind {
                     AutomationWaitKind::Text {
                         pattern,
+                        lines_from_bottom,
                         after_screen,
                     } => {
                         if after_screen.is_some_and(|sequence| pane.screen_sequence <= sequence) {
                             return None;
                         }
-                        let text = pane
-                            .terminal
-                            .visible_text(pane.copy.as_ref().map_or(0, |copy| copy.offset));
+                        let terminal = &pane.terminal;
+                        let offset = pane
+                            .copy
+                            .as_ref()
+                            .map_or(0, |copy| copy.offset)
+                            .min(terminal.history_len());
+                        let rows = lines_from_bottom
+                            .map_or(terminal.rows(), usize::from)
+                            .min(terminal.rows());
+                        let start = (terminal.rows() - rows) as isize - offset as isize;
+                        let text = terminal.extract_rows(start, rows);
                         let matched = match pattern {
                             AutomationTextPattern::Literal(pattern) => text.contains(pattern),
                             AutomationTextPattern::Regex(pattern) => pattern.is_match(&text),
@@ -934,10 +978,16 @@ impl SessionActor {
                         }
                         // Lossy rather than refused: a pane's output is bytes, and a multi-byte
                         // character split across two reads must not make a wait fail.
-                        let text = String::from_utf8_lossy(&bytes);
                         let matched = match pattern {
-                            AutomationTextPattern::Literal(pattern) => text.contains(pattern),
-                            AutomationTextPattern::Regex(pattern) => pattern.is_match(&text),
+                            OutputPattern::Bytes(pattern) => {
+                                memchr::memmem::find(&bytes, pattern).is_some()
+                            }
+                            OutputPattern::Text(AutomationTextPattern::Literal(pattern)) => {
+                                String::from_utf8_lossy(&bytes).contains(pattern)
+                            }
+                            OutputPattern::Text(AutomationTextPattern::Regex(pattern)) => {
+                                pattern.is_match(&String::from_utf8_lossy(&bytes))
+                            }
                         };
                         matched.then(|| {
                             Ok(serde_json::json!({

@@ -36,7 +36,9 @@ pub const MAGIC: &[u8; 4] = b"VVMX";
 /// differ in client-message framing, so accepting an older peer would misdecode bridge state.
 /// Version 26 binds window action claims and replies to their original server and bridge.
 /// Version 27 carries same-host monotonic deadlines and publication-bound document edits.
-pub const VERSION: u16 = 27;
+/// Version 28 adds paced and render-verified mouse gestures, scoped output observations,
+/// terminal reset/respawn, and the physical-row limit for text waits.
+pub const VERSION: u16 = 28;
 /// Raised when a peer's preface carries a different [`VERSION`].
 ///
 /// A session server outlives the binary that spawned it, so rebuilding across a version bump
@@ -647,11 +649,15 @@ pub enum AutomationMethod {
         base64: bool,
         max_bytes: Option<u32>,
     },
+    /// Read this pane's active copy-mode or retained mouse selection.
+    GetSelection,
     /// Wait for a pattern in a pane's output stream rather than on its screen.
     ///
     /// A screen wait can miss text that was overwritten before any snapshot ran; this cannot.
     WaitOutput {
         pattern: String,
+        #[serde(default)]
+        base64: bool,
         regex: bool,
         after_offset: Option<u64>,
         timeout_ms: u64,
@@ -755,6 +761,9 @@ pub enum AutomationMethod {
     WaitText {
         text: String,
         regex: bool,
+        /// Restrict the match to the last physical rows of the displayed viewport.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines_from_bottom: Option<u16>,
         after_screen: Option<u64>,
         timeout_ms: u64,
     },
@@ -818,6 +827,8 @@ pub enum AutomationMethod {
         condition: MediaTrackWaitCondition,
         timeout_ms: u64,
     },
+    ResetPane,
+    RespawnPane,
 }
 
 /// What a method does, so a caller can tell an observation from a mutation before running one.
@@ -907,6 +918,7 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         capability("agent_explain", Observe),
         capability("subscribe", Observe),
         capability("transcript", Observe),
+        capability("get_selection", Observe),
         capability("wait_output", Observe),
         capability("wait_text", Observe),
         capability("wait_screen_change", Observe),
@@ -933,6 +945,8 @@ pub const METHOD_CAPABILITIES: &[MethodCapability] = {
         capability("split", Pane),
         capability("run", Pane),
         capability("close_pane", Pane),
+        capability("reset_pane", Pane),
+        capability("respawn_pane", Pane),
         capability("activate_pane", Layout),
         // Activation is a layout change, so a read-only pass must skip this even though what it
         // returns is an observation. `--no-activate` exists for exactly that case.
@@ -1008,6 +1022,7 @@ impl AutomationMethod {
             Self::CaptureMedia { .. } => "capture_media",
             Self::Mouse { .. } => "mouse",
             Self::Transcript { .. } => "transcript",
+            Self::GetSelection => "get_selection",
             Self::WaitOutput { .. } => "wait_output",
             Self::ResizePane { .. } => "resize_pane",
             Self::MovePane { .. } => "move_pane",
@@ -1021,6 +1036,8 @@ impl AutomationMethod {
             Self::Focus => "focus",
             Self::FocusWait { .. } => "focus_wait",
             Self::ClosePane => "close_pane",
+            Self::ResetPane => "reset_pane",
+            Self::RespawnPane => "respawn_pane",
             Self::Typing { .. } => "typing",
             Self::Key { .. } => "key",
             Self::Paste { .. } => "paste",
@@ -1068,19 +1085,27 @@ impl EventFilter {
     /// Longest event name a filter may list, in bytes.
     pub const MAX_NAME_BYTES: usize = 64;
 
-    pub fn accepts(&self, envelope: &PluginEventEnvelope) -> bool {
+    pub fn accepts(&self, envelope: &PluginEventEnvelope, can_read_panes: bool) -> bool {
         match envelope {
             // A gap always passes. It reports events this subscriber will never see, and hiding
             // that because the lost events might not have matched would be a lie about coverage.
             PluginEventEnvelope::Gap { .. } => true,
             PluginEventEnvelope::Event { name, context, .. } => {
-                (self.names.is_empty() || self.names.iter().any(|allowed| allowed == name))
+                (can_read_panes || !event_reads_pane(name))
+                    && (self.names.is_empty() || self.names.iter().any(|allowed| allowed == name))
                     && self
                         .pane_id
                         .is_none_or(|pane_id| context.pane_id == Some(pane_id))
             }
         }
     }
+}
+
+pub(crate) fn event_reads_pane(name: &str) -> bool {
+    matches!(
+        name,
+        "pane.output" | "pane.title_changed" | "pane.directory_changed"
+    )
 }
 
 /// Which terminal text a pane read returns.

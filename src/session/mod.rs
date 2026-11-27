@@ -59,6 +59,8 @@ mod automation;
 mod clients;
 mod commands;
 mod copy_vi;
+mod mouse_gestures;
+use mouse_gestures::PacedMouse;
 mod documents;
 mod input;
 mod input_epochs;
@@ -469,6 +471,7 @@ struct PluginEventSubscription {
     sender: mpsc::SyncSender<PluginStreamMessage>,
     cancel: crate::platform::ConnectionCancel,
     filter: crate::ipc::EventFilter,
+    can_read_panes: bool,
 }
 
 enum PluginStreamMessage {
@@ -688,7 +691,7 @@ enum AttachmentView {
 #[derive(Default)]
 struct KittyTransferBuffer {
     transfers: HashMap<PaneId, Vec<u8>>,
-    pending: VecDeque<Vec<u8>>,
+    pending: VecDeque<(PaneId, Vec<u8>)>,
     bytes: usize,
 }
 
@@ -697,6 +700,20 @@ impl KittyTransferBuffer {
         self.transfers.clear();
         self.pending.clear();
         self.bytes = 0;
+    }
+
+    fn forget_pane(&mut self, pane: PaneId) {
+        if let Some(transfer) = self.transfers.remove(&pane) {
+            self.bytes -= transfer.len();
+        }
+        self.pending.retain(|(owner, packet)| {
+            if *owner == pane {
+                self.bytes -= packet.len();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn push(&mut self, pane_id: PaneId, packet: Vec<u8>, starts: bool, more: bool) -> bool {
@@ -721,7 +738,7 @@ impl KittyTransferBuffer {
             if more {
                 self.transfers.insert(pane_id, packet);
             } else {
-                self.pending.push_back(packet);
+                self.pending.push_back((pane_id, packet));
             }
             return true;
         }
@@ -737,7 +754,7 @@ impl KittyTransferBuffer {
         if more {
             self.transfers.insert(pane_id, transfer);
         } else {
-            self.pending.push_back(transfer);
+            self.pending.push_back((pane_id, transfer));
         }
         true
     }
@@ -754,9 +771,9 @@ impl KittyTransferBuffer {
     }
 
     fn drain_pending(&mut self) -> Vec<u8> {
-        let capacity = self.pending.iter().map(Vec::len).sum();
+        let capacity = self.pending.iter().map(|(_, packet)| packet.len()).sum();
         let mut prefix = Vec::with_capacity(capacity);
-        while let Some(packet) = self.pending.pop_front() {
+        while let Some((_, packet)) = self.pending.pop_front() {
             self.bytes = self.bytes.saturating_sub(packet.len());
             prefix.extend_from_slice(&packet);
         }
@@ -1012,6 +1029,11 @@ struct PendingAgentRead {
 }
 
 enum AutomationWaitKind {
+    MouseRendered {
+        client_id: u64,
+        after_session: u64,
+        result: serde_json::Value,
+    },
     /// A scaled capture, waiting for the producer to re-render at the raised cell metrics.
     ///
     /// `baseline` is what the pane's layers looked like before the resize, so the wait resolves on
@@ -1026,6 +1048,7 @@ enum AutomationWaitKind {
     },
     Text {
         pattern: AutomationTextPattern,
+        lines_from_bottom: Option<u16>,
         after_screen: Option<u64>,
     },
     /// Match against a pane's raw output stream rather than its screen.
@@ -1033,7 +1056,7 @@ enum AutomationWaitKind {
     /// The difference that matters: a screen wait can miss text entirely, because the pane may
     /// overwrite it before any snapshot runs. Output is matched as it arrives.
     Output {
-        pattern: AutomationTextPattern,
+        pattern: OutputPattern,
         after_offset: Option<u64>,
     },
     /// A command running in a pane's own shell, waiting for its OSC 133 completion marker.
@@ -1116,6 +1139,11 @@ enum AgentPromptPhase {
 enum AutomationTextPattern {
     Literal(String),
     Regex(regex::Regex),
+}
+
+enum OutputPattern {
+    Text(AutomationTextPattern),
+    Bytes(Vec<u8>),
 }
 
 #[derive(Clone, Copy)]
@@ -2122,6 +2150,7 @@ struct SessionActor {
     last_plugin_focus: Option<(bool, Option<u64>, Option<PaneId>)>,
     last_plugin_media_revision: u64,
     automation_waiters: Vec<AutomationWaiter>,
+    mouse_gestures: Vec<PacedMouse>,
     alt_reads: HashMap<PaneId, PendingAgentRead>,
     /// Input scheduled to reach a pane later, earliest first.
     delayed_inputs: BinaryHeap<Reverse<DelayedInput>>,
@@ -2388,6 +2417,7 @@ pub fn start(options: SessionOptions) -> io::Result<ActorHandle> {
         last_plugin_focus: None,
         last_plugin_media_revision: 0,
         automation_waiters: Vec::new(),
+        mouse_gestures: Vec::new(),
         alt_reads: HashMap::new(),
         delayed_inputs: BinaryHeap::new(),
         next_delayed_input: 0,
@@ -2452,6 +2482,9 @@ impl SessionActor {
                 IDLE_WAKE_INTERVAL
             };
             timeout = timeout.min(self.next_automation_deadline());
+            if let Some(next) = self.next_mouse_deadline() {
+                timeout = timeout.min(next);
+            }
             timeout = timeout.min(self.next_agent_evaluation_delay());
             timeout = timeout.min(self.next_notice_deadline());
             timeout = timeout.min(self.next_sync_flush_delay());
@@ -2497,6 +2530,7 @@ impl SessionActor {
                     // for the cases where classification changed nothing.
                     self.evaluate_agent_states();
                     self.poll_alt_reads();
+                    self.poll_mouse_gestures();
                     self.check_automation_waiters();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -2519,6 +2553,7 @@ impl SessionActor {
                     // for the cases where classification changed nothing.
                     self.evaluate_agent_states();
                     self.poll_alt_reads();
+                    self.poll_mouse_gestures();
                     self.check_automation_waiters();
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2703,6 +2738,7 @@ impl SessionActor {
                     .retain(|(client_id, _)| *client_id != id);
                 self.automation_waiters
                     .retain(|waiter| waiter.reply.client_id != id);
+                self.cancel_client_gestures(id);
                 self.alt_reads
                     .retain(|_, pending| pending.reply.client_id != id);
                 self.plugin_event_subscriptions
@@ -2712,8 +2748,23 @@ impl SessionActor {
             ActorEvent::PtyOutput(pane_id, bytes) => {
                 // Recorded before the terminal consumes it: the point of the transcript is the
                 // bytes the grid is about to overwrite.
-                if let Some(pane) = self.panes.get_mut(&pane_id) {
-                    pane.transcript.push(&bytes);
+                let Some(pane) = self.panes.get_mut(&pane_id) else {
+                    return Ok(());
+                };
+                let mut offset = pane.transcript.offset;
+                pane.transcript.push(&bytes);
+                for chunk in bytes.chunks(64 * 1024) {
+                    let end = offset.saturating_add(chunk.len() as u64);
+                    self.publish_plugin_event(
+                        "pane.output",
+                        serde_json::json!({
+                            "pane_id": pane_id, "from_offset": offset, "output_offset": end,
+                            "base64": base64::engine::general_purpose::STANDARD.encode(chunk),
+                        }),
+                        Some(pane_id),
+                        None,
+                    );
+                    offset = end;
                 }
                 if self.recorder.is_some() {
                     use base64::Engine as _;
@@ -3004,7 +3055,8 @@ impl SessionActor {
     {
         let focused = self.active_tab().is_some_and(|tab| tab.focused == pane_id);
         let mut title = None;
-        let mut bell = false;
+        let mut directory = None;
+        let mut bell_count = 0u32;
         let mut input_warning = false;
         let mut input_closed = false;
         let mut changed_screen_sequence = None;
@@ -3044,11 +3096,12 @@ impl SessionActor {
                     TerminalEvent::PtyWrite(bytes) => {
                         replies.push(bytes);
                     }
-                    TerminalEvent::Title(next_title) if focused => {
-                        title = next_title;
+                    TerminalEvent::Title(next_title) => {
+                        title = Some(next_title);
                     }
+                    TerminalEvent::Directory(uri) => directory = Some(uri),
                     TerminalEvent::Bell => {
-                        bell = true;
+                        bell_count = bell_count.saturating_add(1);
                     }
                     TerminalEvent::VividMarker {
                         marker,
@@ -3160,10 +3213,32 @@ impl SessionActor {
                 self.session_sequence = self.session_sequence.wrapping_add(1);
             }
             if let Some(title) = title {
-                self.send_to_clients(&ServerMessage::Title(format!("{title} — vvmux")));
+                if focused && let Some(value) = &title {
+                    self.send_to_clients(&ServerMessage::Title(format!("{value} — vvmux")));
+                }
+                self.publish_plugin_event(
+                    "pane.title_changed",
+                    serde_json::json!({"pane_id":pane_id,"title":title}),
+                    Some(pane_id),
+                    None,
+                );
             }
-            if bell {
+            if let Some(uri) = directory {
+                self.publish_plugin_event(
+                    "pane.directory_changed",
+                    serde_json::json!({"pane_id":pane_id,"uri":uri}),
+                    Some(pane_id),
+                    None,
+                );
+            }
+            if bell_count != 0 {
                 self.send_to_clients(&ServerMessage::Bell);
+                self.publish_plugin_event(
+                    "pane.bell",
+                    serde_json::json!({"pane_id":pane_id,"count":bell_count}),
+                    Some(pane_id),
+                    None,
+                );
             }
             self.schedule_render();
         }
@@ -3296,6 +3371,7 @@ fn pane_cwd(_child_pid: u32) -> Option<String> {
 ///
 /// `pixels` is present only when the caller gave pixels, because that is the one form the SGR
 /// pixel encoder can pass through exactly; a cell has no sub-cell position to preserve.
+#[derive(Clone, Copy)]
 struct ResolvedMousePoint {
     x: u16,
     y: u16,
@@ -3465,6 +3541,8 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
         | AutomationMethod::CaptureMedia { .. }
         | AutomationMethod::ClearAgentReport { .. }
         | AutomationMethod::ClosePane
+        | AutomationMethod::ResetPane
+        | AutomationMethod::RespawnPane
         | AutomationMethod::Focus
         | AutomationMethod::FocusWait { .. }
         | AutomationMethod::GetGrid { .. }
@@ -3495,6 +3573,7 @@ fn method_needs_pane(method: &AutomationMethod) -> bool {
         | AutomationMethod::WaitExit { .. }
         | AutomationMethod::WaitMedia { .. }
         | AutomationMethod::WaitMediaTrack { .. }
+        | AutomationMethod::GetSelection
         | AutomationMethod::WaitOutput { .. }
         | AutomationMethod::WaitScreenChange { .. }
         | AutomationMethod::WaitScreenStable { .. }
@@ -3809,6 +3888,13 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
         AutomationMethod::WaitText { text, regex, .. } if *regex && text.len() > 8 * 1024 => Err(
             AutomationError::new("limit_exceeded", "regular expression exceeds 8 KiB"),
         ),
+        AutomationMethod::WaitText {
+            lines_from_bottom: Some(0 | 1001..),
+            ..
+        } => Err(AutomationError::new(
+            "invalid_params",
+            "lines_from_bottom must be 1 through 1000",
+        )),
         AutomationMethod::TraceMedia { limit, .. }
             if !(1..=crate::media_trace::MAX_MEDIA_TRACE_QUERY_EVENTS).contains(limit) =>
         {
@@ -3834,6 +3920,21 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 "media trace identity filters require producer-id",
             ))
         }
+        AutomationMethod::Mouse {
+            action,
+            duration_ms: Some(ms),
+            timeout_ms,
+            ..
+        } if *action != crate::ipc::MouseAction::Path
+            || *ms == 0
+            || *ms >= *timeout_ms
+            || *ms > MAX_AUTOMATION_TIMEOUT_MS =>
+        {
+            Err(AutomationError::new(
+                "invalid_params",
+                "mouse duration requires a path and must be positive, at most 24h, and shorter than timeout",
+            ))
+        }
         AutomationMethod::WaitScreenStable { quiet_ms, .. }
             if !(1..=24 * 60 * 60 * 1000).contains(quiet_ms) =>
         {
@@ -3844,7 +3945,9 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
         }
         method => {
             let timeout = match method {
-                AutomationMethod::WaitText { timeout_ms, .. }
+                AutomationMethod::Mouse { timeout_ms, .. }
+                | AutomationMethod::WaitOutput { timeout_ms, .. }
+                | AutomationMethod::WaitText { timeout_ms, .. }
                 | AutomationMethod::WaitScreenChange { timeout_ms, .. }
                 | AutomationMethod::WaitScreenStable { timeout_ms, .. }
                 | AutomationMethod::WaitRendered { timeout_ms, .. }
@@ -3862,7 +3965,7 @@ fn validate_automation_method(method: &AutomationMethod) -> Result<(), Automatio
                 }
                 _ => None,
             };
-            if timeout.is_some_and(|timeout| !(1..=24 * 60 * 60 * 1000).contains(&timeout)) {
+            if timeout.is_some_and(|timeout| !(1..=MAX_AUTOMATION_TIMEOUT_MS).contains(&timeout)) {
                 Err(AutomationError::new(
                     "invalid_params",
                     "timeout must be from 1ms through 24h",
@@ -4223,8 +4326,11 @@ fn automation_base_limits() -> serde_json::Value {
     })
 }
 
+/// Largest deadline accepted from an automation caller.
+const MAX_AUTOMATION_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
+
 fn deadline(timeout_ms: u64) -> Instant {
-    Instant::now() + Duration::from_millis(timeout_ms.clamp(1, 24 * 60 * 60 * 1000))
+    Instant::now() + Duration::from_millis(timeout_ms.clamp(1, MAX_AUTOMATION_TIMEOUT_MS))
 }
 
 fn rect_json(rect: Rect) -> serde_json::Value {
@@ -5815,9 +5921,13 @@ fn extract_mouse_selection(terminal: &Terminal, selection: MouseSelection) -> Ve
                 if wrote_row {
                     output.push('\n');
                 }
-                output.push_str(
-                    &extract_selection_row(terminal, line, 0, line_len).unwrap_or_default(),
-                );
+                let row = extract_selection_row(terminal, line, 0, line_len).unwrap_or_default();
+                let remaining = COPY_BUFFER_LIMIT - output.len();
+                if row.len() >= remaining {
+                    output.push_str(&row[..row.floor_char_boundary(remaining)]);
+                    break;
+                }
+                output.push_str(&row);
                 wrote_row = true;
             }
             output.into_bytes()

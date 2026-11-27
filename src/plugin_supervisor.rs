@@ -1695,6 +1695,9 @@ fn run_manager(inputs: ManagerInputs) {
                 if context.causation_depth >= 8 {
                     continue;
                 }
+                // Pane text, titles and reported directories carry the same private content
+                // a plugin reads through pane.get_text.
+                let reads_pane = crate::ipc::event_reads_pane(&name);
                 let plugin_ids = registry.plugins.keys().cloned().collect::<Vec<_>>();
                 for plugin_id in plugin_ids {
                     let Some(plugin) = registry.plugins.get(&plugin_id).cloned() else {
@@ -1703,7 +1706,9 @@ fn run_manager(inputs: ManagerInputs) {
                     if !plugin.enabled || transitions.contains(&plugin_id) {
                         continue;
                     }
-                    if !plugin.permissions.contains(&Permission::EventsSubscribe) {
+                    if !plugin.permissions.contains(&Permission::EventsSubscribe)
+                        || (reads_pane && !plugin.permissions.contains(&Permission::PaneRead))
+                    {
                         continue;
                     }
                     let hooks = plugin
@@ -1794,6 +1799,9 @@ fn run_manager(inputs: ManagerInputs) {
                     .plugins
                     .values()
                     .filter(|plugin| plugin.enabled && !transitions.contains(&plugin.id))
+                    .filter(|plugin| {
+                        !reads_pane || plugin.permissions.contains(&Permission::PaneRead)
+                    })
                     .flat_map(|plugin| {
                         plugin
                             .workflows

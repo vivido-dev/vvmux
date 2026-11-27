@@ -441,6 +441,21 @@ fn kitty_transfers_are_pane_isolated_bounded_and_drained_in_order() {
 }
 
 #[test]
+fn retiring_one_panes_kitty_transfers_preserves_other_pending_packets_and_credit() {
+    let mut transfers = KittyTransferBuffer::default();
+    assert!(transfers.push(1, vec![1, 1], true, false));
+    assert!(transfers.push(2, vec![2, 2], true, false));
+    assert!(transfers.push(1, vec![3], true, true));
+    assert!(transfers.push(2, vec![4], true, true));
+    transfers.forget_pane(1);
+    assert_eq!(transfers.bytes, 3);
+    assert!(!transfers.push(1, vec![5], false, false));
+    assert!(transfers.push(2, vec![6], false, false));
+    assert_eq!(transfers.drain_pending(), vec![2, 2, 4, 6]);
+    assert_eq!(transfers.bytes, 0);
+}
+
+#[test]
 fn clearing_kitty_transfers_drops_attachment_pixels() {
     let mut transfers = KittyTransferBuffer::default();
     assert!(transfers.push(1, b"upload".to_vec(), true, false));
@@ -2267,6 +2282,7 @@ fn automation_raw_request_limits_are_enforced() {
         validate_automation_method(&AutomationMethod::WaitText {
             text: "x".into(),
             regex: false,
+            lines_from_bottom: None,
             after_screen: None,
             timeout_ms: 0,
         })
@@ -2334,4 +2350,63 @@ fn collapse_prunes_only_its_own_tiles_and_reserves_one_dock_row() {
     tab.set_focus(11);
     assert!(tab.collapse_pane(tab.focused).is_err());
     assert_eq!(visible_projections(&other, area), original);
+}
+
+#[test]
+fn event_streams_apply_pane_read_scope_on_live_delivery_and_replay() {
+    use crate::ipc::EventFilter;
+    let mut journal = PluginEventJournal::default();
+    let filter = EventFilter {
+        names: Vec::new(),
+        pane_id: Some(1),
+    };
+    let other = EventFilter {
+        names: Vec::new(),
+        pane_id: Some(2),
+    };
+    for (index, kind) in [
+        "pane.output",
+        "pane.title_changed",
+        "pane.directory_changed",
+        "pane.bell",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut envelope = test_plugin_event(index as u64 + 1, 8);
+        if let PluginEventEnvelope::Event { name, .. } = &mut envelope {
+            *name = kind.into();
+        }
+        assert_eq!(filter.accepts(&envelope, false), kind == "pane.bell");
+        assert!(filter.accepts(&envelope, true));
+        assert!(!other.accepts(&envelope, true));
+        journal.push(envelope);
+    }
+    let replay = journal.replay(0, 4, 8);
+    assert_eq!(
+        replay.iter().filter(|e| filter.accepts(e, false)).count(),
+        1
+    );
+    assert_eq!(replay.iter().filter(|e| filter.accepts(e, true)).count(), 4);
+}
+
+#[test]
+fn mouse_wire_timing_bounds_are_checked_before_deadline_arithmetic() {
+    let mut request = serde_json::json!({
+        "method":"mouse", "action":"path", "route":"application", "button":"left",
+        "shift":false, "alt":false, "ctrl":false, "scroll":0, "points":[],
+        "wait_rendered":false, "duration_ms":1, "timeout_ms":2
+    });
+    for (duration, timeout, valid) in [
+        (1, 2, true),
+        (0, 1, false),
+        (1, 1, false),
+        (1, u64::MAX, false),
+        (u64::MAX - 1, u64::MAX, false),
+    ] {
+        request["duration_ms"] = duration.into();
+        request["timeout_ms"] = timeout.into();
+        let method = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(validate_automation_method(&method).is_ok(), valid);
+    }
 }

@@ -61,7 +61,80 @@ pub struct PtyParts {
     pub waiter: PtyWaiter,
 }
 
+#[derive(Debug, Default)]
+struct InputBudget {
+    items: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct InputCharge {
+    budget: Arc<InputBudget>,
+    bytes: usize,
+    queued: bool,
+}
+
+impl InputCharge {
+    fn release_item(&mut self) {
+        if self.queued {
+            self.budget.items.fetch_sub(1, Ordering::AcqRel);
+            self.queued = false;
+        }
+    }
+}
+
+impl Drop for InputCharge {
+    fn drop(&mut self) {
+        self.budget.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.release_item();
+    }
+}
+
+/// Capacity for a later write to this exact PTY. Dropping it returns the capacity.
+#[derive(Debug)]
+pub struct PtyWritePermit {
+    sender: mpsc::SyncSender<InputMessage>,
+    charge: InputCharge,
+}
+
+impl PtyWritePermit {
+    /// Send a bounded report using the pre-reserved capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the report exceeds the reservation or the writer has closed.
+    pub fn send(self, bytes: &[u8]) -> io::Result<()> {
+        self.submit(bytes, None)
+    }
+
+    fn submit(
+        self,
+        bytes: &[u8],
+        completion: Option<mpsc::Sender<io::Result<()>>>,
+    ) -> io::Result<()> {
+        if bytes.len() > self.charge.bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write exceeds its reservation",
+            ));
+        }
+        let message = InputMessage {
+            bytes: bytes.to_vec(),
+            completion,
+            charge: self.charge,
+        };
+        self.sender.try_send(message).map_err(|error| {
+            let kind = match error {
+                mpsc::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
+                mpsc::TrySendError::Disconnected(_) => io::ErrorKind::BrokenPipe,
+            };
+            io::Error::new(kind, "PTY input queue is unavailable")
+        })
+    }
+}
+
 struct InputMessage {
+    charge: InputCharge,
     bytes: Vec<u8>,
     completion: Option<mpsc::Sender<io::Result<()>>>,
 }
@@ -73,13 +146,13 @@ struct InputMessage {
 /// blocking the caller.
 pub struct PtyInput {
     sender: mpsc::SyncSender<InputMessage>,
-    queued_bytes: Arc<AtomicUsize>,
+    budget: Arc<InputBudget>,
 }
 
 impl fmt::Debug for PtyInput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PtyInput")
-            .field("queued_bytes", &self.queued_bytes.load(Ordering::Acquire))
+            .field("queued_bytes", &self.budget.bytes.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
 }
@@ -87,17 +160,15 @@ impl fmt::Debug for PtyInput {
 impl PtyInput {
     fn start(mut writer: File) -> io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<InputMessage>(INPUT_QUEUE_ITEMS);
-        let queued_bytes = Arc::new(AtomicUsize::new(0));
-        let worker_bytes = Arc::clone(&queued_bytes);
         std::thread::Builder::new()
             .name("vvmux-pty-input".into())
             .spawn(move || {
-                while let Ok(message) = receiver.recv() {
-                    let length = message.bytes.len();
+                while let Ok(mut message) = receiver.recv() {
+                    message.charge.release_item();
                     let result = writer
                         .write_all(&message.bytes)
                         .and_then(|()| writer.flush());
-                    worker_bytes.fetch_sub(length, Ordering::AcqRel);
+                    drop(message.charge);
                     if let Some(completion) = message.completion {
                         let reported = match &result {
                             Ok(()) => Ok(()),
@@ -112,7 +183,7 @@ impl PtyInput {
             })?;
         Ok(Self {
             sender,
-            queued_bytes,
+            budget: Arc::default(),
         })
     }
 
@@ -153,49 +224,50 @@ impl PtyInput {
         if bytes.is_empty() {
             return Ok(());
         }
-        if bytes.len() > INPUT_QUEUE_BYTES {
+        self.reserve(bytes.len())?.submit(bytes, completion)
+    }
+
+    /// Reserve one input message and its maximum byte length before beginning a multi-step write.
+    ///
+    /// # Errors
+    ///
+    /// An oversized reservation returns `InvalidInput`. A full item or byte budget returns
+    /// `WouldBlock`; no capacity remains charged after an error.
+    pub fn reserve(&self, max_bytes: usize) -> io::Result<PtyWritePermit> {
+        if max_bytes > INPUT_QUEUE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "PTY input exceeds the bounded queue",
             ));
         }
-        let mut queued = self.queued_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(next) = queued.checked_add(bytes.len()) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "PTY input queue is full",
-                ));
-            };
-            if next > INPUT_QUEUE_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "PTY input queue is full",
-                ));
-            }
-            match self.queued_bytes.compare_exchange_weak(
-                queued,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => queued = actual,
-            }
+        let full = || io::Error::new(io::ErrorKind::WouldBlock, "PTY input queue is full");
+        self.budget
+            .items
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |items| {
+                (items < INPUT_QUEUE_ITEMS).then_some(items + 1)
+            })
+            .map_err(|_items| full())?;
+        if self
+            .budget
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+                bytes
+                    .checked_add(max_bytes)
+                    .filter(|total| *total <= INPUT_QUEUE_BYTES)
+            })
+            .is_err()
+        {
+            self.budget.items.fetch_sub(1, Ordering::AcqRel);
+            return Err(full());
         }
-        let message = InputMessage {
-            bytes: bytes.to_vec(),
-            completion,
-        };
-        if let Err(error) = self.sender.try_send(message) {
-            self.queued_bytes.fetch_sub(bytes.len(), Ordering::AcqRel);
-            let kind = match error {
-                mpsc::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
-                mpsc::TrySendError::Disconnected(_) => io::ErrorKind::BrokenPipe,
-            };
-            return Err(io::Error::new(kind, "PTY input queue is unavailable"));
-        }
-        Ok(())
+        Ok(PtyWritePermit {
+            sender: self.sender.clone(),
+            charge: InputCharge {
+                budget: Arc::clone(&self.budget),
+                bytes: max_bytes,
+                queued: true,
+            },
+        })
     }
 }
 
@@ -286,6 +358,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"written");
+    }
+
+    #[test]
+    fn reserved_release_can_be_sent_with_every_other_input_slot_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("release");
+        let input = PtyInput::start(File::create(&path).unwrap()).unwrap();
+        let release = input.reserve(32).unwrap();
+        let others: Vec<_> = (1..super::INPUT_QUEUE_ITEMS)
+            .map(|_| input.reserve(1).unwrap())
+            .collect();
+        assert_eq!(
+            input.send(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        release.send(b"release").unwrap();
+        drop(others);
+        input
+            .send_with_completion(b"done")
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"releasedone");
     }
 
     /// A command pane really does run its command and end with it.

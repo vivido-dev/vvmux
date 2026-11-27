@@ -917,7 +917,11 @@ impl SessionActor {
             }
             PaneMenuCommand::Swap(direction) => self.swap_tiled_pane(pane_id, direction),
             PaneMenuCommand::Kill => self.close_pane(pane_id),
-            PaneMenuCommand::Respawn => self.respawn_pane(pane_id),
+            PaneMenuCommand::Respawn => {
+                if let Err(error) = self.respawn_pane(pane_id) {
+                    self.status(&error.message);
+                }
+            }
             PaneMenuCommand::ToggleZoom => {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.set_focus(pane_id);

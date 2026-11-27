@@ -94,6 +94,7 @@ image = { workspace = true, features = ["png", "jpeg"] }
 log = { workspace = true, features = ["kv"] }
 # The binary's global allocator; see `src/main.rs`. The library never sets one.
 mimalloc.workspace = true
+memchr = "2"
 regex = { workspace = true, features = ["std", "unicode-case", "unicode-perl"] }
 rpassword = { workspace = true, optional = true }
 rustls = { workspace = true, features = ["ring"], optional = true }

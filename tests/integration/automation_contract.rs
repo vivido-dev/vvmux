@@ -756,10 +756,12 @@ fn run_plan_binds_results_between_steps_and_verifies_them() {
     {"id": "split", "method": "split", "params": {"axis": "Horizontal"}, "pane_id": 1,
      "bind": {"right": "/new_pane_id"}},
     {"id": "name", "method": "pane_rename", "pane_id": {"$ref": "right"},
-     "params": {"name": "worker"}},
+     "params": {"name": "worker"},
+     "assert": {"result_pointer": "/pane_name", "result_equals": "worker"}},
     {"id": "run", "method": "submit_line", "pane_name": "worker",
      "params": {"text": "printf 'plan-ran\\n'", "report": true},
-     "verify": {"screen_changed": true, "capture": true, "timeout_ms": 5000}},
+     "verify": {"screen_changed": true, "capture": true, "timeout_ms": 5000},
+     "assert": {"text_contains": "plan-ran", "timeout_ms": 5000}},
     {"id": "confirm", "method": "wait_text", "pane_name": "worker",
      "params": {"text": "plan-ran", "regex": false, "after_screen": null, "timeout_ms": 5000}}
   ]
@@ -1106,6 +1108,166 @@ fn capture_reveals_waits_and_reads_in_one_request() {
     );
 }
 
+/// A row-scoped assertion parks on its own pane while another client can make progress.
+#[test]
+fn run_plan_waits_for_the_right_rows_and_keeps_other_panes_live() {
+    let fixture = Fixture::start("plan-rows");
+    let other = fixture.json(&["split", "horizontal", "--pane-id", "1"])["new_pane_id"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let dir = fixture.directory.path();
+    let plan = dir.join("plan.json");
+    let report = dir.join("plan.sarif");
+    let original = fixture.json(&["inspect", "--pane-id", "1"])["pane"]["output_offset"]
+        .as_u64()
+        .unwrap();
+    let script = r"printf '\033[1;1HROW-%s' MARK";
+    fs::write(&plan, serde_json::to_vec(&serde_json::json!({"version":1,"steps":[
+        {"id":"target","method":"inspect","pane_id":1,"bind":{"pane":"/pane/pane_id"}},
+        {"id":"row","method":"submit_line","params":{"text":script,"report":true},"pane_id":1,
+         "assert":{"pane_id":{"$ref":"pane"},"text_contains":"ROW-MARK","lines_from_bottom":3,"timeout_ms":5000}},
+        {"id":"fail","method":"inspect","pane_id":1,"on_error":"continue",
+         "assert":{"result_pointer":"/pane/pane_id","result_equals":false}},
+        {"id":"pass","method":"inspect","pane_id":1,
+         "assert":{"result_pointer":"/pane/pane_id","result_equals":1}}
+    ]})).unwrap()).unwrap();
+    let mut runner = fixture
+        .command()
+        .args([
+            "msg",
+            "--target",
+            &fixture.name,
+            "run-plan",
+            "--file",
+            plan.to_str().unwrap(),
+            "--report",
+            "sarif",
+            "--output",
+            report.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The action put its string in the first row. Waiting on raw PTY bytes proves it ran.
+    assert!(
+        fixture
+            .msg(&[
+                "wait",
+                "output",
+                "ROW-MARK",
+                "--after-offset",
+                &original.to_string(),
+                "--pane-id",
+                "1",
+                "--timeout",
+                "5s"
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .msg(&["submit", "--pane-id", &other, "printf 'OTHER-%s' ACTIVE"])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .msg(&[
+                "wait",
+                "text",
+                "OTHER-ACTIVE",
+                "--pane-id",
+                &other,
+                "--timeout",
+                "3s"
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        runner.try_wait().unwrap().is_none(),
+        "text outside the requested rows matched"
+    );
+    assert!(
+        fixture
+            .msg(&[
+                "submit",
+                "--pane-id",
+                "1",
+                r"printf '\033[999;1HROW-%s' MARK"
+            ])
+            .status
+            .success()
+    );
+    let output = runner.wait_with_output().unwrap();
+    let events = ndjson(&output.stdout);
+    assert_eq!(events[2]["status"], "ok", "{events:?}");
+    assert_eq!(events[3]["status"], "error");
+    assert_eq!(events[4]["status"], "ok");
+    assert_eq!(events[5]["status"], "completed_with_errors");
+    assert!(!output.status.success());
+    let artifact: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(artifact["version"], "2.1.0");
+    assert_eq!(artifact["runs"][0]["results"][2]["level"], "error");
+    assert_eq!(artifact["runs"][0]["results"][3]["kind"], "pass");
+}
+
+#[test]
+fn run_plan_reports_timeout_and_rejects_invalid_assertions_before_mutating() {
+    let fixture = Fixture::start("plan-report");
+    let plan = fixture.directory.path().join("plan.json");
+    let report = fixture.directory.path().join("plan.xml");
+    let args = [
+        "run-plan",
+        "--file",
+        plan.to_str().unwrap(),
+        "--report",
+        "junit",
+        "--output",
+        report.to_str().unwrap(),
+    ];
+    fs::write(&plan, r#"{"version":1,"steps":[
+        {"id":"first","method":"split","pane_id":1,"params":{"axis":"Horizontal"}},
+        {"id":"bad","method":"inspect","pane_id":1,"assert":{"text_contains":"x","lines_from_bottom":1001}}]}"#).unwrap();
+    let invalid = fixture.msg(&args);
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert!(!report.exists());
+    assert_eq!(
+        fixture.json(&["list-panes"])["panes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::write(&plan, r#"{"version":1,"steps":[
+        {"id":"empty","method":"session_inspect","assert":{"result_pointer":"/outer","result_equals":null}},
+        {"id":"timeout","method":"inspect","pane_id":1,"assert":{"text_contains":"ABSENT","timeout_ms":60}},
+        {"id":"after","method":"split","pane_id":1,"params":{"axis":"Horizontal"}}]}"#).unwrap();
+    let failed = fixture.msg(&args);
+    let events = ndjson(&failed.stdout);
+    assert!(!failed.status.success());
+    assert_eq!(events[1]["status"], "ok", "{events:?}");
+    assert!(
+        events[2]["error"].as_str().unwrap().contains("timeout"),
+        "{events:?}"
+    );
+    assert_eq!(events[3]["status"], "failed");
+    assert_eq!(
+        fixture.json(&["list-panes"])["panes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let xml = fs::read_to_string(&report).unwrap();
+    assert!(xml.contains(r#"tests="2" failures="1""#), "{xml}");
+    assert!(xml.contains(r#"name="timeout"><failure"#));
+}
+
 /// Every NDJSON line a plan run emitted.
 fn ndjson(bytes: &[u8]) -> Vec<Value> {
     String::from_utf8_lossy(bytes)
@@ -1364,4 +1526,413 @@ fn the_session_reports_the_presenting_window_or_says_there_is_none() {
             "session-inspect leaked {secret}: {encoded}"
         );
     }
+}
+
+#[test]
+fn raw_output_waits_and_semantic_events_agree_with_the_retained_stream() {
+    use base64::Engine as _;
+    use std::io::BufRead as _;
+    use std::time::Duration;
+
+    let fixture = Fixture::start("stream-bytes");
+    let before = fixture.json(&["transcript", "--pane-id", "1"])["output_offset"]
+        .as_u64()
+        .unwrap();
+    let command = r"printf '\377\376\033]2;stream-title\007\033]7;file:///work/one\007\007'";
+    assert!(
+        fixture
+            .msg(&["submit", command, "--pane-id", "1"])
+            .status
+            .success()
+    );
+    fixture.json(&[
+        "wait",
+        "output",
+        "//4=",
+        "--base64",
+        "--after-offset",
+        &before.to_string(),
+        "--timeout",
+        "3s",
+        "--pane-id",
+        "1",
+    ]);
+    let raw = fixture.msg(&[
+        "transcript",
+        "--raw",
+        "--after-offset",
+        &before.to_string(),
+        "--pane-id",
+        "1",
+    ]);
+    assert!(raw.status.success());
+    assert!(raw.stdout.windows(2).any(|part| part == [0xff, 0xfe]));
+    assert!(
+        !fixture
+            .msg(&["wait", "output", "**", "--base64", "--pane-id", "1"])
+            .status
+            .success()
+    );
+    assert!(fixture.json(&["get-selection", "--pane-id", "1"])["text"].is_null());
+
+    let mut child = fixture
+        .command()
+        .args([
+            "msg",
+            "--target",
+            &fixture.name,
+            "subscribe",
+            "--after",
+            "0",
+            "--pane-id",
+            "1",
+            "--name",
+            "pane.output",
+            "--name",
+            "pane.title_changed",
+            "--name",
+            "pane.directory_changed",
+            "--name",
+            "pane.bell",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut last = None;
+        let (mut title, mut directory) = (false, false);
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let item: Value = serde_json::from_str(&line).unwrap();
+            let p = &item["payload"];
+            match item["name"].as_str() {
+                Some("pane.output") => {
+                    let chunk = base64::engine::general_purpose::STANDARD
+                        .decode(p["base64"].as_str().unwrap())
+                        .unwrap();
+                    let from = p["from_offset"].as_u64().unwrap();
+                    assert!(last.is_none_or(|previous| previous == from));
+                    last = Some(p["output_offset"].as_u64().unwrap());
+                    assert_eq!(last, Some(from + chunk.len() as u64));
+                    if last.unwrap() > before {
+                        bytes.extend_from_slice(&chunk[before.saturating_sub(from) as usize..]);
+                    }
+                }
+                Some("pane.title_changed") => title = p["title"] == "stream-title",
+                Some("pane.directory_changed") => directory = p["uri"] == "file:///work/one",
+                Some("pane.bell") if p["count"] == 1 => {
+                    let _ = tx.send((bytes, title, directory));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+    let observed = rx.recv_timeout(Duration::from_secs(5));
+    let _ = child.kill();
+    let _ = child.wait();
+    let (bytes, title, directory) = observed.unwrap();
+    assert!(title && directory);
+    assert!(raw.stdout.starts_with(&bytes));
+}
+
+#[test]
+fn a_paced_path_can_be_cancelled_without_blocking_other_requests() {
+    use std::time::{Duration, Instant};
+    let fixture = Fixture::start("paced-path");
+    fixture.json(&["split", "horizontal", "--pane-id", "1"]);
+    let reader = fixture.directory.path().join("reader.py");
+    fs::write(
+        &reader,
+        r"import os,tty
+tty.setraw(0)
+os.write(1,b'MOUSE-READY\r\n')
+buf=b''
+while True:
+    ch=os.read(0,1)
+    if not ch: break
+    buf+=ch
+    if ch in (b'M', b'm'):
+        os.write(1,buf.hex().encode()+b'\r\n')
+        buf=b''
+",
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .msg(&[
+                "submit",
+                &format!("exec python3 {}", reader.display()),
+                "--pane-id",
+                "1"
+            ])
+            .status
+            .success()
+    );
+    fixture.json(&[
+        "wait",
+        "output",
+        "MOUSE-READY",
+        "--pane-id",
+        "1",
+        "--timeout",
+        "3s",
+    ]);
+    let before = fixture.json(&["transcript", "--pane-id", "1"])["output_offset"]
+        .as_u64()
+        .unwrap();
+    let mut child = fixture
+        .command()
+        .args([
+            "msg",
+            "--target",
+            &fixture.name,
+            "mouse",
+            "path",
+            "--pane-id",
+            "1",
+            "--point",
+            "1,1",
+            "--point",
+            "0.5,0.5rel",
+            "--duration",
+            "4s",
+            "--timeout",
+            "6s",
+        ])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The raw-mode reader reports the bytes it actually received.
+    fixture.json(&[
+        "wait",
+        "output",
+        &hex::encode(b"\x1b[<0;2;2M"),
+        "--after-offset",
+        &before.to_string(),
+        "--pane-id",
+        "1",
+        "--timeout",
+        "2s",
+    ]);
+    assert_eq!(
+        fixture.json(&["inspect", "--pane-id", "2"])["pane"]["pane_id"],
+        2
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    fixture.json(&[
+        "wait",
+        "output",
+        &hex::encode(b"\x1b[<0;2;2m"),
+        "--after-offset",
+        &before.to_string(),
+        "--pane-id",
+        "1",
+        "--timeout",
+        "2s",
+    ]);
+    let start = Instant::now();
+    let completed = fixture.json(&[
+        "mouse",
+        "path",
+        "--pane-id",
+        "1",
+        "--point",
+        "0,0",
+        "--point",
+        "1,1",
+        "--duration",
+        "120ms",
+        "--timeout",
+        "2s",
+    ]);
+    assert!(start.elapsed() >= Duration::from_millis(120));
+    assert_eq!(completed["events"], 2);
+    for extra in [
+        &["--point", "1,1px", "--point", "2,2px"][..],
+        &["--point", "0,0", "--point", "1,1", "--wait-rendered"],
+    ] {
+        let mut args = vec!["mouse", "path", "--pane-id", "1"];
+        args.extend_from_slice(extra);
+        assert!(!fixture.msg(&args).status.success());
+    }
+    for (interrupt, error_code) in [
+        ("reset-pane", "invalid_state"),
+        ("close-pane", "pane_not_found"),
+    ] {
+        let offset = fixture.json(&["transcript", "--pane-id", "1"])["output_offset"]
+            .as_u64()
+            .unwrap()
+            .to_string();
+        let gesture = fixture
+            .command()
+            .args([
+                "msg",
+                "--target",
+                &fixture.name,
+                "mouse",
+                "path",
+                "--pane-id",
+                "1",
+                "--point",
+                "2,2",
+                "--point",
+                "3,3",
+                "--duration",
+                "4s",
+                "--timeout",
+                "6s",
+            ])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        fixture.json(&[
+            "wait",
+            "output",
+            &hex::encode(b"\x1b[<0;3;3M"),
+            "--after-offset",
+            &offset,
+            "--pane-id",
+            "1",
+            "--timeout",
+            "2s",
+        ]);
+        assert!(fixture.msg(&[interrupt, "--pane-id", "1"]).status.success());
+        let result = gesture.wait_with_output().unwrap();
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(error_code), "{stderr}");
+        if interrupt == "reset-pane" {
+            fixture.json(&[
+                "wait",
+                "output",
+                &hex::encode(b"\x1b[<0;3;3m"),
+                "--after-offset",
+                &offset,
+                "--pane-id",
+                "1",
+                "--timeout",
+                "2s",
+            ]);
+        }
+        assert_eq!(
+            fixture.json(&["inspect", "--pane-id", "2"])["pane"]["pane_id"],
+            2
+        );
+    }
+}
+
+#[test]
+fn a_stalled_output_subscriber_leaves_peers_live_and_replay_reports_eviction() {
+    use std::io::BufRead as _;
+    use std::time::Duration;
+    let fixture = Fixture::start("slow-output");
+    fixture.json(&["split", "horizontal", "--pane-id", "1"]);
+    let mut stalled = fixture
+        .command()
+        .args([
+            "msg",
+            "--target",
+            &fixture.name,
+            "subscribe",
+            "--after",
+            "0",
+            "--name",
+            "pane.output",
+            "--pane-id",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = stalled.stdout.take().unwrap();
+    let (send, recv) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut first = String::new();
+        let result = reader.read_line(&mut first);
+        let _ = send.send((result, first, reader));
+    });
+    let (read, first, _unread_stdout) =
+        recv.recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|error| {
+                let _ = stalled.kill();
+                let _ = stalled.wait();
+                panic!("stalled subscriber did not become ready: {error}");
+            });
+    assert!(read.unwrap() > 0);
+    let seeded: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(seeded["name"], "pane.output");
+    // Fill the existing two-MiB journal and the unread subscriber pipe while the other pane accepts commands.
+    assert!(
+        fixture
+            .msg(&[
+                "submit",
+                r"head -c 2500000 /dev/zero; printf 'FLOOD-%s\n' END",
+                "--pane-id",
+                "1"
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .msg(&["submit", r"printf 'PEER-%s\n' READY", "--pane-id", "2"])
+            .status
+            .success()
+    );
+    fixture.json(&[
+        "wait",
+        "output",
+        "PEER-READY",
+        "--pane-id",
+        "2",
+        "--timeout",
+        "5s",
+    ]);
+    fixture.json(&[
+        "wait",
+        "output",
+        "FLOOD-END",
+        "--pane-id",
+        "1",
+        "--timeout",
+        "10s",
+    ]);
+    let _ = stalled.kill();
+    let _ = stalled.wait();
+    let mut replay = fixture
+        .command()
+        .args([
+            "msg",
+            "--target",
+            &fixture.name,
+            "subscribe",
+            "--after",
+            "0",
+            "--name",
+            "pane.bell",
+            "--pane-id",
+            "2",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = replay.stdout.take().unwrap();
+    let (send, recv) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut first = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut first);
+        let _ = send.send(first);
+    });
+    let first = recv.recv_timeout(Duration::from_secs(5));
+    let _ = replay.kill();
+    let _ = replay.wait();
+    let gap: Value = serde_json::from_str(&first.unwrap()).unwrap();
+    assert_eq!(gap["type"], "gap");
+    assert!(gap["to_sequence"].as_u64().unwrap() >= gap["from_sequence"].as_u64().unwrap());
 }

@@ -10,6 +10,8 @@ pub(crate) struct AgentOscTracker {
     pub(crate) title: Option<String>,
     pub(crate) progress: Option<String>,
     pub(crate) shell: ShellIntegration,
+    pub(crate) directory_uri: Option<String>,
+    pub(crate) directory_revision: u64,
 }
 
 /// Where a pane's shell says it is, from its OSC 133 markers.
@@ -181,6 +183,22 @@ impl AgentOscTracker {
             b"0" | b"2" => self.title = (!value.is_empty()).then_some(value),
             b"9" => self.progress = Some(value),
             b"133" => self.shell_marker(&value),
+            b"7" => {
+                // Report the shell's own URI as data. It never becomes a local spawn directory.
+                if let Ok(uri) = std::str::from_utf8(payload)
+                    && uri.starts_with("file://")
+                    && !uri.chars().any(char::is_control)
+                    && let Ok(parsed) = url::Url::parse(uri)
+                    && parsed.username().is_empty()
+                    && parsed.password().is_none()
+                    && parsed.query().is_none()
+                    && parsed.fragment().is_none()
+                    && self.directory_uri.as_deref() != Some(uri)
+                {
+                    self.directory_uri = Some(uri.to_owned());
+                    self.directory_revision = self.directory_revision.wrapping_add(1);
+                }
+            }
             _ => {}
         }
         self.body.clear();

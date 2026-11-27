@@ -644,6 +644,12 @@ impl SessionActor {
                 return Err(error);
             }
         };
+        let retire_child = |_: &io::Error| {
+            parts.control.terminate();
+            if birth_metrics.is_some() {
+                self.vivid.revoke_pane(pane_id);
+            }
+        };
         let child_pid = parts.child_pid;
         let reader_sender = self.sender.clone();
         let mut reader = parts.reader;
@@ -666,7 +672,8 @@ impl SessionActor {
                         Err(_) => break,
                     }
                 }
-            })?;
+            })
+            .inspect_err(retire_child)?;
         let exit_sender = self.sender.clone();
         let waiter = parts.waiter;
         std::thread::Builder::new()
@@ -674,7 +681,8 @@ impl SessionActor {
             .spawn(move || {
                 let status = waiter.wait().ok();
                 let _ = exit_sender.send(ActorEvent::PtyExit(pane_id, status));
-            })?;
+            })
+            .inspect_err(retire_child)?;
         self.panes.insert(
             pane_id,
             Pane {
@@ -772,12 +780,14 @@ impl SessionActor {
     /// End a pane's process and everything scoped to it, leaving its tab slot to the caller:
     /// `close_pane` collapses the slot, `respawn_pane` has already handed it to a new pane.
     pub(super) fn release_pane(&mut self, pane_id: PaneId) {
+        self.cancel_pane_gestures(pane_id, "pane_not_found", "mouse target closed");
         if self.direct_pane() == Some(pane_id) {
             self.detach_all_clients(&format!("directly attached pane {pane_id} closed"));
         }
         // A lease on a pane that no longer exists would keep refusing requests for a pane nobody
         // can reach, until it expired.
         self.leases.forget_pane(pane_id);
+        self.kitty_transfers.forget_pane(pane_id);
         if let Some(pending) = self.alt_reads.remove(&pane_id) {
             self.reply_automation_error(
                 pending.reply,
@@ -804,18 +814,59 @@ impl SessionActor {
         self.vivid.revoke_pane(pane_id);
     }
 
+    /// Resets the terminal and retires its Vivid sessions without replacing its PTY.
+    pub(super) fn reset_pane(&mut self, pane_id: PaneId) -> Result<(), AutomationError> {
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "pane no longer exists"))?;
+        if !matches!(pane.role, PaneRole::Core) {
+            return Err(AutomationError::new(
+                "unsupported",
+                "plugin panes cannot be reset",
+            ));
+        }
+        self.cancel_pane_gestures(pane_id, "invalid_state", "pane reset during mouse gesture");
+        if let Some(pending) = self.alt_reads.remove(&pane_id) {
+            self.reply_automation_error(
+                pending.reply,
+                AutomationError::new("invalid_state", "pane reset during alternate-screen read"),
+            );
+        }
+        let pane = self.panes.get_mut(&pane_id).ok_or_else(|| {
+            AutomationError::new("pane_not_found", "pane closed during gesture release")
+        })?;
+        pane.terminal.reset_preserving_history();
+        pane.key_paste = false;
+        pane.copy = None;
+        self.invalidate_mouse_selection_for_pane(pane_id);
+        self.clear_pane_hover(pane_id);
+        self.kitty_transfers.forget_pane(pane_id);
+        self.vivid.reset_pane_scene(pane_id);
+        self.mark_pane_screen_change(pane_id, None);
+        self.mark_snapshot_dirty();
+        self.force_full = true;
+        self.schedule_render();
+        Ok(())
+    }
+
     /// Kill a pane's process and run its original command again in the same slot.
     ///
     /// The fresh process is a new pane with a new ID, as it has to be: the old process's reader
     /// and exit waiter are still addressing the old ID, and its Vivid capability and media belong
     /// to that ID alone. Only the slot, focus, zoom, transparency, and name carry over.
-    pub(super) fn respawn_pane(&mut self, pane_id: PaneId) {
+    pub(super) fn respawn_pane(&mut self, pane_id: PaneId) -> Result<PaneId, AutomationError> {
         let Some(pane) = self.panes.get(&pane_id) else {
-            return;
+            return Err(AutomationError::new(
+                "pane_not_found",
+                "pane no longer exists",
+            ));
         };
         if !matches!(pane.role, PaneRole::Core) {
-            self.status("plugin panes cannot be respawned");
-            return;
+            return Err(AutomationError::new(
+                "unsupported",
+                "plugin panes cannot be respawned",
+            ));
         }
         let spec = PaneSpawn {
             transparent: Some(pane.transparent),
@@ -828,14 +879,20 @@ impl SessionActor {
             .find(|tab| tab.contains(pane_id))
             .map(|tab| tab.id)
         else {
-            return;
+            return Err(AutomationError::new(
+                "pane_not_found",
+                "pane slot no longer exists",
+            ));
         };
         let new_id = self.next_pane_id;
-        if self.spawn_pane(new_id, tab_id, &spec).is_err() {
-            self.status("could not respawn pane");
-            return;
-        }
-        self.next_pane_id += 1;
+        let next_id = new_id
+            .checked_add(1)
+            .ok_or_else(|| AutomationError::new("limit_exceeded", "pane IDs exhausted"))?;
+        // Even a partially started reader can still post events to this ID after a failure.
+        self.next_pane_id = next_id;
+        self.spawn_pane(new_id, tab_id, &spec).map_err(|error| {
+            AutomationError::new("spawn_failed", format!("could not respawn pane: {error}"))
+        })?;
         self.release_pane(pane_id);
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             if !tab
@@ -870,6 +927,7 @@ impl SessionActor {
             Some(pane_id),
             None,
         );
+        Ok(new_id)
     }
 
     pub(super) fn close_plugin_panes(&mut self, plugin_id: &str, package_digest: &str) {

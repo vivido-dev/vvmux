@@ -320,7 +320,7 @@ checked pixel dimensions; Windows accepts the same internal call and continues u
 This is the sole scoped PTY media exception in vvmux and does not change the Vivid wire stack.
 
 ```text
-Vivi → inner vvmux presenter → VVMX 27 → outer vvmux producer → Vivido
+Vivi → inner vvmux presenter → VVMX 28 → outer vvmux producer → Vivido
 ```
 
 
@@ -331,7 +331,7 @@ edit carries its full surface key, original editor and revision, and a sequence
 number. The native client and server share a monotonic clock. Serialization,
 IPC queueing and locking all consume the original one-second input lifetime.
 Clearing an excerpt retires its revisions. Detach and session replacement retire
-the attachment's grants and pending publications. Both binaries must use VVMX 27.
+the attachment's grants and pending publications. Version 28 also carries the automation additions for pane lifecycle, paced mouse input, output observations and row-scoped text waits. Both binaries must use VVMX 28.
 
 Version 21 also carries bounded overlay host requests/replies and native input events. The inner
 presenter queues vector frames/assets as acknowledged media deliveries; retained rehydration

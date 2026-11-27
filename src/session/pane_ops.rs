@@ -630,19 +630,35 @@ impl SessionActor {
             }
             MousePosition::Pixel { x, y } => {
                 let (cell_width, cell_height) = (display.cell_width, display.cell_height);
-                if cell_width == 0 || cell_height == 0 {
+                if self.clients.is_empty() || cell_width == 0 || cell_height == 0 {
                     return Err(AutomationError::new(
                         "invalid_state",
                         "pixel coordinates need an attached client's cell metrics; use --cell-column and --cell-row",
                     ));
                 }
-                let column = (x / u32::from(cell_width)) as u16;
-                let row = (y / u32::from(cell_height)) as u16;
-                // Session-absolute pixels, which is what the SGR pixel encoder subtracts the
-                // pane origin from.
+                let bounds = || {
+                    AutomationError::new(
+                        "invalid_params",
+                        "pixel point exceeds pane or pointer coordinates",
+                    )
+                };
+                let column =
+                    u16::try_from(x / u32::from(cell_width)).map_err(|_overflow| bounds())?;
+                let row =
+                    u16::try_from(y / u32::from(cell_height)).map_err(|_overflow| bounds())?;
                 let absolute = (
-                    (u32::from(content.x) * u32::from(cell_width)).saturating_add(x) as u16,
-                    (u32::from(content.y) * u32::from(cell_height)).saturating_add(y) as u16,
+                    u16::try_from(
+                        (u32::from(content.x) * u32::from(cell_width))
+                            .checked_add(x)
+                            .ok_or_else(bounds)?,
+                    )
+                    .map_err(|_overflow| bounds())?,
+                    u16::try_from(
+                        (u32::from(content.y) * u32::from(cell_height))
+                            .checked_add(y)
+                            .ok_or_else(bounds)?,
+                    )
+                    .map_err(|_overflow| bounds())?,
                 );
                 (column, row, Some(absolute))
             }
@@ -687,7 +703,7 @@ impl SessionActor {
         pane_id: PaneId,
         request: MouseRequest,
     ) -> Result<serde_json::Value, AutomationError> {
-        use crate::ipc::{MouseAction, MouseRoute};
+        use crate::ipc::MouseAction;
         let content = self.pane_content_rect(pane_id)?;
         let before_session = self.session_sequence;
 
@@ -702,44 +718,39 @@ impl SessionActor {
         })?;
         let ResolvedMousePoint { x, y, pixels } = self.resolve_mouse_position(content, position)?;
 
-        let mut sent = 0_usize;
-        let mut send = |actor: &mut Self, kind: MouseKind, button: u8| {
-            let event = MouseEvent {
-                button,
-                x,
-                y,
-                kind,
-                shift: request.shift,
-                alt: request.alt,
-                ctrl: request.ctrl,
-            };
-            match request.route {
-                MouseRoute::Application => actor.send_application_mouse(pane_id, event, pixels),
-                // Through the session's own handler, so copy-mode selection, float drag, and
-                // focus behave exactly as they do for a real pointer.
-                MouseRoute::Mux => actor.mouse(event, pixels.is_some()),
-            }
-            sent += 1;
+        let mut events = Vec::new();
+        let mut push = |kind, button| {
+            events.push((
+                MouseEvent {
+                    button,
+                    x,
+                    y,
+                    kind,
+                    shift: request.shift,
+                    alt: request.alt,
+                    ctrl: request.ctrl,
+                },
+                pixels,
+            ));
         };
-
         let button = request.button.code();
         match request.action {
-            MouseAction::Move => send(self, MouseKind::Move, 0),
-            MouseAction::Down => send(self, MouseKind::Press, button),
-            MouseAction::Up => send(self, MouseKind::Release, button),
+            MouseAction::Move => push(MouseKind::Move, 0),
+            MouseAction::Down => push(MouseKind::Press, button),
+            MouseAction::Up => push(MouseKind::Release, button),
             MouseAction::Click | MouseAction::Drag => {
-                send(self, MouseKind::Press, button);
+                push(MouseKind::Press, button);
                 if request.action == MouseAction::Drag {
                     // A drag with one point is a press and a release at the same place; the motion
                     // report between them is what makes an application treat it as a drag.
-                    send(self, MouseKind::Move, button);
+                    push(MouseKind::Move, button);
                 }
-                send(self, MouseKind::Release, button);
+                push(MouseKind::Release, button);
             }
             MouseAction::DoubleClick => {
                 for _ in 0..2 {
-                    send(self, MouseKind::Press, button);
-                    send(self, MouseKind::Release, button);
+                    push(MouseKind::Press, button);
+                    push(MouseKind::Release, button);
                 }
             }
             MouseAction::Scroll => {
@@ -755,11 +766,13 @@ impl SessionActor {
                     crate::agent_drive::WHEEL_DOWN
                 };
                 for _ in 0..request.scroll.unsigned_abs().min(MAX_MOUSE_SCROLL_NOTCHES) {
-                    send(self, MouseKind::Wheel, (wheel & 0xff) as u8);
+                    push(MouseKind::Wheel, (wheel & 0xff) as u8);
                 }
             }
             MouseAction::Path => unreachable!("handled above"),
         }
+        let sent = events.len();
+        self.send_gesture_points(pane_id, request.route, events)?;
         Ok(serde_json::json!({
             "pane_id": pane_id,
             "events": sent,
@@ -782,40 +795,8 @@ impl SessionActor {
         request: MouseRequest,
         before_session: u64,
     ) -> Result<serde_json::Value, AutomationError> {
-        use crate::ipc::MouseRoute;
-        if !(2..=MAX_MOUSE_PATH_POINTS).contains(&request.points.len()) {
-            return Err(AutomationError::new(
-                "invalid_params",
-                format!("a mouse path takes 2 through {MAX_MOUSE_PATH_POINTS} points"),
-            ));
-        }
-        let resolved = request
-            .points
-            .iter()
-            .map(|point| self.resolve_mouse_position(content, *point))
-            .collect::<Result<Vec<_>, _>>()?;
-        let button = request.button.code();
-        let last = resolved.len() - 1;
-        for (index, ResolvedMousePoint { x, y, pixels }) in resolved.into_iter().enumerate() {
-            let kind = match index {
-                0 => MouseKind::Press,
-                index if index == last => MouseKind::Release,
-                _ => MouseKind::Move,
-            };
-            let event = MouseEvent {
-                button,
-                x,
-                y,
-                kind,
-                shift: request.shift,
-                alt: request.alt,
-                ctrl: request.ctrl,
-            };
-            match request.route {
-                MouseRoute::Application => self.send_application_mouse(pane_id, event, pixels),
-                MouseRoute::Mux => self.mouse(event, pixels.is_some()),
-            }
-        }
+        let resolved = self.resolve_mouse_path(content, &request)?;
+        self.send_gesture_points(pane_id, request.route, resolved)?;
         Ok(serde_json::json!({
             "pane_id": pane_id,
             "events": request.points.len(),
@@ -825,25 +806,31 @@ impl SessionActor {
         }))
     }
 
-    /// Encode one event through a pane's own terminal modes and write it to that pane's PTY.
+    /// Encode one report through the target pane's own terminal modes.
     ///
     /// Addressed rather than hit-tested, which is what lets an explicitly targeted event reach a
     /// pane that is hidden, in another tab, or covered by a zoom. The interactive path has to hit
     /// test because it starts from a pointer position with no pane attached to it; this one was
     /// told which pane.
-    pub(super) fn send_application_mouse(
-        &mut self,
+    pub(super) fn application_mouse_report(
+        &self,
         pane_id: PaneId,
         mouse: MouseEvent,
         pixels: Option<(u16, u16)>,
-    ) {
+    ) -> Result<String, AutomationError> {
         let display = self.layout_display();
-        let Ok(content) = self.pane_content_rect(pane_id) else {
-            return;
-        };
-        let Some(modes) = self.panes.get(&pane_id).map(|pane| pane.terminal.modes()) else {
-            return;
-        };
+        let content = self.pane_content_rect(pane_id)?;
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| AutomationError::new("pane_not_found", "mouse target closed"))?;
+        if pane.exit_status.is_some() {
+            return Err(AutomationError::new(
+                "pty_closed",
+                "pane process has exited",
+            ));
+        }
+        let modes = pane.terminal.modes();
         let mut button = u16::from(mouse.button);
         if mouse.kind == MouseKind::Wheel {
             button |= 64;
@@ -862,9 +849,12 @@ impl SessionActor {
         }
         let (x, y) =
             application_mouse_coordinates(mouse, pixels, content, display, modes.sgr_pixels);
-        let encoded =
-            crate::agent_drive::encode_sgr_mouse(button, x, y, mouse.kind != MouseKind::Release);
-        self.send_pane_input(pane_id, encoded.as_bytes());
+        Ok(crate::agent_drive::encode_sgr_mouse(
+            button,
+            x,
+            y,
+            mouse.kind != MouseKind::Release,
+        ))
     }
 
     /// Submit a command line to a pane's shell, once that shell is in a state to accept one.

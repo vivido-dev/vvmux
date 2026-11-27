@@ -3447,6 +3447,7 @@ dependencies = [
  "image",
  "libc",
  "log",
+ "memchr",
  "mimalloc",
  "rcgen",
  "regex",

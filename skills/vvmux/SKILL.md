@@ -78,6 +78,10 @@ A pane name is written into the snapshot and comes back attached to the same pan
 belongs to the agent *process*: it is cleared when that agent exits or is replaced, so
 `agent_alias_not_found` means the agent is gone, not that you mistyped.
 
+For a wedged terminal, `msg reset-pane` keeps its PTY and history. To rerun its original
+command, `msg respawn-pane` returns the replacement's new pane ID. A pane name follows the
+replacement. [Reset and respawn commands](references/commands.md#reset-or-respawn-a-pane)
+
 Address a tab by its stable `tab_id` or `--tab-name`, **never** by display index. A `--tab-name`
 matching two tabs is refused rather than guessed.
 
@@ -138,6 +142,11 @@ client is attached unless `--force`, because it visibly resizes the pane.
 For anything past a couple of calls, write a plan and run `run-plan --file PATH`: one connection,
 `bind` carrying a result into a later step by JSON Pointer, `{"$ref":"alias"}` substituting it, the
 whole plan validated before any of it runs. `--preflight` runs only the observations.
+Use `assert.result_pointer` with `result_equals` for an exact reply check or `assert.text_contains`
+for a bounded wait on the target pane. `--report junit --output steps.xml` and
+`--report sarif --output steps.sarif` write CI artifacts alongside the NDJSON on stdout.
+The [command reference](references/commands.md#events-plans-leases-recording) includes a
+detached CI session and example plan.
 
 When more than one agent is working in a session, take a lease first:
 
@@ -217,7 +226,9 @@ needs no Vivido at all. When the terminal text itself must be in the picture, re
 `session-inspect`'s `outer` block: it names the Vivido window presenting the session now — the
 media presenter's when several clients are attached — is `null` when nothing is attached, and has `remote: true` when the client arrived over `vvssh`, in which case
 that route does not exist. `inspect`'s `pane.outer_crop` is the pane's rectangle in that window's
-pixels.
+pixels. For a local outer window, use the [attached pane capture example](../../examples/capture_vivido_pane.py)
+to include the window padding, match the frame metrics and check that the target stayed in place.
+The [command reference](references/commands.md#mouse) lists which observations work detached.
 
 ## When something is wrong
 
